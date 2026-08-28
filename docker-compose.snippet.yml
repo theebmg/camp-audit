@@ -1,0 +1,21 @@
+# Add this service to ~/nocodb/docker-compose.yml (merge, don't replace).
+# Adjust `context` to wherever this repo is checked out on the droplet, and
+# `networks` to match whatever network your Caddy container already shares
+# with the nocodb service in that same compose file.
+
+services:
+  camp-audit:
+    build:
+      context: ../camp-audit # adjust path
+      dockerfile: Dockerfile
+    container_name: camp-audit
+    restart: unless-stopped
+    env_file:
+      - ../camp-audit/.env
+    environment:
+      - NC_URL=http://nocodb:8080 # internal container URL, if on the same docker network; otherwise use the public NC_URL
+      - NC_PUBLIC_URL=https://nocodb.fracturedrv.com # always the public URL — used for attachment links sent to the browser
+    networks:
+      - default # match nocodb/Caddy's network name here
+    expose:
+      - "3000"

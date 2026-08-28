@@ -1,0 +1,6 @@
+# Add this block to the existing Caddyfile alongside the nocodb.fracturedrv.com block.
+# Requires a DNS A record for audit.fracturedrv.com pointing at the droplet (operator to add).
+
+audit.fracturedrv.com {
+    reverse_proxy camp-audit:3000
+}

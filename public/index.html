@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Camp Sychar Audit</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <div class="sidebar-overlay" id="sidebarOverlay" hidden></div>
+    <nav class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <span class="brand">🏕️ <span>Camp Sychar</span></span>
+        <button id="closeSidebarBtn" class="icon-btn sidebar-close">&times;</button>
+      </div>
+      <div class="sidebar-nav" id="sidebarNav"></div>
+      <div class="sidebar-footer">
+        <div class="sidebar-user" id="sidebarUser"></div>
+        <button id="logoutBtn" class="sidebar-logout" hidden>Log Out</button>
+      </div>
+    </nav>
+
+    <div class="main-col">
+      <header class="topbar">
+        <button id="menuBtn" class="icon-btn menu-btn" hidden>&#9776;</button>
+        <button id="backBtn" class="icon-btn" hidden>&larr;</button>
+        <h1 id="pageTitle">Camp Sychar Audit</h1>
+      </header>
+      <div class="global-search" id="globalSearchWrap" hidden>
+        <input type="text" id="globalSearch" placeholder="Search locations & assets…" autocomplete="off" />
+        <div class="global-search-results" id="globalSearchResults" hidden></div>
+      </div>
+      <nav id="breadcrumbs" class="breadcrumbs" hidden></nav>
+      <main id="app"></main>
+    </div>
+  </div>
+  <div id="toast" class="toast" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>
