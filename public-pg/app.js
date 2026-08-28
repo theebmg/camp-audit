@@ -73,6 +73,67 @@ function bucketColorKey(bucket) {
   return 'neutral';
 }
 
+// Reusable searchable/creatable asset picker. Mounts into `container` (an
+// empty element you provide), always searches the live DB (never a cached
+// list — see the migration brief's "dynamic assets" requirement), and offers
+// "+ Add new asset" when nothing matches. Call this once per container;
+// returns { getSelected() } so the caller can read the chosen asset on submit.
+function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {} } = {}) {
+  let selected = initialAsset;
+  let searchTimer;
+  container.classList.add('ac-wrap');
+  container.innerHTML = `
+    <input type="text" class="ac-input" autocomplete="off" placeholder="Type to search assets…"
+      value="${initialAsset ? escapeHtml(initialAsset.Name) : ''}" />
+    <div class="ac-results" hidden></div>`;
+  const input = container.querySelector('.ac-input');
+  const resultsEl = container.querySelector('.ac-results');
+
+  function renderResults(items, query) {
+    const rows = items.map((a) => `
+      <div class="ac-item" data-id="${a.Id}" data-name="${escapeHtml(a.Name)}">
+        ${escapeHtml(a.Name)}${a.locationName ? ` <span class="muted">— ${escapeHtml(a.locationName)}</span>` : ''}
+      </div>`).join('');
+    const addRow = query ? `<div class="ac-item ac-add" data-add-name="${escapeHtml(query)}">➕ Add new asset "${escapeHtml(query)}"</div>` : '';
+    resultsEl.innerHTML = rows + addRow;
+    resultsEl.hidden = false;
+    resultsEl.querySelectorAll('.ac-item[data-id]').forEach((el) => el.addEventListener('click', () => {
+      selected = { Id: Number(el.dataset.id), Name: el.dataset.name };
+      input.value = el.dataset.name;
+      resultsEl.hidden = true;
+      onSelect(selected);
+    }));
+    resultsEl.querySelector('.ac-add')?.addEventListener('click', async () => {
+      const name = resultsEl.querySelector('.ac-add').dataset.addName;
+      if (!confirm(`Create new asset "${name}"? You can fill in its location/type afterward from Edit Asset.`)) return;
+      try {
+        const { asset } = await api('/api/pg/assets', { method: 'POST', body: JSON.stringify({ name }) });
+        selected = asset;
+        input.value = asset.Name;
+        resultsEl.hidden = true;
+        toast(`Created asset "${asset.Name}"`);
+        onSelect(selected);
+      } catch (err) { toast(err.message); }
+    });
+  }
+
+  input.addEventListener('input', () => {
+    selected = null;
+    onSelect(null);
+    clearTimeout(searchTimer);
+    const q = input.value.trim();
+    if (!q) { resultsEl.hidden = true; return; }
+    searchTimer = setTimeout(async () => {
+      const { assets } = await api(`/api/pg/assets-search?q=${encodeURIComponent(q)}`);
+      renderResults(assets, q);
+    }, 250);
+  });
+  input.addEventListener('focus', () => { if (input.value.trim() && resultsEl.innerHTML) resultsEl.hidden = false; });
+  document.addEventListener('click', (e) => { if (!container.contains(e.target)) resultsEl.hidden = true; });
+
+  return { getSelected: () => selected };
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) } });
   if (res.status === 401) {
@@ -934,20 +995,14 @@ async function renderWorkOrders() {
 
 async function renderNewWorkOrder({ assetId, assetName }) {
   setChrome({ title: 'New Work Order', showBack: true, showLogout: true });
-  let assets = [];
-  if (!assetId) {
-    const { locations } = await api('/api/pg/locations');
-    const allAssets = await Promise.all(locations.map((l) => api(`/api/pg/locations/${l.Id}/assets`).then((r) => r.assets.map((a) => ({ ...a, locName: l.Name })))));
-    assets = allAssets.flat();
-  }
-  app.innerHTML = `
+  setApp(`
     <div class="card">
       <h3>New Work Order</h3>
       <form id="newWoForm">
         <div class="field-row"><label>Title</label><input name="title" required /></div>
-        ${assetId
-          ? `<div class="field-row"><label>Asset</label><input value="${escapeHtml(assetName)}" disabled /></div>`
-          : `<div class="field-row"><label>Asset</label><select name="assetId" required><option value="">— select —</option>${assets.map((a) => `<option value="${a.Id}">${escapeHtml(a.Name)} (${escapeHtml(a.locName)})</option>`).join('')}</select></div>`}
+        <div class="field-row"><label>Asset</label>
+          ${assetId ? `<input value="${escapeHtml(assetName)}" disabled />` : `<div id="woAssetPicker"></div>`}
+        </div>
         <div class="field-row"><label>Priority</label>
           <select name="priority"><option>Low</option><option selected>Medium</option><option>High</option><option>Urgent</option></select>
         </div>
@@ -957,13 +1012,18 @@ async function renderNewWorkOrder({ assetId, assetName }) {
           <button class="btn btn-secondary" type="button" id="cancelWoBtn">Cancel</button>
         </div>
       </form>
-    </div>`;
+    </div>`);
+
+  let assetPicker = null;
+  if (!assetId) assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'));
+
   document.getElementById('cancelWoBtn').addEventListener('click', goBack);
   document.getElementById('newWoForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const title = fd.get('title');
-    const finalAssetId = assetId || fd.get('assetId');
+    const finalAssetId = assetId || assetPicker?.getSelected()?.Id;
+    if (!finalAssetId) { toast('Pick an asset first (or add a new one)'); return; }
     if (!confirm(`Create work order "${title}"?`)) return;
     try {
       const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({ title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description') }) });
@@ -976,9 +1036,10 @@ async function renderNewWorkOrder({ assetId, assetName }) {
 async function renderWorkOrderDetail({ id }) {
   setChrome({ title: 'Work Order', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const [detail, allVolunteers, allVendors] = await Promise.all([
-    api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'),
+  const [detail, allVolunteers, allVendors, skillsRes] = await Promise.all([
+    api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'), api('/api/pg/skills'),
   ]);
+  const allSkills = skillsRes.skills.map((s) => s.Name);
   const { workOrder: wo, assetUpdates, volunteers, vendors } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
 
@@ -1035,15 +1096,30 @@ async function renderWorkOrderDetail({ id }) {
       <h4 style="margin-bottom:6px">Volunteers</h4>
       ${volunteers.map((v) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(v.Name)}</span><button class="btn btn-secondary unassign-vol" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('') || '<p class="muted">None assigned.</p>'}
       <form id="assignVolForm" style="margin-top:8px">
-        <div class="field-row"><select name="volunteerId"><option value="">— add volunteer —</option>${availableVols.map((v) => `<option value="${v.Id}">${escapeHtml(v.Name)}</option>`).join('')}</select></div>
+        <div class="field-row"><select name="volunteerId"><option value="">— add existing volunteer —</option>${availableVols.map((v) => `<option value="${v.Id}">${escapeHtml(v.Name)}</option>`).join('')}</select></div>
         <button class="btn btn-secondary" type="submit">Assign</button>
       </form>
+      <button type="button" class="btn btn-secondary" id="newVolToggle" style="margin-top:6px">+ New Volunteer</button>
+      <div id="newVolBox" hidden style="margin-top:10px">
+        <div class="field-row"><label>Name</label><input id="newVolName" required /></div>
+        <div class="field-row"><label>Phone</label><input id="newVolPhone" /></div>
+        <div class="field-row"><label>Skills</label><div class="skill-chips" id="newVolSkills">${skillChipsHtml(allSkills, [])}</div></div>
+        <button type="button" class="btn btn-primary" id="newVolSave">Add & Assign</button>
+      </div>
+
       <h4 style="margin:16px 0 6px">Vendors</h4>
       ${vendors.map((v) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(v.Name)}</span><button class="btn btn-secondary unassign-ven" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('') || '<p class="muted">None assigned.</p>'}
       <form id="assignVenForm" style="margin-top:8px">
-        <div class="field-row"><select name="vendorId"><option value="">— add vendor —</option>${availableVens.map((v) => `<option value="${v.Id}">${escapeHtml(v.Name)}</option>`).join('')}</select></div>
+        <div class="field-row"><select name="vendorId"><option value="">— add existing vendor —</option>${availableVens.map((v) => `<option value="${v.Id}">${escapeHtml(v.Name)}</option>`).join('')}</select></div>
         <button class="btn btn-secondary" type="submit">Assign</button>
       </form>
+      <button type="button" class="btn btn-secondary" id="newVenToggle" style="margin-top:6px">+ New Vendor</button>
+      <div id="newVenBox" hidden style="margin-top:10px">
+        <div class="field-row"><label>Name</label><input id="newVenName" required /></div>
+        <div class="field-row"><label>Phone</label><input id="newVenPhone" /></div>
+        <div class="field-row"><label>Specialties</label><div class="skill-chips" id="newVenSkills">${skillChipsHtml(allSkills, [])}</div></div>
+        <button type="button" class="btn btn-primary" id="newVenSave">Add & Assign</button>
+      </div>
     </div>`;
 
   document.getElementById('woFieldsForm').addEventListener('submit', async (e) => {
@@ -1102,6 +1178,39 @@ async function renderWorkOrderDetail({ id }) {
     await api(`/api/pg/work-orders/${id}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: Number(vendorId) }) });
     renderWorkOrderDetail({ id });
   });
+
+  document.getElementById('newVolToggle').addEventListener('click', () => document.getElementById('newVolBox').hidden = false);
+  document.getElementById('newVenToggle').addEventListener('click', () => document.getElementById('newVenBox').hidden = false);
+  wireSkillChipToggle(document.getElementById('newVolSkills'));
+  wireSkillChipToggle(document.getElementById('newVenSkills'));
+  document.getElementById('newVolSave').addEventListener('click', async () => {
+    const name = document.getElementById('newVolName').value.trim();
+    if (!name) { toast('Name is required'); return; }
+    if (!confirm(`Add volunteer "${name}" and assign to this work order?`)) return;
+    try {
+      const { volunteer } = await api('/api/pg/volunteers', { method: 'POST', body: JSON.stringify({
+        name, phone: document.getElementById('newVolPhone').value.trim(),
+        skill: selectedSkillsOf(document.getElementById('newVolSkills')),
+      }) });
+      await api(`/api/pg/work-orders/${id}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: volunteer.Id }) });
+      toast('Volunteer added and assigned');
+      renderWorkOrderDetail({ id });
+    } catch (err) { toast(err.message); }
+  });
+  document.getElementById('newVenSave').addEventListener('click', async () => {
+    const name = document.getElementById('newVenName').value.trim();
+    if (!name) { toast('Name is required'); return; }
+    if (!confirm(`Add vendor "${name}" and assign to this work order?`)) return;
+    try {
+      const { vendor } = await api('/api/pg/vendors', { method: 'POST', body: JSON.stringify({
+        name, phone: document.getElementById('newVenPhone').value.trim(),
+        specialty: selectedSkillsOf(document.getElementById('newVenSkills')),
+      }) });
+      await api(`/api/pg/work-orders/${id}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: vendor.Id }) });
+      toast('Vendor added and assigned');
+      renderWorkOrderDetail({ id });
+    } catch (err) { toast(err.message); }
+  });
   app.querySelectorAll('.unassign-vol').forEach((btn) => btn.addEventListener('click', async () => {
     if (!confirm(`Remove ${btn.dataset.name} from this work order?`)) return;
     await api(`/api/pg/work-orders/${id}/volunteers/${btn.dataset.id}`, { method: 'DELETE' });
@@ -1114,41 +1223,155 @@ async function renderWorkOrderDetail({ id }) {
   }));
 }
 
+// Shared "person" card — used for both Volunteers and Vendors, which are
+// structurally identical (name/phone/email/address/skills/active). `kind` is
+// 'vol' or 'ven'; skills come from the shared skill_catalog either way.
+function personSkillsOf(p, kind) { return (kind === 'vol' ? p.Skill : p.Specialty) || []; }
+
+function skillChipsHtml(allSkills, selected, extraClass = '') {
+  return allSkills.map((s) => `<span class="skill-chip ${extraClass} ${selected.includes(s) ? 'selected' : ''}" data-skill="${escapeHtml(s)}">${escapeHtml(s)}</span>`).join('');
+}
+
+function wireSkillChipToggle(container) {
+  container.querySelectorAll('.skill-chip').forEach((chip) => chip.addEventListener('click', () => chip.classList.toggle('selected')));
+}
+function selectedSkillsOf(container) {
+  return [...container.querySelectorAll('.skill-chip.selected')].map((c) => c.dataset.skill);
+}
+
 async function renderCrew() {
   setChrome({ title: 'Crew', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const [vols, vens] = await Promise.all([api('/api/pg/volunteers'), api('/api/pg/vendors')]);
-  app.innerHTML = `
-    <div class="card"><h3>Volunteers</h3>
-      ${vols.volunteers.map((v) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(v.Name)}</span><span class="muted">${escapeHtml(v['Phone Number'] || '')}</span></div>`).join('') || '<p class="muted">None yet.</p>'}
-      <form id="addVolForm" style="margin-top:10px">
-        <div class="field-row"><label>Name</label><input name="name" required /></div>
-        <div class="field-row"><label>Phone</label><input name="phone" /></div>
-        <button class="btn btn-secondary" type="submit">Add Volunteer</button>
-      </form>
-    </div>
-    <div class="card"><h3>Vendors</h3>
-      ${vens.vendors.map((v) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(v.Name)}</span><span class="muted">${escapeHtml(v['Phone Number'] || '')}</span></div>`).join('') || '<p class="muted">None yet.</p>'}
-      <form id="addVenForm" style="margin-top:10px">
-        <div class="field-row"><label>Name</label><input name="name" required /></div>
-        <div class="field-row"><label>Phone</label><input name="phone" /></div>
-        <button class="btn btn-secondary" type="submit">Add Vendor</button>
-      </form>
+  const [skillsRes, volsRes, vensRes] = await Promise.all([
+    api('/api/pg/skills'), api('/api/pg/volunteers?all=1'), api('/api/pg/vendors?all=1'),
+  ]);
+  let allSkills = skillsRes.skills.map((s) => s.Name);
+  const volunteers = volsRes.volunteers;
+  const vendors = vensRes.vendors;
+  let editing = null; // { kind: 'vol'|'ven', id } | 'new-vol' | 'new-ven' | null
+
+  function personCard(p, kind) {
+    const skills = personSkillsOf(p, kind);
+    return `<div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start;gap:10px">
+      <div style="flex:1;min-width:180px">
+        <div><strong>${escapeHtml(p.Name)}</strong>${!p.Active ? ' <span class="pill">inactive</span>' : ''}</div>
+        <div class="muted">${escapeHtml(p['Phone Number'] || '—')}${p.Email ? ' · ' + escapeHtml(p.Email) : ''}</div>
+        ${p.Address ? `<div class="muted">${escapeHtml(p.Address)}</div>` : ''}
+        ${skills.length ? `<div class="skill-chips">${skills.map((s) => `<span class="skill-chip selected">${escapeHtml(s)}</span>`).join('')}</div>` : ''}
+      </div>
+      <div class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary edit-person" data-kind="${kind}" data-id="${p.Id}">Edit</button>
+        <button class="btn btn-secondary remove-person" data-kind="${kind}" data-id="${p.Id}" data-name="${escapeHtml(p.Name)}" data-active="${p.Active}">${p.Active ? 'Remove' : 'Delete permanently'}</button>
+      </div>
     </div>`;
-  document.getElementById('addVolForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    if (!confirm(`Add volunteer "${fd.get('name')}"?`)) return;
-    await api('/api/pg/volunteers', { method: 'POST', body: JSON.stringify({ name: fd.get('name'), phone: fd.get('phone') }) });
-    renderCrew();
-  });
-  document.getElementById('addVenForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const fd = new FormData(e.target);
-    if (!confirm(`Add vendor "${fd.get('name')}"?`)) return;
-    await api('/api/pg/vendors', { method: 'POST', body: JSON.stringify({ name: fd.get('name'), phone: fd.get('phone') }) });
-    renderCrew();
-  });
+  }
+
+  function editFormHtml(kind, p) {
+    const skills = p ? personSkillsOf(p, kind) : [];
+    const label = kind === 'vol' ? 'Skills' : 'Specialties';
+    return `<div class="card">
+      <h3>${p ? `Edit ${escapeHtml(p.Name)}` : (kind === 'vol' ? 'Add Volunteer' : 'Add Vendor')}</h3>
+      <div class="field-row"><label>Name</label><input class="ef-name" value="${escapeHtml(p?.Name || '')}" required /></div>
+      <div class="field-row"><label>Phone</label><input class="ef-phone" value="${escapeHtml(p?.['Phone Number'] || '')}" /></div>
+      <div class="field-row"><label>Email</label><input class="ef-email" type="email" value="${escapeHtml(p?.Email || '')}" /></div>
+      <div class="field-row"><label>Address</label><input class="ef-address" value="${escapeHtml(p?.Address || '')}" /></div>
+      <div class="field-row"><label>${label}</label>
+        <div class="skill-chips ef-skills">${skillChipsHtml(allSkills, skills)}</div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <input class="ef-new-skill" placeholder="Add a new ${kind === 'vol' ? 'skill' : 'specialty'}…" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm)" />
+          <button type="button" class="btn btn-secondary ef-add-skill">+</button>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary ef-save" data-kind="${kind}" data-id="${p?.Id ?? ''}">Save</button>
+        <button class="btn btn-secondary ef-cancel">Cancel</button>
+      </div>
+    </div>`;
+  }
+
+  function draw() {
+    setApp(`
+      <div class="card"><h3>Volunteers</h3>
+        ${volunteers.map((v) => personCard(v, 'vol')).join('') || '<p class="muted">🤷 None yet.</p>'}
+      </div>
+      ${editing === 'new-vol' ? editFormHtml('vol', null) : `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="addVolBtn">+ Add Volunteer</button></div>`}
+      ${editing?.kind === 'vol' ? editFormHtml('vol', volunteers.find((v) => v.Id === editing.id)) : ''}
+
+      <div class="card"><h3>Vendors</h3>
+        ${vendors.map((v) => personCard(v, 'ven')).join('') || '<p class="muted">🤷 None yet.</p>'}
+      </div>
+      ${editing === 'new-ven' ? editFormHtml('ven', null) : `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="addVenBtn">+ Add Vendor</button></div>`}
+      ${editing?.kind === 'ven' ? editFormHtml('ven', vendors.find((v) => v.Id === editing.id)) : ''}
+    `);
+    wire();
+  }
+
+  function wire() {
+    document.getElementById('addVolBtn')?.addEventListener('click', () => { editing = 'new-vol'; draw(); });
+    document.getElementById('addVenBtn')?.addEventListener('click', () => { editing = 'new-ven'; draw(); });
+    app.querySelectorAll('.edit-person').forEach((btn) => btn.addEventListener('click', () => {
+      editing = { kind: btn.dataset.kind, id: Number(btn.dataset.id) };
+      draw();
+    }));
+    app.querySelectorAll('.ef-cancel').forEach((btn) => btn.addEventListener('click', () => { editing = null; draw(); }));
+    app.querySelectorAll('.ef-skills').forEach(wireSkillChipToggle); // only the editable forms — not the read-only display chips on cards
+
+    app.querySelectorAll('.ef-add-skill').forEach((btn) => btn.addEventListener('click', async () => {
+      const input = btn.closest('.field-row').querySelector('.ef-new-skill');
+      const name = input.value.trim();
+      if (!name) return;
+      try {
+        await api('/api/pg/skills', { method: 'POST', body: JSON.stringify({ name }) });
+        if (!allSkills.includes(name)) allSkills.push(name);
+        const chipsEl = btn.closest('.field-row').querySelector('.ef-skills');
+        const chip = document.createElement('span');
+        chip.className = 'skill-chip selected';
+        chip.dataset.skill = name;
+        chip.textContent = name;
+        chip.addEventListener('click', () => chip.classList.toggle('selected'));
+        chipsEl.appendChild(chip);
+        input.value = '';
+      } catch (err) { toast(err.message); }
+    }));
+
+    app.querySelectorAll('.ef-save').forEach((btn) => btn.addEventListener('click', async () => {
+      const card = btn.closest('.card');
+      const kind = btn.dataset.kind;
+      const id = btn.dataset.id;
+      const fields = {
+        name: card.querySelector('.ef-name').value.trim(),
+        phone: card.querySelector('.ef-phone').value.trim(),
+        email: card.querySelector('.ef-email').value.trim(),
+        address: card.querySelector('.ef-address').value.trim(),
+        [kind === 'vol' ? 'skill' : 'specialty']: selectedSkillsOf(card),
+      };
+      if (!fields.name) { toast('Name is required'); return; }
+      const isNew = !id;
+      if (!confirm(isNew ? `Add ${kind === 'vol' ? 'volunteer' : 'vendor'} "${fields.name}"?` : `Save changes to "${fields.name}"?`)) return;
+      try {
+        const base = kind === 'vol' ? '/api/pg/volunteers' : '/api/pg/vendors';
+        await api(isNew ? base : `${base}/${id}`, { method: isNew ? 'POST' : 'PATCH', body: JSON.stringify(fields) });
+        toast(isNew ? 'Added' : 'Saved');
+        renderCrew();
+      } catch (err) { toast(err.message); }
+    }));
+
+    app.querySelectorAll('.remove-person').forEach((btn) => btn.addEventListener('click', async () => {
+      const isActive = btn.dataset.active === 'true';
+      const msg = isActive
+        ? `Remove ${btn.dataset.name}? If they have work order history they'll be deactivated (kept for records, hidden from new assignments); otherwise deleted entirely.`
+        : `Permanently delete ${btn.dataset.name}? This cannot be undone.`;
+      if (!confirm(msg)) return;
+      const base = btn.dataset.kind === 'vol' ? '/api/pg/volunteers' : '/api/pg/vendors';
+      try {
+        const result = await api(`${base}/${btn.dataset.id}`, { method: 'DELETE' });
+        toast(result.deactivated ? 'Deactivated (had work order history)' : 'Deleted');
+        renderCrew();
+      } catch (err) { toast(err.message); }
+    }));
+  }
+
+  draw();
 }
 
 // ---------- Boot ----------

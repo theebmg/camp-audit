@@ -108,6 +108,24 @@
     .bucket-tile .n { font-size: 1.4rem; font-weight: 800; }
     .note-item { padding: 10px 12px; border-radius: var(--radius-sm); background: var(--surface-alt); margin-bottom: 8px; }
     .note-item.resolved { opacity: 0.55; text-decoration: line-through; }
+
+    /* Asset combobox — searchable, typeable, creatable. Always queries the
+       live DB (see searchAssetsLive in db.js), so a newly-added asset shows
+       up in every picker immediately, no stale cached list anywhere. */
+    .ac-wrap { position: relative; }
+    .ac-results { position: absolute; top: 100%; left: 0; right: 0; z-index: 20; background: var(--surface);
+      border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: var(--shadow-md);
+      max-height: 240px; overflow-y: auto; margin-top: 4px; }
+    .ac-item { padding: 10px 12px; cursor: pointer; border-bottom: 1px solid var(--border); font-size: 0.92rem; }
+    .ac-item:last-child { border-bottom: none; }
+    .ac-item:hover { background: var(--surface-alt); }
+    .ac-item.ac-add { color: var(--accent-dark); font-weight: 700; }
+    .ac-item.ac-empty { cursor: default; color: var(--muted); }
+    .ac-item.ac-empty:hover { background: none; }
+    .skill-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .skill-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 999px;
+      border: 1px solid var(--border); font-size: 0.82rem; cursor: pointer; user-select: none; background: var(--surface); }
+    .skill-chip.selected { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-dark); font-weight: 600; }
   </style>
 </head>
 <body>

@@ -790,26 +790,113 @@ export async function unassignVendor(woId, vendorId) {
   return getWorkOrderAssignees(woId);
 }
 
-export async function listVolunteers() {
-  const { rows } = await pool.query('SELECT id, name, phone, email, skill, active FROM volunteers WHERE active ORDER BY name');
-  return rows.map((r) => ({ Id: r.id, Name: r.name, 'Phone Number': r.phone, Email: r.email, Skill: r.skill }));
+function volunteerRowShape(r) {
+  return { Id: r.id, Name: r.name, 'Phone Number': r.phone, Email: r.email, Address: r.address, Skill: r.skill, Active: r.active };
 }
-export async function createVolunteer({ name, phone, email, skill = [] }) {
-  const { rows } = await pool.query(
-    `INSERT INTO volunteers (name, phone, email, skill) VALUES ($1,$2,$3,$4) RETURNING *`,
-    [name, phone || null, email || null, skill]
-  );
-  return rows[0];
+function vendorRowShape(r) {
+  return { Id: r.id, Name: r.name, 'Phone Number': r.phone, Email: r.email, Address: r.address, Specialty: r.specialty, Active: r.active };
 }
 
-export async function listVendors() {
-  const { rows } = await pool.query('SELECT id, name, phone, email, specialty, active FROM vendors WHERE active ORDER BY name');
-  return rows.map((r) => ({ Id: r.id, Name: r.name, 'Phone Number': r.phone, Email: r.email, Specialty: r.specialty }));
-}
-export async function createVendor({ name, phone, email, specialty = [] }) {
+export async function listVolunteers({ includeInactive = false } = {}) {
   const { rows } = await pool.query(
-    `INSERT INTO vendors (name, phone, email, specialty) VALUES ($1,$2,$3,$4) RETURNING *`,
-    [name, phone || null, email || null, specialty]
+    `SELECT * FROM volunteers ${includeInactive ? '' : 'WHERE active'} ORDER BY name`
   );
-  return rows[0];
+  return rows.map(volunteerRowShape);
+}
+export async function createVolunteer({ name, phone, email, address, skill = [] }) {
+  const { rows } = await pool.query(
+    `INSERT INTO volunteers (name, phone, email, address, skill) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [name, phone || null, email || null, address || null, skill]
+  );
+  return volunteerRowShape(rows[0]);
+}
+export async function updateVolunteer(id, { name, phone, email, address, skill }) {
+  const { rows } = await pool.query(
+    `UPDATE volunteers SET name = COALESCE($2,name), phone = COALESCE($3,phone), email = COALESCE($4,email),
+       address = COALESCE($5,address), skill = COALESCE($6, skill)
+     WHERE id = $1 RETURNING *`,
+    [id, name ?? null, phone ?? null, email ?? null, address ?? null, skill ?? null]
+  );
+  return rows[0] ? volunteerRowShape(rows[0]) : null;
+}
+// Hard-deletes only if never assigned to a Work Order (mirrors
+// adminDeleteBuildingType's block-if-in-use pattern); otherwise deactivates
+// so WO assignment history isn't silently lost.
+export async function removeVolunteer(id) {
+  const used = await pool.query('SELECT count(*) FROM work_order_volunteers WHERE volunteer_id = $1', [id]);
+  if (Number(used.rows[0].count) > 0) {
+    await pool.query('UPDATE volunteers SET active = false WHERE id = $1', [id]);
+    return { deactivated: true };
+  }
+  await pool.query('DELETE FROM volunteers WHERE id = $1', [id]);
+  return { deleted: true };
+}
+
+export async function listVendors({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(
+    `SELECT * FROM vendors ${includeInactive ? '' : 'WHERE active'} ORDER BY name`
+  );
+  return rows.map(vendorRowShape);
+}
+export async function createVendor({ name, phone, email, address, specialty = [] }) {
+  const { rows } = await pool.query(
+    `INSERT INTO vendors (name, phone, email, address, specialty) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [name, phone || null, email || null, address || null, specialty]
+  );
+  return vendorRowShape(rows[0]);
+}
+export async function updateVendor(id, { name, phone, email, address, specialty }) {
+  const { rows } = await pool.query(
+    `UPDATE vendors SET name = COALESCE($2,name), phone = COALESCE($3,phone), email = COALESCE($4,email),
+       address = COALESCE($5,address), specialty = COALESCE($6, specialty)
+     WHERE id = $1 RETURNING *`,
+    [id, name ?? null, phone ?? null, email ?? null, address ?? null, specialty ?? null]
+  );
+  return rows[0] ? vendorRowShape(rows[0]) : null;
+}
+export async function removeVendor(id) {
+  const used = await pool.query('SELECT count(*) FROM work_order_vendors WHERE vendor_id = $1', [id]);
+  if (Number(used.rows[0].count) > 0) {
+    await pool.query('UPDATE vendors SET active = false WHERE id = $1', [id]);
+    return { deactivated: true };
+  }
+  await pool.query('DELETE FROM vendors WHERE id = $1', [id]);
+  return { deleted: true };
+}
+
+// ── Skill catalog — shared by volunteers.skill and vendors.specialty. Same
+//    "add on the fly, no deploy" philosophy as the rest of the admin system. ──
+
+export async function listSkills() {
+  const { rows } = await pool.query('SELECT id, name FROM skill_catalog ORDER BY name');
+  return rows.map((r) => ({ Id: r.id, Name: r.name }));
+}
+export async function createSkill(name) {
+  const { rows } = await pool.query(
+    `INSERT INTO skill_catalog (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING *`,
+    [name]
+  );
+  return { Id: rows[0].id, Name: rows[0].name };
+}
+
+// ── Asset quick-create + live search — for the "add an asset without leaving
+//    the screen" combobox used anywhere an asset needs to be picked. ────────
+
+export async function searchAssetsLive(q) {
+  const { rows } = await pool.query(
+    `SELECT a.id, a.name, a.asset_type, a.location_id, l.name AS location_name
+     FROM assets a LEFT JOIN locations l ON l.id = a.location_id
+     WHERE a.name ILIKE $1 ORDER BY a.name LIMIT 20`,
+    [`%${q}%`]
+  );
+  return rows.map((r) => ({ Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: r.location_name }));
+}
+
+export async function createAssetQuick({ name, locationId, assetType }) {
+  const { rows } = await pool.query(
+    `INSERT INTO assets (name, location_id, asset_type) VALUES ($1,$2,$3) RETURNING id, name, location_id, asset_type`,
+    [name, locationId || null, assetType || null]
+  );
+  const r = rows[0];
+  return { Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: null };
 }

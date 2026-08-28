@@ -26,7 +26,9 @@ import {
   listWorkOrders, getWorkOrderDetail, createWorkOrder, updateWorkOrder,
   addAssetUpdateToWorkOrder, deleteAssetUpdate, completeWorkOrder,
   assignVolunteer, unassignVolunteer, assignVendor, unassignVendor,
-  listVolunteers, createVolunteer, listVendors, createVendor,
+  listVolunteers, createVolunteer, updateVolunteer, removeVolunteer,
+  listVendors, createVendor, updateVendor, removeVendor,
+  listSkills, createSkill, searchAssetsLive, createAssetQuick,
 } from '../db.js';
 
 const router = express.Router();
@@ -390,24 +392,77 @@ router.delete('/work-orders/:id/vendors/:vendorId', async (req, res, next) => {
 });
 
 router.get('/volunteers', async (req, res, next) => {
-  try { res.json({ volunteers: await listVolunteers() }); } catch (e) { next(e); }
+  try { res.json({ volunteers: await listVolunteers({ includeInactive: req.query.all === '1' }) }); } catch (e) { next(e); }
 });
 router.post('/volunteers', async (req, res, next) => {
   try {
-    const { name, phone, email, skill } = req.body || {};
+    const { name, phone, email, address, skill } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    res.json({ ok: true, volunteer: await createVolunteer({ name, phone, email, skill }) });
+    res.json({ ok: true, volunteer: await createVolunteer({ name, phone, email, address, skill }) });
   } catch (e) { next(e); }
+});
+router.patch('/volunteers/:id', async (req, res, next) => {
+  try {
+    const { name, phone, email, address, skill } = req.body || {};
+    const volunteer = await updateVolunteer(req.params.id, { name, phone, email, address, skill });
+    if (!volunteer) return res.status(404).json({ ok: false, error: 'Volunteer not found' });
+    res.json({ ok: true, volunteer });
+  } catch (e) { next(e); }
+});
+router.delete('/volunteers/:id', async (req, res, next) => {
+  try { res.json({ ok: true, ...(await removeVolunteer(req.params.id)) }); } catch (e) { next(e); }
 });
 
 router.get('/vendors', async (req, res, next) => {
-  try { res.json({ vendors: await listVendors() }); } catch (e) { next(e); }
+  try { res.json({ vendors: await listVendors({ includeInactive: req.query.all === '1' }) }); } catch (e) { next(e); }
 });
 router.post('/vendors', async (req, res, next) => {
   try {
-    const { name, phone, email, specialty } = req.body || {};
+    const { name, phone, email, address, specialty } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    res.json({ ok: true, vendor: await createVendor({ name, phone, email, specialty }) });
+    res.json({ ok: true, vendor: await createVendor({ name, phone, email, address, specialty }) });
+  } catch (e) { next(e); }
+});
+router.patch('/vendors/:id', async (req, res, next) => {
+  try {
+    const { name, phone, email, address, specialty } = req.body || {};
+    const vendor = await updateVendor(req.params.id, { name, phone, email, address, specialty });
+    if (!vendor) return res.status(404).json({ ok: false, error: 'Vendor not found' });
+    res.json({ ok: true, vendor });
+  } catch (e) { next(e); }
+});
+router.delete('/vendors/:id', async (req, res, next) => {
+  try { res.json({ ok: true, ...(await removeVendor(req.params.id)) }); } catch (e) { next(e); }
+});
+
+router.get('/skills', async (req, res, next) => {
+  try { res.json({ skills: await listSkills() }); } catch (e) { next(e); }
+});
+router.post('/skills', async (req, res, next) => {
+  try {
+    const { name } = req.body || {};
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+    res.json({ ok: true, skill: await createSkill(name) });
+  } catch (e) { next(e); }
+});
+
+// ---- Asset live search + quick-create — for any "pick an asset" combobox
+// in the app. Always hits the DB fresh (no cached list), so an asset added
+// anywhere shows up in every picker immediately. ----
+
+router.get('/assets-search', async (req, res, next) => {
+  try {
+    const q = (req.query.q || '').trim();
+    res.json({ assets: q ? await searchAssetsLive(q) : [] });
+  } catch (e) { next(e); }
+});
+
+router.post('/assets', async (req, res, next) => {
+  try {
+    const { name, locationId, assetType } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'name is required' });
+    const asset = await createAssetQuick({ name: name.trim(), locationId, assetType });
+    res.json({ ok: true, asset });
   } catch (e) { next(e); }
 });
 
