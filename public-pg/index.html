@@ -126,7 +126,12 @@
     .skill-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 999px;
       border: 1px solid var(--border); font-size: 0.82rem; cursor: pointer; user-select: none; background: var(--surface); }
     .skill-chip.selected { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-dark); font-weight: 600; }
-  </style>
+    /* .field-row's generic `input { width: 100% }` clashes with flex layouts
+       like this one — force it back to auto so flex:1/flex:0 actually control
+       sizing instead of both children fighting over 100% width. */
+    .inline-add-row { display: flex; gap: 8px; margin-top: 8px; }
+    .inline-add-row input { flex: 1 1 auto; width: auto !important; }
+    .inline-add-row .btn { flex: 0 0 auto; }
 </head>
 <body>
   <div class="pg-banner">🚧 Postgres migration preview — separate database from the main app, safe to click around</div>

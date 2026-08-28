@@ -105,7 +105,6 @@ function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {
     }));
     resultsEl.querySelector('.ac-add')?.addEventListener('click', async () => {
       const name = resultsEl.querySelector('.ac-add').dataset.addName;
-      if (!confirm(`Create new asset "${name}"? You can fill in its location/type afterward from Edit Asset.`)) return;
       try {
         const { asset } = await api('/api/pg/assets', { method: 'POST', body: JSON.stringify({ name }) });
         selected = asset;
@@ -809,7 +808,6 @@ async function renderAdminPropertyFields({ openAdd } = {}) {
     const fd = new FormData(e.target);
     const inputType = fd.get('inputType');
     const options = fd.get('options').split(',').map((s) => s.trim()).filter(Boolean);
-    if (!confirm(`Create new property field "${fd.get('label')}"? It'll appear in the audit form for every asset immediately.`)) return;
     try {
       await api('/api/pg/admin/property-fields', { method: 'POST', body: JSON.stringify({ fieldKey: fd.get('fieldKey'), label: fd.get('label'), inputType, options }) });
       toast('Field created — available immediately in the audit form');
@@ -855,7 +853,6 @@ async function renderAdminComponentTypes({ openAdd } = {}) {
   document.getElementById('addCompForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    if (!confirm(`Create new component type "${fd.get('componentType')}"?`)) return;
     try {
       await api('/api/pg/admin/component-types', {
         method: 'POST',
@@ -901,7 +898,6 @@ async function renderAdminBuildingTypes() {
   document.getElementById('addBtForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const name = new FormData(e.target).get('name');
-    if (!confirm(`Add new building type "${name}"?`)) return;
     try {
       await api('/api/pg/admin/building-types', { method: 'POST', body: JSON.stringify({ name }) });
       renderAdminBuildingTypes();
@@ -967,7 +963,6 @@ async function renderAdminSubAreas() {
   document.getElementById('addSaForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    if (!confirm(`Add sub-area "${fd.get('subArea')}" to ${fd.get('componentType')}?`)) return;
     try {
       await api('/api/pg/admin/sub-areas', { method: 'POST', body: JSON.stringify({ componentType: fd.get('componentType'), subArea: fd.get('subArea') }) });
       renderAdminSubAreas();
@@ -1024,7 +1019,6 @@ async function renderNewWorkOrder({ assetId, assetName }) {
     const title = fd.get('title');
     const finalAssetId = assetId || assetPicker?.getSelected()?.Id;
     if (!finalAssetId) { toast('Pick an asset first (or add a new one)'); return; }
-    if (!confirm(`Create work order "${title}"?`)) return;
     try {
       const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({ title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description') }) });
       toast('Work order created');
@@ -1102,8 +1096,11 @@ async function renderWorkOrderDetail({ id }) {
       <button type="button" class="btn btn-secondary" id="newVolToggle" style="margin-top:6px">+ New Volunteer</button>
       <div id="newVolBox" hidden style="margin-top:10px">
         <div class="field-row"><label>Name</label><input id="newVolName" required /></div>
-        <div class="field-row"><label>Phone</label><input id="newVolPhone" /></div>
-        <div class="field-row"><label>Skills</label><div class="skill-chips" id="newVolSkills">${skillChipsHtml(allSkills, [])}</div></div>
+        <div class="field-row"><label>Phone</label><input id="newVolPhone" class="phone-input" type="tel" /></div>
+        <div class="field-row"><label>Skills</label>
+          <div class="skill-chips" id="newVolSkills">${skillChipsHtml(allSkills, [])}</div>
+          <div class="inline-add-row"><input class="new-skill-input" placeholder="Add a new skill…" /><button type="button" class="btn btn-secondary add-skill-btn">+</button></div>
+        </div>
         <button type="button" class="btn btn-primary" id="newVolSave">Add & Assign</button>
       </div>
 
@@ -1116,8 +1113,11 @@ async function renderWorkOrderDetail({ id }) {
       <button type="button" class="btn btn-secondary" id="newVenToggle" style="margin-top:6px">+ New Vendor</button>
       <div id="newVenBox" hidden style="margin-top:10px">
         <div class="field-row"><label>Name</label><input id="newVenName" required /></div>
-        <div class="field-row"><label>Phone</label><input id="newVenPhone" /></div>
-        <div class="field-row"><label>Specialties</label><div class="skill-chips" id="newVenSkills">${skillChipsHtml(allSkills, [])}</div></div>
+        <div class="field-row"><label>Phone</label><input id="newVenPhone" class="phone-input" type="tel" /></div>
+        <div class="field-row"><label>Specialties</label>
+          <div class="skill-chips" id="newVenSkills">${skillChipsHtml(allSkills, [])}</div>
+          <div class="inline-add-row"><input class="new-skill-input" placeholder="Add a new specialty…" /><button type="button" class="btn btn-secondary add-skill-btn">+</button></div>
+        </div>
         <button type="button" class="btn btn-primary" id="newVenSave">Add & Assign</button>
       </div>
     </div>`;
@@ -1149,7 +1149,6 @@ async function renderWorkOrderDetail({ id }) {
   document.getElementById('addJobLineForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
-    if (!confirm(`Add job line: set "${fd.get('targetField')}" to "${fd.get('newValue')}" when this WO completes?`)) return;
     try {
       await api(`/api/pg/work-orders/${id}/asset-updates`, { method: 'POST', body: JSON.stringify({ targetField: fd.get('targetField'), newValue: fd.get('newValue') }) });
       renderWorkOrderDetail({ id });
@@ -1166,7 +1165,6 @@ async function renderWorkOrderDetail({ id }) {
     e.preventDefault();
     const volunteerId = new FormData(e.target).get('volunteerId');
     if (!volunteerId) return;
-    if (!confirm('Assign this volunteer to the work order?')) return;
     await api(`/api/pg/work-orders/${id}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: Number(volunteerId) }) });
     renderWorkOrderDetail({ id });
   });
@@ -1174,7 +1172,6 @@ async function renderWorkOrderDetail({ id }) {
     e.preventDefault();
     const vendorId = new FormData(e.target).get('vendorId');
     if (!vendorId) return;
-    if (!confirm('Assign this vendor to the work order?')) return;
     await api(`/api/pg/work-orders/${id}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: Number(vendorId) }) });
     renderWorkOrderDetail({ id });
   });
@@ -1183,10 +1180,11 @@ async function renderWorkOrderDetail({ id }) {
   document.getElementById('newVenToggle').addEventListener('click', () => document.getElementById('newVenBox').hidden = false);
   wireSkillChipToggle(document.getElementById('newVolSkills'));
   wireSkillChipToggle(document.getElementById('newVenSkills'));
+  app.querySelectorAll('.add-skill-btn').forEach(wireAddSkillButton);
+  wirePhoneFormatting(app);
   document.getElementById('newVolSave').addEventListener('click', async () => {
     const name = document.getElementById('newVolName').value.trim();
     if (!name) { toast('Name is required'); return; }
-    if (!confirm(`Add volunteer "${name}" and assign to this work order?`)) return;
     try {
       const { volunteer } = await api('/api/pg/volunteers', { method: 'POST', body: JSON.stringify({
         name, phone: document.getElementById('newVolPhone').value.trim(),
@@ -1200,7 +1198,6 @@ async function renderWorkOrderDetail({ id }) {
   document.getElementById('newVenSave').addEventListener('click', async () => {
     const name = document.getElementById('newVenName').value.trim();
     if (!name) { toast('Name is required'); return; }
-    if (!confirm(`Add vendor "${name}" and assign to this work order?`)) return;
     try {
       const { vendor } = await api('/api/pg/vendors', { method: 'POST', body: JSON.stringify({
         name, phone: document.getElementById('newVenPhone').value.trim(),
@@ -1239,6 +1236,49 @@ function selectedSkillsOf(container) {
   return [...container.querySelectorAll('.skill-chip.selected')].map((c) => c.dataset.skill);
 }
 
+// US phone auto-format as you type: 5551234567 -> (555) 123-4567.
+function formatPhoneValue(raw) {
+  const digits = raw.replace(/\D/g, '').slice(0, 10);
+  if (digits.length > 6) return `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
+  if (digits.length > 3) return `(${digits.slice(0, 3)}) ${digits.slice(3)}`;
+  if (digits.length > 0) return `(${digits}`;
+  return '';
+}
+function wirePhoneFormatting(root) {
+  root.querySelectorAll('.phone-input').forEach((input) => {
+    input.value = formatPhoneValue(input.value);
+    input.addEventListener('input', () => {
+      const pos = input.value.length;
+      input.value = formatPhoneValue(input.value);
+      // keep the cursor near the end rather than jumping to start on reformat
+      if (pos === input.value.length) input.setSelectionRange(input.value.length, input.value.length);
+    });
+  });
+}
+
+// Reusable "add a new skill/specialty" inline control — used by the Crew edit
+// forms AND the Work Order detail's inline quick-add. Creates it in the
+// shared catalog and appends a selected chip, no page reload needed.
+function wireAddSkillButton(button) {
+  button.addEventListener('click', async () => {
+    const row = button.closest('.inline-add-row');
+    const input = row.querySelector('.new-skill-input');
+    const name = input.value.trim();
+    if (!name) return;
+    try {
+      await api('/api/pg/skills', { method: 'POST', body: JSON.stringify({ name }) });
+      const chipsEl = row.previousElementSibling; // the .skill-chips div this row sits right after
+      const chip = document.createElement('span');
+      chip.className = 'skill-chip selected';
+      chip.dataset.skill = name;
+      chip.textContent = name;
+      chip.addEventListener('click', () => chip.classList.toggle('selected'));
+      chipsEl.appendChild(chip);
+      input.value = '';
+    } catch (err) { toast(err.message); }
+  });
+}
+
 async function renderCrew() {
   setChrome({ title: 'Crew', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
@@ -1272,14 +1312,14 @@ async function renderCrew() {
     return `<div class="card">
       <h3>${p ? `Edit ${escapeHtml(p.Name)}` : (kind === 'vol' ? 'Add Volunteer' : 'Add Vendor')}</h3>
       <div class="field-row"><label>Name</label><input class="ef-name" value="${escapeHtml(p?.Name || '')}" required /></div>
-      <div class="field-row"><label>Phone</label><input class="ef-phone" value="${escapeHtml(p?.['Phone Number'] || '')}" /></div>
+      <div class="field-row"><label>Phone</label><input class="ef-phone phone-input" type="tel" value="${escapeHtml(p?.['Phone Number'] || '')}" /></div>
       <div class="field-row"><label>Email</label><input class="ef-email" type="email" value="${escapeHtml(p?.Email || '')}" /></div>
       <div class="field-row"><label>Address</label><input class="ef-address" value="${escapeHtml(p?.Address || '')}" /></div>
       <div class="field-row"><label>${label}</label>
         <div class="skill-chips ef-skills">${skillChipsHtml(allSkills, skills)}</div>
-        <div style="display:flex;gap:8px;margin-top:8px">
-          <input class="ef-new-skill" placeholder="Add a new ${kind === 'vol' ? 'skill' : 'specialty'}…" style="flex:1;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm)" />
-          <button type="button" class="btn btn-secondary ef-add-skill">+</button>
+        <div class="inline-add-row">
+          <input class="new-skill-input" placeholder="Add a new ${kind === 'vol' ? 'skill' : 'specialty'}…" />
+          <button type="button" class="btn btn-secondary add-skill-btn">+</button>
         </div>
       </div>
       <div class="btn-row">
@@ -1315,24 +1355,8 @@ async function renderCrew() {
     }));
     app.querySelectorAll('.ef-cancel').forEach((btn) => btn.addEventListener('click', () => { editing = null; draw(); }));
     app.querySelectorAll('.ef-skills').forEach(wireSkillChipToggle); // only the editable forms — not the read-only display chips on cards
-
-    app.querySelectorAll('.ef-add-skill').forEach((btn) => btn.addEventListener('click', async () => {
-      const input = btn.closest('.field-row').querySelector('.ef-new-skill');
-      const name = input.value.trim();
-      if (!name) return;
-      try {
-        await api('/api/pg/skills', { method: 'POST', body: JSON.stringify({ name }) });
-        if (!allSkills.includes(name)) allSkills.push(name);
-        const chipsEl = btn.closest('.field-row').querySelector('.ef-skills');
-        const chip = document.createElement('span');
-        chip.className = 'skill-chip selected';
-        chip.dataset.skill = name;
-        chip.textContent = name;
-        chip.addEventListener('click', () => chip.classList.toggle('selected'));
-        chipsEl.appendChild(chip);
-        input.value = '';
-      } catch (err) { toast(err.message); }
-    }));
+    app.querySelectorAll('.add-skill-btn').forEach(wireAddSkillButton);
+    wirePhoneFormatting(app);
 
     app.querySelectorAll('.ef-save').forEach((btn) => btn.addEventListener('click', async () => {
       const card = btn.closest('.card');
@@ -1347,7 +1371,7 @@ async function renderCrew() {
       };
       if (!fields.name) { toast('Name is required'); return; }
       const isNew = !id;
-      if (!confirm(isNew ? `Add ${kind === 'vol' ? 'volunteer' : 'vendor'} "${fields.name}"?` : `Save changes to "${fields.name}"?`)) return;
+      if (!isNew && !confirm(`Save changes to "${fields.name}"?`)) return;
       try {
         const base = kind === 'vol' ? '/api/pg/volunteers' : '/api/pg/vendors';
         await api(isNew ? base : `${base}/${id}`, { method: isNew ? 'POST' : 'PATCH', body: JSON.stringify(fields) });
