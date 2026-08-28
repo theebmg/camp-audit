@@ -5,9 +5,11 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 
 import { getTableMeta, listRecords, TABLES } from './nocodb.js';
+import { pingDb } from './db.js';
 import apiRouter from './routes/api.js';
 import manageRouter from './routes/manage.js';
 import reportsRouter from './routes/reports.js';
+import pgApiRouter from './routes/pg-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -68,9 +70,27 @@ app.get('/health', async (req, res) => {
   }
 });
 
+// DB health check (no auth) — proves the app can reach the new `camp` Postgres
+// database. Separate from /health (which checks NocoDB) so each dependency's
+// status is visible on its own during the Postgres migration.
+app.get('/db-health', async (req, res) => {
+  try {
+    const row = await pingDb();
+    res.json({ ok: true, db: row.db, serverTime: row.now });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: e.message });
+  }
+});
+
+// Postgres-backed parallel API (migration in progress) — additive, does not
+// replace /api. See toClaudeCode/camp-cmms-postgres-migration-brief.md.
+app.use('/api/pg', requireAuth, pgApiRouter);
 app.use('/api', requireAuth, apiRouter);
 app.use('/api/manage', requireAuth, manageRouter);
 app.use('/api/reports', requireAuth, reportsRouter);
+// Postgres frontend preview — separate static bundle, mounted at /next so the
+// live UI at / is completely untouched. Shares /style.css from public/.
+app.use('/next', express.static(path.join(__dirname, '..', 'public-pg')));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // JSON error handler — without this, an uncaught error anywhere in the API routes

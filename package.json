@@ -6,13 +6,18 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "migrate": "node scripts/migrate.js",
+    "export-nocodb": "node scripts/export-nocodb.mjs",
+    "load-postgres": "node scripts/load-postgres.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1120.0",
     "cookie-parser": "^1.4.6",
     "express": "^4.19.2",
     "express-session": "^1.18.0",
     "multer": "^2.2.0",
-    "nodemailer": "^9.0.5"
+    "nodemailer": "^9.0.5",
+    "pg": "^8.23.0"
   }
 }
