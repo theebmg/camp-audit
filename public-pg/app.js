@@ -382,6 +382,36 @@ function woStatusPillClass(status) {
   return ''; // Open = neutral
 }
 
+// A step with no dependency is always visible. Otherwise it's visible only
+// once the step it depends on is checked/unchecked as configured — matches
+// the same rule the PDF export route evaluates server-side.
+function checklistStepVisible(step, stepById) {
+  if (step.DependsOnInstanceStepId == null) return true;
+  const dep = stepById.get(step.DependsOnInstanceStepId);
+  return dep ? dep.Done === step.ShowWhenChecked : true;
+}
+
+function checklistHtmlFor(checklist, { forCard = true } = {}) {
+  if (!checklist) return '';
+  const stepById = new Map(checklist.Steps.map((s) => [s.Id, s]));
+  const visibleSteps = checklist.Steps.filter((s) => checklistStepVisible(s, stepById));
+  const hiddenCount = checklist.Steps.length - visibleSteps.length;
+  return `
+    <div class="card"><h3>Checklist: ${escapeHtml(checklist.Name)}</h3>
+      ${visibleSteps.map((s) => `<div class="list-item" style="cursor:default">
+        <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
+          <input type="checkbox" class="checklist-step-toggle" data-id="${s.Id}" ${s.Done ? 'checked' : ''} />
+          <span style="${s.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(s.StepText)}</span>
+        </label>
+      </div>`).join('')}
+      ${hiddenCount ? `<p class="muted">${hiddenCount} step${hiddenCount > 1 ? 's' : ''} hidden until their condition is met.</p>` : ''}
+      <div class="btn-row">
+        <a class="btn btn-secondary" href="/api/pg/checklist-instances/${checklist.Id}/pdf" target="_blank" rel="noopener">⬇ Export PDF</a>
+        <button class="btn btn-secondary" id="removeChecklistBtn">Remove Checklist</button>
+      </div>
+    </div>`;
+}
+
 async function renderAssetDetail({ id }) {
   setChrome({ title: 'Asset', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
@@ -1295,16 +1325,7 @@ async function renderCalendarEventDetail({ id }) {
   const { workOrders } = workOrdersRes;
   const checklistTemplates = tplRes.templates;
 
-  const checklistHtml = checklist ? `
-    <div class="card"><h3>Checklist: ${escapeHtml(checklist.Name)}</h3>
-      ${checklist.Steps.map((s) => `<div class="list-item" style="cursor:default">
-        <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
-          <input type="checkbox" class="checklist-step-toggle" data-id="${s.Id}" ${s.Done ? 'checked' : ''} />
-          <span style="${s.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(s.StepText)}</span>
-        </label>
-      </div>`).join('')}
-      <button class="btn btn-secondary" id="removeChecklistBtn" style="margin-top:8px">Remove Checklist</button>
-    </div>`
+  const checklistHtml = checklist ? checklistHtmlFor(checklist)
     : (checklistTemplates.length ? `
     <div class="card"><h3>Checklist</h3>
       <div class="field-row"><select id="checklistTplPicker"><option value="">— choose a checklist —</option>${checklistTemplates.map((t) => `<option value="${t.Id}">${escapeHtml(t.Name)} (${t.Steps.length} steps)</option>`).join('')}</select></div>
@@ -1376,10 +1397,40 @@ async function renderAdminChecklistTemplates() {
   const { templates } = await api('/api/pg/checklist-templates');
   let editingId = null;
 
-  const stepRowHtml = (text = '') => `<div class="inline-add-row step-row"><input class="step-text" value="${escapeHtml(text)}" placeholder="Step description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>`;
+  let uidCounter = 0;
+  const stepRowHtml = (step = {}) => {
+    const uid = `s${uidCounter++}`;
+    const text = typeof step === 'string' ? step : (step.Text || '');
+    return `<div class="card step-row" data-uid="${uid}" data-depends-uid="${step.dependsOnUid || ''}" style="padding:10px 12px;margin-bottom:8px">
+      <div class="inline-add-row"><input class="step-text" value="${escapeHtml(text)}" placeholder="Step description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>
+      <div class="field-row" style="margin:8px 0 0"><label style="font-size:0.82rem">Only show this step when… (optional)</label>
+        <div style="display:flex;gap:8px">
+          <select class="step-depends-on" style="flex:2"></select>
+          <select class="step-show-when" style="flex:1"><option value="true" ${step.ShowWhenChecked !== false ? 'selected' : ''}>is checked</option><option value="false" ${step.ShowWhenChecked === false ? 'selected' : ''}>is unchecked</option></select>
+        </div>
+      </div>
+    </div>`;
+  };
+
+  function refreshDependencyOptions(container) {
+    const rows = [...container.querySelectorAll('.step-row')];
+    rows.forEach((row) => {
+      const select = row.querySelector('.step-depends-on');
+      const currentValue = select.value || row.dataset.dependsUid;
+      const options = rows.filter((r) => r !== row).map((r) => {
+        const label = r.querySelector('.step-text').value.trim() || '(untitled step)';
+        return `<option value="${r.dataset.uid}">${escapeHtml(label)}</option>`;
+      }).join('');
+      select.innerHTML = `<option value="">— none, always show —</option>${options}`;
+      if ([...select.options].some((o) => o.value === currentValue)) select.value = currentValue;
+    });
+  }
 
   function formHtml(t) {
-    const rows = (t?.Steps || []).map(stepRowHtml).join('');
+    uidCounter = 0;
+    // Resolve each step's DependsOnIndex to the uid it'll get when re-rendered (same order).
+    const stepsWithUid = (t?.Steps || []).map((s, i, arr) => ({ ...s, dependsOnUid: s.DependsOnIndex != null ? `s${s.DependsOnIndex}` : '' }));
+    const rows = stepsWithUid.map(stepRowHtml).join('');
     return `<div class="card">
       <h3>${t ? `Edit "${escapeHtml(t.Name)}"` : 'New Checklist'}</h3>
       <div class="field-row"><label>Name</label><input class="cf-name" value="${escapeHtml(t?.Name || '')}" placeholder="e.g. Winterization" required /></div>
@@ -1417,11 +1468,24 @@ async function renderAdminChecklistTemplates() {
     document.getElementById('newChecklistBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
     app.querySelectorAll('.cl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
     app.querySelectorAll('.cf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
-    app.querySelectorAll('.cf-add-step').forEach((btn) => btn.addEventListener('click', () => {
-      btn.previousElementSibling.insertAdjacentHTML('beforeend', stepRowHtml());
-      wireStepRemove();
-    }));
-    wireStepRemove();
+    const stepsContainer = document.querySelector('.cf-steps');
+    if (stepsContainer) {
+      document.querySelector('.cf-add-step').addEventListener('click', () => {
+        stepsContainer.insertAdjacentHTML('beforeend', stepRowHtml());
+        wireStepRow();
+      });
+      wireStepRow();
+      refreshDependencyOptions(stepsContainer);
+    }
+
+    function wireStepRow() {
+      stepsContainer.querySelectorAll('.row-remove').forEach((btn) => {
+        btn.onclick = () => { btn.closest('.step-row').remove(); refreshDependencyOptions(stepsContainer); };
+      });
+      stepsContainer.querySelectorAll('.step-text').forEach((input) => {
+        input.oninput = () => refreshDependencyOptions(stepsContainer);
+      });
+    }
 
     app.querySelectorAll('.cl-delete').forEach((btn) => btn.addEventListener('click', async () => {
       if (!confirm(`Delete checklist "${btn.dataset.name}"? Any WOs/events already using it keep their own copy of the steps.`)) return;
@@ -1434,7 +1498,16 @@ async function renderAdminChecklistTemplates() {
       const card = btn.closest('.card');
       const name = card.querySelector('.cf-name').value.trim();
       if (!name) { toast('Name is required'); return; }
-      const steps = [...card.querySelectorAll('.step-row .step-text')].map((el) => el.value.trim()).filter(Boolean);
+      const stepRows = [...card.querySelectorAll('.step-row')];
+      const steps = stepRows.map((row) => {
+        const dependsUid = row.querySelector('.step-depends-on').value;
+        const dependsOnIndex = dependsUid ? stepRows.findIndex((r) => r.dataset.uid === dependsUid) : -1;
+        return {
+          text: row.querySelector('.step-text').value.trim(),
+          dependsOnIndex: dependsOnIndex >= 0 ? dependsOnIndex : null,
+          showWhenChecked: row.querySelector('.step-show-when').value === 'true',
+        };
+      }).filter((s) => s.text);
       const id = btn.dataset.id;
       try {
         await api(id ? `/api/pg/checklist-templates/${id}` : '/api/pg/checklist-templates', { method: id ? 'PATCH' : 'POST', body: JSON.stringify({ name, steps }) });
@@ -1442,10 +1515,6 @@ async function renderAdminChecklistTemplates() {
         renderAdminChecklistTemplates();
       } catch (err) { toast(err.message); }
     }));
-  }
-
-  function wireStepRemove() {
-    app.querySelectorAll('.row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); });
   }
 
   draw();
@@ -1591,16 +1660,7 @@ async function renderWorkOrderDetail({ id }) {
       </span>
     </div>`).join('') || '<p class="muted">None.</p>';
 
-  const checklistHtml = checklist ? `
-    <div class="card"><h3>Checklist: ${escapeHtml(checklist.Name)}</h3>
-      ${checklist.Steps.map((s) => `<div class="list-item" style="cursor:default">
-        <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
-          <input type="checkbox" class="checklist-step-toggle" data-id="${s.Id}" ${s.Done ? 'checked' : ''} />
-          <span style="${s.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(s.StepText)}</span>
-        </label>
-      </div>`).join('')}
-      <button class="btn btn-secondary" id="removeChecklistBtn" style="margin-top:8px">Remove Checklist</button>
-    </div>`
+  const checklistHtml = checklist ? checklistHtmlFor(checklist)
     : (checklistTemplates.length ? `
     <div class="card"><h3>Checklist</h3>
       <p class="muted">Attach a step-by-step checklist to this work order.</p>

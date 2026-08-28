@@ -13,6 +13,7 @@ import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
 import { buildCapitalPlanPg } from '../reportDataPg.js';
 import { uploadPhoto } from '../storage.js';
+import { renderChecklistPdf } from '../pdf.js';
 import {
   listLocations, listAssetsByLocation, searchLocationsAndAssets,
   getAssetPropertyFields, getComponentTypeCatalog, getAssetDetail, getAssetHistory,
@@ -35,6 +36,7 @@ import {
   listChecklistTemplates, createChecklistTemplate, updateChecklistTemplate, deleteChecklistTemplate,
   getChecklistInstanceForWorkOrder, getChecklistInstanceForCalendarEvent,
   attachChecklistToWorkOrder, attachChecklistToCalendarEvent, detachChecklistInstance, toggleChecklistStep,
+  getChecklistInstanceForExport,
 } from '../db.js';
 
 const router = express.Router();
@@ -621,6 +623,29 @@ router.patch('/checklist-steps/:id', async (req, res, next) => {
     const step = await toggleChecklistStep(req.params.id, !!done);
     if (!step) return res.status(404).json({ ok: false, error: 'Step not found' });
     res.json({ ok: true, step });
+  } catch (e) { next(e); }
+});
+
+// A step whose dependency isn't satisfied is left out of the export, same as
+// what's shown on screen — the PDF should match what you'd actually see.
+router.get('/checklist-instances/:id/pdf', async (req, res, next) => {
+  try {
+    const instance = await getChecklistInstanceForExport(req.params.id);
+    if (!instance) return res.status(404).json({ ok: false, error: 'Checklist not found' });
+    const stepById = new Map(instance.Steps.map((s) => [s.Id, s]));
+    const isVisible = (s) => {
+      if (s.DependsOnInstanceStepId == null) return true;
+      const dep = stepById.get(s.DependsOnInstanceStepId);
+      return dep ? dep.Done === s.ShowWhenChecked : true;
+    };
+    const pdf = await renderChecklistPdf({
+      checklistName: instance.Name,
+      contextLabel: instance.ContextLabel,
+      steps: instance.Steps.map((s) => ({ text: s.StepText, done: s.Done, visible: isVisible(s) })),
+    });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${instance.Name.replace(/[^a-z0-9]+/gi, '-')}.pdf"`);
+    res.send(pdf);
   } catch (e) { next(e); }
 });
 

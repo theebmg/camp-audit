@@ -1124,31 +1124,63 @@ export async function deleteCalendarEvent(id) {
 //    reusable; instances are live checkable copies attached to one WO or one
 //    Calendar Event. ─────────────────────────────────────────────────────────
 
+// Steps accepted for create/update are [{ text, dependsOnIndex, showWhenChecked }]
+// — dependsOnIndex is a position within the SAME steps array (not a DB id),
+// since a step being newly added in the same save has no id yet. Resolved to
+// real depends_on_step_id values in a second pass after insert.
+async function writeTemplateSteps(client, templateId, steps) {
+  const ids = [];
+  for (let i = 0; i < steps.length; i++) {
+    const s = typeof steps[i] === 'string' ? { text: steps[i] } : steps[i];
+    const { rows } = await client.query(
+      'INSERT INTO checklist_template_steps (checklist_template_id, step_text, sort_order, show_when_checked) VALUES ($1,$2,$3,$4) RETURNING id',
+      [templateId, s.text, i, s.showWhenChecked !== false]
+    );
+    ids.push(rows[0].id);
+  }
+  for (let i = 0; i < steps.length; i++) {
+    const s = typeof steps[i] === 'string' ? {} : steps[i];
+    if (s.dependsOnIndex != null && ids[s.dependsOnIndex] != null) {
+      await client.query('UPDATE checklist_template_steps SET depends_on_step_id = $1 WHERE id = $2', [ids[s.dependsOnIndex], ids[i]]);
+    }
+  }
+}
+
 export async function listChecklistTemplates() {
   const { rows } = await pool.query('SELECT * FROM checklist_templates ORDER BY name');
   const steps = await pool.query('SELECT * FROM checklist_template_steps ORDER BY checklist_template_id, sort_order');
   const byTemplate = new Map();
   for (const s of steps.rows) {
     if (!byTemplate.has(s.checklist_template_id)) byTemplate.set(s.checklist_template_id, []);
-    byTemplate.get(s.checklist_template_id).push(s.step_text);
+    byTemplate.get(s.checklist_template_id).push(s);
   }
-  return rows.map((r) => ({ Id: r.id, Name: r.name, Steps: byTemplate.get(r.id) || [] }));
+  return rows.map((r) => {
+    const stepRows = byTemplate.get(r.id) || [];
+    const idToIndex = new Map(stepRows.map((s, i) => [s.id, i]));
+    return {
+      Id: r.id, Name: r.name,
+      Steps: stepRows.map((s) => ({
+        Text: s.step_text, ShowWhenChecked: s.show_when_checked,
+        DependsOnIndex: s.depends_on_step_id != null ? idToIndex.get(s.depends_on_step_id) : null,
+      })),
+    };
+  });
 }
 
 export async function createChecklistTemplate({ name, steps = [] }) {
   const client = await pool.connect();
+  let id;
   try {
     await client.query('BEGIN');
     const { rows } = await client.query('INSERT INTO checklist_templates (name) VALUES ($1) RETURNING *', [name]);
-    const id = rows[0].id;
-    for (let i = 0; i < steps.length; i++) {
-      await client.query('INSERT INTO checklist_template_steps (checklist_template_id, step_text, sort_order) VALUES ($1,$2,$3)', [id, steps[i], i]);
-    }
+    id = rows[0].id;
+    await writeTemplateSteps(client, id, steps);
     await client.query('COMMIT');
-    return { Id: id, Name: name, Steps: steps };
   } catch (e) {
     await client.query('ROLLBACK'); throw e;
   } finally { client.release(); }
+  const all = await listChecklistTemplates();
+  return all.find((t) => t.Id === id) || null;
 }
 
 export async function updateChecklistTemplate(id, { name, steps }) {
@@ -1158,9 +1190,7 @@ export async function updateChecklistTemplate(id, { name, steps }) {
     if (name) await client.query('UPDATE checklist_templates SET name = $2 WHERE id = $1', [id, name]);
     if (steps) {
       await client.query('DELETE FROM checklist_template_steps WHERE checklist_template_id = $1', [id]);
-      for (let i = 0; i < steps.length; i++) {
-        await client.query('INSERT INTO checklist_template_steps (checklist_template_id, step_text, sort_order) VALUES ($1,$2,$3)', [id, steps[i], i]);
-      }
+      await writeTemplateSteps(client, id, steps);
     }
     await client.query('COMMIT');
   } catch (e) {
@@ -1180,7 +1210,11 @@ async function getChecklistInstanceFull(instanceId) {
   const steps = await pool.query('SELECT * FROM checklist_instance_steps WHERE checklist_instance_id = $1 ORDER BY sort_order, id', [instanceId]);
   return {
     Id: inst.rows[0].id, Name: inst.rows[0].name,
-    Steps: steps.rows.map((s) => ({ Id: s.id, StepText: s.step_text, Done: s.done, SortOrder: s.sort_order })),
+    WorkOrderId: inst.rows[0].work_order_id, CalendarEventId: inst.rows[0].calendar_event_id,
+    Steps: steps.rows.map((s) => ({
+      Id: s.id, StepText: s.step_text, Done: s.done, SortOrder: s.sort_order,
+      DependsOnInstanceStepId: s.depends_on_instance_step_id, ShowWhenChecked: s.show_when_checked,
+    })),
   };
 }
 
@@ -1196,7 +1230,10 @@ export async function getChecklistInstanceForCalendarEvent(eventId) {
 async function attachChecklist({ templateId, workOrderId, calendarEventId }) {
   const tpl = await pool.query('SELECT * FROM checklist_templates WHERE id = $1', [templateId]);
   if (!tpl.rows[0]) { const err = new Error('Checklist template not found'); err.status = 400; throw err; }
-  const stepsRes = await pool.query('SELECT step_text, sort_order FROM checklist_template_steps WHERE checklist_template_id = $1 ORDER BY sort_order', [templateId]);
+  const stepsRes = await pool.query(
+    'SELECT id, step_text, sort_order, depends_on_step_id, show_when_checked FROM checklist_template_steps WHERE checklist_template_id = $1 ORDER BY sort_order',
+    [templateId]
+  );
 
   const client = await pool.connect();
   try {
@@ -1206,8 +1243,21 @@ async function attachChecklist({ templateId, workOrderId, calendarEventId }) {
       [templateId, tpl.rows[0].name, workOrderId || null, calendarEventId || null]
     );
     const instanceId = rows[0].id;
+    const templateIdToInstanceId = new Map(); // maps template_step.id -> new instance_step.id
     for (const s of stepsRes.rows) {
-      await client.query('INSERT INTO checklist_instance_steps (checklist_instance_id, step_text, sort_order) VALUES ($1,$2,$3)', [instanceId, s.step_text, s.sort_order]);
+      const { rows: newStep } = await client.query(
+        'INSERT INTO checklist_instance_steps (checklist_instance_id, step_text, sort_order, show_when_checked) VALUES ($1,$2,$3,$4) RETURNING id',
+        [instanceId, s.step_text, s.sort_order, s.show_when_checked]
+      );
+      templateIdToInstanceId.set(s.id, newStep[0].id);
+    }
+    for (const s of stepsRes.rows) {
+      if (s.depends_on_step_id != null && templateIdToInstanceId.has(s.depends_on_step_id)) {
+        await client.query(
+          'UPDATE checklist_instance_steps SET depends_on_instance_step_id = $1 WHERE id = $2',
+          [templateIdToInstanceId.get(s.depends_on_step_id), templateIdToInstanceId.get(s.id)]
+        );
+      }
     }
     await client.query('COMMIT');
     return getChecklistInstanceFull(instanceId);
@@ -1217,6 +1267,22 @@ async function attachChecklist({ templateId, workOrderId, calendarEventId }) {
 }
 export async function attachChecklistToWorkOrder(woId, templateId) { return attachChecklist({ templateId, workOrderId: woId }); }
 export async function attachChecklistToCalendarEvent(eventId, templateId) { return attachChecklist({ templateId, calendarEventId: eventId }); }
+
+// For the PDF export route — the instance's steps plus a human label for
+// whatever it's attached to (a Work Order or a Calendar Event).
+export async function getChecklistInstanceForExport(instanceId) {
+  const instance = await getChecklistInstanceFull(instanceId);
+  if (!instance) return null;
+  let contextLabel = null;
+  if (instance.WorkOrderId) {
+    const { rows } = await pool.query('SELECT title FROM work_orders WHERE id = $1', [instance.WorkOrderId]);
+    if (rows[0]) contextLabel = `Work Order: ${rows[0].title}`;
+  } else if (instance.CalendarEventId) {
+    const { rows } = await pool.query('SELECT title FROM calendar_events WHERE id = $1', [instance.CalendarEventId]);
+    if (rows[0]) contextLabel = `Calendar Event: ${rows[0].title}`;
+  }
+  return { ...instance, ContextLabel: contextLabel };
+}
 
 export async function detachChecklistInstance(instanceId) {
   await pool.query('DELETE FROM checklist_instances WHERE id = $1', [instanceId]);
