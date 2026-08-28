@@ -23,7 +23,8 @@ import {
   adminCreateBuildingType, adminDeleteBuildingType,
   adminGetApplicabilityMatrix, adminSetApplicability,
   adminListSubAreas, adminCreateSubArea, adminDeleteSubArea,
-  listWorkOrders, getWorkOrderDetail, createWorkOrder, updateWorkOrder,
+  listWorkOrders, getWorkOrderDetail, createWorkOrder, updateWorkOrder, duplicateWorkOrder,
+  listWorkOrderTemplates, createWorkOrderTemplate, updateWorkOrderTemplate, deleteWorkOrderTemplate,
   addAssetUpdateToWorkOrder, deleteAssetUpdate, completeWorkOrder,
   assignVolunteer, unassignVolunteer, assignVendor, unassignVendor,
   listVolunteers, createVolunteer, updateVolunteer, removeVolunteer,
@@ -326,10 +327,18 @@ router.get('/work-orders/:id', async (req, res, next) => {
 
 router.post('/work-orders', async (req, res, next) => {
   try {
-    const { title, assetId, locationId, priority, description, assetUpdates } = req.body || {};
+    const { title, assetId, locationId, priority, description, scheduledDate, assetUpdates } = req.body || {};
     if (!title) return res.status(400).json({ ok: false, error: 'title is required' });
-    const result = await createWorkOrder({ title, assetId, locationId, priority, description, assetUpdates });
+    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates });
     res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
+router.post('/work-orders/:id/duplicate', async (req, res, next) => {
+  try {
+    const newId = await duplicateWorkOrder(req.params.id);
+    if (!newId) return res.status(404).json({ ok: false, error: 'Work Order not found' });
+    res.json({ ok: true, workOrderId: newId });
   } catch (e) { next(e); }
 });
 
@@ -341,8 +350,10 @@ router.patch('/work-orders/:id', async (req, res, next) => {
     if (body.description !== undefined) fields.description = body.description;
     if (body.priority != null) fields.priority = body.priority;
     if (body.status != null) fields.status = body.status;
+    if (body.assetId !== undefined) fields.asset_id = body.assetId === '' ? null : Number(body.assetId);
     if (body.dateReported !== undefined) fields.date_reported = body.dateReported;
     if (body.dateCompleted !== undefined) fields.date_completed = body.dateCompleted;
+    if (body.scheduledDate !== undefined) fields.scheduled_date = body.scheduledDate;
     if (body.estimatedHours !== undefined) fields.estimated_hours = body.estimatedHours === '' ? null : Math.round(Number(body.estimatedHours));
     if (body.actualHours !== undefined) fields.actual_hours = body.actualHours === '' ? null : Math.round(Number(body.actualHours));
     if (body.estimatedCost !== undefined) fields.estimated_cost = body.estimatedCost === '' ? null : Number(body.estimatedCost);
@@ -464,6 +475,30 @@ router.post('/assets', async (req, res, next) => {
     const asset = await createAssetQuick({ name: name.trim(), locationId, assetType });
     res.json({ ok: true, asset });
   } catch (e) { next(e); }
+});
+
+// ---- Work Order templates ("canned" WOs for repeatable tasks) ----
+
+router.get('/work-order-templates', async (req, res, next) => {
+  try { res.json({ templates: await listWorkOrderTemplates() }); } catch (e) { next(e); }
+});
+router.post('/work-order-templates', async (req, res, next) => {
+  try {
+    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults } = req.body || {};
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults }) });
+  } catch (e) { next(e); }
+});
+router.patch('/work-order-templates/:id', async (req, res, next) => {
+  try {
+    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults } = req.body || {};
+    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults });
+    if (!template) return res.status(404).json({ ok: false, error: 'Template not found' });
+    res.json({ ok: true, template });
+  } catch (e) { next(e); }
+});
+router.delete('/work-order-templates/:id', async (req, res, next) => {
+  try { await deleteWorkOrderTemplate(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 export default router;

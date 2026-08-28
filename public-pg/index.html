@@ -132,6 +132,18 @@
     .inline-add-row { display: flex; gap: 8px; margin-top: 8px; }
     .inline-add-row input { flex: 1 1 auto; width: auto !important; }
     .inline-add-row .btn { flex: 0 0 auto; }
+
+    /* Calendar/scheduler */
+    .cal-scroll { overflow-x: auto; }
+    .cal-grid { display: grid; grid-template-columns: repeat(7, minmax(110px, 1fr)); gap: 1px;
+      background: var(--border); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+    .cal-head { background: var(--surface-alt); padding: 6px 8px; font-size: 0.78rem; font-weight: 700; color: var(--muted); text-align: center; }
+    .cal-cell { background: var(--surface); min-height: 90px; padding: 6px; }
+    .cal-cell.cal-empty { background: var(--bg); }
+    .cal-cell.cal-today { background: var(--accent-soft); }
+    .cal-daynum { font-size: 0.78rem; font-weight: 700; color: var(--muted); margin-bottom: 4px; }
+    .cal-entry { cursor: pointer; margin-bottom: 3px; }
+    .cal-entry .pill { display: block; text-align: left; white-space: normal; line-height: 1.3; }
   </style>
 </head>
 <body>

@@ -186,6 +186,7 @@ const NAV_ITEMS = [
   { icon: '🏠', label: 'Dashboard', view: 'dashboard' },
   { icon: '📍', label: 'Locations', view: 'locations' },
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
+  { icon: '📅', label: 'Calendar', view: 'calendar' },
   { icon: '👷', label: 'Crew', view: 'crew' },
   { icon: '📋', label: 'Maintenance Log', view: 'maintenanceLog' },
   { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
@@ -265,6 +266,8 @@ async function render(view, params = {}) {
       adminBuildingTypes: () => renderAdminBuildingTypes(),
       adminApplicability: () => renderAdminApplicability(),
       adminSubAreas: () => renderAdminSubAreas(),
+      adminWoTemplates: () => renderAdminWoTemplates(),
+      calendar: () => renderCalendar(params),
       workOrders: () => renderWorkOrders(),
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
@@ -341,6 +344,14 @@ function conditionPillClass(c) {
   if (['Poor'].includes(c)) return 'warn';
   if (['Failed', 'Critical'].includes(c)) return 'bad';
   return '';
+}
+
+function woStatusPillClass(status) {
+  if (status === 'Done') return 'good';
+  if (status === 'Urgent') return 'bad';
+  if (status === 'In Progress') return 'pop';
+  if (status === 'On Hold') return 'warn';
+  return ''; // Open = neutral
 }
 
 async function renderAssetDetail({ id }) {
@@ -736,8 +747,118 @@ async function renderAdminHub() {
     <div class="list-item" data-view="adminComponentTypes">🧩 Component Types</div>
     <div class="list-item" data-view="adminBuildingTypes">🏛️ Building Types</div>
     <div class="list-item" data-view="adminApplicability">✅ Applicability Matrix</div>
-    <div class="list-item" data-view="adminSubAreas">📐 Component Sub-Areas</div>`;
+    <div class="list-item" data-view="adminSubAreas">📐 Component Sub-Areas</div>
+    <div class="list-item" data-view="adminWoTemplates">🧾 Work Order Templates</div>`;
   app.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
+}
+
+async function renderAdminWoTemplates() {
+  setChrome({ title: 'Work Order Templates', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const [tplRes, optsRes] = await Promise.all([api('/api/pg/work-order-templates'), Promise.resolve(state.options)]);
+  const templates = tplRes.templates;
+  const fieldTitles = optsRes.propertyFields.map((f) => f.title);
+  let editingId = null; // null | 'new' | number
+
+  function jobLineRowHtml(row = {}) {
+    return `<div class="inline-add-row jl-row" style="align-items:center">
+      <select class="jl-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
+      <input class="jl-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
+      <button type="button" class="btn btn-secondary jl-remove">✕</button>
+    </div>`;
+  }
+
+  function formHtml(t) {
+    const rows = (t?.JobLineDefaults || []).map(jobLineRowHtml).join('');
+    return `<div class="card">
+      <h3>${t ? `Edit "${escapeHtml(t.Name)}"` : 'New Template'}</h3>
+      <div class="field-row"><label>Template Name</label><input class="tf-name" value="${escapeHtml(t?.Name || '')}" placeholder="e.g. Annual Roof Inspection" required /></div>
+      <div class="field-row"><label>Default Title</label><input class="tf-title" value="${escapeHtml(t?.DefaultTitle || '')}" placeholder="Fills in the WO title — you can still edit it per use" /></div>
+      <div class="field-row"><label>Default Priority</label>
+        <select class="tf-priority"><option value="">— none —</option>${['Low', 'Medium', 'High', 'Urgent'].map((p) => `<option ${t?.DefaultPriority === p ? 'selected' : ''}>${p}</option>`).join('')}</select>
+      </div>
+      <div class="field-row"><label>Default Description</label><textarea class="tf-description">${escapeHtml(t?.DefaultDescription || '')}</textarea></div>
+      <div class="field-row"><label>Job Line Defaults</label>
+        <p class="muted" style="margin:2px 0 8px">Pre-fills these asset field changes on every WO created from this template.</p>
+        <div class="tf-job-lines">${rows}</div>
+        <button type="button" class="btn btn-secondary tf-add-line" style="margin-top:6px">+ Add Job Line</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary tf-save" data-id="${t?.Id ?? ''}">Save Template</button>
+        <button class="btn btn-secondary tf-cancel">Cancel</button>
+      </div>
+    </div>`;
+  }
+
+  function draw() {
+    const list = templates.map((t) => `
+      <div class="list-item" style="cursor:default;flex-wrap:wrap">
+        <div>
+          <strong>${escapeHtml(t.Name)}</strong>
+          <div class="muted">${escapeHtml(t.DefaultTitle || '')}${t.DefaultPriority ? ' · ' + escapeHtml(t.DefaultPriority) : ''}</div>
+          ${t.JobLineDefaults?.length ? `<div class="muted">${t.JobLineDefaults.length} job line default${t.JobLineDefaults.length > 1 ? 's' : ''}</div>` : ''}
+        </div>
+        <div class="btn-row" style="margin-top:0">
+          <button class="btn btn-secondary tpl-edit" data-id="${t.Id}">Edit</button>
+          <button class="btn btn-secondary tpl-delete" data-id="${t.Id}" data-name="${escapeHtml(t.Name)}">Delete</button>
+        </div>
+      </div>`).join('') || '<p class="muted">🧾 No templates yet — save your repeatable tasks here.</p>';
+
+    setApp(`
+      <div class="card"><h3>Work Order Templates</h3>
+        <p class="muted">Canned setups for repeatable tasks — pick one from "New Work Order" instead of retyping everything.</p>
+      </div>
+      ${list}
+      ${editingId === 'new' ? formHtml(null) : `<div class="btn-row" style="margin:4px 0 16px"><button class="btn btn-secondary" id="newTplBtn">+ New Template</button></div>`}
+      ${typeof editingId === 'number' ? formHtml(templates.find((t) => t.Id === editingId)) : ''}
+    `);
+    wire();
+  }
+
+  function wire() {
+    document.getElementById('newTplBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
+    app.querySelectorAll('.tpl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
+    app.querySelectorAll('.tf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
+    app.querySelectorAll('.tf-add-line').forEach((btn) => btn.addEventListener('click', () => {
+      btn.previousElementSibling.insertAdjacentHTML('beforeend', jobLineRowHtml());
+      wireRemoveButtons();
+    }));
+    wireRemoveButtons();
+
+    app.querySelectorAll('.tpl-delete').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!confirm(`Delete template "${btn.dataset.name}"? This won't affect any work orders already created from it.`)) return;
+      await api(`/api/pg/work-order-templates/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Template deleted');
+      renderAdminWoTemplates();
+    }));
+
+    app.querySelectorAll('.tf-save').forEach((btn) => btn.addEventListener('click', async () => {
+      const card = btn.closest('.card');
+      const name = card.querySelector('.tf-name').value.trim();
+      if (!name) { toast('Template name is required'); return; }
+      const jobLineDefaults = [...card.querySelectorAll('.jl-row')].map((row) => ({
+        targetField: row.querySelector('.jl-field').value, newValue: row.querySelector('.jl-value').value,
+      })).filter((r) => r.newValue.trim());
+      const fields = {
+        name, defaultTitle: card.querySelector('.tf-title').value.trim(),
+        defaultPriority: card.querySelector('.tf-priority').value,
+        defaultDescription: card.querySelector('.tf-description').value.trim(),
+        jobLineDefaults,
+      };
+      const id = btn.dataset.id;
+      try {
+        await api(id ? `/api/pg/work-order-templates/${id}` : '/api/pg/work-order-templates', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(fields) });
+        toast(id ? 'Template updated' : 'Template created');
+        renderAdminWoTemplates();
+      } catch (err) { toast(err.message); }
+    }));
+  }
+
+  function wireRemoveButtons() {
+    app.querySelectorAll('.jl-remove').forEach((btn) => { btn.onclick = () => btn.closest('.jl-row').remove(); });
+  }
+
+  draw();
 }
 
 function renderAdminAddFieldChoice() {
@@ -970,6 +1091,81 @@ async function renderAdminSubAreas() {
   });
 }
 
+// ---------- Calendar / Scheduler ----------
+
+async function renderCalendar(params = {}) {
+  setChrome({ title: 'Calendar', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const { workOrders } = await api('/api/pg/work-orders');
+  const now = new Date();
+  let viewMonth = params.month != null ? Number(params.month) : now.getMonth();
+  let viewYear = params.year != null ? Number(params.year) : now.getFullYear();
+  const todayKey = now.toISOString().slice(0, 10);
+
+  function draw() {
+    const firstOfMonth = new Date(viewYear, viewMonth, 1);
+    const startWeekday = firstOfMonth.getDay();
+    const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+    const monthLabel = firstOfMonth.toLocaleString('default', { month: 'long', year: 'numeric' });
+
+    const byDate = new Map();
+    const unscheduled = [];
+    for (const w of workOrders) {
+      const sd = w['Scheduled Date'];
+      if (!sd) { unscheduled.push(w); continue; }
+      const key = sd.slice(0, 10);
+      if (!byDate.has(key)) byDate.set(key, []);
+      byDate.get(key).push(w);
+    }
+
+    const entryHtml = (w) => `<div class="cal-entry" data-wo-id="${w.Id}">
+      <span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Asset?.Name || '')}${w.Asset ? ': ' : ''}${escapeHtml(w.Title)} — ${escapeHtml(w.Status)}</span>
+    </div>`;
+
+    const cells = [];
+    for (let i = 0; i < startWeekday; i++) cells.push('<div class="cal-cell cal-empty"></div>');
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateKey = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      const entries = byDate.get(dateKey) || [];
+      cells.push(`<div class="cal-cell ${dateKey === todayKey ? 'cal-today' : ''}">
+        <div class="cal-daynum">${d}</div>
+        ${entries.map(entryHtml).join('')}
+      </div>`);
+    }
+
+    setApp(`
+      <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <button class="btn btn-secondary" id="prevMonthBtn">← Prev</button>
+        <h3 style="margin:0">${monthLabel}</h3>
+        <button class="btn btn-secondary" id="nextMonthBtn">Next →</button>
+      </div>
+      <div class="cal-scroll"><div class="cal-grid">
+        ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => `<div class="cal-head">${d}</div>`).join('')}
+        ${cells.join('')}
+      </div></div>
+      ${unscheduled.length ? `<div class="card"><h3>Unscheduled (${unscheduled.length})</h3>
+        <p class="muted">Set a Scheduled Date on a work order to place it on the calendar.</p>
+        ${unscheduled.map((w) => `<div class="list-item" data-wo-id="${w.Id}">
+          <span>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</span>
+          <span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status)}</span>
+        </div>`).join('')}
+      </div>` : ''}`);
+    wire();
+  }
+
+  function wire() {
+    document.getElementById('prevMonthBtn').addEventListener('click', () => {
+      viewMonth--; if (viewMonth < 0) { viewMonth = 11; viewYear--; } draw();
+    });
+    document.getElementById('nextMonthBtn').addEventListener('click', () => {
+      viewMonth++; if (viewMonth > 11) { viewMonth = 0; viewYear++; } draw();
+    });
+    app.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
+  }
+
+  draw();
+}
+
 // ---------- Work Orders ----------
 
 async function renderWorkOrders() {
@@ -990,9 +1186,20 @@ async function renderWorkOrders() {
 
 async function renderNewWorkOrder({ assetId, assetName }) {
   setChrome({ title: 'New Work Order', showBack: true, showLogout: true });
+  const { templates } = await api('/api/pg/work-order-templates');
+  const fieldTitles = state.options.propertyFields.map((f) => f.title);
+  const jobLineRowHtml = (row = {}) => `<div class="inline-add-row jl-row" style="align-items:center">
+    <select class="jl-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
+    <input class="jl-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
+    <button type="button" class="btn btn-secondary jl-remove">✕</button>
+  </div>`;
+
   setApp(`
     <div class="card">
       <h3>New Work Order</h3>
+      ${templates.length ? `<div class="field-row"><label>Start from Template (optional)</label>
+        <select id="tplPicker"><option value="">— none —</option>${templates.map((t) => `<option value="${t.Id}">${escapeHtml(t.Name)}</option>`).join('')}</select>
+      </div>` : ''}
       <form id="newWoForm">
         <div class="field-row"><label>Title</label><input name="title" required /></div>
         <div class="field-row"><label>Asset</label>
@@ -1001,7 +1208,13 @@ async function renderNewWorkOrder({ assetId, assetName }) {
         <div class="field-row"><label>Priority</label>
           <select name="priority"><option>Low</option><option selected>Medium</option><option>High</option><option>Urgent</option></select>
         </div>
+        <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" /></div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
+        <div class="field-row"><label>Job Lines (optional)</label>
+          <p class="muted" style="margin:2px 0 8px">Asset field changes to apply when this WO is completed.</p>
+          <div class="jl-rows"></div>
+          <button type="button" class="btn btn-secondary" id="addJlBtn" style="margin-top:6px">+ Add Job Line</button>
+        </div>
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Create Work Order</button>
           <button class="btn btn-secondary" type="button" id="cancelWoBtn">Cancel</button>
@@ -1012,6 +1225,25 @@ async function renderNewWorkOrder({ assetId, assetName }) {
   let assetPicker = null;
   if (!assetId) assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'));
 
+  function wireJlRemove() { app.querySelectorAll('.jl-remove').forEach((btn) => { btn.onclick = () => btn.closest('.jl-row').remove(); }); }
+  document.getElementById('addJlBtn').addEventListener('click', () => {
+    document.querySelector('.jl-rows').insertAdjacentHTML('beforeend', jobLineRowHtml());
+    wireJlRemove();
+  });
+
+  document.getElementById('tplPicker')?.addEventListener('change', (e) => {
+    const tpl = templates.find((t) => t.Id === Number(e.target.value));
+    const form = document.getElementById('newWoForm');
+    if (!tpl) return;
+    if (tpl.DefaultTitle) form.title.value = tpl.DefaultTitle;
+    if (tpl.DefaultPriority) form.priority.value = tpl.DefaultPriority;
+    if (tpl.DefaultDescription) form.description.value = tpl.DefaultDescription;
+    const rowsEl = document.querySelector('.jl-rows');
+    rowsEl.innerHTML = (tpl.JobLineDefaults || []).map(jobLineRowHtml).join('');
+    wireJlRemove();
+    toast(`Prefilled from "${tpl.Name}" — review before creating`);
+  });
+
   document.getElementById('cancelWoBtn').addEventListener('click', goBack);
   document.getElementById('newWoForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1019,8 +1251,14 @@ async function renderNewWorkOrder({ assetId, assetName }) {
     const title = fd.get('title');
     const finalAssetId = assetId || assetPicker?.getSelected()?.Id;
     if (!finalAssetId) { toast('Pick an asset first (or add a new one)'); return; }
+    const assetUpdates = [...document.querySelectorAll('.jl-row')].map((row) => ({
+      targetField: row.querySelector('.jl-field').value, newValue: row.querySelector('.jl-value').value,
+    })).filter((r) => r.newValue.trim());
     try {
-      const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({ title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description') }) });
+      const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({
+        title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description'),
+        scheduledDate: fd.get('scheduledDate') || undefined, assetUpdates,
+      }) });
       toast('Work order created');
       go('workOrderDetail', { id: result.workOrderId }, { replace: true });
     } catch (err) { toast(err.message); }
@@ -1054,14 +1292,15 @@ async function renderWorkOrderDetail({ id }) {
   app.innerHTML = `
     <div class="card">
       <h3>${escapeHtml(wo.Title)}</h3>
-      ${wo.Asset ? `<p class="muted">Asset: ${escapeHtml(wo.Asset.Name)}</p>` : ''}
       <form id="woFieldsForm">
+        <div class="field-row"><label>Asset</label><div id="woAssetPicker"></div></div>
         <div class="field-row"><label>Status</label>
           <select name="status">${['Open', 'In Progress', 'On Hold', 'Urgent', 'Done'].map((s) => `<option ${wo.Status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         </div>
         <div class="field-row"><label>Priority</label>
           <select name="priority">${['Low', 'Medium', 'High', 'Urgent'].map((s) => `<option ${wo.Priority === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         </div>
+        <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" value="${(wo['Scheduled Date'] || '').slice(0, 10)}" /></div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(wo.Description || '')}</textarea></div>
         <div class="field-row"><label>Estimated Hours</label><input name="estimatedHours" type="number" value="${wo['Estimated Hours'] ?? ''}" /></div>
         <div class="field-row"><label>Actual Hours</label><input name="actualHours" type="number" value="${wo['Actual Hours'] ?? ''}" /></div>
@@ -1071,6 +1310,7 @@ async function renderWorkOrderDetail({ id }) {
       </form>
       <div class="btn-row">
         <button class="btn btn-primary" id="completeWoBtn" ${wo.Status === 'Done' ? 'disabled' : ''}>${wo.Status === 'Done' ? 'Completed' : 'Complete Work Order'}</button>
+        <button class="btn btn-secondary" id="duplicateWoBtn">Duplicate</button>
       </div>
     </div>
 
@@ -1122,18 +1362,31 @@ async function renderWorkOrderDetail({ id }) {
       </div>
     </div>`;
 
+  const assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'), { initialAsset: wo.Asset });
+
   document.getElementById('woFieldsForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!confirm('Save changes to this work order?')) return;
     const fd = new FormData(e.target);
+    const newAsset = assetPicker.getSelected();
     try {
       await api(`/api/pg/work-orders/${id}`, { method: 'PATCH', body: JSON.stringify({
+        assetId: newAsset ? newAsset.Id : (wo.Asset ? wo.Asset.Id : ''),
         status: fd.get('status'), priority: fd.get('priority'), description: fd.get('description'),
+        scheduledDate: fd.get('scheduledDate') || '',
         estimatedHours: fd.get('estimatedHours'), actualHours: fd.get('actualHours'),
         estimatedCost: fd.get('estimatedCost'), actualCost: fd.get('actualCost'),
       }) });
       toast('Work order updated');
       renderWorkOrderDetail({ id });
+    } catch (err) { toast(err.message); }
+  });
+
+  document.getElementById('duplicateWoBtn').addEventListener('click', async () => {
+    try {
+      const result = await api(`/api/pg/work-orders/${id}/duplicate`, { method: 'POST' });
+      toast('Work order duplicated');
+      go('workOrderDetail', { id: result.workOrderId });
     } catch (err) { toast(err.message); }
   });
 

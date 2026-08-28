@@ -575,7 +575,7 @@ export async function adminDeleteSubArea(id) {
 
 export async function listWorkOrders() {
   const { rows } = await pool.query(
-    `SELECT w.id, w.title, w.status, w.priority, w.date_reported, w.date_completed,
+    `SELECT w.id, w.title, w.status, w.priority, w.date_reported, w.date_completed, w.scheduled_date,
             w.asset_id, a.name AS asset_name, w.location_id, l.name AS location_name
      FROM work_orders w
      LEFT JOIN assets a ON a.id = w.asset_id
@@ -584,7 +584,7 @@ export async function listWorkOrders() {
   );
   return rows.map((r) => ({
     Id: r.id, Title: r.title, Status: r.status, Priority: r.priority,
-    'Date Reported': r.date_reported, 'Date Completed': r.date_completed,
+    'Date Reported': r.date_reported, 'Date Completed': r.date_completed, 'Scheduled Date': r.scheduled_date,
     Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
     Location: r.location_id ? { Id: r.location_id, Name: r.location_name } : null,
   }));
@@ -630,7 +630,7 @@ export async function getWorkOrderDetail(woId) {
   return {
     workOrder: {
       Id: w.id, Title: w.title, Status: w.status, Priority: w.priority,
-      'Date Reported': w.date_reported, 'Date Completed': w.date_completed,
+      'Date Reported': w.date_reported, 'Date Completed': w.date_completed, 'Scheduled Date': w.scheduled_date,
       'Estimated Hours': w.estimated_hours, 'Actual Hours': w.actual_hours,
       'Estimated Cost': w.estimated_cost, 'Actual Cost': w.actual_cost,
       Description: w.description,
@@ -644,7 +644,7 @@ export async function getWorkOrderDetail(woId) {
 
 const today = () => new Date().toISOString().slice(0, 10);
 
-export async function createWorkOrder({ title, assetId, locationId, priority, description, assetUpdates = [] }) {
+export async function createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates = [] }) {
   const propertyFields = await getAssetPropertyFields();
   const byLabel = new Map(propertyFields.map((f) => [f.title, f]));
 
@@ -652,9 +652,9 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO work_orders (title, asset_id, location_id, priority, status, description, date_reported)
-       VALUES ($1,$2,$3,$4,'Open',$5,$6) RETURNING id`,
-      [title, assetId || null, locationId || null, priority || 'Medium', description || null, today()]
+      `INSERT INTO work_orders (title, asset_id, location_id, priority, status, description, date_reported, scheduled_date)
+       VALUES ($1,$2,$3,$4,'Open',$5,$6,$7) RETURNING id`,
+      [title, assetId || null, locationId || null, priority || 'Medium', description || null, today(), scheduledDate || null]
     );
     const woId = rows[0].id;
     const created = [];
@@ -677,7 +677,8 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
 }
 
 export async function updateWorkOrder(woId, fields) {
-  const allowed = ['title', 'description', 'priority', 'status', 'date_reported', 'date_completed', 'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost'];
+  const allowed = ['title', 'description', 'priority', 'status', 'date_reported', 'date_completed',
+    'scheduled_date', 'asset_id', 'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost'];
   const setCols = [];
   const vals = [];
   let i = 1;
@@ -691,6 +692,76 @@ export async function updateWorkOrder(woId, fields) {
   const { rowCount } = await pool.query(`UPDATE work_orders SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
   if (!rowCount) return null;
   return getWorkOrderDetail(woId);
+}
+
+// Fresh copy: same title (+ " (Copy)"), asset, location, priority, description,
+// and pending job lines — but a clean slate otherwise (Open status, no dates,
+// no actuals, no crew assignments, no applied-history). Good for "this happens
+// again next month" without retyping everything.
+export async function duplicateWorkOrder(woId) {
+  const src = await pool.query('SELECT * FROM work_orders WHERE id = $1', [woId]);
+  const w = src.rows[0];
+  if (!w) return null;
+  const srcUpdates = await pool.query('SELECT target_field, new_value FROM asset_updates WHERE work_order_id = $1', [woId]);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO work_orders (title, asset_id, location_id, priority, status, description, date_reported)
+       VALUES ($1,$2,$3,$4,'Open',$5,$6) RETURNING id`,
+      [`${w.title} (Copy)`, w.asset_id, w.location_id, w.priority, w.description, today()]
+    );
+    const newId = rows[0].id;
+    for (const u of srcUpdates.rows) {
+      await client.query(
+        `INSERT INTO asset_updates (work_order_id, target_field, new_value, applied) VALUES ($1,$2,$3,false)`,
+        [newId, u.target_field, u.new_value]
+      );
+    }
+    await client.query('COMMIT');
+    return newId;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// ── Work Order templates ("canned" WOs for repeatable tasks) ───────────────
+
+export async function listWorkOrderTemplates() {
+  const { rows } = await pool.query('SELECT * FROM work_order_templates ORDER BY name');
+  return rows.map((r) => ({
+    Id: r.id, Name: r.name, DefaultTitle: r.default_title, DefaultPriority: r.default_priority,
+    DefaultDescription: r.default_description, JobLineDefaults: r.job_line_defaults,
+  }));
+}
+export async function createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults = [] }) {
+  const { rows } = await pool.query(
+    `INSERT INTO work_order_templates (name, default_title, default_priority, default_description, job_line_defaults)
+     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [name, defaultTitle || null, defaultPriority || null, defaultDescription || null, JSON.stringify(jobLineDefaults)]
+  );
+  const r = rows[0];
+  return { Id: r.id, Name: r.name, DefaultTitle: r.default_title, DefaultPriority: r.default_priority, DefaultDescription: r.default_description, JobLineDefaults: r.job_line_defaults };
+}
+export async function updateWorkOrderTemplate(id, { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults }) {
+  const { rows } = await pool.query(
+    `UPDATE work_order_templates SET
+       name = COALESCE($2,name), default_title = COALESCE($3,default_title),
+       default_priority = COALESCE($4,default_priority), default_description = COALESCE($5,default_description),
+       job_line_defaults = COALESCE($6,job_line_defaults)
+     WHERE id = $1 RETURNING *`,
+    [id, name ?? null, defaultTitle ?? null, defaultPriority ?? null, defaultDescription ?? null,
+      jobLineDefaults ? JSON.stringify(jobLineDefaults) : null]
+  );
+  const r = rows[0];
+  return r ? { Id: r.id, Name: r.name, DefaultTitle: r.default_title, DefaultPriority: r.default_priority, DefaultDescription: r.default_description, JobLineDefaults: r.job_line_defaults } : null;
+}
+export async function deleteWorkOrderTemplate(id) {
+  await pool.query('DELETE FROM work_order_templates WHERE id = $1', [id]);
 }
 
 // targetField is a property-field LABEL (matches an asset_property_fields.label),
