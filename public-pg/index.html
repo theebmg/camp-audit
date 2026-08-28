@@ -126,6 +126,11 @@
     .skill-chip { display: inline-flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 999px;
       border: 1px solid var(--border); font-size: 0.82rem; cursor: pointer; user-select: none; background: var(--surface); }
     .skill-chip.selected { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-dark); font-weight: 600; }
+    /* Shared style.css's .toast hardcodes white text on a var(--text)
+       background — in dark mode --text flips light, leaving white-on-white.
+       Override here (scoped to /next/ only, shared file untouched) with the
+       correctly-paired surface/text tokens, which invert together properly. */
+    .toast { background: var(--surface) !important; color: var(--text) !important; border: 1px solid var(--border); }
     /* .field-row's generic `input { width: 100% }` clashes with flex layouts
        like this one — force it back to auto so flex:1/flex:0 actually control
        sizing instead of both children fighting over 100% width. */

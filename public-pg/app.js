@@ -94,7 +94,7 @@ function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {
       <div class="ac-item" data-id="${a.Id}" data-name="${escapeHtml(a.Name)}">
         ${escapeHtml(a.Name)}${a.locationName ? ` <span class="muted">— ${escapeHtml(a.locationName)}</span>` : ''}
       </div>`).join('');
-    const addRow = query ? `<div class="ac-item ac-add" data-add-name="${escapeHtml(query)}">➕ Add new asset "${escapeHtml(query)}"</div>` : '';
+    const addRow = query ? `<div class="ac-item ac-add" data-add-name="${escapeHtml(query)}">➕ Add new asset "${escapeHtml(query)}"…</div>` : '';
     resultsEl.innerHTML = rows + addRow;
     resultsEl.hidden = false;
     resultsEl.querySelectorAll('.ac-item[data-id]').forEach((el) => el.addEventListener('click', () => {
@@ -103,10 +103,35 @@ function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {
       resultsEl.hidden = true;
       onSelect(selected);
     }));
-    resultsEl.querySelector('.ac-add')?.addEventListener('click', async () => {
-      const name = resultsEl.querySelector('.ac-add').dataset.addName;
+    resultsEl.querySelector('.ac-add')?.addEventListener('click', () => showQuickCreateForm(resultsEl.querySelector('.ac-add').dataset.addName));
+  }
+
+  // A location matters for reporting, so the quick-add flow asks for it (and
+  // asset type) inline rather than creating a bare, unlocated asset — the
+  // rest of an asset's properties still go through Edit Asset afterward,
+  // matching the "deliberate action" spirit for anything beyond the basics.
+  async function showQuickCreateForm(name) {
+    resultsEl.innerHTML = `<div class="ac-item" style="cursor:default">
+      <div class="field-row" style="margin-bottom:8px"><label>New asset name</label><input class="ac-new-name" value="${escapeHtml(name)}" /></div>
+      <div class="field-row" style="margin-bottom:8px"><label>Location</label><select class="ac-new-location"><option value="">— unset —</option></select></div>
+      <div class="field-row" style="margin-bottom:8px"><label>Asset Type</label><input class="ac-new-type" placeholder="e.g. Full Cabin" /></div>
+      <div class="btn-row" style="margin-top:0">
+        <button type="button" class="btn btn-primary ac-create-confirm">Create Asset</button>
+        <button type="button" class="btn btn-secondary ac-create-cancel">Cancel</button>
+      </div>
+    </div>`;
+    const locSelect = resultsEl.querySelector('.ac-new-location');
+    api('/api/pg/locations').then(({ locations }) => {
+      locSelect.insertAdjacentHTML('beforeend', locations.map((l) => `<option value="${l.Id}">${escapeHtml(l.Name)}</option>`).join(''));
+    });
+    resultsEl.querySelector('.ac-create-cancel').addEventListener('click', () => { resultsEl.hidden = true; });
+    resultsEl.querySelector('.ac-create-confirm').addEventListener('click', async () => {
+      const finalName = resultsEl.querySelector('.ac-new-name').value.trim();
+      if (!finalName) { toast('Name is required'); return; }
       try {
-        const { asset } = await api('/api/pg/assets', { method: 'POST', body: JSON.stringify({ name }) });
+        const { asset } = await api('/api/pg/assets', { method: 'POST', body: JSON.stringify({
+          name: finalName, locationId: locSelect.value || undefined, assetType: resultsEl.querySelector('.ac-new-type').value.trim() || undefined,
+        }) });
         selected = asset;
         input.value = asset.Name;
         resultsEl.hidden = true;
@@ -1633,17 +1658,6 @@ async function renderWorkOrderDetail({ id }) {
         <button class="btn btn-secondary" type="submit">Add Field Update</button>
       </form>
     </details>
-
-    <div class="card">
-      <h3>Job Lines (Asset Updates)</h3>
-      <p class="muted">Applied automatically when you Complete this Work Order.</p>
-      ${jobLineRows}
-      <form id="addJobLineForm" style="margin-top:10px">
-        <div class="field-row"><label>Field</label><select name="targetField" required><option value="">— select —</option>${propertyFieldTitles.map((t) => `<option>${escapeHtml(t)}</option>`).join('')}</select></div>
-        <div class="field-row"><label>New Value</label><input name="newValue" required /></div>
-        <button class="btn btn-secondary" type="submit">Add Job Line</button>
-      </form>
-    </div>
 
     <div class="card">
       <h3>Assigned Crew</h3>
