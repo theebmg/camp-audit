@@ -30,6 +30,49 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// Sets #app's content and replays the fade-in — every view render should go
+// through this instead of `app.innerHTML =` directly, so view swaps feel like
+// transitions rather than instant flashes.
+function setApp(html) {
+  app.innerHTML = html;
+  app.classList.remove('view-fade');
+  void app.offsetWidth; // force reflow so the animation replays
+  app.classList.add('view-fade');
+}
+
+const LOADING_HTML = '<div class="loading-wrap"><div class="spinner"></div><span>Loading…</span></div>';
+
+// ---- Table/Cards view toggle (Maintenance Log & Capital Plan) — persists
+// per-browser via localStorage; defaults by screen width on first visit.
+function getTableViewMode() {
+  const saved = localStorage.getItem('campAuditTableView');
+  if (saved === 'cards' || saved === 'table') return saved;
+  return window.matchMedia('(max-width: 640px)').matches ? 'cards' : 'table';
+}
+function tableViewToggleHtml(mode) {
+  return `<div class="view-toggle">
+    <button type="button" class="view-toggle-btn ${mode === 'table' ? 'active' : ''}" data-mode="table">☰ Table</button>
+    <button type="button" class="view-toggle-btn ${mode === 'cards' ? 'active' : ''}" data-mode="cards">▦ Cards</button>
+  </div>`;
+}
+function wireTableViewToggle(onChange) {
+  document.querySelectorAll('.view-toggle-btn').forEach((btn) => btn.addEventListener('click', () => {
+    localStorage.setItem('campAuditTableView', btn.dataset.mode);
+    onChange();
+  }));
+}
+
+// Ordinal urgency → status color, reused for the Capital Plan bucket tiles
+// AND the bucket pill on each row, so the color means the same thing in both
+// places. Uses the same 4 semantic tokens as conditionPillClass below.
+function bucketColorKey(bucket) {
+  if (bucket === 'Overdue') return 'bad';
+  if (bucket === '0–2 yrs') return 'pop';
+  if (bucket === '3–5 yrs') return 'warn';
+  if (bucket === '5+ yrs') return 'good';
+  return 'neutral';
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) } });
   if (res.status === 401) {
@@ -127,34 +170,50 @@ globalSearchInput?.addEventListener('input', () => {
 
 // ---------- Views ----------
 
+// Every view function still sets app.innerHTML itself (loading, then real
+// content) — this dispatcher just triggers the fade-in ONCE, after whichever
+// handler finishes, so view swaps transition instead of flashing. Single
+// choke point: no need to touch each render function's internals.
+function fadeInApp() {
+  app.classList.remove('view-fade');
+  void app.offsetWidth;
+  app.classList.add('view-fade');
+}
+
 async function render(view, params = {}) {
   try {
-    if (view === 'login') return renderLogin();
-    if (!state.user) return renderLogin();
+    if (view === 'login') { await renderLogin(); return fadeInApp(); }
+    if (!state.user) { await renderLogin(); return fadeInApp(); }
     if (!state.options) state.options = await api('/api/pg/options');
     renderSidebar(view);
     setChrome({ title: '', showBack: state.stack.length > 1, showLogout: true });
     breadcrumbsEl.hidden = true;
-    if (view === 'dashboard') return renderDashboard();
-    if (view === 'locations') return renderLocations();
-    if (view === 'assetsInLocation') return renderAssetsInLocation(params);
-    if (view === 'assetDetail') return renderAssetDetail(params);
-    if (view === 'audit') return renderAudit(params);
-    if (view === 'assetHistory') return renderAssetHistory(params);
-    if (view === 'capitalPlan') return renderCapitalPlan();
-    if (view === 'maintenanceLog') return renderMaintenanceLog();
-    if (view === 'editAsset') return renderEditAsset(params);
-    if (view === 'admin') return renderAdminHub();
-    if (view === 'adminAddFieldChoice') return renderAdminAddFieldChoice();
-    if (view === 'adminPropertyFields') return renderAdminPropertyFields(params);
-    if (view === 'adminComponentTypes') return renderAdminComponentTypes(params);
-    if (view === 'adminBuildingTypes') return renderAdminBuildingTypes();
-    if (view === 'adminApplicability') return renderAdminApplicability();
-    if (view === 'adminSubAreas') return renderAdminSubAreas();
-    if (view === 'workOrders') return renderWorkOrders();
-    if (view === 'workOrderDetail') return renderWorkOrderDetail(params);
-    if (view === 'newWorkOrder') return renderNewWorkOrder(params);
-    if (view === 'crew') return renderCrew();
+    const handlers = {
+      dashboard: () => renderDashboard(),
+      locations: () => renderLocations(),
+      assetsInLocation: () => renderAssetsInLocation(params),
+      assetDetail: () => renderAssetDetail(params),
+      audit: () => renderAudit(params),
+      assetHistory: () => renderAssetHistory(params),
+      capitalPlan: () => renderCapitalPlan(),
+      maintenanceLog: () => renderMaintenanceLog(),
+      editAsset: () => renderEditAsset(params),
+      admin: () => renderAdminHub(),
+      adminAddFieldChoice: () => renderAdminAddFieldChoice(),
+      adminPropertyFields: () => renderAdminPropertyFields(params),
+      adminComponentTypes: () => renderAdminComponentTypes(params),
+      adminBuildingTypes: () => renderAdminBuildingTypes(),
+      adminApplicability: () => renderAdminApplicability(),
+      adminSubAreas: () => renderAdminSubAreas(),
+      workOrders: () => renderWorkOrders(),
+      workOrderDetail: () => renderWorkOrderDetail(params),
+      newWorkOrder: () => renderNewWorkOrder(params),
+      crew: () => renderCrew(),
+    };
+    if (handlers[view]) {
+      await handlers[view]();
+      fadeInApp();
+    }
   } catch (e) {
     if (e.message !== 'Not authenticated') toast(e.message);
   }
@@ -195,7 +254,7 @@ function renderDashboard() {
 
 async function renderLocations() {
   setChrome({ title: 'Locations', showBack: false, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { locations } = await api('/api/pg/locations');
   app.innerHTML = locations.map((l) => `
     <div class="list-item" data-id="${l.Id}" data-name="${escapeHtml(l.Name)}">
@@ -207,7 +266,7 @@ async function renderLocations() {
 
 async function renderAssetsInLocation({ id, name }) {
   setChrome({ title: name || 'Assets', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { assets } = await api(`/api/pg/locations/${id}/assets`);
   app.innerHTML = assets.length ? assets.map((a) => `
     <div class="list-item" data-id="${a.Id}">
@@ -226,7 +285,7 @@ function conditionPillClass(c) {
 
 async function renderAssetDetail({ id }) {
   setChrome({ title: 'Asset', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const [detail, notesRes] = await Promise.all([
     api(`/api/pg/assets/${id}`), api(`/api/pg/assets/${id}/notes`),
   ]);
@@ -329,7 +388,7 @@ async function renderAssetDetail({ id }) {
 
 async function renderAudit({ id }) {
   setChrome({ title: 'Audit', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const detail = await api(`/api/pg/assets/${id}`);
   const { asset, properties, components } = detail;
   const fieldByKey = new Map(properties.fields.map((f) => [f.fieldKey, f]));
@@ -444,7 +503,7 @@ async function renderAudit({ id }) {
 
 async function renderAssetHistory({ id }) {
   setChrome({ title: 'History', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { asset, history } = await api(`/api/pg/assets/${id}/history`);
   app.innerHTML = `<div class="card"><h3>${escapeHtml(asset.Name)} — Component History</h3></div>` +
     (history.length ? history.map((h) => `
@@ -458,54 +517,86 @@ async function renderAssetHistory({ id }) {
 
 async function renderCapitalPlan() {
   setChrome({ title: 'Capital Plan', showBack: false, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { rows, summary } = await api('/api/pg/capital-plan');
-  const buckets = summary.map((b) => `
-    <div class="bucket-tile"><div class="n">${b.count}</div><div class="muted">${escapeHtml(b.bucket)}</div>
-      <div class="muted">$${Number(b.totalCost || 0).toLocaleString()}</div></div>`).join('');
-  const tableRows = rows.map((r) => `
-    <tr class="clickable-row" data-asset-id="${r.assetId}">
-      <td>${escapeHtml(r.assetName)}</td><td>${escapeHtml(r.locationName || '')}</td>
-      <td>${escapeHtml(r.componentType)}</td>
-      <td><span class="pill ${conditionPillClass(r.condition)}">${escapeHtml(r.condition || '')}</span></td>
-      <td>${r.estReplacementYear ?? '—'}</td>
-      <td>${r.estReplacementCost ? '$' + Number(r.estReplacementCost).toLocaleString() : '—'}</td>
-      <td>${escapeHtml(r.bucket)}</td>
-    </tr>`).join('');
-  app.innerHTML = `
-    <div class="summary-buckets">${buckets}</div>
-    <div class="card" style="overflow-x:auto">
-      <table class="report-table">
-        <thead><tr><th>Asset</th><th>Location</th><th>Component</th><th>Condition</th><th>Est. Year</th><th>Est. Cost</th><th>Bucket</th></tr></thead>
-        <tbody>${tableRows || '<tr><td colspan="7" class="muted">No component data yet.</td></tr>'}</tbody>
-      </table>
-    </div>`;
-  app.querySelectorAll('.clickable-row').forEach((tr) => tr.addEventListener('click', () => go('assetDetail', { id: tr.dataset.assetId })));
+  let activeBucket = null; // client-side filter — no re-fetch needed, data's already in hand
+
+  function draw() {
+    const mode = getTableViewMode();
+    const buckets = summary.map((b) => `
+      <div class="bucket-tile tile-${bucketColorKey(b.bucket)} ${activeBucket === b.bucket ? 'active' : ''}" data-bucket="${escapeHtml(b.bucket)}">
+        <div class="n">${b.count}</div><div class="muted">${escapeHtml(b.bucket)}</div>
+        <div class="muted">$${Number(b.totalCost || 0).toLocaleString()}</div>
+      </div>`).join('');
+    const visibleRows = activeBucket ? rows.filter((r) => r.bucket === activeBucket) : rows;
+    const tableRows = visibleRows.map((r) => `
+      <tr class="clickable-row" data-asset-id="${r.assetId}">
+        <td data-label="Asset">${escapeHtml(r.assetName)}</td>
+        <td data-label="Location">${escapeHtml(r.locationName || '')}</td>
+        <td data-label="Component">${escapeHtml(r.componentType)}</td>
+        <td data-label="Condition"><span class="pill ${conditionPillClass(r.condition)}">${escapeHtml(r.condition || '')}</span></td>
+        <td data-label="Est. Year">${r.estReplacementYear ?? '—'}</td>
+        <td data-label="Est. Cost">${r.estReplacementCost ? '$' + Number(r.estReplacementCost).toLocaleString() : '—'}</td>
+        <td data-label="Bucket"><span class="pill ${bucketColorKey(r.bucket) === 'neutral' ? '' : bucketColorKey(r.bucket)}">${escapeHtml(r.bucket)}</span></td>
+      </tr>`).join('');
+    setApp(`
+      <div class="summary-buckets">${buckets}</div>
+      ${tableViewToggleHtml(mode)}
+      ${activeBucket ? `<div style="margin-bottom:10px"><button class="btn btn-secondary" id="clearBucketFilter">✕ Clear filter: ${escapeHtml(activeBucket)}</button></div>` : ''}
+      <div class="card" style="overflow-x:auto">
+        <table class="report-table ${mode === 'cards' ? 'card-mode' : ''}">
+          <thead><tr><th>Asset</th><th>Location</th><th>Component</th><th>Condition</th><th>Est. Year</th><th>Est. Cost</th><th>Bucket</th></tr></thead>
+          <tbody>${tableRows || `<tr><td colspan="7" class="muted">${activeBucket ? 'Nothing in this bucket.' : '🗒️ No component data yet.'}</td></tr>`}</tbody>
+        </table>
+      </div>`);
+    wire();
+  }
+
+  function wire() {
+    app.querySelectorAll('.bucket-tile').forEach((tile) => tile.addEventListener('click', () => {
+      activeBucket = activeBucket === tile.dataset.bucket ? null : tile.dataset.bucket;
+      draw();
+    }));
+    document.getElementById('clearBucketFilter')?.addEventListener('click', () => { activeBucket = null; draw(); });
+    app.querySelectorAll('.clickable-row').forEach((tr) => tr.addEventListener('click', () => go('assetDetail', { id: tr.dataset.assetId })));
+    wireTableViewToggle(draw);
+  }
+
+  draw();
 }
 
 async function renderMaintenanceLog() {
   setChrome({ title: 'Maintenance Log', showBack: false, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { entries } = await api('/api/pg/maintenance-log');
-  app.innerHTML = `<div class="card" style="overflow-x:auto">
-    <table class="report-table">
-      <thead><tr><th>Date</th><th>Asset</th><th>Component</th><th>Event</th><th>Condition</th><th>Material</th><th>Notes</th></tr></thead>
-      <tbody>${entries.map((e) => `
-        <tr class="clickable-row" data-asset-id="${e.Asset?.Id ?? ''}">
-          <td>${escapeHtml(e['Observed/Installed Date'] || '')}</td>
-          <td>${escapeHtml(e.Asset?.Name || '')}</td>
-          <td>${escapeHtml(e['Component Type'])}</td>
-          <td>${escapeHtml(e['Event Type'] || '')}</td>
-          <td>${escapeHtml(e.Condition || '')}</td>
-          <td>${escapeHtml(e.Material || '')}</td>
-          <td>${escapeHtml(e.Notes || '')}</td>
-        </tr>`).join('') || '<tr><td colspan="7" class="muted">No entries yet.</td></tr>'}</tbody>
-    </table>
-  </div>`;
-  app.querySelectorAll('.clickable-row').forEach((tr) => {
-    if (!tr.dataset.assetId) return;
-    tr.addEventListener('click', () => go('assetDetail', { id: tr.dataset.assetId }));
-  });
+
+  function draw() {
+    const mode = getTableViewMode();
+    setApp(`
+      ${tableViewToggleHtml(mode)}
+      <div class="card" style="overflow-x:auto">
+        <table class="report-table ${mode === 'cards' ? 'card-mode' : ''}">
+          <thead><tr><th>Date</th><th>Asset</th><th>Component</th><th>Event</th><th>Condition</th><th>Material</th><th>Notes</th></tr></thead>
+          <tbody>${entries.map((e) => `
+            <tr class="clickable-row" data-asset-id="${e.Asset?.Id ?? ''}">
+              <td data-label="Date">${escapeHtml(e['Observed/Installed Date'] || '')}</td>
+              <td data-label="Asset">${escapeHtml(e.Asset?.Name || '')}</td>
+              <td data-label="Component">${escapeHtml(e['Component Type'])}</td>
+              <td data-label="Event">${escapeHtml(e['Event Type'] || '')}</td>
+              <td data-label="Condition"><span class="pill ${conditionPillClass(e.Condition)}">${escapeHtml(e.Condition || '')}</span></td>
+              <td data-label="Material">${escapeHtml(e.Material || '')}</td>
+              <td data-label="Notes">${escapeHtml(e.Notes || '')}</td>
+            </tr>`).join('') || '<tr><td colspan="7" class="muted">🗒️ No entries yet.</td></tr>'}</tbody>
+        </table>
+      </div>`);
+    app.querySelectorAll('.clickable-row').forEach((tr) => {
+      if (!tr.dataset.assetId) return;
+      tr.addEventListener('click', () => go('assetDetail', { id: tr.dataset.assetId }));
+    });
+    wireTableViewToggle(draw);
+  }
+
+  draw();
 }
 
 // ---------- Edit Asset (full direct edit — core fields + every property field,
@@ -513,7 +604,7 @@ async function renderMaintenanceLog() {
 
 async function renderEditAsset({ id }) {
   setChrome({ title: 'Edit Asset', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const [detail, locsRes] = await Promise.all([api(`/api/pg/assets/${id}`), api('/api/pg/locations')]);
   const { asset, properties } = detail;
   const locOptions = locsRes.locations.map((l) => `<option value="${l.Id}" ${asset.locationId === l.Id ? 'selected' : ''}>${escapeHtml(l.Name)}</option>`).join('');
@@ -610,7 +701,7 @@ function renderAdminAddFieldChoice() {
 
 async function renderAdminPropertyFields({ openAdd } = {}) {
   setChrome({ title: 'Property Fields', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { fields } = await api('/api/pg/admin/property-fields');
   const rows = fields.map((f) => `
     <div class="list-item" style="cursor:default">
@@ -669,7 +760,7 @@ async function renderAdminPropertyFields({ openAdd } = {}) {
 
 async function renderAdminComponentTypes({ openAdd } = {}) {
   setChrome({ title: 'Component Types', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { componentTypes } = await api('/api/pg/admin/component-types');
   const rows = componentTypes.map((c) => `
     <div class="list-item" style="cursor:default">
@@ -722,7 +813,7 @@ async function renderAdminComponentTypes({ openAdd } = {}) {
 
 async function renderAdminBuildingTypes() {
   setChrome({ title: 'Building Types', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { buildingTypes } = await api('/api/pg/admin/building-types');
   const rows = buildingTypes.map((b) => `
     <div class="list-item" style="cursor:default">
@@ -759,7 +850,7 @@ async function renderAdminBuildingTypes() {
 
 async function renderAdminApplicability() {
   setChrome({ title: 'Applicability Matrix', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { buildingTypes, questionKeys, matrix } = await api('/api/pg/admin/applicability');
   const header = questionKeys.map((q) => `<th>${escapeHtml(q.label)}</th>`).join('');
   const rows = matrix.map((row) => `
@@ -773,7 +864,7 @@ async function renderAdminApplicability() {
       <p class="muted">Unchecked = that question/component is skipped for that building type during the audit. Checked (default) = it applies.</p>
     </div>
     <div class="card" style="overflow-x:auto">
-      <table class="report-table"><thead><tr><th>Building Type</th>${header}</tr></thead><tbody>${rows}</tbody></table>
+      <table class="report-table matrix-table"><thead><tr><th>Building Type</th>${header}</tr></thead><tbody>${rows}</tbody></table>
     </div>`;
 
   app.querySelectorAll('.applies-cb').forEach((cb) => cb.addEventListener('change', async () => {
@@ -785,7 +876,7 @@ async function renderAdminApplicability() {
 
 async function renderAdminSubAreas() {
   setChrome({ title: 'Component Sub-Areas', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { subAreas } = await api('/api/pg/admin/sub-areas');
   const byType = new Map();
   subAreas.forEach((s) => { if (!byType.has(s.component_type)) byType.set(s.component_type, []); byType.get(s.component_type).push(s); });
@@ -827,7 +918,7 @@ async function renderAdminSubAreas() {
 
 async function renderWorkOrders() {
   setChrome({ title: 'Work Orders', showBack: false, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const { workOrders } = await api('/api/pg/work-orders');
   const rows = workOrders.map((w) => `
     <div class="list-item" data-id="${w.Id}">
@@ -884,7 +975,7 @@ async function renderNewWorkOrder({ assetId, assetName }) {
 
 async function renderWorkOrderDetail({ id }) {
   setChrome({ title: 'Work Order', showBack: true, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const [detail, allVolunteers, allVendors] = await Promise.all([
     api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'),
   ]);
@@ -1025,7 +1116,7 @@ async function renderWorkOrderDetail({ id }) {
 
 async function renderCrew() {
   setChrome({ title: 'Crew', showBack: false, showLogout: true });
-  app.innerHTML = '<p class="muted">Loading…</p>';
+  app.innerHTML = LOADING_HTML;
   const [vols, vens] = await Promise.all([api('/api/pg/volunteers'), api('/api/pg/vendors')]);
   app.innerHTML = `
     <div class="card"><h3>Volunteers</h3>

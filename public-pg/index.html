@@ -34,21 +34,77 @@
     .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 0.75rem; font-weight: 700;
       background: var(--surface-alt); color: var(--muted); }
     .pill.good { background: var(--accent-soft); color: var(--accent-dark); }
+    .pill.pop { background: var(--pop-soft); color: #9a3412; }
     .pill.warn { background: var(--warn-soft); color: #92400e; }
     .pill.bad { background: var(--danger-soft); color: #991b1b; }
     .btn { display: inline-block; padding: 10px 16px; border-radius: var(--radius-sm); border: none;
-      font-weight: 700; font-size: 0.95rem; cursor: pointer; }
+      font-weight: 700; font-size: 0.95rem; cursor: pointer; transition: filter 0.15s ease, transform 0.1s ease; }
+    .btn:hover { filter: brightness(0.95); }
+    .btn:active { transform: scale(0.97); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; filter: none; }
     .btn-primary { background: var(--accent); color: var(--accent-text); }
     .btn-secondary { background: var(--surface-alt); color: var(--text); }
-    .btn-row { display: flex; gap: 10px; margin-top: 16px; }
+    .btn-row { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
     .reveal { margin-left: 16px; padding-left: 12px; border-left: 2px solid var(--border); }
+
+    /* Motion: cards/list-items/nav get a soft hover + a fade-in when a view
+       swaps in — the thing that actually makes an app feel "fluid" vs. flat. */
+    .card, .list-item, .nav-item { transition: background-color 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease; }
+    .list-item:hover { background: var(--surface-alt); box-shadow: var(--shadow-sm); }
+    @keyframes viewFadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    #app.view-fade { animation: viewFadeIn 0.2s ease; }
+    .field-row select:focus, .field-row input:focus, .field-row textarea:focus {
+      outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent);
+    }
+
+    .loading-wrap { display: flex; align-items: center; justify-content: center; gap: 10px; color: var(--muted); padding: 32px 0; }
+    .spinner { width: 18px; height: 18px; border: 2px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin 0.7s linear infinite; flex-shrink: 0; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
     table.report-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
     table.report-table th, table.report-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
-    table.report-table tr.clickable-row { cursor: pointer; }
+    table.report-table tr.clickable-row { cursor: pointer; transition: background-color 0.15s ease; }
     table.report-table tr.clickable-row:hover { background: var(--surface-alt); }
+
+    /* Applicability Matrix only — inherently a 2D grid, so it keeps a sticky
+       first column + horizontal scroll rather than the card-mode toggle. */
+    .matrix-table th:first-child, .matrix-table td:first-child {
+      position: sticky; left: 0; background: var(--surface); z-index: 1;
+    }
+    .matrix-table th { white-space: nowrap; }
+    .matrix-table input[type="checkbox"], input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; }
+
+    /* Table/Cards view toggle — Maintenance Log & Capital Plan only. Default
+       picked by screen width on first visit; overridden choice persists via
+       localStorage (see getTableViewMode() in app.js). */
+    .view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm);
+      overflow: hidden; margin-bottom: 12px; }
+    .view-toggle-btn { padding: 7px 14px; border: none; background: var(--surface); color: var(--muted);
+      font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: background-color 0.15s ease, color 0.15s ease; }
+    .view-toggle-btn.active { background: var(--accent-soft); color: var(--accent-dark); }
+    table.report-table.card-mode thead { display: none; }
+    table.report-table.card-mode, table.report-table.card-mode tbody,
+    table.report-table.card-mode tr, table.report-table.card-mode td { display: block; width: 100%; }
+    table.report-table.card-mode tr { margin-bottom: 10px; border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: 10px 12px; background: var(--surface); }
+    table.report-table.card-mode td { border: none; padding: 3px 0; }
+    table.report-table.card-mode td::before {
+      content: attr(data-label); font-weight: 600; color: var(--muted); display: inline-block; min-width: 108px;
+    }
+    table.report-table.card-mode td[data-label=""]::before { display: none; }
+
     .summary-buckets { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
     .bucket-tile { flex: 1; min-width: 110px; background: var(--surface); border: 1px solid var(--border);
-      border-radius: var(--radius-sm); padding: 12px; text-align: center; }
+      border-left: 4px solid var(--border); border-radius: var(--radius-sm); padding: 12px; text-align: center;
+      cursor: pointer; transition: all 0.15s ease; }
+    .bucket-tile:hover { box-shadow: var(--shadow-sm); }
+    .bucket-tile.active { box-shadow: var(--shadow-md); background: var(--surface-alt); }
+    .bucket-tile.tile-bad { border-left-color: var(--danger); }
+    .bucket-tile.tile-pop { border-left-color: var(--pop); }
+    .bucket-tile.tile-warn { border-left-color: var(--warn); }
+    .bucket-tile.tile-good { border-left-color: var(--accent); }
+    .bucket-tile.tile-neutral { border-left-color: var(--muted); }
     .bucket-tile .n { font-size: 1.4rem; font-weight: 800; }
     .note-item { padding: 10px 12px; border-radius: var(--radius-sm); background: var(--surface-alt); margin-bottom: 8px; }
     .note-item.resolved { opacity: 0.55; text-decoration: line-through; }
