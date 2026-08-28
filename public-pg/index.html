@@ -129,9 +129,9 @@
     /* .field-row's generic `input { width: 100% }` clashes with flex layouts
        like this one — force it back to auto so flex:1/flex:0 actually control
        sizing instead of both children fighting over 100% width. */
-    .inline-add-row { display: flex; gap: 8px; margin-top: 8px; }
-    .inline-add-row input { flex: 1 1 auto; width: auto !important; }
-    .inline-add-row .btn { flex: 0 0 auto; }
+    .inline-add-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+    .inline-add-row select, .inline-add-row input { flex: 1 1 0%; width: 0 !important; min-width: 0; }
+    .inline-add-row .btn { flex: 0 0 auto !important; width: auto !important; white-space: nowrap; }
 
     /* Calendar/scheduler */
     .cal-scroll { overflow-x: auto; }
