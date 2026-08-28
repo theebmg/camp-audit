@@ -30,6 +30,11 @@ import {
   listVolunteers, createVolunteer, updateVolunteer, removeVolunteer,
   listVendors, createVendor, updateVendor, removeVendor,
   listSkills, createSkill, searchAssetsLive, createAssetQuick,
+  listWorkOrderTasks, createWorkOrderTask, updateWorkOrderTask, deleteWorkOrderTask,
+  listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
+  listChecklistTemplates, createChecklistTemplate, updateChecklistTemplate, deleteChecklistTemplate,
+  getChecklistInstanceForWorkOrder, getChecklistInstanceForCalendarEvent,
+  attachChecklistToWorkOrder, attachChecklistToCalendarEvent, detachChecklistInstance, toggleChecklistStep,
 } from '../db.js';
 
 const router = express.Router();
@@ -321,15 +326,39 @@ router.get('/work-orders/:id', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    res.json(detail);
+    const [tasks, checklist] = await Promise.all([
+      listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id),
+    ]);
+    res.json({ ...detail, tasks, checklist });
   } catch (e) { next(e); }
+});
+
+// ---- Work Order Tasks (free-text job lines — the default way to add work) ----
+
+router.post('/work-orders/:id/tasks', async (req, res, next) => {
+  try {
+    const { description } = req.body || {};
+    if (!description || !description.trim()) return res.status(400).json({ ok: false, error: 'description is required' });
+    res.json({ ok: true, task: await createWorkOrderTask(req.params.id, description.trim()) });
+  } catch (e) { next(e); }
+});
+router.patch('/work-order-tasks/:taskId', async (req, res, next) => {
+  try {
+    const { description, done } = req.body || {};
+    const task = await updateWorkOrderTask(req.params.taskId, { description, done });
+    if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
+    res.json({ ok: true, task });
+  } catch (e) { next(e); }
+});
+router.delete('/work-order-tasks/:taskId', async (req, res, next) => {
+  try { await deleteWorkOrderTask(req.params.taskId); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 router.post('/work-orders', async (req, res, next) => {
   try {
-    const { title, assetId, locationId, priority, description, scheduledDate, assetUpdates } = req.body || {};
+    const { title, assetId, locationId, priority, description, scheduledDate, assetUpdates, tasks } = req.body || {};
     if (!title) return res.status(400).json({ ok: false, error: 'title is required' });
-    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates });
+    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates, tasks });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
@@ -484,21 +513,115 @@ router.get('/work-order-templates', async (req, res, next) => {
 });
 router.post('/work-order-templates', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults } = req.body || {};
+    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults }) });
+    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults }) });
   } catch (e) { next(e); }
 });
 router.patch('/work-order-templates/:id', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults } = req.body || {};
-    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults });
+    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults } = req.body || {};
+    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults });
     if (!template) return res.status(404).json({ ok: false, error: 'Template not found' });
     res.json({ ok: true, template });
   } catch (e) { next(e); }
 });
 router.delete('/work-order-templates/:id', async (req, res, next) => {
   try { await deleteWorkOrderTemplate(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Calendar Events (independent of Work Orders; optional link either way) ----
+
+router.get('/calendar-events', async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to (YYYY-MM-DD) are required' });
+    res.json({ occurrences: await listCalendarEventOccurrences(from, to) });
+  } catch (e) { next(e); }
+});
+router.get('/calendar-events/:id', async (req, res, next) => {
+  try {
+    const event = await getCalendarEvent(req.params.id);
+    if (!event) return res.status(404).json({ ok: false, error: 'Event not found' });
+    const checklist = await getChecklistInstanceForCalendarEvent(req.params.id);
+    res.json({ event, checklist });
+  } catch (e) { next(e); }
+});
+router.post('/calendar-events', async (req, res, next) => {
+  try {
+    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId } = req.body || {};
+    if (!title || !eventDate) return res.status(400).json({ ok: false, error: 'title and eventDate are required' });
+    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId }) });
+  } catch (e) { next(e); }
+});
+router.patch('/calendar-events/:id', async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const fields = {};
+    if (body.title != null) fields.title = body.title;
+    if (body.description !== undefined) fields.description = body.description;
+    if (body.eventDate != null) fields.event_date = body.eventDate;
+    if (body.recurrenceType != null) fields.recurrence_type = body.recurrenceType;
+    if (body.recurrenceInterval != null) fields.recurrence_interval = body.recurrenceInterval;
+    if (body.recurrenceEndDate !== undefined) fields.recurrence_end_date = body.recurrenceEndDate;
+    if (body.workOrderId !== undefined) fields.work_order_id = body.workOrderId === '' ? null : Number(body.workOrderId);
+    const event = await updateCalendarEvent(req.params.id, fields);
+    if (!event) return res.status(404).json({ ok: false, error: 'Event not found' });
+    res.json({ ok: true, event });
+  } catch (e) { next(e); }
+});
+router.delete('/calendar-events/:id', async (req, res, next) => {
+  try { await deleteCalendarEvent(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Checklists (simple ordered steps — templates + live checkable instances) ----
+
+router.get('/checklist-templates', async (req, res, next) => {
+  try { res.json({ templates: await listChecklistTemplates() }); } catch (e) { next(e); }
+});
+router.post('/checklist-templates', async (req, res, next) => {
+  try {
+    const { name, steps } = req.body || {};
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+    res.json({ ok: true, template: await createChecklistTemplate({ name, steps }) });
+  } catch (e) { next(e); }
+});
+router.patch('/checklist-templates/:id', async (req, res, next) => {
+  try {
+    const { name, steps } = req.body || {};
+    const template = await updateChecklistTemplate(req.params.id, { name, steps });
+    if (!template) return res.status(404).json({ ok: false, error: 'Template not found' });
+    res.json({ ok: true, template });
+  } catch (e) { next(e); }
+});
+router.delete('/checklist-templates/:id', async (req, res, next) => {
+  try { await deleteChecklistTemplate(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.post('/work-orders/:id/checklist', async (req, res, next) => {
+  try {
+    const { templateId } = req.body || {};
+    if (!templateId) return res.status(400).json({ ok: false, error: 'templateId is required' });
+    res.json({ ok: true, checklist: await attachChecklistToWorkOrder(req.params.id, templateId) });
+  } catch (e) { next(e); }
+});
+router.post('/calendar-events/:id/checklist', async (req, res, next) => {
+  try {
+    const { templateId } = req.body || {};
+    if (!templateId) return res.status(400).json({ ok: false, error: 'templateId is required' });
+    res.json({ ok: true, checklist: await attachChecklistToCalendarEvent(req.params.id, templateId) });
+  } catch (e) { next(e); }
+});
+router.delete('/checklist-instances/:id', async (req, res, next) => {
+  try { await detachChecklistInstance(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+router.patch('/checklist-steps/:id', async (req, res, next) => {
+  try {
+    const { done } = req.body || {};
+    const step = await toggleChecklistStep(req.params.id, !!done);
+    if (!step) return res.status(404).json({ ok: false, error: 'Step not found' });
+    res.json({ ok: true, step });
+  } catch (e) { next(e); }
 });
 
 export default router;

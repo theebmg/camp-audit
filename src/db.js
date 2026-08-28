@@ -644,7 +644,7 @@ export async function getWorkOrderDetail(woId) {
 
 const today = () => new Date().toISOString().slice(0, 10);
 
-export async function createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates = [] }) {
+export async function createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates = [], tasks = [] }) {
   const propertyFields = await getAssetPropertyFields();
   const byLabel = new Map(propertyFields.map((f) => [f.title, f]));
 
@@ -665,6 +665,15 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
         [woId, u.targetField, String(u.newValue ?? '')]
       );
       created.push(auRows[0]);
+    }
+    let sortOrder = 0;
+    for (const t of tasks) {
+      const desc = (typeof t === 'string' ? t : t?.description || '').trim();
+      if (!desc) continue;
+      await client.query(
+        `INSERT INTO work_order_tasks (work_order_id, description, sort_order) VALUES ($1,$2,$3)`,
+        [woId, desc, sortOrder++]
+      );
     }
     await client.query('COMMIT');
     return { workOrderId: woId, assetUpdates: created };
@@ -731,34 +740,35 @@ export async function duplicateWorkOrder(woId) {
 
 // ── Work Order templates ("canned" WOs for repeatable tasks) ───────────────
 
+function templateRowShape(r) {
+  return {
+    Id: r.id, Name: r.name, DefaultTitle: r.default_title, DefaultPriority: r.default_priority,
+    DefaultDescription: r.default_description, TaskDefaults: r.task_defaults, JobLineDefaults: r.job_line_defaults,
+  };
+}
 export async function listWorkOrderTemplates() {
   const { rows } = await pool.query('SELECT * FROM work_order_templates ORDER BY name');
-  return rows.map((r) => ({
-    Id: r.id, Name: r.name, DefaultTitle: r.default_title, DefaultPriority: r.default_priority,
-    DefaultDescription: r.default_description, JobLineDefaults: r.job_line_defaults,
-  }));
+  return rows.map(templateRowShape);
 }
-export async function createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults = [] }) {
+export async function createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, taskDefaults = [], jobLineDefaults = [] }) {
   const { rows } = await pool.query(
-    `INSERT INTO work_order_templates (name, default_title, default_priority, default_description, job_line_defaults)
-     VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [name, defaultTitle || null, defaultPriority || null, defaultDescription || null, JSON.stringify(jobLineDefaults)]
+    `INSERT INTO work_order_templates (name, default_title, default_priority, default_description, task_defaults, job_line_defaults)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [name, defaultTitle || null, defaultPriority || null, defaultDescription || null, JSON.stringify(taskDefaults), JSON.stringify(jobLineDefaults)]
   );
-  const r = rows[0];
-  return { Id: r.id, Name: r.name, DefaultTitle: r.default_title, DefaultPriority: r.default_priority, DefaultDescription: r.default_description, JobLineDefaults: r.job_line_defaults };
+  return templateRowShape(rows[0]);
 }
-export async function updateWorkOrderTemplate(id, { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults }) {
+export async function updateWorkOrderTemplate(id, { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults }) {
   const { rows } = await pool.query(
     `UPDATE work_order_templates SET
        name = COALESCE($2,name), default_title = COALESCE($3,default_title),
        default_priority = COALESCE($4,default_priority), default_description = COALESCE($5,default_description),
-       job_line_defaults = COALESCE($6,job_line_defaults)
+       task_defaults = COALESCE($6,task_defaults), job_line_defaults = COALESCE($7,job_line_defaults)
      WHERE id = $1 RETURNING *`,
     [id, name ?? null, defaultTitle ?? null, defaultPriority ?? null, defaultDescription ?? null,
-      jobLineDefaults ? JSON.stringify(jobLineDefaults) : null]
+      taskDefaults ? JSON.stringify(taskDefaults) : null, jobLineDefaults ? JSON.stringify(jobLineDefaults) : null]
   );
-  const r = rows[0];
-  return r ? { Id: r.id, Name: r.name, DefaultTitle: r.default_title, DefaultPriority: r.default_priority, DefaultDescription: r.default_description, JobLineDefaults: r.job_line_defaults } : null;
+  return rows[0] ? templateRowShape(rows[0]) : null;
 }
 export async function deleteWorkOrderTemplate(id) {
   await pool.query('DELETE FROM work_order_templates WHERE id = $1', [id]);
@@ -970,4 +980,251 @@ export async function createAssetQuick({ name, locationId, assetType }) {
   );
   const r = rows[0];
   return { Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: null };
+}
+
+// ── Work Order Tasks — free-text scope-of-work job lines (the default way to
+//    add work to a WO). Distinct from asset_updates, which is the separate,
+//    optional "this WO also changes an asset property field" mechanism —
+//    audit-style fields (Has Key, Window Count, ...) stay reserved for the
+//    audit flow; routine work doesn't need to touch them. ───────────────────
+
+export async function listWorkOrderTasks(woId) {
+  const { rows } = await pool.query(
+    'SELECT id, description, done, sort_order FROM work_order_tasks WHERE work_order_id = $1 ORDER BY sort_order, id',
+    [woId]
+  );
+  return rows.map((r) => ({ Id: r.id, Description: r.description, Done: r.done, SortOrder: r.sort_order }));
+}
+export async function createWorkOrderTask(woId, description) {
+  const { rows: maxRows } = await pool.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM work_order_tasks WHERE work_order_id = $1', [woId]);
+  const { rows } = await pool.query(
+    'INSERT INTO work_order_tasks (work_order_id, description, sort_order) VALUES ($1,$2,$3) RETURNING *',
+    [woId, description, maxRows[0].next]
+  );
+  return { Id: rows[0].id, Description: rows[0].description, Done: rows[0].done, SortOrder: rows[0].sort_order };
+}
+export async function updateWorkOrderTask(id, { description, done }) {
+  const { rows } = await pool.query(
+    'UPDATE work_order_tasks SET description = COALESCE($2,description), done = COALESCE($3,done) WHERE id = $1 RETURNING *',
+    [id, description ?? null, done ?? null]
+  );
+  return rows[0] ? { Id: rows[0].id, Description: rows[0].description, Done: rows[0].done, SortOrder: rows[0].sort_order } : null;
+}
+export async function deleteWorkOrderTask(id) {
+  await pool.query('DELETE FROM work_order_tasks WHERE id = $1', [id]);
+}
+
+// ── Calendar Events — independent of Work Orders (optional link either way).
+//    Recurrence is expanded on read for whatever date range is requested;
+//    no occurrence rows are stored. ──────────────────────────────────────────
+
+function addInterval(date, type, n) {
+  const d = new Date(date);
+  if (type === 'daily') d.setUTCDate(d.getUTCDate() + n);
+  else if (type === 'weekly') d.setUTCDate(d.getUTCDate() + n * 7);
+  else if (type === 'monthly') d.setUTCMonth(d.getUTCMonth() + n);
+  else if (type === 'yearly') d.setUTCFullYear(d.getUTCFullYear() + n);
+  return d;
+}
+
+// Returns the Date occurrences of one event that fall within [rangeStart, rangeEnd].
+// Fast-forwards past irrelevant early occurrences instead of walking one at a
+// time from the original date, so an old yearly/monthly event viewed much
+// later doesn't require hundreds of loop iterations.
+function expandRecurrence(event, rangeStart, rangeEnd) {
+  const base = new Date(event.event_date);
+  const type = event.recurrence_type;
+  const interval = Math.max(1, event.recurrence_interval || 1);
+  const endLimit = event.recurrence_end_date ? new Date(event.recurrence_end_date) : null;
+  if (type === 'none' || !type) {
+    return (base >= rangeStart && base <= rangeEnd) ? [base] : [];
+  }
+  let n = 0;
+  if (rangeStart > base) {
+    const approxUnitMs = { daily: 86400000, weekly: 604800000, monthly: 2629800000, yearly: 31557600000 }[type];
+    n = Math.max(0, Math.floor((rangeStart - base) / (approxUnitMs * interval)) - 2);
+  }
+  let cursor = addInterval(base, type, n * interval);
+  const occurrences = [];
+  let guard = 0;
+  while (cursor <= rangeEnd && guard < 400) {
+    guard++;
+    if (endLimit && cursor > endLimit) break;
+    if (cursor >= rangeStart && cursor <= rangeEnd) occurrences.push(new Date(cursor));
+    cursor = addInterval(cursor, type, interval);
+  }
+  return occurrences;
+}
+
+function calendarEventRowShape(r) {
+  return {
+    Id: r.id, Title: r.title, Description: r.description, EventDate: r.event_date,
+    RecurrenceType: r.recurrence_type, RecurrenceInterval: r.recurrence_interval, RecurrenceEndDate: r.recurrence_end_date,
+    WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title,
+  };
+}
+
+// Expands recurring events into their occurrence dates within [fromDate, toDate]
+// (YYYY-MM-DD strings). Each returned entry is one occurrence, tagged with its
+// concrete Date so the calendar can place it on the right day.
+export async function listCalendarEventOccurrences(fromDate, toDate) {
+  const { rows } = await pool.query(
+    `SELECT e.*, w.title AS wo_title FROM calendar_events e LEFT JOIN work_orders w ON w.id = e.work_order_id
+     WHERE e.event_date <= $2 AND (e.recurrence_end_date IS NULL OR e.recurrence_end_date >= $1)`,
+    [fromDate, toDate]
+  );
+  const rangeStart = new Date(fromDate);
+  const rangeEnd = new Date(toDate);
+  const out = [];
+  for (const row of rows) {
+    const shaped = calendarEventRowShape(row);
+    for (const occDate of expandRecurrence(row, rangeStart, rangeEnd)) {
+      out.push({ ...shaped, OccurrenceDate: occDate.toISOString().slice(0, 10) });
+    }
+  }
+  return out;
+}
+
+export async function getCalendarEvent(id) {
+  const { rows } = await pool.query(
+    `SELECT e.*, w.title AS wo_title FROM calendar_events e LEFT JOIN work_orders w ON w.id = e.work_order_id WHERE e.id = $1`,
+    [id]
+  );
+  return rows[0] ? calendarEventRowShape(rows[0]) : null;
+}
+
+export async function createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId }) {
+  const { rows } = await pool.query(
+    `INSERT INTO calendar_events (title, description, event_date, recurrence_type, recurrence_interval, recurrence_end_date, work_order_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [title, description || null, eventDate, recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null]
+  );
+  return calendarEventRowShape(rows[0]);
+}
+
+export async function updateCalendarEvent(id, fields) {
+  const allowed = ['title', 'description', 'event_date', 'recurrence_type', 'recurrence_interval', 'recurrence_end_date', 'work_order_id'];
+  const setCols = []; const vals = []; let i = 1;
+  for (const [key, value] of Object.entries(fields)) {
+    if (!allowed.includes(key)) continue;
+    setCols.push(`${key} = $${i++}`);
+    vals.push(value === '' ? null : value);
+  }
+  if (!setCols.length) return getCalendarEvent(id);
+  vals.push(id);
+  const { rowCount } = await pool.query(`UPDATE calendar_events SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
+  return rowCount ? getCalendarEvent(id) : null;
+}
+
+export async function deleteCalendarEvent(id) {
+  await pool.query('DELETE FROM calendar_events WHERE id = $1', [id]);
+}
+
+// ── Checklists — simple ORDERED steps (no branching, v1 scope). Templates are
+//    reusable; instances are live checkable copies attached to one WO or one
+//    Calendar Event. ─────────────────────────────────────────────────────────
+
+export async function listChecklistTemplates() {
+  const { rows } = await pool.query('SELECT * FROM checklist_templates ORDER BY name');
+  const steps = await pool.query('SELECT * FROM checklist_template_steps ORDER BY checklist_template_id, sort_order');
+  const byTemplate = new Map();
+  for (const s of steps.rows) {
+    if (!byTemplate.has(s.checklist_template_id)) byTemplate.set(s.checklist_template_id, []);
+    byTemplate.get(s.checklist_template_id).push(s.step_text);
+  }
+  return rows.map((r) => ({ Id: r.id, Name: r.name, Steps: byTemplate.get(r.id) || [] }));
+}
+
+export async function createChecklistTemplate({ name, steps = [] }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query('INSERT INTO checklist_templates (name) VALUES ($1) RETURNING *', [name]);
+    const id = rows[0].id;
+    for (let i = 0; i < steps.length; i++) {
+      await client.query('INSERT INTO checklist_template_steps (checklist_template_id, step_text, sort_order) VALUES ($1,$2,$3)', [id, steps[i], i]);
+    }
+    await client.query('COMMIT');
+    return { Id: id, Name: name, Steps: steps };
+  } catch (e) {
+    await client.query('ROLLBACK'); throw e;
+  } finally { client.release(); }
+}
+
+export async function updateChecklistTemplate(id, { name, steps }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (name) await client.query('UPDATE checklist_templates SET name = $2 WHERE id = $1', [id, name]);
+    if (steps) {
+      await client.query('DELETE FROM checklist_template_steps WHERE checklist_template_id = $1', [id]);
+      for (let i = 0; i < steps.length; i++) {
+        await client.query('INSERT INTO checklist_template_steps (checklist_template_id, step_text, sort_order) VALUES ($1,$2,$3)', [id, steps[i], i]);
+      }
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK'); throw e;
+  } finally { client.release(); }
+  const all = await listChecklistTemplates();
+  return all.find((t) => t.Id === Number(id)) || null;
+}
+
+export async function deleteChecklistTemplate(id) {
+  await pool.query('DELETE FROM checklist_templates WHERE id = $1', [id]);
+}
+
+async function getChecklistInstanceFull(instanceId) {
+  const inst = await pool.query('SELECT * FROM checklist_instances WHERE id = $1', [instanceId]);
+  if (!inst.rows[0]) return null;
+  const steps = await pool.query('SELECT * FROM checklist_instance_steps WHERE checklist_instance_id = $1 ORDER BY sort_order, id', [instanceId]);
+  return {
+    Id: inst.rows[0].id, Name: inst.rows[0].name,
+    Steps: steps.rows.map((s) => ({ Id: s.id, StepText: s.step_text, Done: s.done, SortOrder: s.sort_order })),
+  };
+}
+
+export async function getChecklistInstanceForWorkOrder(woId) {
+  const { rows } = await pool.query('SELECT id FROM checklist_instances WHERE work_order_id = $1', [woId]);
+  return rows[0] ? getChecklistInstanceFull(rows[0].id) : null;
+}
+export async function getChecklistInstanceForCalendarEvent(eventId) {
+  const { rows } = await pool.query('SELECT id FROM checklist_instances WHERE calendar_event_id = $1', [eventId]);
+  return rows[0] ? getChecklistInstanceFull(rows[0].id) : null;
+}
+
+async function attachChecklist({ templateId, workOrderId, calendarEventId }) {
+  const tpl = await pool.query('SELECT * FROM checklist_templates WHERE id = $1', [templateId]);
+  if (!tpl.rows[0]) { const err = new Error('Checklist template not found'); err.status = 400; throw err; }
+  const stepsRes = await pool.query('SELECT step_text, sort_order FROM checklist_template_steps WHERE checklist_template_id = $1 ORDER BY sort_order', [templateId]);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      'INSERT INTO checklist_instances (checklist_template_id, name, work_order_id, calendar_event_id) VALUES ($1,$2,$3,$4) RETURNING id',
+      [templateId, tpl.rows[0].name, workOrderId || null, calendarEventId || null]
+    );
+    const instanceId = rows[0].id;
+    for (const s of stepsRes.rows) {
+      await client.query('INSERT INTO checklist_instance_steps (checklist_instance_id, step_text, sort_order) VALUES ($1,$2,$3)', [instanceId, s.step_text, s.sort_order]);
+    }
+    await client.query('COMMIT');
+    return getChecklistInstanceFull(instanceId);
+  } catch (e) {
+    await client.query('ROLLBACK'); throw e;
+  } finally { client.release(); }
+}
+export async function attachChecklistToWorkOrder(woId, templateId) { return attachChecklist({ templateId, workOrderId: woId }); }
+export async function attachChecklistToCalendarEvent(eventId, templateId) { return attachChecklist({ templateId, calendarEventId: eventId }); }
+
+export async function detachChecklistInstance(instanceId) {
+  await pool.query('DELETE FROM checklist_instances WHERE id = $1', [instanceId]);
+}
+export async function toggleChecklistStep(stepId, done) {
+  const { rows } = await pool.query(
+    'UPDATE checklist_instance_steps SET done = $2, done_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1 RETURNING *',
+    [stepId, done]
+  );
+  return rows[0] || null;
 }

@@ -268,6 +268,9 @@ async function render(view, params = {}) {
       adminSubAreas: () => renderAdminSubAreas(),
       adminWoTemplates: () => renderAdminWoTemplates(),
       calendar: () => renderCalendar(params),
+      newCalendarEvent: () => renderNewCalendarEvent(params),
+      calendarEventDetail: () => renderCalendarEventDetail(params),
+      adminChecklistTemplates: () => renderAdminChecklistTemplates(),
       workOrders: () => renderWorkOrders(),
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
@@ -748,7 +751,8 @@ async function renderAdminHub() {
     <div class="list-item" data-view="adminBuildingTypes">🏛️ Building Types</div>
     <div class="list-item" data-view="adminApplicability">✅ Applicability Matrix</div>
     <div class="list-item" data-view="adminSubAreas">📐 Component Sub-Areas</div>
-    <div class="list-item" data-view="adminWoTemplates">🧾 Work Order Templates</div>`;
+    <div class="list-item" data-view="adminWoTemplates">🧾 Work Order Templates</div>
+    <div class="list-item" data-view="adminChecklistTemplates">✅ Checklist Templates</div>`;
   app.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
 }
 
@@ -760,29 +764,34 @@ async function renderAdminWoTemplates() {
   const fieldTitles = optsRes.propertyFields.map((f) => f.title);
   let editingId = null; // null | 'new' | number
 
-  function jobLineRowHtml(row = {}) {
-    return `<div class="inline-add-row jl-row" style="align-items:center">
+  const taskRowHtml = (text = '') => `<div class="inline-add-row task-row"><input class="task-text" value="${escapeHtml(text)}" placeholder="Task description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>`;
+  const jobLineRowHtml = (row = {}) => `<div class="inline-add-row jl-row" style="align-items:center">
       <select class="jl-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
       <input class="jl-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
-      <button type="button" class="btn btn-secondary jl-remove">✕</button>
+      <button type="button" class="btn btn-secondary row-remove">✕</button>
     </div>`;
-  }
 
   function formHtml(t) {
-    const rows = (t?.JobLineDefaults || []).map(jobLineRowHtml).join('');
+    const taskRows = (t?.TaskDefaults || []).map(taskRowHtml).join('');
+    const jlRows = (t?.JobLineDefaults || []).map(jobLineRowHtml).join('');
     return `<div class="card">
       <h3>${t ? `Edit "${escapeHtml(t.Name)}"` : 'New Template'}</h3>
-      <div class="field-row"><label>Template Name</label><input class="tf-name" value="${escapeHtml(t?.Name || '')}" placeholder="e.g. Annual Roof Inspection" required /></div>
+      <div class="field-row"><label>Template Name</label><input class="tf-name" value="${escapeHtml(t?.Name || '')}" placeholder="e.g. Winterization" required /></div>
       <div class="field-row"><label>Default Title</label><input class="tf-title" value="${escapeHtml(t?.DefaultTitle || '')}" placeholder="Fills in the WO title — you can still edit it per use" /></div>
       <div class="field-row"><label>Default Priority</label>
         <select class="tf-priority"><option value="">— none —</option>${['Low', 'Medium', 'High', 'Urgent'].map((p) => `<option ${t?.DefaultPriority === p ? 'selected' : ''}>${p}</option>`).join('')}</select>
       </div>
       <div class="field-row"><label>Default Description</label><textarea class="tf-description">${escapeHtml(t?.DefaultDescription || '')}</textarea></div>
-      <div class="field-row"><label>Job Line Defaults</label>
-        <p class="muted" style="margin:2px 0 8px">Pre-fills these asset field changes on every WO created from this template.</p>
-        <div class="tf-job-lines">${rows}</div>
-        <button type="button" class="btn btn-secondary tf-add-line" style="margin-top:6px">+ Add Job Line</button>
+      <div class="field-row"><label>Default Tasks</label>
+        <p class="muted" style="margin:2px 0 8px">Pre-fills these scope-of-work tasks on every WO created from this template.</p>
+        <div class="tf-tasks">${taskRows}</div>
+        <button type="button" class="btn btn-secondary tf-add-task" style="margin-top:6px">+ Add Task</button>
       </div>
+      <details style="margin:12px 0">
+        <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
+        <div class="tf-job-lines" style="margin-top:8px">${jlRows}</div>
+        <button type="button" class="btn btn-secondary tf-add-line" style="margin-top:6px">+ Add Field Update</button>
+      </details>
       <div class="btn-row">
         <button class="btn btn-primary tf-save" data-id="${t?.Id ?? ''}">Save Template</button>
         <button class="btn btn-secondary tf-cancel">Cancel</button>
@@ -796,7 +805,7 @@ async function renderAdminWoTemplates() {
         <div>
           <strong>${escapeHtml(t.Name)}</strong>
           <div class="muted">${escapeHtml(t.DefaultTitle || '')}${t.DefaultPriority ? ' · ' + escapeHtml(t.DefaultPriority) : ''}</div>
-          ${t.JobLineDefaults?.length ? `<div class="muted">${t.JobLineDefaults.length} job line default${t.JobLineDefaults.length > 1 ? 's' : ''}</div>` : ''}
+          ${t.TaskDefaults?.length ? `<div class="muted">${t.TaskDefaults.length} default task${t.TaskDefaults.length > 1 ? 's' : ''}</div>` : ''}
         </div>
         <div class="btn-row" style="margin-top:0">
           <button class="btn btn-secondary tpl-edit" data-id="${t.Id}">Edit</button>
@@ -819,6 +828,10 @@ async function renderAdminWoTemplates() {
     document.getElementById('newTplBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
     app.querySelectorAll('.tpl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
     app.querySelectorAll('.tf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
+    app.querySelectorAll('.tf-add-task').forEach((btn) => btn.addEventListener('click', () => {
+      btn.previousElementSibling.insertAdjacentHTML('beforeend', taskRowHtml());
+      wireRemoveButtons();
+    }));
     app.querySelectorAll('.tf-add-line').forEach((btn) => btn.addEventListener('click', () => {
       btn.previousElementSibling.insertAdjacentHTML('beforeend', jobLineRowHtml());
       wireRemoveButtons();
@@ -836,6 +849,7 @@ async function renderAdminWoTemplates() {
       const card = btn.closest('.card');
       const name = card.querySelector('.tf-name').value.trim();
       if (!name) { toast('Template name is required'); return; }
+      const taskDefaults = [...card.querySelectorAll('.task-row .task-text')].map((el) => el.value.trim()).filter(Boolean);
       const jobLineDefaults = [...card.querySelectorAll('.jl-row')].map((row) => ({
         targetField: row.querySelector('.jl-field').value, newValue: row.querySelector('.jl-value').value,
       })).filter((r) => r.newValue.trim());
@@ -843,7 +857,7 @@ async function renderAdminWoTemplates() {
         name, defaultTitle: card.querySelector('.tf-title').value.trim(),
         defaultPriority: card.querySelector('.tf-priority').value,
         defaultDescription: card.querySelector('.tf-description').value.trim(),
-        jobLineDefaults,
+        taskDefaults, jobLineDefaults,
       };
       const id = btn.dataset.id;
       try {
@@ -855,7 +869,7 @@ async function renderAdminWoTemplates() {
   }
 
   function wireRemoveButtons() {
-    app.querySelectorAll('.jl-remove').forEach((btn) => { btn.onclick = () => btn.closest('.jl-row').remove(); });
+    app.querySelectorAll('.row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); });
   }
 
   draw();
@@ -1096,17 +1110,23 @@ async function renderAdminSubAreas() {
 async function renderCalendar(params = {}) {
   setChrome({ title: 'Calendar', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const { workOrders } = await api('/api/pg/work-orders');
   const now = new Date();
   let viewMonth = params.month != null ? Number(params.month) : now.getMonth();
   let viewYear = params.year != null ? Number(params.year) : now.getFullYear();
   const todayKey = now.toISOString().slice(0, 10);
 
-  function draw() {
+  async function draw() {
+    app.innerHTML = LOADING_HTML;
     const firstOfMonth = new Date(viewYear, viewMonth, 1);
     const startWeekday = firstOfMonth.getDay();
     const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
     const monthLabel = firstOfMonth.toLocaleString('default', { month: 'long', year: 'numeric' });
+    const fromStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-01`;
+    const toStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
+
+    const [{ workOrders }, { occurrences }] = await Promise.all([
+      api('/api/pg/work-orders'), api(`/api/pg/calendar-events?from=${fromStr}&to=${toStr}`),
+    ]);
 
     const byDate = new Map();
     const unscheduled = [];
@@ -1114,13 +1134,20 @@ async function renderCalendar(params = {}) {
       const sd = w['Scheduled Date'];
       if (!sd) { unscheduled.push(w); continue; }
       const key = sd.slice(0, 10);
+      if (key < fromStr || key > toStr) continue; // different month, don't clutter "Unscheduled"... but keep visible via nav
       if (!byDate.has(key)) byDate.set(key, []);
-      byDate.get(key).push(w);
+      byDate.get(key).push({ type: 'wo', ...w });
     }
+    for (const occ of occurrences) {
+      if (!byDate.has(occ.OccurrenceDate)) byDate.set(occ.OccurrenceDate, []);
+      byDate.get(occ.OccurrenceDate).push({ type: 'event', ...occ });
+    }
+    // WOs scheduled outside this month (shouldn't normally happen since we filtered) — recompute unscheduled properly across ALL WOs regardless of month
+    const allUnscheduled = workOrders.filter((w) => !w['Scheduled Date']);
 
-    const entryHtml = (w) => `<div class="cal-entry" data-wo-id="${w.Id}">
-      <span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Asset?.Name || '')}${w.Asset ? ': ' : ''}${escapeHtml(w.Title)} — ${escapeHtml(w.Status)}</span>
-    </div>`;
+    const entryHtml = (e) => e.type === 'wo'
+      ? `<div class="cal-entry" data-wo-id="${e.Id}"><span class="pill ${woStatusPillClass(e.Status)}">🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.Title)} — ${escapeHtml(e.Status)}</span></div>`
+      : `<div class="cal-entry" data-event-id="${e.Id}"><span class="pill pop">📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`;
 
     const cells = [];
     for (let i = 0; i < startWeekday; i++) cells.push('<div class="cal-cell cal-empty"></div>');
@@ -1139,13 +1166,14 @@ async function renderCalendar(params = {}) {
         <h3 style="margin:0">${monthLabel}</h3>
         <button class="btn btn-secondary" id="nextMonthBtn">Next →</button>
       </div>
+      <div class="btn-row" style="margin-bottom:12px"><button class="btn btn-primary" id="addEventBtn">+ Add Event</button></div>
       <div class="cal-scroll"><div class="cal-grid">
         ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => `<div class="cal-head">${d}</div>`).join('')}
         ${cells.join('')}
       </div></div>
-      ${unscheduled.length ? `<div class="card"><h3>Unscheduled (${unscheduled.length})</h3>
+      ${allUnscheduled.length ? `<div class="card"><h3>Unscheduled Work Orders (${allUnscheduled.length})</h3>
         <p class="muted">Set a Scheduled Date on a work order to place it on the calendar.</p>
-        ${unscheduled.map((w) => `<div class="list-item" data-wo-id="${w.Id}">
+        ${allUnscheduled.map((w) => `<div class="list-item" data-wo-id="${w.Id}">
           <span>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</span>
           <span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status)}</span>
         </div>`).join('')}
@@ -1160,7 +1188,239 @@ async function renderCalendar(params = {}) {
     document.getElementById('nextMonthBtn').addEventListener('click', () => {
       viewMonth++; if (viewMonth > 11) { viewMonth = 0; viewYear++; } draw();
     });
+    document.getElementById('addEventBtn').addEventListener('click', () => go('newCalendarEvent', {}));
     app.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
+    app.querySelectorAll('[data-event-id]').forEach((el) => el.addEventListener('click', () => go('calendarEventDetail', { id: el.dataset.eventId })));
+  }
+
+  draw();
+}
+
+const RECURRENCE_LABELS = { none: 'Does not repeat', daily: 'Day(s)', weekly: 'Week(s)', monthly: 'Month(s)', yearly: 'Year(s)' };
+
+function recurrenceFieldsHtml(ev = {}) {
+  return `
+    <div class="field-row"><label>Repeats</label>
+      <select name="recurrenceType" id="recurrenceType">
+        ${Object.entries(RECURRENCE_LABELS).map(([k, v]) => `<option value="${k}" ${(ev.RecurrenceType || 'none') === k ? 'selected' : ''}>${k === 'none' ? v : `Every N ${v}`}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field-row" id="recurrenceIntervalRow" ${(!ev.RecurrenceType || ev.RecurrenceType === 'none') ? 'hidden' : ''}>
+      <label>Every</label>
+      <input name="recurrenceInterval" type="number" min="1" value="${ev.RecurrenceInterval || 1}" style="max-width:100px" />
+    </div>
+    <div class="field-row" id="recurrenceEndRow" ${(!ev.RecurrenceType || ev.RecurrenceType === 'none') ? 'hidden' : ''}>
+      <label>Stop Repeating After (optional)</label>
+      <input name="recurrenceEndDate" type="date" value="${(ev.RecurrenceEndDate || '').slice(0, 10)}" />
+    </div>`;
+}
+function wireRecurrenceToggle(root) {
+  root.querySelector('#recurrenceType').addEventListener('change', (e) => {
+    const on = e.target.value !== 'none';
+    root.querySelector('#recurrenceIntervalRow').hidden = !on;
+    root.querySelector('#recurrenceEndRow').hidden = !on;
+  });
+}
+
+async function renderNewCalendarEvent(params = {}) {
+  setChrome({ title: 'New Calendar Event', showBack: true, showLogout: true });
+  const { workOrders } = await api('/api/pg/work-orders');
+  setApp(`
+    <div class="card">
+      <h3>New Calendar Event</h3>
+      <form id="newEventForm">
+        <div class="field-row"><label>Title</label><input name="title" required /></div>
+        <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${params.date || ''}" required /></div>
+        <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
+        ${recurrenceFieldsHtml()}
+        <div class="field-row"><label>Link to Work Order (optional)</label>
+          <select name="workOrderId"><option value="">— none —</option>${workOrders.map((w) => `<option value="${w.Id}">${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</option>`).join('')}</select>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" type="submit">Create Event</button>
+          <button class="btn btn-secondary" type="button" id="cancelEventBtn">Cancel</button>
+        </div>
+      </form>
+    </div>`);
+  wireRecurrenceToggle(document.getElementById('newEventForm'));
+  document.getElementById('cancelEventBtn').addEventListener('click', goBack);
+  document.getElementById('newEventForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      const { event } = await api('/api/pg/calendar-events', { method: 'POST', body: JSON.stringify({
+        title: fd.get('title'), eventDate: fd.get('eventDate'), description: fd.get('description'),
+        recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
+        recurrenceEndDate: fd.get('recurrenceEndDate') || undefined,
+        workOrderId: fd.get('workOrderId') || undefined,
+      }) });
+      toast('Event created');
+      go('calendarEventDetail', { id: event.Id }, { replace: true });
+    } catch (err) { toast(err.message); }
+  });
+}
+
+async function renderCalendarEventDetail({ id }) {
+  setChrome({ title: 'Calendar Event', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const [detail, workOrdersRes, tplRes] = await Promise.all([
+    api(`/api/pg/calendar-events/${id}`), api('/api/pg/work-orders'), api('/api/pg/checklist-templates'),
+  ]);
+  const { event: ev, checklist } = detail;
+  const { workOrders } = workOrdersRes;
+  const checklistTemplates = tplRes.templates;
+
+  const checklistHtml = checklist ? `
+    <div class="card"><h3>Checklist: ${escapeHtml(checklist.Name)}</h3>
+      ${checklist.Steps.map((s) => `<div class="list-item" style="cursor:default">
+        <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
+          <input type="checkbox" class="checklist-step-toggle" data-id="${s.Id}" ${s.Done ? 'checked' : ''} />
+          <span style="${s.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(s.StepText)}</span>
+        </label>
+      </div>`).join('')}
+      <button class="btn btn-secondary" id="removeChecklistBtn" style="margin-top:8px">Remove Checklist</button>
+    </div>`
+    : (checklistTemplates.length ? `
+    <div class="card"><h3>Checklist</h3>
+      <div class="field-row"><select id="checklistTplPicker"><option value="">— choose a checklist —</option>${checklistTemplates.map((t) => `<option value="${t.Id}">${escapeHtml(t.Name)} (${t.Steps.length} steps)</option>`).join('')}</select></div>
+      <button class="btn btn-secondary" id="attachChecklistBtn">Attach Checklist</button>
+    </div>` : '');
+
+  setApp(`
+    <div class="card">
+      <h3>${escapeHtml(ev.Title)}</h3>
+      <form id="eventForm">
+        <div class="field-row"><label>Title</label><input name="title" value="${escapeHtml(ev.Title)}" required /></div>
+        <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${(ev.EventDate || '').slice(0, 10)}" required /></div>
+        <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(ev.Description || '')}</textarea></div>
+        ${recurrenceFieldsHtml(ev)}
+        <div class="field-row"><label>Link to Work Order (optional)</label>
+          <select name="workOrderId"><option value="">— none —</option>${workOrders.map((w) => `<option value="${w.Id}" ${ev.WorkOrderId === w.Id ? 'selected' : ''}>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</option>`).join('')}</select>
+        </div>
+        <button class="btn btn-secondary" type="submit">Save Changes</button>
+      </form>
+      ${ev.WorkOrderId ? `<div class="btn-row"><button class="btn btn-secondary" id="viewWoBtn">View Linked Work Order</button></div>` : ''}
+      <div class="btn-row"><button class="btn btn-secondary" id="deleteEventBtn">Delete Event</button></div>
+    </div>
+    ${checklistHtml}`);
+
+  wireRecurrenceToggle(document.getElementById('eventForm'));
+
+  document.getElementById('viewWoBtn')?.addEventListener('click', () => go('workOrderDetail', { id: ev.WorkOrderId }));
+  document.getElementById('eventForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!confirm('Save changes to this event?')) return;
+    const fd = new FormData(e.target);
+    try {
+      await api(`/api/pg/calendar-events/${id}`, { method: 'PATCH', body: JSON.stringify({
+        title: fd.get('title'), eventDate: fd.get('eventDate'), description: fd.get('description'),
+        recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
+        recurrenceEndDate: fd.get('recurrenceEndDate') || '', workOrderId: fd.get('workOrderId') || '',
+      }) });
+      toast('Event updated');
+      renderCalendarEventDetail({ id });
+    } catch (err) { toast(err.message); }
+  });
+  document.getElementById('deleteEventBtn').addEventListener('click', async () => {
+    if (!confirm(`Delete "${ev.Title}"? This removes all its recurrences from the calendar.`)) return;
+    try { await api(`/api/pg/calendar-events/${id}`, { method: 'DELETE' }); toast('Event deleted'); go('calendar', {}, { replace: true }); }
+    catch (err) { toast(err.message); }
+  });
+  document.getElementById('attachChecklistBtn')?.addEventListener('click', async () => {
+    const templateId = document.getElementById('checklistTplPicker').value;
+    if (!templateId) { toast('Choose a checklist first'); return; }
+    try { await api(`/api/pg/calendar-events/${id}/checklist`, { method: 'POST', body: JSON.stringify({ templateId: Number(templateId) }) }); renderCalendarEventDetail({ id }); }
+    catch (err) { toast(err.message); }
+  });
+  document.getElementById('removeChecklistBtn')?.addEventListener('click', async () => {
+    if (!confirm('Remove this checklist? Progress will be lost.')) return;
+    try { await api(`/api/pg/checklist-instances/${checklist.Id}`, { method: 'DELETE' }); renderCalendarEventDetail({ id }); }
+    catch (err) { toast(err.message); }
+  });
+  app.querySelectorAll('.checklist-step-toggle').forEach((cb) => cb.addEventListener('change', async () => {
+    try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderCalendarEventDetail({ id }); }
+    catch (err) { toast(err.message); }
+  }));
+}
+
+// ---------- Admin: Checklist Templates ----------
+
+async function renderAdminChecklistTemplates() {
+  setChrome({ title: 'Checklist Templates', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const { templates } = await api('/api/pg/checklist-templates');
+  let editingId = null;
+
+  const stepRowHtml = (text = '') => `<div class="inline-add-row step-row"><input class="step-text" value="${escapeHtml(text)}" placeholder="Step description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>`;
+
+  function formHtml(t) {
+    const rows = (t?.Steps || []).map(stepRowHtml).join('');
+    return `<div class="card">
+      <h3>${t ? `Edit "${escapeHtml(t.Name)}"` : 'New Checklist'}</h3>
+      <div class="field-row"><label>Name</label><input class="cf-name" value="${escapeHtml(t?.Name || '')}" placeholder="e.g. Winterization" required /></div>
+      <div class="field-row"><label>Steps (in order)</label>
+        <div class="cf-steps">${rows}</div>
+        <button type="button" class="btn btn-secondary cf-add-step" style="margin-top:6px">+ Add Step</button>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary cf-save" data-id="${t?.Id ?? ''}">Save Checklist</button>
+        <button class="btn btn-secondary cf-cancel">Cancel</button>
+      </div>
+    </div>`;
+  }
+
+  function draw() {
+    const list = templates.map((t) => `
+      <div class="list-item" style="cursor:default">
+        <span><strong>${escapeHtml(t.Name)}</strong> <span class="muted">(${t.Steps.length} steps)</span></span>
+        <div class="btn-row" style="margin-top:0">
+          <button class="btn btn-secondary cl-edit" data-id="${t.Id}">Edit</button>
+          <button class="btn btn-secondary cl-delete" data-id="${t.Id}" data-name="${escapeHtml(t.Name)}">Delete</button>
+        </div>
+      </div>`).join('') || '<p class="muted">✅ No checklists yet.</p>';
+
+    setApp(`
+      <div class="card"><h3>Checklist Templates</h3><p class="muted">Ordered step-by-step lists you can attach to a Work Order or a Calendar Event.</p></div>
+      ${list}
+      ${editingId === 'new' ? formHtml(null) : `<div class="btn-row" style="margin:4px 0 16px"><button class="btn btn-secondary" id="newChecklistBtn">+ New Checklist</button></div>`}
+      ${typeof editingId === 'number' ? formHtml(templates.find((t) => t.Id === editingId)) : ''}
+    `);
+    wire();
+  }
+
+  function wire() {
+    document.getElementById('newChecklistBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
+    app.querySelectorAll('.cl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
+    app.querySelectorAll('.cf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
+    app.querySelectorAll('.cf-add-step').forEach((btn) => btn.addEventListener('click', () => {
+      btn.previousElementSibling.insertAdjacentHTML('beforeend', stepRowHtml());
+      wireStepRemove();
+    }));
+    wireStepRemove();
+
+    app.querySelectorAll('.cl-delete').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!confirm(`Delete checklist "${btn.dataset.name}"? Any WOs/events already using it keep their own copy of the steps.`)) return;
+      await api(`/api/pg/checklist-templates/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Checklist deleted');
+      renderAdminChecklistTemplates();
+    }));
+
+    app.querySelectorAll('.cf-save').forEach((btn) => btn.addEventListener('click', async () => {
+      const card = btn.closest('.card');
+      const name = card.querySelector('.cf-name').value.trim();
+      if (!name) { toast('Name is required'); return; }
+      const steps = [...card.querySelectorAll('.step-row .step-text')].map((el) => el.value.trim()).filter(Boolean);
+      const id = btn.dataset.id;
+      try {
+        await api(id ? `/api/pg/checklist-templates/${id}` : '/api/pg/checklist-templates', { method: id ? 'PATCH' : 'POST', body: JSON.stringify({ name, steps }) });
+        toast(id ? 'Checklist updated' : 'Checklist created');
+        renderAdminChecklistTemplates();
+      } catch (err) { toast(err.message); }
+    }));
+  }
+
+  function wireStepRemove() {
+    app.querySelectorAll('.row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); });
   }
 
   draw();
@@ -1188,10 +1448,11 @@ async function renderNewWorkOrder({ assetId, assetName }) {
   setChrome({ title: 'New Work Order', showBack: true, showLogout: true });
   const { templates } = await api('/api/pg/work-order-templates');
   const fieldTitles = state.options.propertyFields.map((f) => f.title);
+  const taskRowHtml = (text = '') => `<div class="inline-add-row task-row"><input class="task-text" value="${escapeHtml(text)}" placeholder="Task description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>`;
   const jobLineRowHtml = (row = {}) => `<div class="inline-add-row jl-row" style="align-items:center">
     <select class="jl-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
     <input class="jl-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
-    <button type="button" class="btn btn-secondary jl-remove">✕</button>
+    <button type="button" class="btn btn-secondary row-remove">✕</button>
   </div>`;
 
   setApp(`
@@ -1210,11 +1471,16 @@ async function renderNewWorkOrder({ assetId, assetName }) {
         </div>
         <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" /></div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
-        <div class="field-row"><label>Job Lines (optional)</label>
-          <p class="muted" style="margin:2px 0 8px">Asset field changes to apply when this WO is completed.</p>
-          <div class="jl-rows"></div>
-          <button type="button" class="btn btn-secondary" id="addJlBtn" style="margin-top:6px">+ Add Job Line</button>
+        <div class="field-row"><label>Tasks (scope of work)</label>
+          <div class="task-rows"></div>
+          <button type="button" class="btn btn-secondary" id="addTaskRowBtn" style="margin-top:6px">+ Add Task</button>
         </div>
+        <details style="margin:16px 0">
+          <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
+          <p class="muted" style="margin:8px 0">Only for the rare case this WO should change a stable asset fact — most work orders don't need this.</p>
+          <div class="jl-rows"></div>
+          <button type="button" class="btn btn-secondary" id="addJlBtn" style="margin-top:6px">+ Add Field Update</button>
+        </details>
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Create Work Order</button>
           <button class="btn btn-secondary" type="button" id="cancelWoBtn">Cancel</button>
@@ -1225,10 +1491,14 @@ async function renderNewWorkOrder({ assetId, assetName }) {
   let assetPicker = null;
   if (!assetId) assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'));
 
-  function wireJlRemove() { app.querySelectorAll('.jl-remove').forEach((btn) => { btn.onclick = () => btn.closest('.jl-row').remove(); }); }
+  function wireRowRemove() { app.querySelectorAll('.row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); }); }
+  document.getElementById('addTaskRowBtn').addEventListener('click', () => {
+    document.querySelector('.task-rows').insertAdjacentHTML('beforeend', taskRowHtml());
+    wireRowRemove();
+  });
   document.getElementById('addJlBtn').addEventListener('click', () => {
     document.querySelector('.jl-rows').insertAdjacentHTML('beforeend', jobLineRowHtml());
-    wireJlRemove();
+    wireRowRemove();
   });
 
   document.getElementById('tplPicker')?.addEventListener('change', (e) => {
@@ -1238,9 +1508,9 @@ async function renderNewWorkOrder({ assetId, assetName }) {
     if (tpl.DefaultTitle) form.title.value = tpl.DefaultTitle;
     if (tpl.DefaultPriority) form.priority.value = tpl.DefaultPriority;
     if (tpl.DefaultDescription) form.description.value = tpl.DefaultDescription;
-    const rowsEl = document.querySelector('.jl-rows');
-    rowsEl.innerHTML = (tpl.JobLineDefaults || []).map(jobLineRowHtml).join('');
-    wireJlRemove();
+    document.querySelector('.task-rows').innerHTML = (tpl.TaskDefaults || []).map(taskRowHtml).join('');
+    document.querySelector('.jl-rows').innerHTML = (tpl.JobLineDefaults || []).map(jobLineRowHtml).join('');
+    wireRowRemove();
     toast(`Prefilled from "${tpl.Name}" — review before creating`);
   });
 
@@ -1251,13 +1521,14 @@ async function renderNewWorkOrder({ assetId, assetName }) {
     const title = fd.get('title');
     const finalAssetId = assetId || assetPicker?.getSelected()?.Id;
     if (!finalAssetId) { toast('Pick an asset first (or add a new one)'); return; }
+    const tasks = [...document.querySelectorAll('.task-row .task-text')].map((el) => el.value.trim()).filter(Boolean);
     const assetUpdates = [...document.querySelectorAll('.jl-row')].map((row) => ({
       targetField: row.querySelector('.jl-field').value, newValue: row.querySelector('.jl-value').value,
     })).filter((r) => r.newValue.trim());
     try {
       const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({
         title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description'),
-        scheduledDate: fd.get('scheduledDate') || undefined, assetUpdates,
+        scheduledDate: fd.get('scheduledDate') || undefined, tasks, assetUpdates,
       }) });
       toast('Work order created');
       go('workOrderDetail', { id: result.workOrderId }, { replace: true });
@@ -1268,21 +1539,49 @@ async function renderNewWorkOrder({ assetId, assetName }) {
 async function renderWorkOrderDetail({ id }) {
   setChrome({ title: 'Work Order', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const [detail, allVolunteers, allVendors, skillsRes] = await Promise.all([
+  const [detail, allVolunteers, allVendors, skillsRes, tplRes] = await Promise.all([
     api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'), api('/api/pg/skills'),
+    api('/api/pg/checklist-templates'),
   ]);
   const allSkills = skillsRes.skills.map((s) => s.Name);
-  const { workOrder: wo, assetUpdates, volunteers, vendors } = detail;
+  const checklistTemplates = tplRes.templates;
+  const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
 
-  const jobLineRows = assetUpdates.map((u) => `
+  const taskRows = tasks.map((t) => `
+    <div class="list-item" style="cursor:default">
+      <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
+        <input type="checkbox" class="task-toggle" data-id="${t.Id}" ${t.Done ? 'checked' : ''} />
+        <span style="${t.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(t.Description)}</span>
+      </label>
+      <button class="btn btn-secondary delete-task" data-id="${t.Id}" data-label="${escapeHtml(t.Description)}">Delete</button>
+    </div>`).join('') || '<p class="muted">No tasks yet — add the scope of work below.</p>';
+
+  const fieldUpdateRows = assetUpdates.map((u) => `
     <div class="list-item" style="cursor:default">
       <span>${escapeHtml(u['Target Field'])} → <strong>${escapeHtml(u['New Value'])}</strong></span>
       <span>
         <span class="pill ${u.Applied ? 'good' : ''}">${u.Applied ? 'Applied' : 'Pending'}</span>
         ${!u.Applied ? `<button class="btn btn-secondary delete-au" data-id="${u.Id}" data-label="${escapeHtml(u['Target Field'])}" style="margin-left:8px">Delete</button>` : ''}
       </span>
-    </div>`).join('') || '<p class="muted">No job lines yet.</p>';
+    </div>`).join('') || '<p class="muted">None.</p>';
+
+  const checklistHtml = checklist ? `
+    <div class="card"><h3>Checklist: ${escapeHtml(checklist.Name)}</h3>
+      ${checklist.Steps.map((s) => `<div class="list-item" style="cursor:default">
+        <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
+          <input type="checkbox" class="checklist-step-toggle" data-id="${s.Id}" ${s.Done ? 'checked' : ''} />
+          <span style="${s.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(s.StepText)}</span>
+        </label>
+      </div>`).join('')}
+      <button class="btn btn-secondary" id="removeChecklistBtn" style="margin-top:8px">Remove Checklist</button>
+    </div>`
+    : (checklistTemplates.length ? `
+    <div class="card"><h3>Checklist</h3>
+      <p class="muted">Attach a step-by-step checklist to this work order.</p>
+      <div class="field-row"><select id="checklistTplPicker"><option value="">— choose a checklist —</option>${checklistTemplates.map((t) => `<option value="${t.Id}">${escapeHtml(t.Name)} (${t.Steps.length} steps)</option>`).join('')}</select></div>
+      <button class="btn btn-secondary" id="attachChecklistBtn">Attach Checklist</button>
+    </div>` : '');
 
   const assignedVolIds = new Set(volunteers.map((v) => v.Id));
   const assignedVenIds = new Set(vendors.map((v) => v.Id));
@@ -1292,6 +1591,7 @@ async function renderWorkOrderDetail({ id }) {
   app.innerHTML = `
     <div class="card">
       <h3>${escapeHtml(wo.Title)}</h3>
+      ${wo['Scheduled Date'] ? `<p class="muted"><a href="#" id="viewOnCalendarLink">📅 View on Calendar (${new Date(wo['Scheduled Date']).toLocaleDateString('default', { month: 'long', year: 'numeric' })})</a></p>` : ''}
       <form id="woFieldsForm">
         <div class="field-row"><label>Asset</label><div id="woAssetPicker"></div></div>
         <div class="field-row"><label>Status</label>
@@ -1313,6 +1613,26 @@ async function renderWorkOrderDetail({ id }) {
         <button class="btn btn-secondary" id="duplicateWoBtn">Duplicate</button>
       </div>
     </div>
+
+    <div class="card">
+      <h3>Tasks</h3>
+      <p class="muted">The scope of work — plain checklist items, not tied to any audit field.</p>
+      ${taskRows}
+      <div class="inline-add-row"><input class="new-task-input" placeholder="Add a task…" /><button type="button" class="btn btn-secondary" id="addTaskBtn">+</button></div>
+    </div>
+
+    ${checklistHtml}
+
+    <details class="card">
+      <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
+      <p class="muted" style="margin-top:8px">Only for the rare case this WO should change a stable asset fact (e.g. Window Count after installing new windows) — most work orders don't need this.</p>
+      ${fieldUpdateRows}
+      <form id="addJobLineForm" style="margin-top:10px">
+        <div class="field-row"><label>Field</label><select name="targetField" required><option value="">— select —</option>${propertyFieldTitles.map((t) => `<option>${escapeHtml(t)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>New Value</label><input name="newValue" required /></div>
+        <button class="btn btn-secondary" type="submit">Add Field Update</button>
+      </form>
+    </details>
 
     <div class="card">
       <h3>Job Lines (Asset Updates)</h3>
@@ -1390,8 +1710,51 @@ async function renderWorkOrderDetail({ id }) {
     } catch (err) { toast(err.message); }
   });
 
+  document.getElementById('viewOnCalendarLink')?.addEventListener('click', (e) => {
+    e.preventDefault();
+    const d = new Date(wo['Scheduled Date']);
+    go('calendar', { month: d.getMonth(), year: d.getFullYear() });
+  });
+
+  document.getElementById('addTaskBtn').addEventListener('click', async () => {
+    const input = document.querySelector('.new-task-input');
+    const description = input.value.trim();
+    if (!description) return;
+    try {
+      await api(`/api/pg/work-orders/${id}/tasks`, { method: 'POST', body: JSON.stringify({ description }) });
+      renderWorkOrderDetail({ id });
+    } catch (err) { toast(err.message); }
+  });
+  app.querySelectorAll('.task-toggle').forEach((cb) => cb.addEventListener('change', async () => {
+    try { await api(`/api/pg/work-order-tasks/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderWorkOrderDetail({ id }); }
+    catch (err) { toast(err.message); }
+  }));
+  app.querySelectorAll('.delete-task').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!confirm(`Delete task "${btn.dataset.label}"?`)) return;
+    try { await api(`/api/pg/work-order-tasks/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
+    catch (err) { toast(err.message); }
+  }));
+
+  document.getElementById('attachChecklistBtn')?.addEventListener('click', async () => {
+    const templateId = document.getElementById('checklistTplPicker').value;
+    if (!templateId) { toast('Choose a checklist first'); return; }
+    try {
+      await api(`/api/pg/work-orders/${id}/checklist`, { method: 'POST', body: JSON.stringify({ templateId: Number(templateId) }) });
+      renderWorkOrderDetail({ id });
+    } catch (err) { toast(err.message); }
+  });
+  document.getElementById('removeChecklistBtn')?.addEventListener('click', async () => {
+    if (!confirm('Remove this checklist from the work order? Progress will be lost.')) return;
+    try { await api(`/api/pg/checklist-instances/${checklist.Id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
+    catch (err) { toast(err.message); }
+  });
+  app.querySelectorAll('.checklist-step-toggle').forEach((cb) => cb.addEventListener('change', async () => {
+    try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderWorkOrderDetail({ id }); }
+    catch (err) { toast(err.message); }
+  }));
+
   document.getElementById('completeWoBtn').addEventListener('click', async () => {
-    if (!confirm(`Complete this Work Order? All pending job lines will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;
+    if (!confirm(`Complete this Work Order? Any pending "asset field update" entries will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;
     try {
       await api(`/api/pg/work-orders/${id}/complete`, { method: 'POST' });
       toast('Work order completed — asset updated');
@@ -1409,7 +1772,7 @@ async function renderWorkOrderDetail({ id }) {
   });
 
   app.querySelectorAll('.delete-au').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!confirm(`Delete the "${btn.dataset.label}" job line?`)) return;
+    if (!confirm(`Delete the "${btn.dataset.label}" field update?`)) return;
     try { await api(`/api/pg/work-orders/${id}/asset-updates/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
     catch (err) { toast(err.message); }
   }));
