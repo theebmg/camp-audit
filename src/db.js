@@ -962,6 +962,46 @@ export async function updateWorkOrder(woId, fields) {
   return detail;
 }
 
+// ── Work Order log — free-text updates + optional hours + optional status
+//    change, distinct from Tasks (scope-of-work) and the single Actual
+//    Hours aggregate. Feeds future reporting. ───────────────────────────
+
+export async function listWorkOrderLogEntries(woId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM work_order_log_entries WHERE work_order_id = $1 ORDER BY created_at DESC',
+    [woId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, Note: r.note, Hours: r.hours != null ? Number(r.hours) : null,
+    StatusChange: r.status_change, Username: r.username, CreatedAt: r.created_at,
+  }));
+}
+
+// Logging an entry can optionally also change the WO's status in the same
+// action ("log what I did, and mark it In Progress") — one motion instead
+// of two separate saves.
+export async function createWorkOrderLogEntry(woId, { note, hours, statusChange }) {
+  const { rows } = await pool.query(
+    'INSERT INTO work_order_log_entries (work_order_id, note, hours, status_change, username) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+    [woId, note, hours ?? null, statusChange || null, currentUsername()]
+  );
+  if (statusChange) await pool.query('UPDATE work_orders SET status = $2 WHERE id = $1', [woId, statusChange]);
+  const woRes = await pool.query('SELECT title FROM work_orders WHERE id = $1', [woId]);
+  await logActivity({
+    action: 'created', entityType: 'work_order_log_entry', entityId: rows[0].id, entityLabel: woRes.rows[0]?.title,
+    details: [hours ? `${hours}h` : null, statusChange ? `status → ${statusChange}` : null].filter(Boolean).join(', ') || undefined,
+  });
+  return {
+    Id: rows[0].id, Note: rows[0].note, Hours: rows[0].hours != null ? Number(rows[0].hours) : null,
+    StatusChange: rows[0].status_change, Username: rows[0].username, CreatedAt: rows[0].created_at,
+  };
+}
+
+export async function deleteWorkOrderLogEntry(id) {
+  const { rows } = await pool.query('DELETE FROM work_order_log_entries WHERE id = $1 RETURNING note, work_order_id', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'work_order_log_entry', entityId: Number(id), entityLabel: rows[0].note, details: `On Work Order #${rows[0].work_order_id}` });
+}
+
 // Fresh copy: same title (+ " (Copy)"), asset, location, priority, description,
 // and pending job lines — but a clean slate otherwise (Open status, no dates,
 // no actuals, no crew assignments, no applied-history). Good for "this happens

@@ -2215,10 +2215,17 @@ async function renderWorkOrders() {
     const mode = getTableViewMode();
     const cardRows = workOrders.map((w) => {
       const days = daysSince(w['Date Reported']);
-      return `<div class="list-item" data-id="${w.Id}">
-        <span>${escapeHtml(w.Title)}${w.Asset ? ` <span class="muted">— ${escapeHtml(w.Asset.Name)}</span>` : ''}
-          ${days != null ? `<span class="muted"> · ${days}d old</span>` : ''}</span>
-        <span class="pill ${w.Status === 'Done' ? 'good' : w.Priority === 'Urgent' || w.Priority === 'High' ? 'warn' : ''}">${escapeHtml(w.Status || '')} · ${escapeHtml(w.Priority || '')}</span>
+      const bits = [];
+      if (cols.asset && w.Asset) bits.push(escapeHtml(w.Asset.Name));
+      if (cols.priority) bits.push(escapeHtml(w.Priority || ''));
+      if (cols.daysSinceCreated && days != null) bits.push(`${days}d old`);
+      if (cols.scheduledDate && w['Scheduled Date']) bits.push(`Sched. ${formatDateNice(w['Scheduled Date'])}`);
+      if (cols.dateCreated && w['Date Reported']) bits.push(`Created ${formatDateNice(w['Date Reported'])}`);
+      if (cols.estHours && w['Estimated Hours'] != null) bits.push(`${w['Estimated Hours']}h est.`);
+      if (cols.estCost && w['Estimated Cost'] != null) bits.push(`$${Number(w['Estimated Cost']).toLocaleString()} est.`);
+      return `<div class="list-item" style="flex-wrap:wrap" data-id="${w.Id}">
+        <span>${escapeHtml(w.Title)}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}</span>
+        ${cols.status ? `<span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status || '')}</span>` : ''}
       </div>`;
     }).join('') || '<p class="muted">No work orders yet.</p>';
 
@@ -2447,7 +2454,7 @@ async function renderWorkOrderDetail({ id }) {
   const allSkills = skillsRes.skills.map((s) => s.Name);
   const checklistTemplates = tplRes.templates;
   const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
-  const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist } = detail;
+  const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist, logEntries } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
 
   const taskRows = tasks.map((t) => `
@@ -2458,6 +2465,17 @@ async function renderWorkOrderDetail({ id }) {
       </label>
       <button class="btn btn-secondary delete-task" data-id="${t.Id}" data-label="${escapeHtml(t.Description)}">Delete</button>
     </div>`).join('') || '<p class="muted">No tasks yet — add the scope of work below.</p>';
+
+  const WO_STATUS_OPTIONS = ['Open', 'In Progress', 'On Hold', 'Urgent', 'Done'];
+  const logRows = logEntries.map((e) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start">
+      <div style="flex:1;min-width:200px">
+        <div>${escapeHtml(e.Note)}</div>
+        <div class="muted">${new Date(e.CreatedAt).toLocaleString()}${e.Username ? ` · ${escapeHtml(e.Username)}` : ''}
+          ${e.Hours != null ? ` · ${e.Hours}h` : ''}${e.StatusChange ? ` · status → ${escapeHtml(e.StatusChange)}` : ''}</div>
+      </div>
+      <button class="btn btn-secondary delete-log-entry" data-id="${e.Id}" data-label="${escapeHtml(e.Note)}">Delete</button>
+    </div>`).join('') || '<p class="muted">No log entries yet.</p>';
 
   const fieldUpdateRows = assetUpdates.map((u) => `
     <div class="list-item" style="cursor:default">
@@ -2513,6 +2531,20 @@ async function renderWorkOrderDetail({ id }) {
       <p class="muted">The scope of work — plain checklist items, not tied to any audit field.</p>
       ${taskRows}
       <div class="inline-add-row"><input class="new-task-input" placeholder="Add a task…" /><button type="button" class="btn btn-secondary" id="addTaskBtn">+</button></div>
+    </div>
+
+    <div class="card">
+      <h3>Work Log</h3>
+      <p class="muted">What's been done, hours worked, and status updates over the life of this work order.</p>
+      ${logRows}
+      <form id="addLogEntryForm" style="margin-top:10px">
+        <div class="field-row"><label>Note</label><textarea name="note" required placeholder="What did you do?"></textarea></div>
+        <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
+        <div class="field-row"><label>Update Status To (optional)</label>
+          <select name="statusChange"><option value="" selected>— no change —</option>${WO_STATUS_OPTIONS.map((s) => `<option>${s}</option>`).join('')}</select>
+        </div>
+        <button class="btn btn-primary" type="submit">Add Log Entry</button>
+      </form>
     </div>
 
     ${checklistHtml}
@@ -2622,6 +2654,25 @@ async function renderWorkOrderDetail({ id }) {
   app.querySelectorAll('.delete-task').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Delete task "${btn.dataset.label}"?`)) return;
     try { await api(`/api/pg/work-order-tasks/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
+    catch (err) { toast(err.message); }
+  }));
+
+  document.getElementById('addLogEntryForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const note = fd.get('note').trim();
+    if (!note) return;
+    try {
+      await api(`/api/pg/work-orders/${id}/log`, { method: 'POST', body: JSON.stringify({
+        note, hours: fd.get('hours') || undefined, statusChange: fd.get('statusChange') || undefined,
+      }) });
+      toast('Log entry added');
+      renderWorkOrderDetail({ id });
+    } catch (err) { toast(err.message); }
+  });
+  app.querySelectorAll('.delete-log-entry').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete this log entry? "${btn.dataset.label}"`)) return;
+    try { await api(`/api/pg/work-order-log/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
     catch (err) { toast(err.message); }
   }));
 

@@ -33,6 +33,7 @@ import {
   listVendors, createVendor, updateVendor, removeVendor,
   listSkills, createSkill, searchAssetsLive, createAssetQuick,
   listWorkOrderTasks, createWorkOrderTask, updateWorkOrderTask, deleteWorkOrderTask,
+  listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
   listChecklistTemplates, createChecklistTemplate, updateChecklistTemplate, deleteChecklistTemplate,
   getChecklistInstanceForWorkOrder, getChecklistInstanceForCalendarEvent,
@@ -417,11 +418,25 @@ router.get('/work-orders/:id', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    const [tasks, checklist] = await Promise.all([
-      listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id),
+    const [tasks, checklist, logEntries] = await Promise.all([
+      listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id), listWorkOrderLogEntries(req.params.id),
     ]);
-    res.json({ ...detail, tasks, checklist });
+    res.json({ ...detail, tasks, checklist, logEntries });
   } catch (e) { next(e); }
+});
+
+router.post('/work-orders/:id/log', async (req, res, next) => {
+  try {
+    const { note, hours, statusChange } = req.body || {};
+    if (!note || !note.trim()) return res.status(400).json({ ok: false, error: 'A note is required' });
+    const entry = await createWorkOrderLogEntry(req.params.id, {
+      note: note.trim(), hours: hours ? Number(hours) : null, statusChange: statusChange || null,
+    });
+    res.json({ ok: true, entry });
+  } catch (e) { next(e); }
+});
+router.delete('/work-order-log/:id', async (req, res, next) => {
+  try { await deleteWorkOrderLogEntry(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 // ---- Work Order Tasks (free-text job lines — the default way to add work) ----
