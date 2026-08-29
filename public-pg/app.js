@@ -348,6 +348,22 @@ async function renderLocations() {
   app.innerHTML = LOADING_HTML;
   const { locations } = await api('/api/pg/locations');
   let editing = null; // 'new' | { id } | null
+  let typeFilter = null; // set by clicking a type pill — filters the list to that type
+
+  function locationGridHtml(list, emptyMsg) {
+    const parentNameById = new Map(locations.map((l) => [l.Id, l.Name]));
+    const rows = list.map((l) => `
+      <tr>
+        <td data-label="Name"><a href="#" class="loc-open" data-id="${l.Id}" data-name="${escapeHtml(l.Name)}">${escapeHtml(l.Name)}</a></td>
+        <td data-label="Type">${l['Location Type'] ? `<span class="pill type-filter-chip" data-type="${escapeHtml(l['Location Type'])}">${escapeHtml(l['Location Type'])}</span>` : '—'}</td>
+        <td data-label="Parent">${escapeHtml(parentNameById.get(l.ParentLocationId) || '—')}</td>
+        <td data-label="Actions"><button class="btn btn-secondary edit-location" data-id="${l.Id}">Edit</button></td>
+      </tr>`).join('');
+    return `<div style="overflow-x:auto"><table class="report-table">
+      <thead><tr><th>Name</th><th>Type</th><th>Parent</th><th>Actions</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="4" class="muted">${emptyMsg}</td></tr>`}</tbody>
+    </table></div>`;
+  }
 
   function editFormHtml(loc) {
     const existingTypes = [...new Set(locations.map((l) => l['Location Type']).filter(Boolean))].sort();
@@ -372,13 +388,18 @@ async function renderLocations() {
   }
 
   function draw() {
+    const mode = getTableViewMode();
+    const visible = typeFilter ? locations.filter((l) => l['Location Type'] === typeFilter) : locations;
+    const emptyMsg = typeFilter ? `No locations of type "${escapeHtml(typeFilter)}".` : 'No locations yet.';
     setApp(`
-      ${locations.map((l) => `
-        <div class="list-item loc-row" data-id="${l.Id}" data-name="${escapeHtml(l.Name)}">
-          <span class="loc-open">📍 ${escapeHtml(l.Name)}</span>
-          <span class="pill">${escapeHtml(l['Location Type'] || '')}</span>
+      ${tableViewToggleHtml(mode)}
+      ${typeFilter ? `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="clearTypeFilter">✕ Filtered by type: ${escapeHtml(typeFilter)}</button></div>` : ''}
+      ${mode === 'table' ? locationGridHtml(visible, emptyMsg) : (visible.map((l) => `
+        <div class="list-item loc-row">
+          <span class="loc-open" data-id="${l.Id}" data-name="${escapeHtml(l.Name)}">📍 ${escapeHtml(l.Name)}</span>
+          ${l['Location Type'] ? `<span class="pill type-filter-chip" data-type="${escapeHtml(l['Location Type'])}">${escapeHtml(l['Location Type'])}</span>` : '<span class="pill"></span>'}
           <button class="btn btn-secondary edit-location" data-id="${l.Id}">Edit</button>
-        </div>`).join('')}
+        </div>`).join('') || `<p class="muted">${emptyMsg}</p>`)}
       ${editing === 'new' ? editFormHtml(null) : `<div class="btn-row" style="margin-top:10px"><button class="btn btn-secondary" id="addLocationBtn">+ Add Location</button></div>`}
       ${editing?.id ? editFormHtml(locations.find((l) => l.Id === editing.id)) : ''}
     `);
@@ -386,9 +407,16 @@ async function renderLocations() {
   }
 
   function wire() {
-    app.querySelectorAll('.loc-open').forEach((el) => el.addEventListener('click', () => {
-      const row = el.closest('.list-item');
-      go('assetsInLocation', { id: row.dataset.id, name: row.dataset.name });
+    wireTableViewToggle(draw);
+    app.querySelectorAll('.type-filter-chip').forEach((chip) => chip.addEventListener('click', (e) => {
+      e.preventDefault();
+      typeFilter = chip.dataset.type;
+      draw();
+    }));
+    document.getElementById('clearTypeFilter')?.addEventListener('click', () => { typeFilter = null; draw(); });
+    app.querySelectorAll('.loc-open').forEach((el) => el.addEventListener('click', (e) => {
+      e.preventDefault();
+      go('assetsInLocation', { id: el.dataset.id, name: el.dataset.name });
     }));
     document.getElementById('addLocationBtn')?.addEventListener('click', () => { editing = 'new'; draw(); });
     app.querySelectorAll('.edit-location').forEach((btn) => btn.addEventListener('click', () => {
