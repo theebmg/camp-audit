@@ -1061,6 +1061,7 @@ function calendarEventRowShape(r) {
     Id: r.id, Title: r.title, Description: r.description, EventDate: r.event_date,
     RecurrenceType: r.recurrence_type, RecurrenceInterval: r.recurrence_interval, RecurrenceEndDate: r.recurrence_end_date,
     WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title,
+    WorkOrderTaskId: r.work_order_task_id, TaskDescription: r.task_description,
   };
 }
 
@@ -1069,7 +1070,9 @@ function calendarEventRowShape(r) {
 // concrete Date so the calendar can place it on the right day.
 export async function listCalendarEventOccurrences(fromDate, toDate) {
   const { rows } = await pool.query(
-    `SELECT e.*, w.title AS wo_title FROM calendar_events e LEFT JOIN work_orders w ON w.id = e.work_order_id
+    `SELECT e.*, w.title AS wo_title, t.description AS task_description FROM calendar_events e
+     LEFT JOIN work_orders w ON w.id = e.work_order_id
+     LEFT JOIN work_order_tasks t ON t.id = e.work_order_task_id
      WHERE e.event_date <= $2 AND (e.recurrence_end_date IS NULL OR e.recurrence_end_date >= $1)`,
     [fromDate, toDate]
   );
@@ -1087,23 +1090,26 @@ export async function listCalendarEventOccurrences(fromDate, toDate) {
 
 export async function getCalendarEvent(id) {
   const { rows } = await pool.query(
-    `SELECT e.*, w.title AS wo_title FROM calendar_events e LEFT JOIN work_orders w ON w.id = e.work_order_id WHERE e.id = $1`,
+    `SELECT e.*, w.title AS wo_title, t.description AS task_description FROM calendar_events e
+     LEFT JOIN work_orders w ON w.id = e.work_order_id
+     LEFT JOIN work_order_tasks t ON t.id = e.work_order_task_id
+     WHERE e.id = $1`,
     [id]
   );
   return rows[0] ? calendarEventRowShape(rows[0]) : null;
 }
 
-export async function createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId }) {
+export async function createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId }) {
   const { rows } = await pool.query(
-    `INSERT INTO calendar_events (title, description, event_date, recurrence_type, recurrence_interval, recurrence_end_date, work_order_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-    [title, description || null, eventDate, recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null]
+    `INSERT INTO calendar_events (title, description, event_date, recurrence_type, recurrence_interval, recurrence_end_date, work_order_id, work_order_task_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [title, description || null, eventDate, recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null, workOrderTaskId || null]
   );
   return calendarEventRowShape(rows[0]);
 }
 
 export async function updateCalendarEvent(id, fields) {
-  const allowed = ['title', 'description', 'event_date', 'recurrence_type', 'recurrence_interval', 'recurrence_end_date', 'work_order_id'];
+  const allowed = ['title', 'description', 'event_date', 'recurrence_type', 'recurrence_interval', 'recurrence_end_date', 'work_order_id', 'work_order_task_id'];
   const setCols = []; const vals = []; let i = 1;
   for (const [key, value] of Object.entries(fields)) {
     if (!allowed.includes(key)) continue;

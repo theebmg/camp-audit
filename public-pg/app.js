@@ -1277,6 +1277,63 @@ function wireRecurrenceToggle(root) {
   });
 }
 
+// Link-to-Work-Order(-Task) fields shared by New/Edit Calendar Event. Picking a
+// Work Order auto-fills Title/Description/Date from it and reveals a Task
+// dropdown scoped to that WO's tasks; picking a task narrows Title further to
+// the task's own text. This only fires on user-driven changes — initial render
+// for an existing event never overwrites its saved fields.
+function calendarLinkFieldsHtml({ workOrders, initialTasks = [], ev = {} }) {
+  const hasWo = !!ev.WorkOrderId;
+  return `
+    <div class="field-row"><label>Link to Work Order (optional)</label>
+      <select name="workOrderId" id="linkWorkOrderId">
+        <option value="">— none —</option>
+        ${workOrders.map((w) => `<option value="${w.Id}" ${ev.WorkOrderId === w.Id ? 'selected' : ''}>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field-row" id="linkTaskRow" ${hasWo ? '' : 'hidden'}>
+      <label>Link to Task (optional)</label>
+      <select name="workOrderTaskId" id="linkTaskId">
+        <option value="">— whole work order —</option>
+        ${initialTasks.map((t) => `<option value="${t.Id}" ${ev.WorkOrderTaskId === t.Id ? 'selected' : ''}>${escapeHtml(t.Description)}${t.Done ? ' (done)' : ''}</option>`).join('')}
+      </select>
+    </div>`;
+}
+function wireCalendarLinkFields(root) {
+  const woSelect = root.querySelector('#linkWorkOrderId');
+  const taskRow = root.querySelector('#linkTaskRow');
+  const taskSelect = root.querySelector('#linkTaskId');
+  const titleInput = root.querySelector('[name="title"]');
+  const descInput = root.querySelector('[name="description"]');
+  const dateInput = root.querySelector('[name="eventDate"]');
+  let currentTasks = [];
+
+  woSelect.addEventListener('change', async () => {
+    const woId = woSelect.value;
+    taskSelect.innerHTML = '<option value="">— whole work order —</option>';
+    currentTasks = [];
+    if (!woId) { taskRow.hidden = true; return; }
+    taskRow.hidden = false;
+    const { workOrder, tasks } = await api(`/api/pg/work-orders/${woId}`);
+    currentTasks = tasks;
+    taskSelect.innerHTML += tasks.map((t) => `<option value="${t.Id}">${escapeHtml(t.Description)}${t.Done ? ' (done)' : ''}</option>`).join('');
+    titleInput.value = workOrder.Title;
+    descInput.value = workOrder.Description || '';
+    if (workOrder['Scheduled Date']) dateInput.value = workOrder['Scheduled Date'].slice(0, 10);
+  });
+
+  taskSelect.addEventListener('change', () => {
+    const taskId = taskSelect.value;
+    if (!taskId) return;
+    const task = currentTasks.find((t) => String(t.Id) === taskId);
+    const woLabel = woSelect.selectedOptions[0]?.textContent || '';
+    if (task) {
+      titleInput.value = task.Description;
+      descInput.value = `Task from Work Order: ${woLabel}`;
+    }
+  });
+}
+
 async function renderNewCalendarEvent(params = {}) {
   setChrome({ title: 'New Calendar Event', showBack: true, showLogout: true });
   const { workOrders } = await api('/api/pg/work-orders');
@@ -1288,9 +1345,7 @@ async function renderNewCalendarEvent(params = {}) {
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${params.date || ''}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
         ${recurrenceFieldsHtml()}
-        <div class="field-row"><label>Link to Work Order (optional)</label>
-          <select name="workOrderId"><option value="">— none —</option>${workOrders.map((w) => `<option value="${w.Id}">${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</option>`).join('')}</select>
-        </div>
+        ${calendarLinkFieldsHtml({ workOrders })}
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Create Event</button>
           <button class="btn btn-secondary" type="button" id="cancelEventBtn">Cancel</button>
@@ -1298,6 +1353,7 @@ async function renderNewCalendarEvent(params = {}) {
       </form>
     </div>`);
   wireRecurrenceToggle(document.getElementById('newEventForm'));
+  wireCalendarLinkFields(document.getElementById('newEventForm'));
   document.getElementById('cancelEventBtn').addEventListener('click', goBack);
   document.getElementById('newEventForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1308,6 +1364,7 @@ async function renderNewCalendarEvent(params = {}) {
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || undefined,
         workOrderId: fd.get('workOrderId') || undefined,
+        workOrderTaskId: fd.get('workOrderTaskId') || undefined,
       }) });
       toast('Event created');
       go('calendarEventDetail', { id: event.Id }, { replace: true });
@@ -1324,6 +1381,7 @@ async function renderCalendarEventDetail({ id }) {
   const { event: ev, checklist } = detail;
   const { workOrders } = workOrdersRes;
   const checklistTemplates = tplRes.templates;
+  const initialTasks = ev.WorkOrderId ? (await api(`/api/pg/work-orders/${ev.WorkOrderId}`)).tasks : [];
 
   const checklistHtml = checklist ? checklistHtmlFor(checklist)
     : (checklistTemplates.length ? `
@@ -1340,17 +1398,17 @@ async function renderCalendarEventDetail({ id }) {
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${(ev.EventDate || '').slice(0, 10)}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(ev.Description || '')}</textarea></div>
         ${recurrenceFieldsHtml(ev)}
-        <div class="field-row"><label>Link to Work Order (optional)</label>
-          <select name="workOrderId"><option value="">— none —</option>${workOrders.map((w) => `<option value="${w.Id}" ${ev.WorkOrderId === w.Id ? 'selected' : ''}>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</option>`).join('')}</select>
-        </div>
+        ${calendarLinkFieldsHtml({ workOrders, initialTasks, ev })}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       ${ev.WorkOrderId ? `<div class="btn-row"><button class="btn btn-secondary" id="viewWoBtn">View Linked Work Order</button></div>` : ''}
+      ${ev.TaskDescription ? `<p class="muted">Linked to task: "${escapeHtml(ev.TaskDescription)}"</p>` : ''}
       <div class="btn-row"><button class="btn btn-secondary" id="deleteEventBtn">Delete Event</button></div>
     </div>
     ${checklistHtml}`);
 
   wireRecurrenceToggle(document.getElementById('eventForm'));
+  wireCalendarLinkFields(document.getElementById('eventForm'));
 
   document.getElementById('viewWoBtn')?.addEventListener('click', () => go('workOrderDetail', { id: ev.WorkOrderId }));
   document.getElementById('eventForm').addEventListener('submit', async (e) => {
@@ -1362,6 +1420,7 @@ async function renderCalendarEventDetail({ id }) {
         title: fd.get('title'), eventDate: fd.get('eventDate'), description: fd.get('description'),
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || '', workOrderId: fd.get('workOrderId') || '',
+        workOrderTaskId: fd.get('workOrderTaskId') || '',
       }) });
       toast('Event updated');
       renderCalendarEventDetail({ id });

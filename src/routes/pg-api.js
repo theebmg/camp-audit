@@ -551,9 +551,9 @@ router.get('/calendar-events/:id', async (req, res, next) => {
 });
 router.post('/calendar-events', async (req, res, next) => {
   try {
-    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId } = req.body || {};
+    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId } = req.body || {};
     if (!title || !eventDate) return res.status(400).json({ ok: false, error: 'title and eventDate are required' });
-    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId }) });
+    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId }) });
   } catch (e) { next(e); }
 });
 router.patch('/calendar-events/:id', async (req, res, next) => {
@@ -567,6 +567,7 @@ router.patch('/calendar-events/:id', async (req, res, next) => {
     if (body.recurrenceInterval != null) fields.recurrence_interval = body.recurrenceInterval;
     if (body.recurrenceEndDate !== undefined) fields.recurrence_end_date = body.recurrenceEndDate;
     if (body.workOrderId !== undefined) fields.work_order_id = body.workOrderId === '' ? null : Number(body.workOrderId);
+    if (body.workOrderTaskId !== undefined) fields.work_order_task_id = body.workOrderTaskId === '' ? null : Number(body.workOrderTaskId);
     const event = await updateCalendarEvent(req.params.id, fields);
     if (!event) return res.status(404).json({ ok: false, error: 'Event not found' });
     res.json({ ok: true, event });
