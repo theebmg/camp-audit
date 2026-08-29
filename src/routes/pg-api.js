@@ -13,7 +13,7 @@ import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
 import { buildCapitalPlanPg } from '../reportDataPg.js';
 import { uploadPhoto } from '../storage.js';
-import { renderChecklistPdf } from '../pdf.js';
+import { renderChecklistPdf, renderWorkOrderScopePdf } from '../pdf.js';
 import { currentUsername, currentRole } from '../requestContext.js';
 import {
   listLocations, createLocation, updateLocation, listAssetsByLocation, searchLocationsAndAssets,
@@ -813,6 +813,45 @@ router.get('/checklist-instances/:id/pdf', async (req, res, next) => {
     });
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${instance.Name.replace(/[^a-z0-9]+/gi, '-')}.pdf"`);
+    res.send(pdf);
+  } catch (e) { next(e); }
+});
+
+// Handed to a vendor or volunteer so there's a record every repair went
+// through the system (see the user's "all future repairs run through this"
+// request) — deliberately excludes cost figures, see pdf.js.
+router.get('/work-orders/:id/scope-pdf', async (req, res, next) => {
+  try {
+    const detail = await getWorkOrderDetail(req.params.id);
+    if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
+    const [tasks, checklist] = await Promise.all([
+      listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id),
+    ]);
+    let checklistSteps = null;
+    if (checklist) {
+      const stepById = new Map(checklist.Steps.map((s) => [s.Id, s]));
+      const isVisible = (s) => {
+        if (s.DependsOnInstanceStepId == null) return true;
+        const dep = stepById.get(s.DependsOnInstanceStepId);
+        return dep ? dep.Done === s.ShowWhenChecked : true;
+      };
+      checklistSteps = checklist.Steps.filter(isVisible).map((s) => s.StepText);
+    }
+    const w = detail.workOrder;
+    const pdf = await renderWorkOrderScopePdf({
+      title: w.Title,
+      assetName: w.Asset?.Name,
+      locationName: w.Location?.Name,
+      priority: w.Priority,
+      scheduledDate: w['Scheduled Date'],
+      description: w.Description,
+      tasks: tasks.filter((t) => !t.Done).map((t) => t.Description),
+      volunteers: (detail.volunteers || []).map((v) => v.Name),
+      vendors: (detail.vendors || []).map((v) => v.Name),
+      checklistSteps,
+    });
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="Scope of Work - ${w.Title.replace(/[^a-z0-9]+/gi, '-')}.pdf"`);
     res.send(pdf);
   } catch (e) { next(e); }
 });

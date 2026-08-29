@@ -3280,6 +3280,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       </form>
       <div class="btn-row">
         <button class="btn btn-primary" id="completeWoBtn" ${wo.Status === 'Done' ? 'disabled' : ''}>${wo.Status === 'Done' ? 'Completed' : 'Complete Work Order'}</button>
+        <a class="btn btn-secondary" href="/api/pg/work-orders/${id}/scope-pdf" target="_blank" rel="noopener" title="A printable job description to hand a vendor or volunteer — no cost figures included">🖨️ Scope of Work (PDF)</a>
         <button class="btn btn-secondary" id="duplicateWoBtn">Duplicate</button>
       </div>
     </div>
