@@ -33,9 +33,29 @@ export async function pingDb() {
 
 // ── Locations / Assets (read) ───────────────────────────────────────────
 
+function locationRowShape(r) {
+  return { Id: r.id, Name: r.name, 'Location Type': r.location_type, ParentLocationId: r.parent_location_id, Notes: r.notes };
+}
+
 export async function listLocations() {
-  const { rows } = await pool.query('SELECT id, name, location_type FROM locations ORDER BY name');
-  return rows.map((r) => ({ Id: r.id, Name: r.name, 'Location Type': r.location_type }));
+  const { rows } = await pool.query('SELECT id, name, location_type, parent_location_id, notes FROM locations ORDER BY name');
+  return rows.map(locationRowShape);
+}
+
+export async function createLocation({ name, parentLocationId, locationType, notes }) {
+  const { rows } = await pool.query(
+    `INSERT INTO locations (name, parent_location_id, location_type, notes) VALUES ($1,$2,$3,$4) RETURNING *`,
+    [name, parentLocationId || null, locationType || null, notes || null]
+  );
+  return locationRowShape(rows[0]);
+}
+
+export async function updateLocation(id, { name, parentLocationId, locationType, notes }) {
+  const { rows } = await pool.query(
+    `UPDATE locations SET name = $2, parent_location_id = $3, location_type = $4, notes = $5 WHERE id = $1 RETURNING *`,
+    [id, name, parentLocationId || null, locationType || null, notes || null]
+  );
+  return rows[0] ? locationRowShape(rows[0]) : null;
 }
 
 export async function listAssetsByLocation(locationId) {

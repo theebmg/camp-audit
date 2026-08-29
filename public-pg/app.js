@@ -347,12 +347,75 @@ async function renderLocations() {
   setChrome({ title: 'Locations', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
   const { locations } = await api('/api/pg/locations');
-  app.innerHTML = locations.map((l) => `
-    <div class="list-item" data-id="${l.Id}" data-name="${escapeHtml(l.Name)}">
-      <span>📍 ${escapeHtml(l.Name)}</span><span class="pill">${escapeHtml(l['Location Type'] || '')}</span>
-    </div>`).join('');
-  app.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () =>
-    go('assetsInLocation', { id: el.dataset.id, name: el.dataset.name })));
+  let editing = null; // 'new' | { id } | null
+
+  function editFormHtml(loc) {
+    const existingTypes = [...new Set(locations.map((l) => l['Location Type']).filter(Boolean))].sort();
+    const parentOptions = locations.filter((l) => l.Id !== loc?.Id).map((l) =>
+      `<option value="${l.Id}" ${loc?.ParentLocationId === l.Id ? 'selected' : ''}>${escapeHtml(l.Name)}</option>`).join('');
+    return `<div class="card">
+      <h3>${loc ? `Edit ${escapeHtml(loc.Name)}` : 'Add Location'}</h3>
+      <div class="field-row"><label>Name</label><input class="loc-name" value="${escapeHtml(loc?.Name || '')}" required /></div>
+      <div class="field-row"><label>Parent Location</label>
+        <select class="loc-parent"><option value="">— top-level —</option>${parentOptions}</select>
+      </div>
+      <div class="field-row"><label>Type</label>
+        <input class="loc-type" list="locationTypeOptions" value="${escapeHtml(loc?.['Location Type'] || '')}" />
+        <datalist id="locationTypeOptions">${existingTypes.map((t) => `<option value="${escapeHtml(t)}">`).join('')}</datalist>
+      </div>
+      <div class="field-row"><label>Notes</label><textarea class="loc-notes">${escapeHtml(loc?.Notes || '')}</textarea></div>
+      <div class="btn-row">
+        <button class="btn btn-primary loc-save" data-id="${loc?.Id ?? ''}">Save</button>
+        <button class="btn btn-secondary loc-cancel">Cancel</button>
+      </div>
+    </div>`;
+  }
+
+  function draw() {
+    setApp(`
+      ${locations.map((l) => `
+        <div class="list-item" data-id="${l.Id}" data-name="${escapeHtml(l.Name)}">
+          <span class="loc-open" style="cursor:pointer;flex:1">📍 ${escapeHtml(l.Name)}</span>
+          <span class="pill">${escapeHtml(l['Location Type'] || '')}</span>
+          <button class="btn btn-secondary edit-location" data-id="${l.Id}">Edit</button>
+        </div>`).join('')}
+      ${editing === 'new' ? editFormHtml(null) : `<div class="btn-row" style="margin-top:10px"><button class="btn btn-secondary" id="addLocationBtn">+ Add Location</button></div>`}
+      ${editing?.id ? editFormHtml(locations.find((l) => l.Id === editing.id)) : ''}
+    `);
+    wire();
+  }
+
+  function wire() {
+    app.querySelectorAll('.loc-open').forEach((el) => el.addEventListener('click', () => {
+      const row = el.closest('.list-item');
+      go('assetsInLocation', { id: row.dataset.id, name: row.dataset.name });
+    }));
+    document.getElementById('addLocationBtn')?.addEventListener('click', () => { editing = 'new'; draw(); });
+    app.querySelectorAll('.edit-location').forEach((btn) => btn.addEventListener('click', () => {
+      editing = { id: Number(btn.dataset.id) };
+      draw();
+    }));
+    app.querySelectorAll('.loc-cancel').forEach((btn) => btn.addEventListener('click', () => { editing = null; draw(); }));
+    app.querySelectorAll('.loc-save').forEach((btn) => btn.addEventListener('click', async () => {
+      const card = btn.closest('.card');
+      const id = btn.dataset.id;
+      const fields = {
+        name: card.querySelector('.loc-name').value.trim(),
+        parentLocationId: card.querySelector('.loc-parent').value || undefined,
+        locationType: card.querySelector('.loc-type').value.trim(),
+        notes: card.querySelector('.loc-notes').value.trim(),
+      };
+      if (!fields.name) { toast('Name is required'); return; }
+      const isNew = !id;
+      try {
+        await api(isNew ? '/api/pg/locations' : `/api/pg/locations/${id}`, { method: isNew ? 'POST' : 'PATCH', body: JSON.stringify(fields) });
+        toast(isNew ? 'Location added' : 'Location saved');
+        renderLocations();
+      } catch (err) { toast(err.message); }
+    }));
+  }
+
+  draw();
 }
 
 async function renderAssetsInLocation({ id, name }) {
@@ -1925,8 +1988,8 @@ async function renderWorkOrderDetail({ id }) {
     renderWorkOrderDetail({ id });
   });
 
-  document.getElementById('newVolToggle').addEventListener('click', () => document.getElementById('newVolBox').hidden = false);
-  document.getElementById('newVenToggle').addEventListener('click', () => document.getElementById('newVenBox').hidden = false);
+  document.getElementById('newVolToggle').addEventListener('click', () => openCrewAddBox('newVolBox', 'newVenBox'));
+  document.getElementById('newVenToggle').addEventListener('click', () => openCrewAddBox('newVenBox', 'newVolBox'));
   wireSkillChipToggle(document.getElementById('newVolSkills'));
   wireSkillChipToggle(document.getElementById('newVenSkills'));
   app.querySelectorAll('.add-skill-btn').forEach(wireAddSkillButton);
@@ -1985,6 +2048,33 @@ function selectedSkillsOf(container) {
   return [...container.querySelectorAll('.skill-chip.selected')].map((c) => c.dataset.skill);
 }
 
+// The "+ New Volunteer" / "+ New Vendor" inline boxes on WO Detail are mutually
+// exclusive — opening one while the other has unsaved text/skills prompts to
+// discard rather than silently leaving both open (a prior bug).
+function crewAddBoxHasData(boxId) {
+  const box = document.getElementById(boxId);
+  const hasText = [...box.querySelectorAll('input')].some((i) => i.value.trim());
+  const hasSkills = box.querySelectorAll('.skill-chip.selected').length > 0;
+  return hasText || hasSkills;
+}
+function resetCrewAddBox(boxId) {
+  const box = document.getElementById(boxId);
+  box.querySelectorAll('input').forEach((i) => { i.value = ''; });
+  box.querySelectorAll('.skill-chip.selected').forEach((c) => c.classList.remove('selected'));
+  box.hidden = true;
+}
+function openCrewAddBox(openId, otherId) {
+  const otherBox = document.getElementById(otherId);
+  if (!otherBox.hidden) {
+    if (crewAddBoxHasData(otherId)) {
+      const label = otherId === 'newVolBox' ? 'volunteer' : 'vendor';
+      if (!confirm(`You have unsaved new-${label} info entered. Discard it and continue?`)) return;
+    }
+    resetCrewAddBox(otherId);
+  }
+  document.getElementById(openId).hidden = false;
+}
+
 // US phone auto-format as you type: 5551234567 -> (555) 123-4567.
 function formatPhoneValue(raw) {
   const digits = raw.replace(/\D/g, '').slice(0, 10);
@@ -2038,6 +2128,7 @@ async function renderCrew() {
   const volunteers = volsRes.volunteers;
   const vendors = vensRes.vendors;
   let editing = null; // { kind: 'vol'|'ven', id } | 'new-vol' | 'new-ven' | null
+  let skillFilter = null; // set by clicking a skill chip — filters both lists to that skill
 
   function personCard(p, kind) {
     const skills = personSkillsOf(p, kind);
@@ -2046,13 +2137,33 @@ async function renderCrew() {
         <div><strong>${escapeHtml(p.Name)}</strong>${!p.Active ? ' <span class="pill">inactive</span>' : ''}</div>
         <div class="muted">${escapeHtml(p['Phone Number'] || '—')}${p.Email ? ' · ' + escapeHtml(p.Email) : ''}</div>
         ${p.Address ? `<div class="muted">${escapeHtml(p.Address)}</div>` : ''}
-        ${skills.length ? `<div class="skill-chips">${skills.map((s) => `<span class="skill-chip selected">${escapeHtml(s)}</span>`).join('')}</div>` : ''}
+        ${skills.length ? `<div class="skill-chips">${skills.map((s) => `<span class="skill-chip selected skill-filter-chip" data-skill="${escapeHtml(s)}">${escapeHtml(s)}</span>`).join('')}</div>` : ''}
       </div>
       <div class="btn-row" style="margin-top:0">
         <button class="btn btn-secondary edit-person" data-kind="${kind}" data-id="${p.Id}">Edit</button>
         <button class="btn btn-secondary remove-person" data-kind="${kind}" data-id="${p.Id}" data-name="${escapeHtml(p.Name)}" data-active="${p.Active}">${p.Active ? 'Remove' : 'Delete permanently'}</button>
       </div>
     </div>`;
+  }
+
+  function personGridHtml(list, kind, emptyMsg) {
+    const skillLabel = kind === 'vol' ? 'Skills' : 'Specialties';
+    const rows = list.map((p) => `
+      <tr>
+        <td data-label="Name">${escapeHtml(p.Name)}${!p.Active ? ' <span class="pill">inactive</span>' : ''}</td>
+        <td data-label="Phone">${escapeHtml(p['Phone Number'] || '—')}</td>
+        <td data-label="Email">${escapeHtml(p.Email || '—')}</td>
+        <td data-label="Address">${escapeHtml(p.Address || '—')}</td>
+        <td data-label="${skillLabel}"><div class="skill-chips">${personSkillsOf(p, kind).map((s) => `<span class="skill-chip selected skill-filter-chip" data-skill="${escapeHtml(s)}">${escapeHtml(s)}</span>`).join('') || '—'}</div></td>
+        <td data-label="Actions"><div class="btn-row" style="margin-top:0">
+          <button class="btn btn-secondary edit-person" data-kind="${kind}" data-id="${p.Id}">Edit</button>
+          <button class="btn btn-secondary remove-person" data-kind="${kind}" data-id="${p.Id}" data-name="${escapeHtml(p.Name)}" data-active="${p.Active}">${p.Active ? 'Remove' : 'Delete permanently'}</button>
+        </div></td>
+      </tr>`).join('');
+    return `<div style="overflow-x:auto"><table class="report-table">
+      <thead><tr><th>Name</th><th>Phone</th><th>Email</th><th>Address</th><th>${skillLabel}</th><th>Actions</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6" class="muted">${emptyMsg}</td></tr>`}</tbody>
+    </table></div>`;
   }
 
   function editFormHtml(kind, p) {
@@ -2079,15 +2190,22 @@ async function renderCrew() {
   }
 
   function draw() {
+    const mode = getTableViewMode();
+    const visibleVols = skillFilter ? volunteers.filter((v) => personSkillsOf(v, 'vol').includes(skillFilter)) : volunteers;
+    const visibleVens = skillFilter ? vendors.filter((v) => personSkillsOf(v, 'ven').includes(skillFilter)) : vendors;
+    const emptyMsg = skillFilter ? `No one with the skill "${escapeHtml(skillFilter)}".` : '🤷 None yet.';
     setApp(`
+      ${tableViewToggleHtml(mode)}
+      ${skillFilter ? `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="clearSkillFilter">✕ Filtered by skill: ${escapeHtml(skillFilter)}</button></div>` : ''}
+
       <div class="card"><h3>Volunteers</h3>
-        ${volunteers.map((v) => personCard(v, 'vol')).join('') || '<p class="muted">🤷 None yet.</p>'}
+        ${mode === 'table' ? personGridHtml(visibleVols, 'vol', emptyMsg) : (visibleVols.map((v) => personCard(v, 'vol')).join('') || `<p class="muted">${emptyMsg}</p>`)}
       </div>
       ${editing === 'new-vol' ? editFormHtml('vol', null) : `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="addVolBtn">+ Add Volunteer</button></div>`}
       ${editing?.kind === 'vol' ? editFormHtml('vol', volunteers.find((v) => v.Id === editing.id)) : ''}
 
       <div class="card"><h3>Vendors</h3>
-        ${vendors.map((v) => personCard(v, 'ven')).join('') || '<p class="muted">🤷 None yet.</p>'}
+        ${mode === 'table' ? personGridHtml(visibleVens, 'ven', emptyMsg) : (visibleVens.map((v) => personCard(v, 'ven')).join('') || `<p class="muted">${emptyMsg}</p>`)}
       </div>
       ${editing === 'new-ven' ? editFormHtml('ven', null) : `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="addVenBtn">+ Add Vendor</button></div>`}
       ${editing?.kind === 'ven' ? editFormHtml('ven', vendors.find((v) => v.Id === editing.id)) : ''}
@@ -2096,6 +2214,12 @@ async function renderCrew() {
   }
 
   function wire() {
+    wireTableViewToggle(draw);
+    app.querySelectorAll('.skill-filter-chip').forEach((chip) => chip.addEventListener('click', () => {
+      skillFilter = chip.dataset.skill;
+      draw();
+    }));
+    document.getElementById('clearSkillFilter')?.addEventListener('click', () => { skillFilter = null; draw(); });
     document.getElementById('addVolBtn')?.addEventListener('click', () => { editing = 'new-vol'; draw(); });
     document.getElementById('addVenBtn')?.addEventListener('click', () => { editing = 'new-ven'; draw(); });
     app.querySelectorAll('.edit-person').forEach((btn) => btn.addEventListener('click', () => {

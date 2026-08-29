@@ -15,7 +15,7 @@ import { buildCapitalPlanPg } from '../reportDataPg.js';
 import { uploadPhoto } from '../storage.js';
 import { renderChecklistPdf } from '../pdf.js';
 import {
-  listLocations, listAssetsByLocation, searchLocationsAndAssets,
+  listLocations, createLocation, updateLocation, listAssetsByLocation, searchLocationsAndAssets,
   getAssetPropertyFields, getComponentTypeCatalog, getAssetDetail, getAssetHistory,
   submitAudit, getMaintenanceLog, listBuildingTypes, setAssetBuildingType,
   listAssetNotes, createAssetNote, resolveAssetNote, updateAssetFull,
@@ -66,6 +66,30 @@ const FINDING_SEVERITY_OPTIONS = ['1 - Monitor', '2 - Minor', '3 - Moderate', '4
 router.get('/locations', async (req, res, next) => {
   try {
     res.json({ locations: await listLocations() });
+  } catch (e) { next(e); }
+});
+
+router.post('/locations', async (req, res, next) => {
+  try {
+    const { name, parentLocationId, locationType, notes } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'name is required' });
+    res.json({ ok: true, location: await createLocation({
+      name: name.trim(), parentLocationId: parentLocationId ? Number(parentLocationId) : null,
+      locationType: locationType || null, notes: notes || null,
+    }) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/locations/:id', async (req, res, next) => {
+  try {
+    const { name, parentLocationId, locationType, notes } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'name is required' });
+    const location = await updateLocation(req.params.id, {
+      name: name.trim(), parentLocationId: parentLocationId ? Number(parentLocationId) : null,
+      locationType: locationType || null, notes: notes || null,
+    });
+    if (!location) return res.status(404).json({ ok: false, error: 'Location not found' });
+    res.json({ ok: true, location });
   } catch (e) { next(e); }
 });
 
