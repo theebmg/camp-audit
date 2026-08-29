@@ -464,9 +464,10 @@ async function renderDashboard() {
   let selectedWeekDate = isoDate(today);
   const weekOccByDay = new Map();
 
-  const [woSummary, calRes, activityRes] = await Promise.all([
+  const [woSummary, calRes, scheduledWoRes, activityRes] = await Promise.all([
     prefs.woOverview ? api('/api/pg/dashboard/wo-summary') : Promise.resolve(null),
     prefs.calendar ? api(`/api/pg/calendar-events?from=${isoDate(weekStart)}&to=${isoDate(weekEnd)}`) : Promise.resolve(null),
+    prefs.calendar ? api('/api/pg/work-orders') : Promise.resolve(null),
     prefs.activity ? api(`/api/pg/activity-log?limit=12${isAdmin ? '' : `&username=${encodeURIComponent(currentUser.username || '')}`}`) : Promise.resolve(null),
   ]);
 
@@ -505,7 +506,18 @@ async function renderDashboard() {
     for (const occ of calRes.occurrences) {
       const key = occ.OccurrenceDate;
       if (!weekOccByDay.has(key)) weekOccByDay.set(key, []);
-      weekOccByDay.get(key).push(occ);
+      weekOccByDay.get(key).push({ type: 'event', ...occ });
+    }
+    // Work orders with a Scheduled Date show on the full Calendar page too —
+    // this widget was only pulling standalone calendar_events and silently
+    // omitting the far more common case of a WO scheduled for a date.
+    const weekStartStr = isoDate(weekStart);
+    const weekEndStr = isoDate(weekEnd);
+    for (const w of (scheduledWoRes?.workOrders || [])) {
+      const sd = w['Scheduled Date'] ? w['Scheduled Date'].slice(0, 10) : null;
+      if (!sd || sd < weekStartStr || sd > weekEndStr) continue;
+      if (!weekOccByDay.has(sd)) weekOccByDay.set(sd, []);
+      weekOccByDay.get(sd).push({ type: 'wo', ...w });
     }
     const todayStr = isoDate(today);
     const cells = weekDays.map((d) => {
@@ -514,7 +526,7 @@ async function renderDashboard() {
       return `<div class="cal-strip-day ${key === todayStr ? 'cal-strip-today' : ''} ${key === selectedWeekDate ? 'cal-strip-selected' : ''}" data-date="${key}">
         <div class="cal-strip-dow">${d.toLocaleDateString('default', { weekday: 'short' })}</div>
         <div class="cal-strip-num">${d.getDate()}</div>
-        ${dayEvents.slice(0, 2).map((e) => `<div class="cal-strip-event">${escapeHtml(e.Title)}</div>`).join('')}
+        ${dayEvents.slice(0, 2).map((e) => `<div class="cal-strip-event">${e.type === 'wo' ? '🛠️ ' : '📅 '}${escapeHtml(e.Title)}</div>`).join('')}
         ${dayEvents.length > 2 ? `<div class="muted" style="font-size:0.75rem">+${dayEvents.length - 2} more</div>` : ''}
       </div>`;
     }).join('');
@@ -532,11 +544,15 @@ async function renderDashboard() {
     const dayEvents = weekOccByDay.get(dateKey) || [];
     const label = new Date(`${dateKey}T00:00:00`).toLocaleDateString('default', { weekday: 'long', month: 'long', day: 'numeric' });
     if (!dayEvents.length) return `<p class="muted">No events scheduled for ${escapeHtml(label)}.</p>`;
-    return `<p class="muted" style="margin-bottom:6px">${escapeHtml(label)}</p>` + dayEvents.map((e) => `
-      <div class="list-item cal-strip-event-link" style="cursor:pointer" data-event-id="${e.Id}">
-        <span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span>
-        ${e.WorkOrderId ? `<span class="pill">linked WO</span>` : ''}
-      </div>`).join('');
+    return `<p class="muted" style="margin-bottom:6px">${escapeHtml(label)}</p>` + dayEvents.map((e) => e.type === 'wo'
+      ? `<div class="list-item cal-strip-wo-link" style="cursor:pointer" data-wo-id="${e.Id}">
+          <span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.Title)}</span>
+          <span class="pill ${woStatusPillClass(e.Status)}">${escapeHtml(e.Status || '')}</span>
+        </div>`
+      : `<div class="list-item cal-strip-event-link" style="cursor:pointer" data-event-id="${e.Id}">
+          <span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span>
+          ${e.WorkOrderId ? `<span class="pill">linked WO</span>` : ''}
+        </div>`).join('');
   }
 
   function activityHtml() {
@@ -582,17 +598,22 @@ async function renderDashboard() {
     app.querySelectorAll('[data-view]').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
     app.querySelectorAll('.wo-filter-tile').forEach((el) => el.addEventListener('click', () => go('workOrders', JSON.parse(el.dataset.filter))));
 
+    function wireWeekSummaryLinks(root) {
+      root.querySelectorAll('.cal-strip-event-link').forEach((el) => el.addEventListener('click', () => go('calendarEventDetail', { id: el.dataset.eventId })));
+      root.querySelectorAll('.cal-strip-wo-link').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
+    }
     function selectWeekDate(dateKey) {
       selectedWeekDate = dateKey;
       document.getElementById('weekDaySelect').value = dateKey;
       app.querySelectorAll('.cal-strip-day').forEach((el) => el.classList.toggle('cal-strip-selected', el.dataset.date === dateKey));
       const summaryEl = document.getElementById('weekDaySummary');
       summaryEl.innerHTML = weekDaySummaryHtml(dateKey);
-      summaryEl.querySelectorAll('.cal-strip-event-link').forEach((el) => el.addEventListener('click', () => go('calendarEventDetail', { id: el.dataset.eventId })));
+      wireWeekSummaryLinks(summaryEl);
     }
     app.querySelectorAll('.cal-strip-day').forEach((el) => el.addEventListener('click', () => selectWeekDate(el.dataset.date)));
     document.getElementById('weekDaySelect')?.addEventListener('change', (e) => selectWeekDate(e.target.value));
-    document.getElementById('weekDaySummary')?.querySelectorAll('.cal-strip-event-link').forEach((el) => el.addEventListener('click', () => go('calendarEventDetail', { id: el.dataset.eventId })));
+    const initialSummaryEl = document.getElementById('weekDaySummary');
+    if (initialSummaryEl) wireWeekSummaryLinks(initialSummaryEl);
     document.getElementById('viewFullLogBtn')?.addEventListener('click', () => go('activityLog', {}));
     app.querySelectorAll('.widget-toggle').forEach((cb) => cb.addEventListener('change', () => {
       const newPrefs = { ...prefs, [cb.dataset.widget]: cb.checked };
