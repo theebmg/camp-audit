@@ -241,6 +241,7 @@ function componentRowToNocoShape(c) {
     'Est Replacement Year': c.est_replacement_year,
     'Est Replacement Cost': c.est_replacement_cost,
     Notes: c.notes,
+    'Photo URL': c.photo_url,
     Asset: { Id: c.asset_id, Name: c.asset_name },
     'Work Order': c.work_order_id ? { Id: c.work_order_id } : null,
   };
@@ -293,32 +294,69 @@ export async function getAssetDetail(assetId) {
   };
 }
 
+// Flat/EAV property-field changes logged by submitAudit — components already
+// get history for free via asset_components' append-only rows, this covers
+// the rest (Has Key, Window Style, etc.).
+export async function getAssetPropertyHistory(assetId) {
+  const { rows } = await pool.query(
+    `SELECT h.field_key, apf.label, h.old_value, h.new_value, h.changed_by, h.changed_at
+     FROM asset_property_history h
+     LEFT JOIN asset_property_fields apf ON apf.field_key = h.field_key
+     WHERE h.asset_id = $1
+     ORDER BY h.changed_at DESC, h.id DESC`,
+    [assetId]
+  );
+  return rows.map((r) => ({
+    FieldKey: r.field_key, Label: r.label || r.field_key, 'Old Value': r.old_value, 'New Value': r.new_value,
+    ChangedBy: r.changed_by, ChangedAt: r.changed_at,
+  }));
+}
+
 export async function getAssetHistory(assetId) {
-  const [assetRow, componentRows] = await Promise.all([getAssetRow(assetId), getComponentRowsForAsset(assetId)]);
-  return { asset: assetRow ? assetRowToNocoShape(assetRow) : null, componentRows };
+  const [assetRow, componentRows, propertyHistory] = await Promise.all([
+    getAssetRow(assetId), getComponentRowsForAsset(assetId), getAssetPropertyHistory(assetId),
+  ]);
+  return { asset: assetRow ? assetRowToNocoShape(assetRow) : null, componentRows, propertyHistory };
 }
 
 // ── Audit submit (write): one transaction — UPDATE property columns, INSERT
-//    component events, optionally INSERT a linked finding ──────────────────
+//    component events, log property-field history, create inline flags as
+//    condition_findings, optionally INSERT a linked finding + general photos ─
 
-export async function submitAudit(assetId, { properties = {}, componentEvents = [], finding = null }) {
+// Default severity for a quick inline "flag for follow-up" — the lightest
+// tier, since these are call-outs to revisit, not the heavier bolt-on
+// Finding (which has its own explicit severity picker).
+const FLAG_DEFAULT_SEVERITY = '1 - Monitor';
+
+export async function submitAudit(assetId, { properties = {}, componentEvents = [], finding = null, generalPhotos = [] }) {
   const propertyFields = await getAssetPropertyFields();
   const byKey = new Map(propertyFields.map((f) => [f.fieldKey, f]));
-  // properties keyed by fieldKey (e.g. "has_key") — see route for the label->key mapping.
+  const [assetRowBefore, eavValuesBefore] = await Promise.all([getAssetRow(assetId), getAssetPropertyValuesEav(assetId)]);
+  const username = currentUsername();
+
+  // properties keyed by fieldKey (e.g. "has_key") -> { value, flagged, flagNote }.
   const setCols = [];
   const setVals = [];
   const eavUpdates = []; // fields with no real column — go to asset_property_values instead
+  const historyEntries = []; // { fieldKey, oldValue, newValue } — only for fields that actually changed
+  const propertyFlags = []; // { fieldKey, label, value, note }
   let i = 1;
-  for (const [key, value] of Object.entries(properties)) {
+  for (const [key, entry] of Object.entries(properties)) {
     const field = byKey.get(key);
     if (!field) continue; // ignore anything that isn't a live property field
+    const value = entry?.value;
     if (field.options && !field.multi && !field.options.includes(value)) continue;
+    const oldValueRaw = field.columnName ? assetRowBefore?.[field.columnName] : eavValuesBefore.get(key);
+    const oldValue = oldValueRaw == null ? null : String(oldValueRaw);
+    const newValue = value == null ? null : String(value);
+    if (oldValue !== newValue) historyEntries.push({ fieldKey: key, oldValue, newValue });
     if (field.columnName) {
       setCols.push(`${field.columnName} = $${i++}`);
       setVals.push(value);
     } else {
       eavUpdates.push([key, value]);
     }
+    if (entry?.flagged) propertyFlags.push({ fieldKey: key, label: field.title, value: newValue, note: entry.flagNote || null });
   }
 
   const componentCatalog = await getComponentTypeCatalog();
@@ -339,6 +377,22 @@ export async function submitAudit(assetId, { properties = {}, componentEvents = 
         [assetId, fieldKey, value]
       );
     }
+    for (const h of historyEntries) {
+      await client.query(
+        `INSERT INTO asset_property_history (asset_id, field_key, old_value, new_value, changed_by)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [assetId, h.fieldKey, h.oldValue, h.newValue, username]
+      );
+    }
+    for (const f of propertyFlags) {
+      await client.query(
+        `INSERT INTO condition_findings (asset_id, title, severity, description, status, date_identified,
+           source_field_key, flagged_value, created_by)
+         VALUES ($1,$2,$3,$4,'Open',$5,$6,$7,$8)`,
+        [assetId, `${f.label}: ${f.value ?? '—'}`, FLAG_DEFAULT_SEVERITY, f.note || `Flagged during audit (${f.label} = ${f.value ?? '—'})`,
+          today, f.fieldKey, f.value, username]
+      );
+    }
 
     const createdComponents = [];
     for (const ev of componentEvents) {
@@ -349,25 +403,43 @@ export async function submitAudit(assetId, { properties = {}, componentEvents = 
       const observedDate = ev.observedDate || today;
       const { rows } = await client.query(
         `INSERT INTO asset_components (asset_id, component_type, sub_area, event_type, material, condition,
-           observed_installed_date, est_life_years, est_replacement_cost, notes)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+           observed_installed_date, est_life_years, est_replacement_cost, notes, photo_url)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
         [assetId, ev.componentType, ev.subArea || null, eventType, ev.material || null, condition,
-          observedDate, ev.estLifeYears ?? null, ev.estReplacementCost ?? null, ev.notes || null]
+          observedDate, ev.estLifeYears ?? null, ev.estReplacementCost ?? null, ev.notes || null, ev.photoUrl || null]
       );
       createdComponents.push(componentRowToNocoShape(rows[0]));
+      if (ev.flagged) {
+        const label = `${ev.componentType}${condition ? `: ${condition}` : ''}`;
+        await client.query(
+          `INSERT INTO condition_findings (asset_id, title, severity, description, status, date_identified,
+             source_component_type, flagged_value, created_by)
+           VALUES ($1,$2,$3,$4,'Open',$5,$6,$7,$8)`,
+          [assetId, label, FLAG_DEFAULT_SEVERITY, ev.flagNote || `Flagged during audit (${label})`,
+            today, ev.componentType, condition, username]
+        );
+      }
     }
 
     let createdFinding = null;
     if (finding && finding.description && finding.severity) {
       const { rows } = await client.query(
         `INSERT INTO condition_findings (asset_id, title, severity, description, recommended_repair,
-           estimated_hours, estimated_cost, status, date_identified, photo_urls)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'Open',$8,$9) RETURNING *`,
+           estimated_hours, estimated_cost, status, date_identified, photo_urls, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'Open',$8,$9,$10) RETURNING *`,
         [assetId, finding.title || `Finding on Asset #${assetId}`, finding.severity, finding.description,
           finding.recommendedRepair || null, finding.estimatedHours ?? null, finding.estimatedCost ?? null, today,
-          finding.photoUrls || []]
+          finding.photoUrls || [], username]
       );
       createdFinding = rows[0];
+    }
+
+    for (const url of generalPhotos) {
+      if (!url) continue;
+      await client.query(
+        `INSERT INTO asset_photos (asset_id, photo_url, created_by) VALUES ($1,$2,$3)`,
+        [assetId, url, username]
+      );
     }
 
     await client.query('COMMIT');
@@ -416,6 +488,72 @@ export async function getAllComponentRowsWithAssetInfo() {
     componentRows: componentRows.rows.map(componentRowToNocoShape),
     assetById: new Map(assets.rows.map((a) => [a.id, { Id: a.id, Name: a.name, Location: a.location_name ? { Name: a.location_name } : null }])),
   };
+}
+
+// ── Reports v1 (filterable/exportable Assets + Work Orders — see
+//    reports.js for the pure row-shaping/filter/CSV logic that consumes this
+//    raw data; kept out of db.js on purpose, same boundary as
+//    components.js's currentComponentState) ─────────────────────────────
+
+export async function getAssetsReportRawData() {
+  const [assetsRows, propertyFields, eavRows, componentRows, findingsRows] = await Promise.all([
+    pool.query(
+      `SELECT a.*, l.name AS location_name, bt.name AS building_type_name
+       FROM assets a
+       LEFT JOIN locations l ON l.id = a.location_id
+       LEFT JOIN building_types bt ON bt.id = a.building_type_id
+       ORDER BY a.name`
+    ),
+    getAssetPropertyFields(),
+    pool.query('SELECT asset_id, field_key, value FROM asset_property_values'),
+    pool.query('SELECT * FROM asset_components'),
+    pool.query(`SELECT asset_id, source_field_key, source_component_type FROM condition_findings WHERE status = 'Open'`),
+  ]);
+
+  const eavByAsset = new Map();
+  for (const r of eavRows.rows) {
+    if (!eavByAsset.has(r.asset_id)) eavByAsset.set(r.asset_id, new Map());
+    eavByAsset.get(r.asset_id).set(r.field_key, r.value);
+  }
+  const componentRowsByAsset = new Map();
+  for (const r of componentRows.rows) {
+    if (!componentRowsByAsset.has(r.asset_id)) componentRowsByAsset.set(r.asset_id, []);
+    componentRowsByAsset.get(r.asset_id).push(componentRowToNocoShape(r));
+  }
+  const propByKey = new Map(propertyFields.map((f) => [f.fieldKey, f]));
+  const flagsByAsset = new Map();
+  for (const r of findingsRows.rows) {
+    const label = r.source_field_key ? (propByKey.get(r.source_field_key)?.title || r.source_field_key) : (r.source_component_type || 'General');
+    if (!flagsByAsset.has(r.asset_id)) flagsByAsset.set(r.asset_id, new Set());
+    flagsByAsset.get(r.asset_id).add(label);
+  }
+
+  return { assets: assetsRows.rows, propertyFields, eavByAsset, componentRowsByAsset, flagsByAsset };
+}
+
+export async function getWorkOrdersReportRawData() {
+  const [woRows, volRows, venRows] = await Promise.all([
+    pool.query(
+      `SELECT w.id, w.title, w.status, w.priority, w.date_reported, w.date_completed, w.scheduled_date,
+              w.estimated_hours, w.estimated_cost, w.actual_hours, w.actual_cost, w.funding_source,
+              a.name AS asset_name, l.name AS location_name
+       FROM work_orders w
+       LEFT JOIN assets a ON a.id = w.asset_id
+       LEFT JOIN locations l ON l.id = w.location_id
+       ORDER BY w.id DESC`
+    ),
+    pool.query(
+      `SELECT wov.work_order_id, v.name FROM work_order_volunteers wov JOIN volunteers v ON v.id = wov.volunteer_id`
+    ),
+    pool.query(
+      `SELECT wov.work_order_id, vd.name FROM work_order_vendors wov JOIN vendors vd ON vd.id = wov.vendor_id`
+    ),
+  ]);
+  const volByWo = new Map();
+  for (const r of volRows.rows) { if (!volByWo.has(r.work_order_id)) volByWo.set(r.work_order_id, []); volByWo.get(r.work_order_id).push(r.name); }
+  const venByWo = new Map();
+  for (const r of venRows.rows) { if (!venByWo.has(r.work_order_id)) venByWo.set(r.work_order_id, []); venByWo.get(r.work_order_id).push(r.name); }
+  return { workOrders: woRows.rows, volByWo, venByWo };
 }
 
 // ── Ad-hoc field notes (pressure-relief valve — see migration brief's "Ad-hoc

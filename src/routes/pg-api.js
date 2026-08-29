@@ -45,7 +45,12 @@ import {
   listCapitalCampaignProjects, createCapitalCampaignProject, updateCapitalCampaignProject, deleteCapitalCampaignProject,
   listOtherBudgetCategories, createOtherBudgetCategory, updateOtherBudgetCategory, deleteOtherBudgetCategory,
   listCabinHolders, createCabinHolder, updateCabinHolder, deleteCabinHolder,
+  getAssetsReportRawData, getWorkOrdersReportRawData,
 } from '../db.js';
+import {
+  buildAssetReportRows, buildWorkOrderReportRows, assetColumnSpecs, WORK_ORDER_COLUMN_SPECS,
+  columnDefsFromRows, applyReportFilters, rowsToCsv,
+} from '../reports.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -201,16 +206,16 @@ router.patch('/assets/:id', async (req, res, next) => {
 
 router.get('/assets/:id/history', async (req, res, next) => {
   try {
-    const { asset, componentRows } = await getAssetHistory(req.params.id);
+    const { asset, componentRows, propertyHistory } = await getAssetHistory(req.params.id);
     if (!asset) return res.status(404).json({ ok: false, error: 'Asset not found' });
-    res.json({ asset, history: sortHistory(componentRows) });
+    res.json({ asset, history: sortHistory(componentRows), propertyHistory });
   } catch (e) { next(e); }
 });
 
 router.post('/assets/:id/audit', async (req, res, next) => {
   try {
-    const { properties = {}, componentEvents = [], finding = null } = req.body || {};
-    const result = await submitAudit(req.params.id, { properties, componentEvents, finding });
+    const { properties = {}, componentEvents = [], finding = null, generalPhotos = [] } = req.body || {};
+    const result = await submitAudit(req.params.id, { properties, componentEvents, finding, generalPhotos });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
@@ -220,6 +225,62 @@ router.get('/maintenance-log', async (req, res, next) => {
     const { componentType, eventType, from, to } = req.query;
     const entries = await getMaintenanceLog({ componentType, eventType, from, to });
     res.json({ entries });
+  } catch (e) { next(e); }
+});
+
+// ── Reports v1: filterable/exportable Assets + Work Orders. Not the full
+//    custom report builder (arbitrary fields/functions) — deliberately
+//    scoped to a faceted filter + CSV export, with another entity addable
+//    later by following the same pattern (see reports.js). ────────────────
+
+async function getReportRowsAndSpecs(entity) {
+  if (entity === 'assets') {
+    const raw = await getAssetsReportRawData();
+    const componentSchema = await getComponentTypeCatalog();
+    return {
+      rows: buildAssetReportRows(raw, componentSchema.componentTypeOptions),
+      specs: assetColumnSpecs(raw.propertyFields, componentSchema.componentTypeOptions),
+    };
+  }
+  if (entity === 'workOrders') {
+    const raw = await getWorkOrdersReportRawData();
+    return { rows: buildWorkOrderReportRows(raw), specs: WORK_ORDER_COLUMN_SPECS };
+  }
+  return null;
+}
+
+function parseJsonQueryParam(raw) {
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+router.get('/reports/schema', async (req, res, next) => {
+  try {
+    const result = await getReportRowsAndSpecs(req.query.entity);
+    if (!result) return res.status(400).json({ ok: false, error: 'Unknown entity' });
+    res.json({ columns: columnDefsFromRows(result.rows, result.specs) });
+  } catch (e) { next(e); }
+});
+
+router.get('/reports/data', async (req, res, next) => {
+  try {
+    const result = await getReportRowsAndSpecs(req.query.entity);
+    if (!result) return res.status(400).json({ ok: false, error: 'Unknown entity' });
+    res.json({ rows: applyReportFilters(result.rows, parseJsonQueryParam(req.query.filters)) });
+  } catch (e) { next(e); }
+});
+
+router.get('/reports/export', async (req, res, next) => {
+  try {
+    const result = await getReportRowsAndSpecs(req.query.entity);
+    if (!result) return res.status(400).json({ ok: false, error: 'Unknown entity' });
+    const filtered = applyReportFilters(result.rows, parseJsonQueryParam(req.query.filters));
+    const columns = parseJsonQueryParam(req.query.columns);
+    const columnKeys = columns && columns.length ? columns : result.specs.map((s) => s.key);
+    const csv = rowsToCsv(filtered, columnKeys);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${req.query.entity}-report.csv"`);
+    res.send(csv);
   } catch (e) { next(e); }
 });
 

@@ -326,6 +326,7 @@ const NAV_ITEMS = [
   { icon: '👷', label: 'Crew', view: 'crew' },
   { icon: '📋', label: 'Maintenance Log', view: 'maintenanceLog' },
   { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
+  { icon: '📊', label: 'Reports', view: 'reports' },
   { icon: '⚙️', label: 'Admin', view: 'admin' },
 ];
 
@@ -442,6 +443,7 @@ async function render(view, params = {}) {
       assetHistory: () => renderAssetHistory(params),
       capitalPlan: () => renderCapitalPlan(),
       maintenanceLog: () => renderMaintenanceLog(),
+      reports: () => renderReports(params),
       editAsset: () => renderEditAsset(params),
       admin: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderAdminDrilldown() : renderAdminHub()),
       adminCategory: () => renderAdminCategory(params),
@@ -984,6 +986,7 @@ async function renderAssetDetail({ id }, container = app) {
     <div class="card">
       <h3>${escapeHtml(asset.Name)}</h3>
       <div class="muted">${escapeHtml(asset['Asset type'] || '')} · Condition: ${escapeHtml(asset.Condition || 'Unknown')}</div>
+      ${asset['Lodge Holder'] ? `<div class="muted">🏠 Cabin/Lodge Holder: ${escapeHtml(asset['Lodge Holder'])}</div>` : ''}
       <div class="field-row" style="margin-top:12px">
         <label>Building Type</label>
         <select id="buildingTypeSelect"><option value="">— unset —</option>${buildingTypeOptions}</select>
@@ -1067,6 +1070,8 @@ async function renderAudit({ id }) {
     return `<div class="field-row" data-field="${f.fieldKey}">
       <label>${escapeHtml(f.title)}</label>
       ${control}
+      <label class="flag-check"><input type="checkbox" class="flag-toggle" data-flag-for="${f.fieldKey}" /> 🚩 Flag for follow-up</label>
+      <div class="flag-note-wrap" hidden><input type="text" class="flag-note" data-flag-note-for="${f.fieldKey}" placeholder="Optional note" /></div>
     </div>`;
   }
 
@@ -1091,16 +1096,24 @@ async function renderAudit({ id }) {
           </div>
           <div class="field-row"><label>Material</label><input class="comp-material" /></div>
           <div class="field-row"><label>Notes</label><textarea class="comp-notes"></textarea></div>
+          <div class="field-row"><label>Photo (optional)</label><input type="file" class="comp-photo" accept="image/*" capture="environment" /></div>
+          <label class="flag-check"><input type="checkbox" class="comp-flag-toggle" /> 🚩 Flag for follow-up</label>
+          <div class="flag-note-wrap" hidden><input type="text" class="comp-flag-note" placeholder="Optional note" /></div>
         </div>`).join('')}
     </div>` : '';
 
   app.innerHTML = `
     <div class="card">
       <h3>Auditing: ${escapeHtml(asset.Name)}</h3>
+      ${asset['Lodge Holder'] ? `<p class="muted">🏠 Cabin/Lodge Holder: ${escapeHtml(asset['Lodge Holder'])}</p>` : ''}
       <form id="auditForm">
         ${topFieldsHtml}
         ${dependencyBlocks}
         ${componentBlock}
+        <div class="card">
+          <h3>Audit Photos (optional)</h3>
+          <div class="field-row"><label>General condition photos</label><input type="file" name="generalPhotos" accept="image/*" capture="environment" multiple /></div>
+        </div>
         <div class="card">
           <h3>Report a Finding (optional)</h3>
           <div class="field-row"><label>Severity</label>
@@ -1129,6 +1142,17 @@ async function renderAudit({ id }) {
   }
   wireConditionalReveals();
 
+  // Every property field and component card gets a "🚩 Flag for follow-up"
+  // checkbox that reveals an optional note — same toggle behavior either way.
+  document.querySelectorAll('.flag-toggle, .comp-flag-toggle').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const scope = cb.closest('.field-row, .card');
+      const wrap = scope?.querySelector('.flag-note-wrap');
+      if (wrap) wrap.hidden = !cb.checked;
+      cb.closest('.flag-check')?.classList.toggle('flagged', cb.checked);
+    });
+  });
+
   document.getElementById('cancelAuditBtn').addEventListener('click', goBack);
   document.getElementById('auditForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1136,20 +1160,30 @@ async function renderAudit({ id }) {
     const propertiesOut = {};
     properties.fields.forEach((f) => {
       const v = fd.get(`prop_${f.fieldKey}`);
-      if (v) propertiesOut[f.fieldKey] = v;
+      if (!v) return;
+      const flagged = !!document.querySelector(`.flag-toggle[data-flag-for="${f.fieldKey}"]`)?.checked;
+      const flagNote = flagged ? (document.querySelector(`.flag-note[data-flag-note-for="${f.fieldKey}"]`)?.value.trim() || null) : null;
+      propertiesOut[f.fieldKey] = { value: v, flagged, flagNote };
     });
+
     const componentEvents = [];
-    document.querySelectorAll('#componentPromptBlock [data-component]').forEach((card) => {
+    for (const card of document.querySelectorAll('#componentPromptBlock [data-component]')) {
       const condition = card.querySelector('.comp-condition').value;
       const eventType = card.querySelector('.comp-event').value;
       const material = card.querySelector('.comp-material').value;
       const notes = card.querySelector('.comp-notes').value;
-      if (!condition && !material && !notes) return; // skip untouched component cards
-      componentEvents.push({ componentType: card.dataset.component, eventType, condition, material, notes });
-    });
+      const flagged = !!card.querySelector('.comp-flag-toggle')?.checked;
+      const flagNote = flagged ? (card.querySelector('.comp-flag-note')?.value.trim() || null) : null;
+      const photoFile = card.querySelector('.comp-photo')?.files?.[0];
+      if (!condition && !material && !notes && !flagged && !photoFile) continue; // skip untouched component cards
+      const photoUrl = photoFile && photoFile.size ? await uploadPhotoFile(photoFile, 'components', id) : null;
+      componentEvents.push({ componentType: card.dataset.component, eventType, condition, material, notes, flagged, flagNote, photoUrl });
+    }
+
     const severity = fd.get('findingSeverity');
     const description = fd.get('findingDescription');
     const findingPhotos = fd.getAll('findingPhoto').filter((f) => f && f.size);
+    const generalPhotoFiles = fd.getAll('generalPhotos').filter((f) => f && f.size);
 
     try {
       let finding = null;
@@ -1158,7 +1192,9 @@ async function renderAudit({ id }) {
         for (const file of findingPhotos) photoUrls.push(await uploadPhotoFile(file, 'findings', id));
         finding = { severity, description, photoUrls };
       }
-      await api(`/api/pg/assets/${id}/audit`, { method: 'POST', body: JSON.stringify({ properties: propertiesOut, componentEvents, finding }) });
+      const generalPhotos = [];
+      for (const file of generalPhotoFiles) generalPhotos.push(await uploadPhotoFile(file, 'asset-photos', id));
+      await api(`/api/pg/assets/${id}/audit`, { method: 'POST', body: JSON.stringify({ properties: propertiesOut, componentEvents, finding, generalPhotos }) });
       toast('Audit submitted');
       state.stack.pop(); // drop this audit entry
       go('assetDetail', { id }, { replace: true });
@@ -1169,14 +1205,29 @@ async function renderAudit({ id }) {
 async function renderAssetHistory({ id }) {
   setChrome({ title: 'History', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const { asset, history } = await api(`/api/pg/assets/${id}/history`);
-  app.innerHTML = `<div class="card"><h3>${escapeHtml(asset.Name)} — Component History</h3></div>` +
-    (history.length ? history.map((h) => `
+  const { asset, history, propertyHistory } = await api(`/api/pg/assets/${id}/history`);
+  // Component events and property-field changes are two different record
+  // shapes (and property changes have no natural "sort date" beyond when they
+  // were made) — tag each with a common Date/kind pair so they can merge into
+  // one newest-first timeline instead of two separate lists.
+  const merged = [
+    ...history.map((h) => ({ kind: 'component', date: h['Observed/Installed Date'] || null, sortKey: h['Observed/Installed Date'] || '', h })),
+    ...propertyHistory.map((h) => ({ kind: 'property', date: h.ChangedAt, sortKey: h.ChangedAt, h })),
+  ].sort((a, b) => (a.sortKey < b.sortKey ? 1 : a.sortKey > b.sortKey ? -1 : 0));
+
+  app.innerHTML = `<div class="card"><h3>${escapeHtml(asset.Name)} — History</h3></div>` +
+    (merged.length ? merged.map(({ kind, h }) => kind === 'component' ? `
       <div class="card">
         <div><strong>${escapeHtml(h['Component Type'])}</strong> — ${escapeHtml(h['Event Type'] || '')}
           <span class="pill ${conditionPillClass(h.Condition)}">${escapeHtml(h.Condition || '')}</span></div>
         <div class="muted">${escapeHtml(formatDateNice(h['Observed/Installed Date']))} · ${escapeHtml(h.Material || '')}</div>
         ${h.Notes ? `<div>${escapeHtml(h.Notes)}</div>` : ''}
+        ${h['Photo URL'] ? `<a href="${escapeHtml(h['Photo URL'])}" target="_blank" rel="noopener"><img src="${escapeHtml(h['Photo URL'])}" alt="" style="max-width:120px;border-radius:8px;margin-top:6px;display:block" /></a>` : ''}
+      </div>` : `
+      <div class="card">
+        <div><strong>${escapeHtml(h.Label)}</strong> changed</div>
+        <div class="muted">${escapeHtml(h['Old Value'] ?? '—')} → <strong>${escapeHtml(h['New Value'] ?? '—')}</strong></div>
+        <div class="muted">${new Date(h.ChangedAt).toLocaleString()}${h.ChangedBy ? ` · ${escapeHtml(h.ChangedBy)}` : ''}</div>
       </div>`).join('') : '<p class="muted">No history yet.</p>');
 }
 
@@ -1464,6 +1515,156 @@ async function renderMaintenanceLog() {
     wireTableViewToggle(draw);
   }
 
+  draw();
+}
+
+// ---------- Reports v1: filterable/exportable Assets + Work Orders ----------
+// Deliberately NOT the full custom report builder (arbitrary fields/
+// functions) discussed with the user — that's explicitly deferred. This is
+// the scoped-down "pick a table, filter it, export it" version: faceted
+// filters (checking multiple values within one field is OR, different
+// fields AND together), every filter pre-populated from real data so nothing
+// can typo its way to zero results, and a CSV export of whatever's on screen.
+
+async function renderReports(params = {}) {
+  setChrome({ title: 'Reports', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+
+  let entity = params.entity === 'workOrders' ? 'workOrders' : 'assets';
+  let columns = [];
+  let selectedFilters = {}; // { [columnKey]: Set<string> }
+  let visibleColumns = new Set();
+  let openGroups = new Set();
+  let columnsPickerOpen = false;
+  let rows = [];
+
+  async function loadSchema() {
+    const { columns: cols } = await api(`/api/pg/reports/schema?entity=${entity}`);
+    columns = cols;
+    selectedFilters = {};
+    visibleColumns = new Set(columns.filter((c) => c.default).map((c) => c.key));
+    openGroups = new Set(columns[0] ? [columns[0].group] : []);
+  }
+
+  async function loadData() {
+    const filters = {};
+    for (const [k, set] of Object.entries(selectedFilters)) if (set.size) filters[k] = [...set];
+    const res = await api(`/api/pg/reports/data?entity=${entity}&filters=${encodeURIComponent(JSON.stringify(filters))}`);
+    rows = res.rows;
+  }
+
+  function groupedColumns() {
+    const groups = new Map();
+    for (const c of columns) {
+      if (!groups.has(c.group)) groups.set(c.group, []);
+      groups.get(c.group).push(c);
+    }
+    return groups;
+  }
+
+  function exportUrl() {
+    const filters = {};
+    for (const [k, set] of Object.entries(selectedFilters)) if (set.size) filters[k] = [...set];
+    const cols = columns.filter((c) => visibleColumns.has(c.key)).map((c) => c.key);
+    return `/api/pg/reports/export?entity=${entity}&filters=${encodeURIComponent(JSON.stringify(filters))}&columns=${encodeURIComponent(JSON.stringify(cols))}`;
+  }
+
+  function draw() {
+    const groups = groupedColumns();
+    const visibleCols = columns.filter((c) => visibleColumns.has(c.key));
+    setApp(`
+      <div class="card">
+        <div class="view-toggle">
+          <button type="button" class="view-toggle-btn entity-switch ${entity === 'assets' ? 'active' : ''}" data-entity="assets">Assets</button>
+          <button type="button" class="view-toggle-btn entity-switch ${entity === 'workOrders' ? 'active' : ''}" data-entity="workOrders">Work Orders</button>
+        </div>
+        <p class="muted" style="margin-top:10px;margin-bottom:0">A full custom report builder is planned for later — this covers filtering and exporting what's already here.</p>
+      </div>
+      <div class="reports-layout">
+        <div class="card reports-filters">
+          <h3>Filters</h3>
+          ${[...groups.entries()].map(([group, cols]) => `
+            <details class="report-filter-group" data-group="${escapeHtml(group)}" ${openGroups.has(group) ? 'open' : ''}>
+              <summary>${escapeHtml(group)}</summary>
+              ${cols.map((c) => `
+                <div class="report-filter-field">
+                  <div class="report-filter-label">${escapeHtml(c.label)}${selectedFilters[c.key]?.size ? ` <span class="pill">${selectedFilters[c.key].size}</span>` : ''}</div>
+                  <div class="report-filter-options">
+                    ${c.options.length ? c.options.map((o) => `
+                      <label class="report-chip"><input type="checkbox" class="report-filter-cb" data-filter-key="${escapeHtml(c.key)}" value="${escapeHtml(String(o))}" ${selectedFilters[c.key]?.has(String(o)) ? 'checked' : ''} /> ${escapeHtml(String(o))}</label>
+                    `).join('') : '<span class="muted" style="font-size:0.8rem">No values yet</span>'}
+                  </div>
+                </div>`).join('')}
+            </details>`).join('')}
+        </div>
+        <div class="reports-main">
+          <div class="card">
+            <div class="btn-row" style="justify-content:space-between;align-items:center;flex-wrap:wrap">
+              <span class="muted">${rows.length} result${rows.length === 1 ? '' : 's'}</span>
+              <div class="btn-row" style="margin:0">
+                <details class="report-columns-picker" ${columnsPickerOpen ? 'open' : ''}>
+                  <summary class="btn btn-secondary">Columns</summary>
+                  <div class="report-columns-menu">
+                    ${[...groups.entries()].map(([group, cols]) => `
+                      <div class="report-columns-group-label">${escapeHtml(group)}</div>
+                      ${cols.map((c) => `<label class="report-chip"><input type="checkbox" class="report-col-toggle" data-col-key="${escapeHtml(c.key)}" ${visibleColumns.has(c.key) ? 'checked' : ''} /> ${escapeHtml(c.label)}</label>`).join('')}
+                    `).join('')}
+                  </div>
+                </details>
+                <a class="btn btn-primary" href="${exportUrl()}" target="_blank" rel="noopener">Export CSV</a>
+              </div>
+            </div>
+          </div>
+          <div class="card" style="overflow-x:auto">
+            <table class="report-table">
+              <thead><tr>${visibleCols.map((c) => `<th>${escapeHtml(c.label)}</th>`).join('')}</tr></thead>
+              <tbody>${rows.length ? rows.map((r) => `
+                <tr class="clickable-row" data-id="${r._id}" data-entity="${r._entity}">
+                  ${visibleCols.map((c) => `<td data-label="${escapeHtml(c.label)}">${escapeHtml(r[c.key] == null ? '—' : String(r[c.key]))}</td>`).join('')}
+                </tr>`).join('') : `<tr><td colspan="${visibleCols.length || 1}" class="muted">No matching records.</td></tr>`}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>`);
+    wire();
+  }
+
+  function wire() {
+    app.querySelectorAll('.entity-switch').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        if (btn.dataset.entity === entity) return;
+        entity = btn.dataset.entity;
+        columnsPickerOpen = false;
+        app.innerHTML = LOADING_HTML;
+        await loadSchema();
+        await loadData();
+        draw();
+      });
+    });
+    app.querySelectorAll('.report-filter-group').forEach((d) => d.addEventListener('toggle', () => {
+      if (d.open) openGroups.add(d.dataset.group); else openGroups.delete(d.dataset.group);
+    }));
+    const colsPicker = app.querySelector('.report-columns-picker');
+    colsPicker?.addEventListener('toggle', () => { columnsPickerOpen = colsPicker.open; });
+    app.querySelectorAll('.report-col-toggle').forEach((cb) => cb.addEventListener('change', () => {
+      if (cb.checked) visibleColumns.add(cb.dataset.colKey); else visibleColumns.delete(cb.dataset.colKey);
+      draw();
+    }));
+    app.querySelectorAll('.report-filter-cb').forEach((cb) => cb.addEventListener('change', async () => {
+      const key = cb.dataset.filterKey;
+      if (!selectedFilters[key]) selectedFilters[key] = new Set();
+      if (cb.checked) selectedFilters[key].add(cb.value); else selectedFilters[key].delete(cb.value);
+      await loadData();
+      draw();
+    }));
+    app.querySelectorAll('tr.clickable-row[data-id]').forEach((tr) => tr.addEventListener('click', () => {
+      if (tr.dataset.entity === 'asset') go('assetDetail', { id: tr.dataset.id });
+      else go('workOrderDetail', { id: tr.dataset.id });
+    }));
+  }
+
+  await loadSchema();
+  await loadData();
   draw();
 }
 

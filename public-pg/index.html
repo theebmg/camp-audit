@@ -22,6 +22,15 @@
       font-size: 1rem; font-family: inherit; background: var(--surface); color: var(--text);
     }
     .field-row textarea { min-height: 70px; resize: vertical; }
+    /* Inline "flag this answer" control on every audit question — deliberately
+       understated (muted, small) until checked, so it doesn't compete with the
+       actual field for attention. */
+    .flag-check { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; font-weight: 500;
+      color: var(--muted); margin-top: 8px; cursor: pointer; }
+    .flag-check input { width: auto; margin: 0; }
+    .flag-check.flagged { color: var(--danger); }
+    .flag-note-wrap { margin-top: 6px; }
+    .flag-note-wrap input { font-size: 0.85rem; padding: 7px 10px; }
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
       padding: 16px; margin-bottom: 14px; box-shadow: var(--shadow-sm); }
     .card h3 { margin: 0 0 10px; font-size: 1rem; }
@@ -309,6 +318,31 @@
     .cal-sidebar { flex: 1; min-width: 240px; max-width: 340px; }
     @media (max-width: 900px) { .cal-layout { flex-direction: column; } .cal-sidebar { max-width: none; width: 100%; } }
     .cal-scroll { overflow-x: auto; }
+
+    /* Reports tab: a filter sidebar (faceted checkbox groups) + a results
+       table, same side-by-side pattern as the Calendar. */
+    .reports-layout { display: flex; gap: 18px; align-items: flex-start; }
+    .reports-filters { flex: 1; min-width: 260px; max-width: 340px; max-height: calc(100vh - 220px); overflow-y: auto; position: sticky; top: 14px; }
+    .reports-main { flex: 3; min-width: 0; }
+    @media (max-width: 900px) { .reports-layout { flex-direction: column; } .reports-filters { max-width: none; width: 100%; position: static; max-height: none; } }
+    .report-filter-group { margin-bottom: 10px; }
+    .report-filter-group summary { cursor: pointer; font-weight: 700; padding: 6px 0; }
+    .report-filter-field { margin: 8px 0 12px; }
+    .report-filter-label { font-size: 0.85rem; font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+    .report-filter-label .pill { padding: 1px 7px; font-size: 0.7rem; }
+    .report-filter-options { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px;
+      padding: 6px 8px; background: var(--surface-alt); border-radius: var(--radius-sm); }
+    .report-chip { display: flex; align-items: center; gap: 6px; font-size: 0.82rem; font-weight: 500; cursor: pointer; }
+    .report-chip input { width: auto; margin: 0; }
+    .report-columns-picker { position: relative; display: inline-block; }
+    .report-columns-picker summary { list-style: none; cursor: pointer; }
+    .report-columns-picker summary::-webkit-details-marker { display: none; }
+    .report-columns-menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 20; width: 260px; max-height: 360px;
+      overflow-y: auto; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      box-shadow: var(--shadow-md); padding: 10px; display: flex; flex-direction: column; gap: 4px; }
+    .report-columns-group-label { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; color: var(--muted);
+      margin: 8px 0 2px; }
+    .report-columns-group-label:first-child { margin-top: 0; }
     .cal-grid { display: grid; grid-template-columns: repeat(7, minmax(100px, 1fr)); gap: 1px;
       background: var(--border); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
     .cal-head { background: var(--surface-alt); padding: 6px 8px; font-size: 0.78rem; font-weight: 700; color: var(--muted); text-align: center; }
