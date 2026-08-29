@@ -393,7 +393,7 @@ async function render(view, params = {}) {
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
       adminChecklistTemplates: () => renderAdminChecklistTemplates(),
-      workOrders: () => renderWorkOrders(),
+      workOrders: () => renderWorkOrders(params),
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
       crew: () => renderCrew(),
@@ -454,14 +454,17 @@ async function renderDashboard() {
   const weekDays = Array.from({ length: 7 }, (_, i) => { const d = new Date(weekStart); d.setDate(weekStart.getDate() + i); return d; });
   const weekEnd = weekDays[6];
 
+  let selectedWeekDate = isoDate(today);
+  const weekOccByDay = new Map();
+
   const [woSummary, calRes, activityRes] = await Promise.all([
     prefs.woOverview ? api('/api/pg/dashboard/wo-summary') : Promise.resolve(null),
     prefs.calendar ? api(`/api/pg/calendar-events?from=${isoDate(weekStart)}&to=${isoDate(weekEnd)}`) : Promise.resolve(null),
     prefs.activity ? api(`/api/pg/activity-log?limit=12${isAdmin ? '' : `&username=${encodeURIComponent(currentUser.username || '')}`}`) : Promise.resolve(null),
   ]);
 
-  function statTile(n, label, colorClass, view) {
-    return `<div class="bucket-tile tile-${colorClass}${view ? ' clickable-tile' : ''}" ${view ? `data-view="${view}"` : ''}>
+  function statTile(n, label, colorClass, filterParams) {
+    return `<div class="bucket-tile tile-${colorClass}${filterParams ? ' clickable-tile wo-filter-tile' : ''}" ${filterParams ? `data-filter='${JSON.stringify(filterParams)}'` : ''}>
       <div class="n">${n}</div><div class="muted">${escapeHtml(label)}</div>
     </div>`;
   }
@@ -473,35 +476,35 @@ async function renderDashboard() {
       <h3>Work Orders</h3>
       <p class="muted" style="margin-top:-6px">By status</p>
       <div class="summary-buckets">
-        ${statTile(s.Open, 'Open', 'neutral', 'workOrders')}
-        ${statTile(s.InProgress, 'In Progress', 'pop', 'workOrders')}
-        ${statTile(s.OnHold, 'On Hold', 'warn', 'workOrders')}
-        ${statTile(s.Urgent, 'Urgent', 'bad', 'workOrders')}
-        ${statTile(s.Done, 'Done', 'good', 'workOrders')}
+        ${statTile(s.Open, 'Open', 'neutral', { status: 'Open' })}
+        ${statTile(s.InProgress, 'In Progress', 'pop', { status: 'In Progress' })}
+        ${statTile(s.OnHold, 'On Hold', 'warn', { status: 'On Hold' })}
+        ${statTile(s.Urgent, 'Urgent', 'bad', { status: 'Urgent' })}
+        ${statTile(s.Done, 'Done', 'good', { status: 'Done' })}
       </div>
       <p class="muted">By schedule (open WOs only)</p>
       <div class="summary-buckets">
-        ${statTile(s.PastDue, 'Past Due', 'bad', 'workOrders')}
-        ${statTile(s.DueToday, 'Due Today', 'pop', 'workOrders')}
-        ${statTile(s.DueFuture, 'Due Later', 'good', 'workOrders')}
-        ${statTile(s.Unscheduled, 'Unscheduled', 'neutral', 'workOrders')}
+        ${statTile(s.PastDue, 'Past Due', 'bad', { schedule: 'pastDue' })}
+        ${statTile(s.DueToday, 'Due Today', 'pop', { schedule: 'dueToday' })}
+        ${statTile(s.DueFuture, 'Due Later', 'good', { schedule: 'dueFuture' })}
+        ${statTile(s.Unscheduled, 'Unscheduled', 'neutral', { schedule: 'unscheduled' })}
       </div>
     </div>`;
   }
 
   function calendarStripHtml() {
     if (!calRes) return '';
-    const occByDay = new Map();
+    weekOccByDay.clear();
     for (const occ of calRes.occurrences) {
       const key = occ.OccurrenceDate;
-      if (!occByDay.has(key)) occByDay.set(key, []);
-      occByDay.get(key).push(occ);
+      if (!weekOccByDay.has(key)) weekOccByDay.set(key, []);
+      weekOccByDay.get(key).push(occ);
     }
     const todayStr = isoDate(today);
     const cells = weekDays.map((d) => {
       const key = isoDate(d);
-      const dayEvents = occByDay.get(key) || [];
-      return `<div class="cal-strip-day ${key === todayStr ? 'cal-strip-today' : ''}" data-month="${d.getMonth()}" data-year="${d.getFullYear()}">
+      const dayEvents = weekOccByDay.get(key) || [];
+      return `<div class="cal-strip-day ${key === todayStr ? 'cal-strip-today' : ''} ${key === selectedWeekDate ? 'cal-strip-selected' : ''}" data-date="${key}">
         <div class="cal-strip-dow">${d.toLocaleDateString('default', { weekday: 'short' })}</div>
         <div class="cal-strip-num">${d.getDate()}</div>
         ${dayEvents.slice(0, 2).map((e) => `<div class="cal-strip-event">${escapeHtml(e.Title)}</div>`).join('')}
@@ -510,19 +513,36 @@ async function renderDashboard() {
     }).join('');
     return `<div class="card">
       <h3>This Week</h3>
+      <div class="field-row" style="margin-bottom:10px"><select id="weekDaySelect">
+        ${weekDays.map((d) => `<option value="${isoDate(d)}" ${isoDate(d) === selectedWeekDate ? 'selected' : ''}>${d.toLocaleDateString('default', { weekday: 'long', month: 'short', day: 'numeric' })}${isoDate(d) === todayStr ? ' (Today)' : ''}</option>`).join('')}
+      </select></div>
       <div class="cal-strip">${cells}</div>
+      <div id="weekDaySummary" style="margin-top:14px">${weekDaySummaryHtml(selectedWeekDate)}</div>
     </div>`;
+  }
+
+  function weekDaySummaryHtml(dateKey) {
+    const dayEvents = weekOccByDay.get(dateKey) || [];
+    const label = new Date(`${dateKey}T00:00:00`).toLocaleDateString('default', { weekday: 'long', month: 'long', day: 'numeric' });
+    if (!dayEvents.length) return `<p class="muted">No events scheduled for ${escapeHtml(label)}.</p>`;
+    return `<p class="muted" style="margin-bottom:6px">${escapeHtml(label)}</p>` + dayEvents.map((e) => `
+      <div class="list-item cal-strip-event-link" style="cursor:pointer" data-event-id="${e.Id}">
+        <span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span>
+        ${e.WorkOrderId ? `<span class="pill">linked WO</span>` : ''}
+      </div>`).join('');
   }
 
   function activityHtml() {
     if (!activityRes) return '';
-    const entries = activityRes.entries.filter((e) => e.Action !== 'toggled');
+    // The dashboard is a "what's been accomplished" glance, not an audit
+    // trail — deletions (and routine toggles) stay out of it but are still
+    // fully visible in Admin > Activity Log for the "what got deleted" case.
+    const entries = activityRes.entries.filter((e) => e.Action !== 'toggled' && e.Action !== 'deleted');
     return `<div class="card">
       <h3>${isAdmin ? 'Recent Activity (everyone)' : 'Your Recent Activity'}</h3>
       ${entries.length ? entries.map((e) => `
         <div class="list-item" style="cursor:default">
-          <span><span class="pill ${ACTIVITY_ACTION_PILL[e.Action] || ''}">${escapeHtml(e.Action)}</span>
-            ${escapeHtml(e.EntityType.replace(/_/g, ' '))}: <strong>${escapeHtml(e.EntityLabel || '')}</strong></span>
+          <span>${escapeHtml(activityNarrative(e))}</span>
           <span class="muted">${new Date(e.OccurredAt).toLocaleString()}${isAdmin ? ` · ${escapeHtml(e.Username || '')}` : ''}</span>
         </div>`).join('') : '<p class="muted">Nothing yet.</p>'}
       <div class="btn-row"><button class="btn btn-secondary" id="viewFullLogBtn">View Full Activity Log</button></div>
@@ -553,7 +573,19 @@ async function renderDashboard() {
       ${activityHtml()}
     `);
     app.querySelectorAll('[data-view]').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
-    app.querySelectorAll('.cal-strip-day').forEach((el) => el.addEventListener('click', () => go('calendar', { month: Number(el.dataset.month), year: Number(el.dataset.year) })));
+    app.querySelectorAll('.wo-filter-tile').forEach((el) => el.addEventListener('click', () => go('workOrders', JSON.parse(el.dataset.filter))));
+
+    function selectWeekDate(dateKey) {
+      selectedWeekDate = dateKey;
+      document.getElementById('weekDaySelect').value = dateKey;
+      app.querySelectorAll('.cal-strip-day').forEach((el) => el.classList.toggle('cal-strip-selected', el.dataset.date === dateKey));
+      const summaryEl = document.getElementById('weekDaySummary');
+      summaryEl.innerHTML = weekDaySummaryHtml(dateKey);
+      summaryEl.querySelectorAll('.cal-strip-event-link').forEach((el) => el.addEventListener('click', () => go('calendarEventDetail', { id: el.dataset.eventId })));
+    }
+    app.querySelectorAll('.cal-strip-day').forEach((el) => el.addEventListener('click', () => selectWeekDate(el.dataset.date)));
+    document.getElementById('weekDaySelect')?.addEventListener('change', (e) => selectWeekDate(e.target.value));
+    document.getElementById('weekDaySummary')?.querySelectorAll('.cal-strip-event-link').forEach((el) => el.addEventListener('click', () => go('calendarEventDetail', { id: el.dataset.eventId })));
     document.getElementById('viewFullLogBtn')?.addEventListener('click', () => go('activityLog', {}));
     app.querySelectorAll('.widget-toggle').forEach((cb) => cb.addEventListener('change', () => {
       const newPrefs = { ...prefs, [cb.dataset.widget]: cb.checked };
@@ -1127,10 +1159,12 @@ async function renderCapitalPlan() {
       </tr>`).join('');
 
     setApp(`
-      ${budgetSectionHtml()}
-      ${fundingGroupHtml('campaign', budgetOverview.CapitalCampaignProjects)}
-      ${fundingGroupHtml('cabin', budgetOverview.CabinHolders)}
-      ${fundingGroupHtml('other', budgetOverview.OtherCategories)}
+      <div class="budget-grid">
+        ${budgetSectionHtml()}
+        ${fundingGroupHtml('campaign', budgetOverview.CapitalCampaignProjects)}
+        ${fundingGroupHtml('cabin', budgetOverview.CabinHolders)}
+        ${fundingGroupHtml('other', budgetOverview.OtherCategories)}
+      </div>
 
       <div class="card"><h3>📐 Component Replacement Forecast</h3><p class="muted">Upcoming component replacements by urgency — independent of funding source above.</p></div>
       <div class="summary-buckets">${buckets}</div>
@@ -1361,6 +1395,18 @@ async function renderAdminCategory({ category }) {
 const ACTIVITY_ACTION_PILL = {
   created: 'good', deleted: 'bad', deactivated: 'bad', updated: '', completed: 'good', reactivated: 'good',
 };
+// Plain-English phrasing for the Dashboard's Recent Activity feed — "Work
+// order created: X" / "Progress logged on X" instead of a raw action+type
+// pill, since this widget is meant to read like a log of what got done.
+function activityNarrative(e) {
+  const typeLabel = e.EntityType.replace(/_/g, ' ');
+  const typeLabelCap = typeLabel.charAt(0).toUpperCase() + typeLabel.slice(1);
+  if (e.EntityType === 'work_order_log_entry') return `Progress logged on "${e.EntityLabel}"${e.Details ? ` (${e.Details})` : ''}`;
+  if (e.EntityType === 'work_order' && e.Action === 'completed') return `Work order completed: ${e.EntityLabel}`;
+  if (e.Action === 'created') return `${typeLabelCap} created: ${e.EntityLabel}`;
+  if (e.Action === 'updated') return `${typeLabelCap} updated: ${e.EntityLabel}`;
+  return `${typeLabelCap} ${e.Action}: ${e.EntityLabel}`;
+}
 // "Routine toggles" (checking a task/checklist step, flipping an
 // applicability-matrix cell, ...) are logged with action 'toggled' — high
 // frequency, low stakes. Whether to show them by default is remembered per
@@ -1943,6 +1989,10 @@ async function renderCalendar(params = {}) {
     }
 
     setApp(`
+      ${params.fromWorkOrderId ? `
+        <div class="btn-row" style="margin-bottom:10px">
+          <button class="btn btn-secondary" id="backToWoBtn">← Back to Work Order${params.fromWorkOrderTitle ? `: ${escapeHtml(params.fromWorkOrderTitle)}` : ''}</button>
+        </div>` : ''}
       <div class="cal-header">
         <button class="btn btn-secondary" id="prevMonthBtn">‹ Prev</button>
         <h3>${monthLabel}</h3>
@@ -1970,6 +2020,7 @@ async function renderCalendar(params = {}) {
   }
 
   function wire() {
+    document.getElementById('backToWoBtn')?.addEventListener('click', () => go('workOrderDetail', { id: params.fromWorkOrderId }));
     document.getElementById('prevMonthBtn').addEventListener('click', () => {
       viewMonth--; if (viewMonth < 0) { viewMonth = 11; viewYear--; } draw();
     });
@@ -2342,15 +2393,32 @@ function daysSince(dateStr) {
   return Math.floor((Date.now() - new Date(dateStr).getTime()) / 86400000);
 }
 
-async function renderWorkOrders() {
+const WO_SCHEDULE_FILTER_LABELS = { pastDue: 'Past Due', dueToday: 'Due Today', dueFuture: 'Due Later', unscheduled: 'Unscheduled' };
+function matchesScheduleFilter(w, key) {
+  if (w.Status === 'Done') return false;
+  const sd = w['Scheduled Date'] ? w['Scheduled Date'].slice(0, 10) : null;
+  const todayStr = new Date().toISOString().slice(0, 10);
+  if (key === 'unscheduled') return !sd;
+  if (!sd) return false;
+  if (key === 'pastDue') return sd < todayStr;
+  if (key === 'dueToday') return sd === todayStr;
+  if (key === 'dueFuture') return sd > todayStr;
+  return true;
+}
+
+async function renderWorkOrders(params = {}) {
   setChrome({ title: 'Work Orders', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
   const { workOrders } = await api('/api/pg/work-orders');
   let cols = getWoColumnPrefs();
+  let statusFilter = params.status || null;
+  let scheduleFilter = params.schedule || null;
 
   function draw() {
     const mode = getTableViewMode();
-    const cardRows = workOrders.map((w) => {
+    const visibleWOs = workOrders.filter((w) =>
+      (!statusFilter || w.Status === statusFilter) && (!scheduleFilter || matchesScheduleFilter(w, scheduleFilter)));
+    const cardRows = visibleWOs.map((w) => {
       const days = daysSince(w['Date Reported']);
       const bits = [];
       if (cols.asset && w.Asset) bits.push(escapeHtml(w.Asset.Name));
@@ -2364,9 +2432,9 @@ async function renderWorkOrders() {
         <span>${escapeHtml(w.Title)}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}</span>
         ${cols.status ? `<span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status || '')}</span>` : ''}
       </div>`;
-    }).join('') || '<p class="muted">No work orders yet.</p>';
+    }).join('') || `<p class="muted">${(statusFilter || scheduleFilter) ? 'Nothing matches this filter.' : 'No work orders yet.'}</p>`;
 
-    const tableRows = workOrders.map((w) => {
+    const tableRows = visibleWOs.map((w) => {
       const days = daysSince(w['Date Reported']);
       return `<tr class="clickable-row" data-id="${w.Id}">
         <td data-label="Title">${escapeHtml(w.Title)}</td>
@@ -2381,12 +2449,14 @@ async function renderWorkOrders() {
       </tr>`;
     }).join('');
     const visibleCols = WO_LIST_COLUMNS.filter((c) => cols[c.key]);
+    const filterLabel = statusFilter || (scheduleFilter ? WO_SCHEDULE_FILTER_LABELS[scheduleFilter] : null);
 
     setApp(`
       <div class="btn-row" style="margin-bottom:12px;justify-content:space-between">
         <button class="btn btn-primary" id="newWoBtnTop">+ New Work Order</button>
         ${tableViewToggleHtml(mode)}
       </div>
+      ${filterLabel ? `<div class="btn-row" style="margin:-6px 0 12px"><button class="btn btn-secondary" id="clearWoFilter">✕ Filtered: ${escapeHtml(filterLabel)}</button></div>` : ''}
       ${mode === 'table' ? `
         <details class="card" style="margin-bottom:12px">
           <summary style="cursor:pointer;font-weight:700">Columns</summary>
@@ -2399,12 +2469,13 @@ async function renderWorkOrders() {
         <div class="card" style="overflow-x:auto">
           <table class="report-table">
             <thead><tr><th>Title</th>${visibleCols.map((c) => `<th>${escapeHtml(c.label)}</th>`).join('')}</tr></thead>
-            <tbody>${tableRows || `<tr><td colspan="${visibleCols.length + 1}" class="muted">No work orders yet.</td></tr>`}</tbody>
+            <tbody>${tableRows || `<tr><td colspan="${visibleCols.length + 1}" class="muted">${filterLabel ? 'Nothing matches this filter.' : 'No work orders yet.'}</td></tr>`}</tbody>
           </table>
         </div>` : cardRows}
     `);
 
     document.getElementById('newWoBtnTop').addEventListener('click', () => go('newWorkOrder', {}));
+    document.getElementById('clearWoFilter')?.addEventListener('click', () => { statusFilter = null; scheduleFilter = null; draw(); });
     app.querySelectorAll('.list-item[data-id], tr.clickable-row').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.id })));
     wireTableViewToggle(draw);
     app.querySelectorAll('.col-toggle').forEach((cb) => cb.addEventListener('click', (e) => e.stopPropagation()));
@@ -2847,7 +2918,7 @@ async function renderWorkOrderDetail({ id }) {
   document.getElementById('viewOnCalendarLink')?.addEventListener('click', (e) => {
     e.preventDefault();
     const d = new Date(wo['Scheduled Date']);
-    go('calendar', { month: d.getMonth(), year: d.getFullYear() });
+    go('calendar', { month: d.getMonth(), year: d.getFullYear(), fromWorkOrderId: id, fromWorkOrderTitle: wo.Title });
   });
 
   document.getElementById('addTaskBtn').addEventListener('click', async () => {

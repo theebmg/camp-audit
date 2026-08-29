@@ -91,6 +91,7 @@
     }
     .cal-strip-day:hover { background: var(--surface-alt); box-shadow: var(--shadow-sm); }
     .cal-strip-today { border-color: var(--accent); background: var(--accent-soft); }
+    .cal-strip-selected { box-shadow: inset 0 0 0 2px var(--accent); }
     .cal-strip-dow { font-size: 0.72rem; color: var(--muted); font-weight: 700; text-transform: uppercase; }
     .cal-strip-num { font-size: 1.1rem; font-weight: 800; margin-bottom: 4px; }
     .cal-strip-event {
@@ -163,6 +164,16 @@
     }
     .viz-tooltip.visible { opacity: 1; }
     .viz-tooltip .viz-tooltip-value { font-weight: 800; color: var(--viz-ink); }
+
+    /* Capital Plan's budget cards were stretching to the full (now-widened)
+       page width, which looked awkward for content that isn't naturally that
+       wide. Cap the group's width, center it, and let cards go two-wide when
+       there's room. */
+    .budget-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+      gap: 16px; max-width: 1000px; margin: 0 auto 16px;
+    }
+    .budget-grid .card { margin-bottom: 0; }
     @media (max-width: 640px) { .cal-strip { grid-template-columns: repeat(7, minmax(0,1fr)); } .cal-strip-event { display: none; } }
 
     /* Motion: cards/list-items/nav get a soft hover + a fade-in when a view
