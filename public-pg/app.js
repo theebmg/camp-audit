@@ -1548,13 +1548,44 @@ async function renderMaintenanceLog() {
 // fields AND together), every filter pre-populated from real data so nothing
 // can typo its way to zero results, and a CSV export of whatever's on screen.
 
+const REPORT_ENTITIES = [
+  { key: 'assets', label: 'Assets' },
+  { key: 'workOrders', label: 'Work Orders' },
+  { key: 'workOrderLog', label: 'Progress Log' },
+];
+
+// One-click canned filter combinations for the most common "which report do
+// you mean" asks (new work orders, progress made, completed work) — sits on
+// top of the same faceted filters, just pre-applying a combination instead of
+// rebuilding it by hand every visit. Each `apply` returns a selectedFilters-
+// shaped object: Set for a categorical column, { from, to } for a date one.
+function reportPresets(entity) {
+  const todayStr = isoDate(new Date());
+  const daysAgoStr = (n) => { const d = new Date(); d.setDate(d.getDate() - n); return isoDate(d); };
+  const startOfMonthStr = () => { const d = new Date(); return isoDate(new Date(d.getFullYear(), d.getMonth(), 1)); };
+  if (entity === 'workOrders') {
+    return [
+      { label: 'New This Week', apply: () => ({ 'Date Reported': { from: daysAgoStr(7), to: todayStr } }) },
+      { label: 'Completed This Month', apply: () => ({ Status: new Set(['Done']), 'Date Completed': { from: startOfMonthStr(), to: todayStr } }) },
+      { label: 'Open & Urgent', apply: () => ({ Priority: new Set(['Urgent']) }) },
+    ];
+  }
+  if (entity === 'workOrderLog') {
+    return [{ label: 'Progress This Week', apply: () => ({ 'Logged At': { from: daysAgoStr(7), to: todayStr } }) }];
+  }
+  if (entity === 'assets') {
+    return [{ label: 'Flagged Items', apply: () => ({ Flagged: new Set(['Yes']) }) }];
+  }
+  return [];
+}
+
 async function renderReports(params = {}) {
   setChrome({ title: 'Reports', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
 
-  let entity = params.entity === 'workOrders' ? 'workOrders' : 'assets';
+  let entity = REPORT_ENTITIES.some((e) => e.key === params.entity) ? params.entity : 'assets';
   let columns = [];
-  let selectedFilters = {}; // { [columnKey]: Set<string> }
+  let selectedFilters = {}; // { [columnKey]: Set<string> | { from?: string, to?: string } }
   let visibleColumns = new Set();
   let openGroups = new Set();
   let columnsPickerOpen = false;
@@ -1570,6 +1601,15 @@ async function renderReports(params = {}) {
     openGroups = new Set(columns[0] ? [columns[0].group] : []);
     sortKey = null;
     sortDir = 'asc';
+  }
+
+  function filtersPayload() {
+    const filters = {};
+    for (const [k, v] of Object.entries(selectedFilters)) {
+      if (v instanceof Set) { if (v.size) filters[k] = [...v]; }
+      else if (v && (v.from || v.to)) filters[k] = v;
+    }
+    return filters;
   }
 
   // Null/empty values always sort to the bottom regardless of direction —
@@ -1595,9 +1635,7 @@ async function renderReports(params = {}) {
   }
 
   async function loadData() {
-    const filters = {};
-    for (const [k, set] of Object.entries(selectedFilters)) if (set.size) filters[k] = [...set];
-    const res = await api(`/api/pg/reports/data?entity=${entity}&filters=${encodeURIComponent(JSON.stringify(filters))}`);
+    const res = await api(`/api/pg/reports/data?entity=${entity}&filters=${encodeURIComponent(JSON.stringify(filtersPayload()))}`);
     rows = res.rows;
   }
 
@@ -1611,22 +1649,33 @@ async function renderReports(params = {}) {
   }
 
   function exportUrl() {
-    const filters = {};
-    for (const [k, set] of Object.entries(selectedFilters)) if (set.size) filters[k] = [...set];
     const cols = columns.filter((c) => visibleColumns.has(c.key)).map((c) => c.key);
-    return `/api/pg/reports/export?entity=${entity}&filters=${encodeURIComponent(JSON.stringify(filters))}&columns=${encodeURIComponent(JSON.stringify(cols))}`;
+    return `/api/pg/reports/export?entity=${entity}&filters=${encodeURIComponent(JSON.stringify(filtersPayload()))}&columns=${encodeURIComponent(JSON.stringify(cols))}`;
+  }
+
+  function filterBadge(c) {
+    const v = selectedFilters[c.key];
+    if (!v) return '';
+    if (c.type === 'date') return (v.from || v.to) ? ' <span class="pill">range</span>' : '';
+    return v.size ? ` <span class="pill">${v.size}</span>` : '';
   }
 
   function draw() {
     const groups = groupedColumns();
     const visibleCols = columns.filter((c) => visibleColumns.has(c.key));
+    const presets = reportPresets(entity);
+    const hasActiveFilters = Object.keys(selectedFilters).length > 0;
     setApp(`
       <div class="card">
         <div class="view-toggle">
-          <button type="button" class="view-toggle-btn entity-switch ${entity === 'assets' ? 'active' : ''}" data-entity="assets">Assets</button>
-          <button type="button" class="view-toggle-btn entity-switch ${entity === 'workOrders' ? 'active' : ''}" data-entity="workOrders">Work Orders</button>
+          ${REPORT_ENTITIES.map((e) => `<button type="button" class="view-toggle-btn entity-switch ${entity === e.key ? 'active' : ''}" data-entity="${e.key}">${escapeHtml(e.label)}</button>`).join('')}
         </div>
         <p class="muted" style="margin-top:10px;margin-bottom:0">A full custom report builder is planned for later — this covers filtering and exporting what's already here.</p>
+        ${presets.length || hasActiveFilters ? `
+          <div class="btn-row" style="margin-top:10px">
+            ${presets.map((p, i) => `<button type="button" class="btn btn-secondary report-preset-btn" data-preset-idx="${i}">${escapeHtml(p.label)}</button>`).join('')}
+            ${hasActiveFilters ? `<button type="button" class="btn btn-secondary" id="clearFiltersBtn">✕ Clear Filters</button>` : ''}
+          </div>` : ''}
       </div>
       <div class="reports-layout">
         <div class="card reports-filters">
@@ -1634,9 +1683,17 @@ async function renderReports(params = {}) {
           ${[...groups.entries()].map(([group, cols]) => `
             <details class="report-filter-group" data-group="${escapeHtml(group)}" ${openGroups.has(group) ? 'open' : ''}>
               <summary>${escapeHtml(group)}</summary>
-              ${cols.map((c) => `
+              ${cols.map((c) => c.type === 'date' ? `
                 <div class="report-filter-field">
-                  <div class="report-filter-label">${escapeHtml(c.label)}${selectedFilters[c.key]?.size ? ` <span class="pill">${selectedFilters[c.key].size}</span>` : ''}</div>
+                  <div class="report-filter-label">${escapeHtml(c.label)}${filterBadge(c)}</div>
+                  <div class="report-date-range">
+                    <input type="date" class="report-filter-date" data-filter-key="${escapeHtml(c.key)}" data-bound="from" value="${selectedFilters[c.key]?.from || ''}" />
+                    <span class="muted">to</span>
+                    <input type="date" class="report-filter-date" data-filter-key="${escapeHtml(c.key)}" data-bound="to" value="${selectedFilters[c.key]?.to || ''}" />
+                  </div>
+                </div>` : `
+                <div class="report-filter-field">
+                  <div class="report-filter-label">${escapeHtml(c.label)}${filterBadge(c)}</div>
                   <div class="report-filter-options">
                     ${c.options.length ? c.options.map((o) => `
                       <label class="report-chip"><input type="checkbox" class="report-filter-cb" data-filter-key="${escapeHtml(c.key)}" value="${escapeHtml(String(o))}" ${selectedFilters[c.key]?.has(String(o)) ? 'checked' : ''} /> ${escapeHtml(String(o))}</label>
@@ -1705,6 +1762,24 @@ async function renderReports(params = {}) {
       await loadData();
       draw();
     }));
+    app.querySelectorAll('.report-filter-date').forEach((inp) => inp.addEventListener('change', async () => {
+      const key = inp.dataset.filterKey;
+      if (!selectedFilters[key] || selectedFilters[key] instanceof Set) selectedFilters[key] = {};
+      selectedFilters[key][inp.dataset.bound] = inp.value || undefined;
+      if (!selectedFilters[key].from && !selectedFilters[key].to) delete selectedFilters[key];
+      await loadData();
+      draw();
+    }));
+    app.querySelectorAll('.report-preset-btn').forEach((btn) => btn.addEventListener('click', async () => {
+      selectedFilters = reportPresets(entity)[Number(btn.dataset.presetIdx)].apply();
+      await loadData();
+      draw();
+    }));
+    document.getElementById('clearFiltersBtn')?.addEventListener('click', async () => {
+      selectedFilters = {};
+      await loadData();
+      draw();
+    });
     app.querySelectorAll('.sortable-col').forEach((th) => th.addEventListener('click', () => {
       const key = th.dataset.sortKey;
       if (sortKey === key) sortDir = sortDir === 'asc' ? 'desc' : 'asc';

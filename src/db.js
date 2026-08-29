@@ -556,6 +556,22 @@ export async function getWorkOrdersReportRawData() {
   return { workOrders: woRows.rows, volByWo, venByWo };
 }
 
+// "Progress made" (status changes, notes, hours logged — see migration 0017's
+// comment: "what future reporting will read from") — one row per log entry,
+// not per Work Order, so a single WO with five updates shows as five rows.
+export async function getWorkOrderLogReportRawData() {
+  const { rows } = await pool.query(
+    `SELECT l.id, l.note, l.hours, l.status_change, l.username, l.created_at,
+            w.id AS work_order_id, w.title AS wo_title, a.name AS asset_name, loc.name AS location_name
+     FROM work_order_log_entries l
+     JOIN work_orders w ON w.id = l.work_order_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN locations loc ON loc.id = w.location_id
+     ORDER BY l.created_at DESC`
+  );
+  return { logEntries: rows };
+}
+
 // ── Ad-hoc field notes (pressure-relief valve — see migration brief's "Ad-hoc
 //    notes & field creation" section). Just INSERT/UPDATE — no schema risk. ──
 

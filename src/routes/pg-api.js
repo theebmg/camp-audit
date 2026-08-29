@@ -45,10 +45,11 @@ import {
   listCapitalCampaignProjects, createCapitalCampaignProject, updateCapitalCampaignProject, deleteCapitalCampaignProject,
   listOtherBudgetCategories, createOtherBudgetCategory, updateOtherBudgetCategory, deleteOtherBudgetCategory,
   listCabinHolders, createCabinHolder, updateCabinHolder, deleteCabinHolder,
-  getAssetsReportRawData, getWorkOrdersReportRawData,
+  getAssetsReportRawData, getWorkOrdersReportRawData, getWorkOrderLogReportRawData,
 } from '../db.js';
 import {
-  buildAssetReportRows, buildWorkOrderReportRows, assetColumnSpecs, WORK_ORDER_COLUMN_SPECS,
+  buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows,
+  assetColumnSpecs, WORK_ORDER_COLUMN_SPECS, WORK_ORDER_LOG_COLUMN_SPECS,
   columnDefsFromRows, applyReportFilters, rowsToCsv,
 } from '../reports.js';
 
@@ -245,6 +246,10 @@ async function getReportRowsAndSpecs(entity) {
   if (entity === 'workOrders') {
     const raw = await getWorkOrdersReportRawData();
     return { rows: buildWorkOrderReportRows(raw), specs: WORK_ORDER_COLUMN_SPECS };
+  }
+  if (entity === 'workOrderLog') {
+    const raw = await getWorkOrderLogReportRawData();
+    return { rows: buildWorkOrderLogReportRows(raw), specs: WORK_ORDER_LOG_COLUMN_SPECS };
   }
   return null;
 }
