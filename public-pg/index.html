@@ -175,6 +175,19 @@
     }
     .budget-grid .card { margin-bottom: 0; }
     .funding-scroll { max-height: 360px; overflow-y: auto; padding-right: 4px; }
+
+    /* Finder-style drill-down panes — Locations only for now. Each pane is
+       an independent scroll region; the .fab class inside a pane is
+       overridden back to normal in-flow flow (position:fixed would float
+       relative to the viewport, not the pane, which reads fine for a single
+       top-level button but is dropped for the narrower list layout). */
+    .pane-row { display: flex; align-items: stretch; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
+    .pane { min-width: 0; padding: 14px; overflow-y: auto; max-height: calc(100vh - 150px); }
+    .pane + .pane { border-left: 1px solid var(--border); }
+    .pane-locations { flex: 0 0 280px; }
+    .pane-assets { flex: 0 0 280px; }
+    .pane-detail { flex: 1 1 auto; }
+    .pane .card { box-shadow: none; border-color: var(--border); }
     @media (max-width: 640px) { .cal-strip { grid-template-columns: repeat(7, minmax(0,1fr)); } .cal-strip-event { display: none; } }
 
     /* Motion: cards/list-items/nav get a soft hover + a fade-in when a view

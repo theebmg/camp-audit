@@ -76,14 +76,22 @@ function confirmDialog(message, { confirmLabel = 'Confirm', cancelLabel = 'Cance
 // Sets #app's content and replays the fade-in — every view render should go
 // through this instead of `app.innerHTML =` directly, so view swaps feel like
 // transitions rather than instant flashes.
-function setApp(html) {
-  app.innerHTML = html;
-  app.classList.remove('view-fade');
-  void app.offsetWidth; // force reflow so the animation replays
-  app.classList.add('view-fade');
+function setApp(html, container = app) {
+  container.innerHTML = html;
+  container.classList.remove('view-fade');
+  void container.offsetWidth; // force reflow so the animation replays
+  container.classList.add('view-fade');
 }
 
 const LOADING_HTML = '<div class="loading-wrap"><div class="spinner"></div><span>Loading…</span></div>';
+
+// Finder-style drill-down (Locations -> Assets in Location -> Asset Detail),
+// active only when there's enough width for it to look like anything but
+// three cramped columns. Narrow screens keep the existing one-view-at-a-time
+// behavior untouched — renderLocations/renderAssetsInLocation/renderAssetDetail
+// all still work exactly as before when called with no container override.
+const DRILLDOWN_MIN_WIDTH = 1100;
+const DRILLDOWN_VIEWS = new Set(['locations']); // views with a pane variant to swap to/from on resize
 
 // ---- Theme (Light/Dark/System) + accent color — persisted per-browser.
 // ACCENT_PRESETS is set by an early inline <script> in index.html (applied
@@ -330,6 +338,22 @@ menuBtn.addEventListener('click', openSidebar);
 sidebarOverlay.addEventListener('click', closeSidebar);
 document.getElementById('closeSidebarBtn').addEventListener('click', closeSidebar);
 
+// Crossing the drill-down width threshold mid-session (window resize) should
+// swap between the single-view and pane layouts, not leave the wrong one on
+// screen. Only re-renders when the current view actually has a pane variant.
+let resizeReflowTimer;
+let lastAboveDrilldownWidth = window.innerWidth >= DRILLDOWN_MIN_WIDTH;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeReflowTimer);
+  resizeReflowTimer = setTimeout(() => {
+    const nowAbove = window.innerWidth >= DRILLDOWN_MIN_WIDTH;
+    if (nowAbove === lastAboveDrilldownWidth) return;
+    lastAboveDrilldownWidth = nowAbove;
+    const top = state.stack[state.stack.length - 1];
+    if (top && DRILLDOWN_VIEWS.has(top.view)) render(top.view, top.params);
+  }, 200);
+});
+
 let searchTimer;
 globalSearchInput?.addEventListener('input', () => {
   clearTimeout(searchTimer);
@@ -372,7 +396,7 @@ async function render(view, params = {}) {
     breadcrumbsEl.hidden = true;
     const handlers = {
       dashboard: () => renderDashboard(),
-      locations: () => renderLocations(),
+      locations: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderLocationsDrilldown() : renderLocations()),
       assetsInLocation: () => renderAssetsInLocation(params),
       assetDetail: () => renderAssetDetail(params),
       audit: () => renderAudit(params),
@@ -625,12 +649,37 @@ async function renderDashboard() {
   draw();
 }
 
-async function renderLocations() {
+async function renderLocationsDrilldown() {
   setChrome({ title: 'Locations', showBack: false, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+  setApp(`
+    <div class="pane-row">
+      <div class="pane pane-locations" id="paneLocations"></div>
+      <div class="pane pane-assets" id="paneAssets"><p class="muted">Select a location to see its assets.</p></div>
+      <div class="pane pane-detail" id="paneDetail"><p class="muted">Select an asset to see its details.</p></div>
+    </div>`);
+  const paneLocations = document.getElementById('paneLocations');
+  const paneAssets = document.getElementById('paneAssets');
+  const paneDetail = document.getElementById('paneDetail');
+
+  await renderLocations(paneLocations, {
+    onOpenLocation: async (id, name) => {
+      paneDetail.innerHTML = '<p class="muted">Select an asset to see its details.</p>';
+      await renderAssetsInLocation({ id, name }, paneAssets, {
+        onOpenAsset: async (assetId) => {
+          await renderAssetDetail({ id: assetId }, paneDetail);
+        },
+      });
+    },
+  });
+}
+
+async function renderLocations(container = app, { onOpenLocation } = {}) {
+  if (container === app) setChrome({ title: 'Locations', showBack: false, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { locations } = await api('/api/pg/locations');
   let editing = null; // 'new' | { id } | null
   let typeFilter = null; // set by clicking a type pill — filters the list to that type
+  let selectedLocationId = null; // pane mode only — highlights the open location
 
   function locationGridHtml(list, emptyMsg) {
     const parentNameById = new Map(locations.map((l) => [l.Id, l.Name]));
@@ -670,44 +719,47 @@ async function renderLocations() {
   }
 
   function draw() {
-    const mode = getTableViewMode();
+    // A narrow browse pane can't fit the table layout sensibly — force cards
+    // there regardless of the global table/cards preference.
+    const mode = onOpenLocation ? 'cards' : getTableViewMode();
     const visible = typeFilter ? locations.filter((l) => l['Location Type'] === typeFilter) : locations;
     const emptyMsg = typeFilter ? `No locations of type "${escapeHtml(typeFilter)}".` : 'No locations yet.';
     setApp(`
-      <button class="btn btn-primary fab" id="addLocationBtn" title="Add Location">+ Add Location</button>
-      ${tableViewToggleHtml(mode)}
+      <button class="btn btn-primary ${onOpenLocation ? '' : 'fab'}" id="addLocationBtn" title="Add Location">+ Add Location</button>
+      ${onOpenLocation ? '' : tableViewToggleHtml(mode)}
       ${typeFilter ? `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="clearTypeFilter">✕ Filtered by type: ${escapeHtml(typeFilter)}</button></div>` : ''}
       ${mode === 'table' ? locationGridHtml(visible, emptyMsg) : (visible.map((l) => `
-        <div class="list-item loc-row">
+        <div class="list-item loc-row ${onOpenLocation && selectedLocationId === l.Id ? 'cal-strip-selected' : ''}">
           <span class="loc-open" data-id="${l.Id}" data-name="${escapeHtml(l.Name)}">📍 ${escapeHtml(l.Name)}</span>
           ${l['Location Type'] ? `<span class="pill type-filter-chip" data-type="${escapeHtml(l['Location Type'])}">${escapeHtml(l['Location Type'])}</span>` : '<span class="pill"></span>'}
           <button class="btn btn-secondary edit-location" data-id="${l.Id}">Edit</button>
         </div>`).join('') || `<p class="muted">${emptyMsg}</p>`)}
       ${editing === 'new' ? editFormHtml(null) : ''}
       ${editing?.id ? editFormHtml(locations.find((l) => l.Id === editing.id)) : ''}
-    `);
+    `, container);
     wire();
   }
 
   function wire() {
     wireTableViewToggle(draw);
-    app.querySelectorAll('.type-filter-chip').forEach((chip) => chip.addEventListener('click', (e) => {
+    container.querySelectorAll('.type-filter-chip').forEach((chip) => chip.addEventListener('click', (e) => {
       e.preventDefault();
       typeFilter = chip.dataset.type;
       draw();
     }));
-    document.getElementById('clearTypeFilter')?.addEventListener('click', () => { typeFilter = null; draw(); });
-    app.querySelectorAll('.loc-open').forEach((el) => el.addEventListener('click', (e) => {
+    container.querySelector('#clearTypeFilter')?.addEventListener('click', () => { typeFilter = null; draw(); });
+    container.querySelectorAll('.loc-open').forEach((el) => el.addEventListener('click', (e) => {
       e.preventDefault();
-      go('assetsInLocation', { id: el.dataset.id, name: el.dataset.name });
+      if (onOpenLocation) { selectedLocationId = Number(el.dataset.id); draw(); onOpenLocation(el.dataset.id, el.dataset.name); }
+      else go('assetsInLocation', { id: el.dataset.id, name: el.dataset.name });
     }));
-    document.getElementById('addLocationBtn')?.addEventListener('click', () => { editing = 'new'; draw(); });
-    app.querySelectorAll('.edit-location').forEach((btn) => btn.addEventListener('click', () => {
+    container.querySelector('#addLocationBtn')?.addEventListener('click', () => { editing = 'new'; draw(); });
+    container.querySelectorAll('.edit-location').forEach((btn) => btn.addEventListener('click', () => {
       editing = { id: Number(btn.dataset.id) };
       draw();
     }));
-    app.querySelectorAll('.loc-cancel').forEach((btn) => btn.addEventListener('click', () => { editing = null; draw(); }));
-    app.querySelectorAll('.loc-save').forEach((btn) => btn.addEventListener('click', async () => {
+    container.querySelectorAll('.loc-cancel').forEach((btn) => btn.addEventListener('click', () => { editing = null; draw(); }));
+    container.querySelectorAll('.loc-save').forEach((btn) => btn.addEventListener('click', async () => {
       const card = btn.closest('.card');
       const id = btn.dataset.id;
       const fields = {
@@ -721,7 +773,7 @@ async function renderLocations() {
       try {
         await api(isNew ? '/api/pg/locations' : `/api/pg/locations/${id}`, { method: isNew ? 'POST' : 'PATCH', body: JSON.stringify(fields) });
         toast(isNew ? 'Location added' : 'Location saved');
-        renderLocations();
+        renderLocations(container, { onOpenLocation });
       } catch (err) { toast(err.message); }
     }));
   }
@@ -729,16 +781,23 @@ async function renderLocations() {
   draw();
 }
 
-async function renderAssetsInLocation({ id, name }) {
-  setChrome({ title: name || 'Assets', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAssetsInLocation({ id, name }, container = app, { onOpenAsset } = {}) {
+  if (container === app) setChrome({ title: name || 'Assets', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { assets } = await api(`/api/pg/locations/${id}/assets`);
-  app.innerHTML = assets.length ? assets.map((a) => `
-    <div class="list-item" data-id="${a.Id}">
-      <span>🏚️ ${escapeHtml(a.Name)}</span>
-      <span class="pill">${escapeHtml(a['Asset type'] || '')}</span>
-    </div>`).join('') : '<p class="muted">No assets in this location.</p>';
-  app.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => go('assetDetail', { id: el.dataset.id })));
+  let selectedAssetId = null;
+  const draw = () => {
+    container.innerHTML = assets.length ? assets.map((a) => `
+      <div class="list-item ${onOpenAsset && selectedAssetId === a.Id ? 'cal-strip-selected' : ''}" data-id="${a.Id}">
+        <span>🏚️ ${escapeHtml(a.Name)}</span>
+        <span class="pill">${escapeHtml(a['Asset type'] || '')}</span>
+      </div>`).join('') : '<p class="muted">No assets in this location.</p>';
+    container.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => {
+      if (onOpenAsset) { selectedAssetId = Number(el.dataset.id); draw(); onOpenAsset(el.dataset.id); }
+      else go('assetDetail', { id: el.dataset.id });
+    }));
+  };
+  draw();
 }
 
 // Four visually distinct tiers, worst to best: bad (red) > pop (orange) >
@@ -790,9 +849,9 @@ function checklistHtmlFor(checklist, { forCard = true } = {}) {
     </div>`;
 }
 
-async function renderAssetDetail({ id }) {
-  setChrome({ title: 'Asset', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAssetDetail({ id }, container = app) {
+  if (container === app) setChrome({ title: 'Asset', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const [detail, notesRes] = await Promise.all([
     api(`/api/pg/assets/${id}`), api(`/api/pg/assets/${id}/notes`),
   ]);
@@ -822,7 +881,7 @@ async function renderAssetDetail({ id }) {
       </div>
     </div>`).join('') || '<p class="muted">No notes yet.</p>';
 
-  app.innerHTML = `
+  container.innerHTML = `
     <div class="card">
       <h3>${escapeHtml(asset.Name)}</h3>
       <div class="muted">${escapeHtml(asset['Asset type'] || '')} · Condition: ${escapeHtml(asset.Condition || 'Unknown')}</div>
@@ -859,12 +918,12 @@ async function renderAssetDetail({ id }) {
       </form>
     </div>`;
 
-  document.getElementById('startAuditBtn').addEventListener('click', () => go('audit', { id }));
-  document.getElementById('viewHistoryBtn').addEventListener('click', () => go('assetHistory', { id }));
-  document.getElementById('editAssetBtn').addEventListener('click', () => go('editAsset', { id }));
-  document.getElementById('newWoBtn').addEventListener('click', () => go('newWorkOrder', { assetId: id, assetName: asset.Name }));
-  app.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
-  document.getElementById('buildingTypeSelect').addEventListener('change', async (e) => {
+  container.querySelector('#startAuditBtn').addEventListener('click', () => go('audit', { id }));
+  container.querySelector('#viewHistoryBtn').addEventListener('click', () => go('assetHistory', { id }));
+  container.querySelector('#editAssetBtn').addEventListener('click', () => go('editAsset', { id }));
+  container.querySelector('#newWoBtn').addEventListener('click', () => go('newWorkOrder', { assetId: id, assetName: asset.Name }));
+  container.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
+  container.querySelector('#buildingTypeSelect').addEventListener('change', async (e) => {
     const label = e.target.options[e.target.selectedIndex].text;
     if (!await confirmDialog(`Change building type to "${label}"? This affects which questions apply to this asset.`)) {
       e.target.value = asset.buildingTypeId ?? '';
@@ -873,7 +932,7 @@ async function renderAssetDetail({ id }) {
     await api(`/api/pg/assets/${id}/building-type`, { method: 'PATCH', body: JSON.stringify({ buildingTypeId: e.target.value ? Number(e.target.value) : null }) });
     toast('Building type updated');
   });
-  document.getElementById('noteForm').addEventListener('submit', async (e) => {
+  container.querySelector('#noteForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const note = fd.get('note');
@@ -883,13 +942,13 @@ async function renderAssetDetail({ id }) {
       if (file && file.size) photoUrl = await uploadPhotoFile(file, 'notes', id);
       await api(`/api/pg/assets/${id}/notes`, { method: 'POST', body: JSON.stringify({ note, photoUrl }) });
       toast('Note added');
-      renderAssetDetail({ id });
+      renderAssetDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
-  app.querySelectorAll('.resolve-note').forEach((el) => el.addEventListener('click', async (e) => {
+  container.querySelectorAll('.resolve-note').forEach((el) => el.addEventListener('click', async (e) => {
     e.preventDefault();
     await api(`/api/pg/notes/${el.dataset.id}/resolve`, { method: 'PATCH', body: JSON.stringify({ resolved: el.dataset.next === 'true' }) });
-    renderAssetDetail({ id });
+    renderAssetDetail({ id }, container);
   }));
 }
 
