@@ -320,6 +320,7 @@ logoutBtn.addEventListener('click', async () => {
 
 const NAV_ITEMS = [
   { icon: '🏠', label: 'Dashboard', view: 'dashboard' },
+  { icon: '📝', label: 'Start Audit', view: 'auditPicker' },
   { icon: '📍', label: 'Locations', view: 'locations' },
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
@@ -436,6 +437,7 @@ async function render(view, params = {}) {
     renderBreadcrumbs();
     const handlers = {
       dashboard: () => renderDashboard(),
+      auditPicker: () => renderAuditPicker(),
       locations: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderLocationsDrilldown() : renderLocations()),
       assetsInLocation: () => renderAssetsInLocation(params),
       assetDetail: () => renderAssetDetail(params),
@@ -1052,6 +1054,26 @@ async function renderAssetDetail({ id }, container = app) {
     await api(`/api/pg/notes/${el.dataset.id}/resolve`, { method: 'PATCH', body: JSON.stringify({ resolved: el.dataset.next === 'true' }) });
     renderAssetDetail({ id }, container);
   }));
+}
+
+// A direct entry point for the "audit every building" workflow — skips the
+// Locations -> asset -> Asset Detail -> Start Audit detour when you already
+// know (or want to search for) the asset by name. Picking one hands straight
+// off to the same renderAudit used from Asset Detail; nothing about the audit
+// form itself changes.
+async function renderAuditPicker() {
+  setChrome({ title: 'Start Audit', showBack: false, showLogout: true });
+  app.innerHTML = `
+    <div class="card">
+      <h3>Start an Audit</h3>
+      <p class="muted">Search for the asset you want to audit — its current property answers, component conditions, and cabin/lodge holder will load automatically.</p>
+      <div id="auditAssetPicker"></div>
+    </div>`;
+  mountAssetCombobox(document.getElementById('auditAssetPicker'), {
+    // onSelect also fires with null on every keystroke (clearing a prior
+    // selection) — only navigate once an asset is actually chosen.
+    onSelect: (asset) => { if (asset) go('audit', { id: asset.Id }); },
+  });
 }
 
 async function renderAudit({ id }) {
