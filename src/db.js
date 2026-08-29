@@ -49,10 +49,11 @@ export async function logActivity({ action, entityType, entityId, entityLabel, d
   }
 }
 
-export async function listActivityLog({ limit = 200, entityType, action } = {}) {
+export async function listActivityLog({ limit = 200, entityType, action, username } = {}) {
   const clauses = []; const vals = []; let i = 1;
   if (entityType) { clauses.push(`entity_type = $${i++}`); vals.push(entityType); }
   if (action) { clauses.push(`action = $${i++}`); vals.push(action); }
+  if (username) { clauses.push(`username = $${i++}`); vals.push(username); }
   vals.push(limit);
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   const { rows } = await pool.query(
@@ -653,9 +654,35 @@ export async function adminDeleteSubArea(id) {
 
 // ── Work Orders + Asset Updates write-back (brief's Phase 2) ───────────────
 
+// Dashboard aggregate: status breakdown + schedule-vs-today breakdown for
+// open (non-Done) work orders. One query, no row-by-row JS looping needed.
+export async function getWorkOrderSummary() {
+  const { rows } = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE status = 'Open')        AS open,
+      COUNT(*) FILTER (WHERE status = 'In Progress')  AS in_progress,
+      COUNT(*) FILTER (WHERE status = 'On Hold')      AS on_hold,
+      COUNT(*) FILTER (WHERE status = 'Urgent')       AS urgent,
+      COUNT(*) FILTER (WHERE status = 'Done')         AS done,
+      COUNT(*) FILTER (WHERE status != 'Done' AND scheduled_date = CURRENT_DATE) AS due_today,
+      COUNT(*) FILTER (WHERE status != 'Done' AND scheduled_date < CURRENT_DATE) AS past_due,
+      COUNT(*) FILTER (WHERE status != 'Done' AND scheduled_date > CURRENT_DATE) AS due_future,
+      COUNT(*) FILTER (WHERE status != 'Done' AND scheduled_date IS NULL) AS unscheduled
+    FROM work_orders
+  `);
+  const r = rows[0];
+  return {
+    Open: Number(r.open), InProgress: Number(r.in_progress), OnHold: Number(r.on_hold),
+    Urgent: Number(r.urgent), Done: Number(r.done),
+    DueToday: Number(r.due_today), PastDue: Number(r.past_due), DueFuture: Number(r.due_future),
+    Unscheduled: Number(r.unscheduled),
+  };
+}
+
 export async function listWorkOrders() {
   const { rows } = await pool.query(
     `SELECT w.id, w.title, w.status, w.priority, w.date_reported, w.date_completed, w.scheduled_date,
+            w.estimated_hours, w.estimated_cost, w.actual_hours, w.actual_cost,
             w.asset_id, a.name AS asset_name, w.location_id, l.name AS location_name
      FROM work_orders w
      LEFT JOIN assets a ON a.id = w.asset_id
@@ -665,6 +692,8 @@ export async function listWorkOrders() {
   return rows.map((r) => ({
     Id: r.id, Title: r.title, Status: r.status, Priority: r.priority,
     'Date Reported': r.date_reported, 'Date Completed': r.date_completed, 'Scheduled Date': r.scheduled_date,
+    'Estimated Hours': r.estimated_hours, 'Estimated Cost': r.estimated_cost,
+    'Actual Hours': r.actual_hours, 'Actual Cost': r.actual_cost,
     Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
     Location: r.location_id ? { Id: r.location_id, Name: r.location_name } : null,
   }));
@@ -1450,11 +1479,11 @@ function verifyPassword(password, stored) {
   return storedBuf.length === derivedBuf.length && crypto.timingSafeEqual(storedBuf, derivedBuf);
 }
 function userRowShape(r) {
-  return { Id: r.id, Username: r.username, Email: r.email, Active: r.active };
+  return { Id: r.id, Username: r.username, Email: r.email, Active: r.active, Role: r.role };
 }
 
 export async function listUsers() {
-  const { rows } = await pool.query('SELECT id, username, email, active FROM users ORDER BY username');
+  const { rows } = await pool.query('SELECT id, username, email, active, role FROM users ORDER BY username');
   return rows.map(userRowShape);
 }
 
@@ -1463,32 +1492,42 @@ export async function countActiveUsers() {
   return rows[0].n;
 }
 
-export async function createUser({ username, password, email }) {
+export async function countActiveAdmins() {
+  const { rows } = await pool.query(`SELECT COUNT(*)::int AS n FROM users WHERE active AND role = 'admin'`);
+  return rows[0].n;
+}
+
+export async function createUser({ username, password, email, role }) {
   const { rows } = await pool.query(
-    'INSERT INTO users (username, password_hash, email) VALUES ($1,$2,$3) RETURNING id, username, email, active',
-    [username, hashPassword(password), email || null]
+    'INSERT INTO users (username, password_hash, email, role) VALUES ($1,$2,$3,$4) RETURNING id, username, email, active, role',
+    [username, hashPassword(password), email || null, role === 'admin' ? 'admin' : 'standard']
   );
   await logActivity({ action: 'created', entityType: 'user', entityId: rows[0].id, entityLabel: rows[0].username });
   return userRowShape(rows[0]);
 }
 
-export async function updateUser(id, { email, password, active }) {
+export async function updateUser(id, { email, password, active, role }) {
   const sets = []; const vals = []; let i = 1;
   if (email !== undefined) { sets.push(`email = $${i++}`); vals.push(email || null); }
   if (password) { sets.push(`password_hash = $${i++}`); vals.push(hashPassword(password)); }
   if (active !== undefined) { sets.push(`active = $${i++}`); vals.push(active); }
+  if (role !== undefined) { sets.push(`role = $${i++}`); vals.push(role === 'admin' ? 'admin' : 'standard'); }
   if (!sets.length) {
-    const { rows } = await pool.query('SELECT id, username, email, active FROM users WHERE id = $1', [id]);
+    const { rows } = await pool.query('SELECT id, username, email, active, role FROM users WHERE id = $1', [id]);
     return rows[0] ? userRowShape(rows[0]) : null;
   }
   vals.push(id);
   const { rows } = await pool.query(
-    `UPDATE users SET ${sets.join(', ')} WHERE id = $${i} RETURNING id, username, email, active`,
+    `UPDATE users SET ${sets.join(', ')} WHERE id = $${i} RETURNING id, username, email, active, role`,
     vals
   );
   if (rows[0]) {
     // Never log the password itself — just note that a reset happened.
-    const notes = [password ? 'password reset' : null, active === false ? 'deactivated' : active === true ? 'reactivated' : null].filter(Boolean);
+    const notes = [
+      password ? 'password reset' : null,
+      active === false ? 'deactivated' : active === true ? 'reactivated' : null,
+      role !== undefined ? `role → ${rows[0].role}` : null,
+    ].filter(Boolean);
     await logActivity({ action: 'updated', entityType: 'user', entityId: rows[0].id, entityLabel: rows[0].username, details: notes.join(', ') || undefined });
   }
   return rows[0] ? userRowShape(rows[0]) : null;
@@ -1500,9 +1539,9 @@ export async function deleteUser(id) {
 }
 
 export async function verifyUserCredentials(username, password) {
-  const { rows } = await pool.query('SELECT id, username, password_hash, active FROM users WHERE username = $1', [username]);
+  const { rows } = await pool.query('SELECT id, username, password_hash, active, role FROM users WHERE username = $1', [username]);
   const u = rows[0];
   if (!u || !u.active) return null;
   if (!verifyPassword(password, u.password_hash)) return null;
-  return { Id: u.id, Username: u.username };
+  return { Id: u.id, Username: u.username, Role: u.role };
 }

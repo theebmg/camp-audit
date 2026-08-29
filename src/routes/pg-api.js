@@ -14,6 +14,7 @@ import { currentComponentState, sortHistory } from '../components.js';
 import { buildCapitalPlanPg } from '../reportDataPg.js';
 import { uploadPhoto } from '../storage.js';
 import { renderChecklistPdf } from '../pdf.js';
+import { currentUsername, currentRole } from '../requestContext.js';
 import {
   listLocations, createLocation, updateLocation, listAssetsByLocation, searchLocationsAndAssets,
   getAssetPropertyFields, getComponentTypeCatalog, getAssetDetail, getAssetHistory,
@@ -24,7 +25,7 @@ import {
   adminCreateBuildingType, adminDeleteBuildingType,
   adminGetApplicabilityMatrix, adminSetApplicability,
   adminListSubAreas, adminCreateSubArea, adminDeleteSubArea,
-  listWorkOrders, getWorkOrderDetail, createWorkOrder, updateWorkOrder, duplicateWorkOrder,
+  listWorkOrders, getWorkOrderDetail, createWorkOrder, updateWorkOrder, duplicateWorkOrder, getWorkOrderSummary,
   listWorkOrderTemplates, createWorkOrderTemplate, updateWorkOrderTemplate, deleteWorkOrderTemplate,
   addAssetUpdateToWorkOrder, deleteAssetUpdate, completeWorkOrder,
   assignVolunteer, unassignVolunteer, assignVendor, unassignVendor,
@@ -37,7 +38,7 @@ import {
   getChecklistInstanceForWorkOrder, getChecklistInstanceForCalendarEvent,
   attachChecklistToWorkOrder, attachChecklistToCalendarEvent, detachChecklistInstance, toggleChecklistStep,
   getChecklistInstanceForExport,
-  listUsers, countActiveUsers, createUser, updateUser, deleteUser,
+  listUsers, countActiveUsers, countActiveAdmins, createUser, updateUser, deleteUser,
   listActivityLog,
 } from '../db.js';
 
@@ -121,6 +122,7 @@ router.get('/options', async (req, res, next) => {
       conditionOptions: componentSchema.conditionOptions,
       buildingTypes,
       findingSeverity: FINDING_SEVERITY_OPTIONS,
+      currentUser: { username: currentUsername(), role: currentRole() },
     });
   } catch (e) { next(e); }
 });
@@ -686,10 +688,10 @@ router.get('/users', async (req, res, next) => {
 
 router.post('/users', async (req, res, next) => {
   try {
-    const { username, password, email } = req.body || {};
+    const { username, password, email, role } = req.body || {};
     if (!username || !username.trim()) return res.status(400).json({ ok: false, error: 'Username is required' });
     if (!password || password.length < 6) return res.status(400).json({ ok: false, error: 'Password must be at least 6 characters' });
-    const user = await createUser({ username: username.trim(), password, email: (email || '').trim() });
+    const user = await createUser({ username: username.trim(), password, email: (email || '').trim(), role });
     res.json({ ok: true, user });
   } catch (e) {
     if (e.code === '23505') return res.status(409).json({ ok: false, error: 'That username is already taken' });
@@ -699,21 +701,22 @@ router.post('/users', async (req, res, next) => {
 
 router.patch('/users/:id', async (req, res, next) => {
   try {
-    const { email, password, active } = req.body || {};
+    const { email, password, active, role } = req.body || {};
     if (password !== undefined && password !== '' && password.length < 6) {
       return res.status(400).json({ ok: false, error: 'Password must be at least 6 characters' });
     }
-    if (active === false) {
-      const activeCount = await countActiveUsers();
-      const target = (await listUsers()).find((u) => u.Id === Number(req.params.id));
-      if (target?.Active && activeCount <= 1) {
-        return res.status(400).json({ ok: false, error: 'Cannot deactivate the last active user — you would be locked out' });
-      }
+    const target = (await listUsers()).find((u) => u.Id === Number(req.params.id));
+    if (active === false && target?.Active && (await countActiveUsers()) <= 1) {
+      return res.status(400).json({ ok: false, error: 'Cannot deactivate the last active user — you would be locked out' });
+    }
+    if (role === 'standard' && target?.Role === 'admin' && (await countActiveAdmins()) <= 1) {
+      return res.status(400).json({ ok: false, error: 'Cannot demote the last admin — no one would be left to manage roles' });
     }
     const user = await updateUser(req.params.id, {
       email: email !== undefined ? email.trim() : undefined,
       password: password || undefined,
       active: active !== undefined ? !!active : undefined,
+      role: role !== undefined ? role : undefined,
     });
     if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
     res.json({ ok: true, user });
@@ -730,6 +733,9 @@ router.delete('/users/:id', async (req, res, next) => {
     if (target.Active && (await countActiveUsers()) <= 1) {
       return res.status(400).json({ ok: false, error: 'Cannot delete the last active user — you would be locked out' });
     }
+    if (target.Active && target.Role === 'admin' && (await countActiveAdmins()) <= 1) {
+      return res.status(400).json({ ok: false, error: 'Cannot delete the last admin — no one would be left to manage roles' });
+    }
     await deleteUser(req.params.id);
     res.json({ ok: true });
   } catch (e) { next(e); }
@@ -739,9 +745,15 @@ router.delete('/users/:id', async (req, res, next) => {
 
 router.get('/activity-log', async (req, res, next) => {
   try {
-    const { entityType, action, limit } = req.query;
-    res.json({ entries: await listActivityLog({ entityType, action, limit: limit ? Number(limit) : undefined }) });
+    const { entityType, action, limit, username } = req.query;
+    res.json({ entries: await listActivityLog({ entityType, action, username, limit: limit ? Number(limit) : undefined }) });
   } catch (e) { next(e); }
+});
+
+// ---- Dashboard aggregates ----
+
+router.get('/dashboard/wo-summary', async (req, res, next) => {
+  try { res.json(await getWorkOrderSummary()); } catch (e) { next(e); }
 });
 
 export default router;

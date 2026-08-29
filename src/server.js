@@ -34,7 +34,8 @@ app.post('/login', async (req, res) => {
     const user = await verifyUserCredentials(username, password);
     if (user) {
       req.session.user = user.Username;
-      return res.json({ ok: true, user: user.Username });
+      req.session.role = user.Role;
+      return res.json({ ok: true, user: user.Username, role: user.Role });
     }
   } catch (e) {
     console.error('Login check failed:', e.message);
@@ -49,7 +50,7 @@ app.post('/logout', (req, res) => {
 
 function requireAuth(req, res, next) {
   if (req.session?.user) {
-    return requestContext.run({ username: req.session.user }, next);
+    return requestContext.run({ username: req.session.user, role: req.session.role || 'standard' }, next);
   }
   res.status(401).json({ ok: false, error: 'Not authenticated' });
 }

@@ -26,6 +26,15 @@ function toast(msg) {
   toast._t = setTimeout(() => { toastEl.hidden = true; }, 2500);
 }
 
+// Postgres date/timestamp columns arrive as raw ISO strings (e.g.
+// "2026-08-28T00:00:00.000Z") — this renders them as "Aug 28, 2026" instead.
+function formatDateNice(value) {
+  if (!value) return '';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleDateString('default', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -368,15 +377,138 @@ function renderLogin() {
   });
 }
 
-function renderDashboard() {
-  app.innerHTML = `
-    <div class="card"><h3>Welcome${state.user ? `, ${escapeHtml(state.user)}` : ''}</h3>
-      <p class="muted">Postgres-backed preview of the audit app. Pick a location to start auditing an asset, or check the reports.</p>
-    </div>
-    <div class="list-item" data-view="locations">📍 Browse Locations</div>
-    <div class="list-item" data-view="maintenanceLog">📋 Maintenance Log</div>
-    <div class="list-item" data-view="capitalPlan">💰 Capital Plan</div>`;
-  app.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
+const DASHBOARD_WIDGET_DEFAULTS = { woOverview: true, calendar: true, activity: true };
+function getDashboardWidgetPrefs() {
+  try {
+    const raw = localStorage.getItem('campAuditDashboardWidgets');
+    return raw ? { ...DASHBOARD_WIDGET_DEFAULTS, ...JSON.parse(raw) } : { ...DASHBOARD_WIDGET_DEFAULTS };
+  } catch { return { ...DASHBOARD_WIDGET_DEFAULTS }; }
+}
+
+function startOfWeek(d) { const s = new Date(d); s.setDate(s.getDate() - s.getDay()); return s; }
+function isoDate(d) { return d.toISOString().slice(0, 10); }
+
+async function renderDashboard() {
+  setChrome({ title: 'Dashboard', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const prefs = getDashboardWidgetPrefs();
+  const currentUser = state.options?.currentUser || {};
+  const isAdmin = currentUser.role === 'admin';
+
+  const today = new Date();
+  const weekStart = startOfWeek(today);
+  const weekDays = Array.from({ length: 7 }, (_, i) => { const d = new Date(weekStart); d.setDate(weekStart.getDate() + i); return d; });
+  const weekEnd = weekDays[6];
+
+  const [woSummary, calRes, activityRes] = await Promise.all([
+    prefs.woOverview ? api('/api/pg/dashboard/wo-summary') : Promise.resolve(null),
+    prefs.calendar ? api(`/api/pg/calendar-events?from=${isoDate(weekStart)}&to=${isoDate(weekEnd)}`) : Promise.resolve(null),
+    prefs.activity ? api(`/api/pg/activity-log?limit=12${isAdmin ? '' : `&username=${encodeURIComponent(currentUser.username || '')}`}`) : Promise.resolve(null),
+  ]);
+
+  function statTile(n, label, colorClass, view) {
+    return `<div class="bucket-tile tile-${colorClass}${view ? ' clickable-tile' : ''}" ${view ? `data-view="${view}"` : ''}>
+      <div class="n">${n}</div><div class="muted">${escapeHtml(label)}</div>
+    </div>`;
+  }
+
+  function woOverviewHtml() {
+    if (!woSummary) return '';
+    const s = woSummary;
+    return `<div class="card">
+      <h3>Work Orders</h3>
+      <p class="muted" style="margin-top:-6px">By status</p>
+      <div class="summary-buckets">
+        ${statTile(s.Open, 'Open', 'neutral', 'workOrders')}
+        ${statTile(s.InProgress, 'In Progress', 'pop', 'workOrders')}
+        ${statTile(s.OnHold, 'On Hold', 'warn', 'workOrders')}
+        ${statTile(s.Urgent, 'Urgent', 'bad', 'workOrders')}
+        ${statTile(s.Done, 'Done', 'good', 'workOrders')}
+      </div>
+      <p class="muted">By schedule (open WOs only)</p>
+      <div class="summary-buckets">
+        ${statTile(s.PastDue, 'Past Due', 'bad', 'workOrders')}
+        ${statTile(s.DueToday, 'Due Today', 'pop', 'workOrders')}
+        ${statTile(s.DueFuture, 'Due Later', 'good', 'workOrders')}
+        ${statTile(s.Unscheduled, 'Unscheduled', 'neutral', 'workOrders')}
+      </div>
+    </div>`;
+  }
+
+  function calendarStripHtml() {
+    if (!calRes) return '';
+    const occByDay = new Map();
+    for (const occ of calRes.occurrences) {
+      const key = occ.OccurrenceDate;
+      if (!occByDay.has(key)) occByDay.set(key, []);
+      occByDay.get(key).push(occ);
+    }
+    const todayStr = isoDate(today);
+    const cells = weekDays.map((d) => {
+      const key = isoDate(d);
+      const dayEvents = occByDay.get(key) || [];
+      return `<div class="cal-strip-day ${key === todayStr ? 'cal-strip-today' : ''}" data-month="${d.getMonth()}" data-year="${d.getFullYear()}">
+        <div class="cal-strip-dow">${d.toLocaleDateString('default', { weekday: 'short' })}</div>
+        <div class="cal-strip-num">${d.getDate()}</div>
+        ${dayEvents.slice(0, 2).map((e) => `<div class="cal-strip-event">${escapeHtml(e.Title)}</div>`).join('')}
+        ${dayEvents.length > 2 ? `<div class="muted" style="font-size:0.75rem">+${dayEvents.length - 2} more</div>` : ''}
+      </div>`;
+    }).join('');
+    return `<div class="card">
+      <h3>This Week</h3>
+      <div class="cal-strip">${cells}</div>
+    </div>`;
+  }
+
+  function activityHtml() {
+    if (!activityRes) return '';
+    const entries = activityRes.entries.filter((e) => e.Action !== 'toggled');
+    return `<div class="card">
+      <h3>${isAdmin ? 'Recent Activity (everyone)' : 'Your Recent Activity'}</h3>
+      ${entries.length ? entries.map((e) => `
+        <div class="list-item" style="cursor:default">
+          <span><span class="pill ${ACTIVITY_ACTION_PILL[e.Action] || ''}">${escapeHtml(e.Action)}</span>
+            ${escapeHtml(e.EntityType.replace(/_/g, ' '))}: <strong>${escapeHtml(e.EntityLabel || '')}</strong></span>
+          <span class="muted">${new Date(e.OccurredAt).toLocaleString()}${isAdmin ? ` · ${escapeHtml(e.Username || '')}` : ''}</span>
+        </div>`).join('') : '<p class="muted">Nothing yet.</p>'}
+      <div class="btn-row"><button class="btn btn-secondary" id="viewFullLogBtn">View Full Activity Log</button></div>
+    </div>`;
+  }
+
+  function draw() {
+    setApp(`
+      <div class="card">
+        <h3>Welcome${state.user ? `, ${escapeHtml(state.user)}` : ''}</h3>
+        <p class="muted" style="margin-top:-4px">${today.toLocaleDateString('default', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
+        <div class="btn-row" style="margin-top:10px">
+          <div class="list-item" data-view="locations" style="flex:1;min-width:140px">📍 Browse Locations</div>
+          <div class="list-item" data-view="maintenanceLog" style="flex:1;min-width:140px">📋 Maintenance Log</div>
+          <div class="list-item" data-view="capitalPlan" style="flex:1;min-width:140px">💰 Capital Plan</div>
+        </div>
+        <details style="margin-top:10px">
+          <summary class="muted" style="cursor:pointer">Customize dashboard</summary>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:10px">
+            <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="woOverview" ${prefs.woOverview ? 'checked' : ''} style="width:auto" /> Work Order overview</label>
+            <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="calendar" ${prefs.calendar ? 'checked' : ''} style="width:auto" /> This week's calendar</label>
+            <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="activity" ${prefs.activity ? 'checked' : ''} style="width:auto" /> Recent activity</label>
+          </div>
+        </details>
+      </div>
+      ${woOverviewHtml()}
+      ${calendarStripHtml()}
+      ${activityHtml()}
+    `);
+    app.querySelectorAll('[data-view]').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
+    app.querySelectorAll('.cal-strip-day').forEach((el) => el.addEventListener('click', () => go('calendar', { month: Number(el.dataset.month), year: Number(el.dataset.year) })));
+    document.getElementById('viewFullLogBtn')?.addEventListener('click', () => go('activityLog', {}));
+    app.querySelectorAll('.widget-toggle').forEach((cb) => cb.addEventListener('change', () => {
+      const newPrefs = { ...prefs, [cb.dataset.widget]: cb.checked };
+      localStorage.setItem('campAuditDashboardWidgets', JSON.stringify(newPrefs));
+      renderDashboard();
+    }));
+  }
+
+  draw();
 }
 
 async function renderLocations() {
@@ -428,6 +560,7 @@ async function renderLocations() {
     const visible = typeFilter ? locations.filter((l) => l['Location Type'] === typeFilter) : locations;
     const emptyMsg = typeFilter ? `No locations of type "${escapeHtml(typeFilter)}".` : 'No locations yet.';
     setApp(`
+      <button class="btn btn-primary fab" id="addLocationBtn" title="Add Location">+ Add Location</button>
       ${tableViewToggleHtml(mode)}
       ${typeFilter ? `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="clearTypeFilter">✕ Filtered by type: ${escapeHtml(typeFilter)}</button></div>` : ''}
       ${mode === 'table' ? locationGridHtml(visible, emptyMsg) : (visible.map((l) => `
@@ -436,7 +569,7 @@ async function renderLocations() {
           ${l['Location Type'] ? `<span class="pill type-filter-chip" data-type="${escapeHtml(l['Location Type'])}">${escapeHtml(l['Location Type'])}</span>` : '<span class="pill"></span>'}
           <button class="btn btn-secondary edit-location" data-id="${l.Id}">Edit</button>
         </div>`).join('') || `<p class="muted">${emptyMsg}</p>`)}
-      ${editing === 'new' ? editFormHtml(null) : `<div class="btn-row" style="margin-top:10px"><button class="btn btn-secondary" id="addLocationBtn">+ Add Location</button></div>`}
+      ${editing === 'new' ? editFormHtml(null) : ''}
       ${editing?.id ? editFormHtml(locations.find((l) => l.Id === editing.id)) : ''}
     `);
     wire();
@@ -770,7 +903,7 @@ async function renderAssetHistory({ id }) {
       <div class="card">
         <div><strong>${escapeHtml(h['Component Type'])}</strong> — ${escapeHtml(h['Event Type'] || '')}
           <span class="pill ${conditionPillClass(h.Condition)}">${escapeHtml(h.Condition || '')}</span></div>
-        <div class="muted">${escapeHtml(h['Observed/Installed Date'] || '')} · ${escapeHtml(h.Material || '')}</div>
+        <div class="muted">${escapeHtml(formatDateNice(h['Observed/Installed Date']))} · ${escapeHtml(h.Material || '')}</div>
         ${h.Notes ? `<div>${escapeHtml(h.Notes)}</div>` : ''}
       </div>`).join('') : '<p class="muted">No history yet.</p>');
 }
@@ -839,7 +972,7 @@ async function renderMaintenanceLog() {
           <thead><tr><th>Date</th><th>Asset</th><th>Component</th><th>Event</th><th>Condition</th><th>Material</th><th>Notes</th></tr></thead>
           <tbody>${entries.map((e) => `
             <tr class="clickable-row" data-asset-id="${e.Asset?.Id ?? ''}">
-              <td data-label="Date">${escapeHtml(e['Observed/Installed Date'] || '')}</td>
+              <td data-label="Date">${escapeHtml(formatDateNice(e['Observed/Installed Date']))}</td>
               <td data-label="Asset">${escapeHtml(e.Asset?.Name || '')}</td>
               <td data-label="Component">${escapeHtml(e['Component Type'])}</td>
               <td data-label="Event">${escapeHtml(e['Event Type'] || '')}</td>

@@ -69,6 +69,37 @@
     @keyframes modalPopIn { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
     .reveal { margin-left: 16px; padding-left: 12px; border-left: 2px solid var(--border); }
 
+    /* Text links inside tables (e.g. Locations grid view) — themed accent
+       color instead of the browser's default blue, which read poorly
+       against the dark theme's background. */
+    table.report-table a { color: var(--accent-dark); text-decoration: none; font-weight: 600; }
+    table.report-table a:hover { text-decoration: underline; }
+
+    /* A floating "+" action button, top-right of the page — used where a
+       primary "add" action shouldn't get lost at the bottom of a long list. */
+    .fab {
+      position: fixed; top: 74px; right: 20px; z-index: 50;
+      box-shadow: var(--shadow-md);
+    }
+    @media (max-width: 640px) { .fab { top: auto; bottom: 20px; right: 16px; } }
+
+    /* Dashboard "this week" calendar strip */
+    .cal-strip { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; }
+    .cal-strip-day {
+      border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 6px;
+      min-height: 76px; cursor: pointer; transition: background-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .cal-strip-day:hover { background: var(--surface-alt); box-shadow: var(--shadow-sm); }
+    .cal-strip-today { border-color: var(--accent); background: var(--accent-soft); }
+    .cal-strip-dow { font-size: 0.72rem; color: var(--muted); font-weight: 700; text-transform: uppercase; }
+    .cal-strip-num { font-size: 1.1rem; font-weight: 800; margin-bottom: 4px; }
+    .cal-strip-event {
+      font-size: 0.72rem; background: var(--surface-alt); border-radius: 6px; padding: 2px 5px;
+      margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .bucket-tile.clickable-tile { cursor: pointer; }
+    @media (max-width: 640px) { .cal-strip { grid-template-columns: repeat(7, minmax(0,1fr)); } .cal-strip-event { display: none; } }
+
     /* Motion: cards/list-items/nav get a soft hover + a fade-in when a view
        swaps in — the thing that actually makes an app feel "fluid" vs. flat. */
     .card, .list-item, .nav-item { transition: background-color 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease; }
