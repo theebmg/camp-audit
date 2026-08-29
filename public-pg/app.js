@@ -91,7 +91,7 @@ const LOADING_HTML = '<div class="loading-wrap"><div class="spinner"></div><span
 // behavior untouched — renderLocations/renderAssetsInLocation/renderAssetDetail
 // all still work exactly as before when called with no container override.
 const DRILLDOWN_MIN_WIDTH = 1100;
-const DRILLDOWN_VIEWS = new Set(['locations']); // views with a pane variant to swap to/from on resize
+const DRILLDOWN_VIEWS = new Set(['locations', 'workOrders', 'admin']); // views with a pane variant to swap to/from on resize
 
 // ---- Theme (Light/Dark/System) + accent color — persisted per-browser.
 // ACCENT_PRESETS is set by an early inline <script> in index.html (applied
@@ -404,7 +404,7 @@ async function render(view, params = {}) {
       capitalPlan: () => renderCapitalPlan(),
       maintenanceLog: () => renderMaintenanceLog(),
       editAsset: () => renderEditAsset(params),
-      admin: () => renderAdminHub(),
+      admin: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderAdminDrilldown() : renderAdminHub()),
       adminCategory: () => renderAdminCategory(params),
       adminAddFieldChoice: () => renderAdminAddFieldChoice(),
       adminPropertyFields: () => renderAdminPropertyFields(params),
@@ -417,7 +417,7 @@ async function render(view, params = {}) {
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
       adminChecklistTemplates: () => renderAdminChecklistTemplates(),
-      workOrders: () => renderWorkOrders(params),
+      workOrders: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderWorkOrdersDrilldown(params) : renderWorkOrders(params)),
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
       crew: () => renderCrew(),
@@ -669,6 +669,66 @@ async function renderLocationsDrilldown() {
           await renderAssetDetail({ id: assetId }, paneDetail);
         },
       });
+    },
+  });
+}
+
+async function renderWorkOrdersDrilldown(params = {}) {
+  setChrome({ title: 'Work Orders', showBack: false, showLogout: true });
+  setApp(`
+    <div class="pane-row">
+      <div class="pane pane-wo-list" id="paneWoList"></div>
+      <div class="pane pane-detail" id="paneWoDetail"><p class="muted">Select a work order to see its details.</p></div>
+    </div>`);
+  const paneWoList = document.getElementById('paneWoList');
+  const paneWoDetail = document.getElementById('paneWoDetail');
+
+  await renderWorkOrders(params, paneWoList, {
+    onOpenWorkOrder: async (id) => {
+      await renderWorkOrderDetail({ id }, paneWoDetail);
+    },
+  });
+}
+
+// Dispatch table for Admin's leaf tool views — every one of them now accepts
+// (params, container) so this works uniformly regardless of which tool the
+// category list linked to.
+const ADMIN_LEAF_RENDERERS = {
+  adminAddFieldChoice: (params, container, cb) => renderAdminAddFieldChoice(params, container, cb),
+  adminPropertyFields: (params, container) => renderAdminPropertyFields(params, container),
+  adminComponentTypes: (params, container) => renderAdminComponentTypes(params, container),
+  adminBuildingTypes: (params, container) => renderAdminBuildingTypes(container),
+  adminApplicability: (params, container) => renderAdminApplicability(container),
+  adminSubAreas: (params, container) => renderAdminSubAreas(container),
+  adminWoTemplates: (params, container) => renderAdminWoTemplates(container),
+  adminChecklistTemplates: (params, container) => renderAdminChecklistTemplates(container),
+  adminUsers: (params, container) => renderAdminUsers(container),
+  activityLog: (params, container) => renderActivityLog(container),
+};
+
+async function renderAdminDrilldown() {
+  setChrome({ title: 'Admin', showBack: false, showLogout: true });
+  setApp(`
+    <div class="pane-row">
+      <div class="pane pane-locations" id="paneAdminHub"></div>
+      <div class="pane pane-assets" id="paneAdminCategory"><p class="muted">Select a category to see its tools.</p></div>
+      <div class="pane pane-detail" id="paneAdminTool"><p class="muted">Select a tool to configure it.</p></div>
+    </div>`);
+  const paneHub = document.getElementById('paneAdminHub');
+  const paneCategory = document.getElementById('paneAdminCategory');
+  const paneTool = document.getElementById('paneAdminTool');
+
+  function openTool(view, params) {
+    paneTool.innerHTML = LOADING_HTML;
+    const renderer = ADMIN_LEAF_RENDERERS[view];
+    if (!renderer) { paneTool.innerHTML = '<p class="muted">Unknown tool.</p>'; return; }
+    return renderer(params, paneTool, { onOpenTool: openTool });
+  }
+
+  await renderAdminHub(paneHub, {
+    onOpenCategory: async (key) => {
+      paneTool.innerHTML = '<p class="muted">Select a tool to configure it.</p>';
+      await renderAdminCategory({ category: key }, paneCategory, { onOpenTool: openTool });
     },
   });
 }
@@ -1468,9 +1528,9 @@ const ADMIN_CATEGORIES = {
   },
 };
 
-async function renderAdminHub() {
-  setChrome({ title: 'Admin', showBack: false, showLogout: true });
-  app.innerHTML = `
+async function renderAdminHub(container = app, { onOpenCategory } = {}) {
+  if (container === app) setChrome({ title: 'Admin', showBack: false, showLogout: true });
+  container.innerHTML = `
     <div class="admin-category-grid">
       ${Object.entries(ADMIN_CATEGORIES).map(([key, cat]) => `
         <div class="admin-category-card" data-category="${key}">
@@ -1480,17 +1540,23 @@ async function renderAdminHub() {
           <p class="muted" style="font-size:0.78rem">${cat.items.length} item${cat.items.length === 1 ? '' : 's'}</p>
         </div>`).join('')}
     </div>`;
-  app.querySelectorAll('.admin-category-card').forEach((el) => el.addEventListener('click', () => go('adminCategory', { category: el.dataset.category })));
+  container.querySelectorAll('.admin-category-card').forEach((el) => el.addEventListener('click', () => {
+    if (onOpenCategory) onOpenCategory(el.dataset.category);
+    else go('adminCategory', { category: el.dataset.category });
+  }));
 }
 
-async function renderAdminCategory({ category }) {
+async function renderAdminCategory({ category }, container = app, { onOpenTool } = {}) {
   const cat = ADMIN_CATEGORIES[category];
-  setChrome({ title: cat?.title || 'Admin', showBack: true, showLogout: true });
-  if (!cat) { app.innerHTML = '<p class="muted">Unknown category.</p>'; return; }
-  app.innerHTML = `
+  if (container === app) setChrome({ title: cat?.title || 'Admin', showBack: true, showLogout: true });
+  if (!cat) { container.innerHTML = '<p class="muted">Unknown category.</p>'; return; }
+  container.innerHTML = `
     <div class="card"><p class="muted">${escapeHtml(cat.description)}</p></div>
     ${cat.items.map((item) => `<div class="list-item" data-view="${item.view}">${item.icon} ${escapeHtml(item.label)}</div>`).join('')}`;
-  app.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
+  container.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => {
+    if (onOpenTool) onOpenTool(el.dataset.view, {});
+    else go(el.dataset.view, {});
+  }));
 }
 
 const ACTIVITY_ACTION_PILL = {
@@ -1515,9 +1581,9 @@ function activityNarrative(e) {
 function getShowToggleActivity() {
   return localStorage.getItem('campAuditShowToggleActivity') === 'true';
 }
-async function renderActivityLog() {
-  setChrome({ title: 'Activity Log', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderActivityLog(container = app) {
+  if (container === app) setChrome({ title: 'Activity Log', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { entries } = await api('/api/pg/activity-log?limit=300');
   let actionFilter = null;
   let typeFilter = null;
@@ -1555,10 +1621,10 @@ async function renderActivityLog() {
           <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Type</th><th>What</th><th>Details</th></tr></thead>
           <tbody>${rows || '<tr><td colspan="6" class="muted">No activity recorded yet.</td></tr>'}</tbody>
         </table>
-      </div>`);
-    document.getElementById('actionFilter').addEventListener('change', (e) => { actionFilter = e.target.value || null; draw(); });
-    document.getElementById('typeFilter').addEventListener('change', (e) => { typeFilter = e.target.value || null; draw(); });
-    document.getElementById('showTogglesChk').addEventListener('change', (e) => {
+      </div>`, container);
+    container.querySelector('#actionFilter').addEventListener('change', (e) => { actionFilter = e.target.value || null; draw(); });
+    container.querySelector('#typeFilter').addEventListener('change', (e) => { typeFilter = e.target.value || null; draw(); });
+    container.querySelector('#showTogglesChk').addEventListener('change', (e) => {
       showToggles = e.target.checked;
       localStorage.setItem('campAuditShowToggleActivity', String(showToggles));
       actionFilter = null; typeFilter = null; // avoid landing on a filter value that just disappeared
@@ -1569,9 +1635,9 @@ async function renderActivityLog() {
   draw();
 }
 
-async function renderAdminUsers() {
-  setChrome({ title: 'Users', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAdminUsers(container = app) {
+  if (container === app) setChrome({ title: 'Users', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { users } = await api('/api/pg/users');
   let editing = null; // 'new' | { id } | null
 
@@ -1608,15 +1674,15 @@ async function renderAdminUsers() {
         </div>`).join('') || '<p class="muted">No accounts yet.</p>'}
       ${editing === 'new' ? editFormHtml(null) : `<div class="btn-row" style="margin-top:10px"><button class="btn btn-secondary" id="addUserBtn">+ Add User</button></div>`}
       ${editing?.id ? editFormHtml(users.find((u) => u.Id === editing.id)) : ''}
-    `);
+    `, container);
     wire();
   }
 
   function wire() {
-    document.getElementById('addUserBtn')?.addEventListener('click', () => { editing = 'new'; draw(); });
-    app.querySelectorAll('.edit-user').forEach((btn) => btn.addEventListener('click', () => { editing = { id: Number(btn.dataset.id) }; draw(); }));
-    app.querySelectorAll('.u-cancel').forEach((btn) => btn.addEventListener('click', () => { editing = null; draw(); }));
-    app.querySelectorAll('.u-save').forEach((btn) => btn.addEventListener('click', async () => {
+    container.querySelector('#addUserBtn')?.addEventListener('click', () => { editing = 'new'; draw(); });
+    container.querySelectorAll('.edit-user').forEach((btn) => btn.addEventListener('click', () => { editing = { id: Number(btn.dataset.id) }; draw(); }));
+    container.querySelectorAll('.u-cancel').forEach((btn) => btn.addEventListener('click', () => { editing = null; draw(); }));
+    container.querySelectorAll('.u-save').forEach((btn) => btn.addEventListener('click', async () => {
       const card = btn.closest('.card');
       const id = btn.dataset.id;
       const isNew = !id;
@@ -1636,15 +1702,15 @@ async function renderAdminUsers() {
           await api(`/api/pg/users/${id}`, { method: 'PATCH', body: JSON.stringify({ email, password: password || undefined, active, role }) });
           toast('User saved');
         }
-        renderAdminUsers();
+        renderAdminUsers(container);
       } catch (err) { toast(err.message); }
     }));
-    app.querySelectorAll('.delete-user').forEach((btn) => btn.addEventListener('click', async () => {
+    container.querySelectorAll('.delete-user').forEach((btn) => btn.addEventListener('click', async () => {
       if (!await confirmDialog(`Permanently delete the account "${btn.dataset.name}"? This cannot be undone.`)) return;
       try {
         await api(`/api/pg/users/${btn.dataset.id}`, { method: 'DELETE' });
         toast('User deleted');
-        renderAdminUsers();
+        renderAdminUsers(container);
       } catch (err) { toast(err.message); }
     }));
   }
@@ -1652,9 +1718,9 @@ async function renderAdminUsers() {
   draw();
 }
 
-async function renderAdminWoTemplates() {
-  setChrome({ title: 'Work Order Templates', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAdminWoTemplates(container = app) {
+  if (container === app) setChrome({ title: 'Work Order Templates', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const [tplRes, optsRes] = await Promise.all([api('/api/pg/work-order-templates'), Promise.resolve(state.options)]);
   const templates = tplRes.templates;
   const fieldTitles = optsRes.propertyFields.map((f) => f.title);
@@ -1716,32 +1782,32 @@ async function renderAdminWoTemplates() {
       ${list}
       ${editingId === 'new' ? formHtml(null) : `<div class="btn-row" style="margin:4px 0 16px"><button class="btn btn-secondary" id="newTplBtn">+ New Template</button></div>`}
       ${typeof editingId === 'number' ? formHtml(templates.find((t) => t.Id === editingId)) : ''}
-    `);
+    `, container);
     wire();
   }
 
   function wire() {
-    document.getElementById('newTplBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
-    app.querySelectorAll('.tpl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
-    app.querySelectorAll('.tf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
-    app.querySelectorAll('.tf-add-task').forEach((btn) => btn.addEventListener('click', () => {
+    container.querySelector('#newTplBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
+    container.querySelectorAll('.tpl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
+    container.querySelectorAll('.tf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
+    container.querySelectorAll('.tf-add-task').forEach((btn) => btn.addEventListener('click', () => {
       btn.previousElementSibling.insertAdjacentHTML('beforeend', taskRowHtml());
       wireRemoveButtons();
     }));
-    app.querySelectorAll('.tf-add-line').forEach((btn) => btn.addEventListener('click', () => {
+    container.querySelectorAll('.tf-add-line').forEach((btn) => btn.addEventListener('click', () => {
       btn.previousElementSibling.insertAdjacentHTML('beforeend', jobLineRowHtml());
       wireRemoveButtons();
     }));
     wireRemoveButtons();
 
-    app.querySelectorAll('.tpl-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    container.querySelectorAll('.tpl-delete').forEach((btn) => btn.addEventListener('click', async () => {
       if (!await confirmDialog(`Delete template "${btn.dataset.name}"? This won't affect any work orders already created from it.`)) return;
       await api(`/api/pg/work-order-templates/${btn.dataset.id}`, { method: 'DELETE' });
       toast('Template deleted');
-      renderAdminWoTemplates();
+      renderAdminWoTemplates(container);
     }));
 
-    app.querySelectorAll('.tf-save').forEach((btn) => btn.addEventListener('click', async () => {
+    container.querySelectorAll('.tf-save').forEach((btn) => btn.addEventListener('click', async () => {
       const card = btn.closest('.card');
       const name = card.querySelector('.tf-name').value.trim();
       if (!name) { toast('Template name is required'); return; }
@@ -1759,21 +1825,21 @@ async function renderAdminWoTemplates() {
       try {
         await api(id ? `/api/pg/work-order-templates/${id}` : '/api/pg/work-order-templates', { method: id ? 'PATCH' : 'POST', body: JSON.stringify(fields) });
         toast(id ? 'Template updated' : 'Template created');
-        renderAdminWoTemplates();
+        renderAdminWoTemplates(container);
       } catch (err) { toast(err.message); }
     }));
   }
 
   function wireRemoveButtons() {
-    app.querySelectorAll('.row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); });
+    container.querySelectorAll('.row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); });
   }
 
   draw();
 }
 
-function renderAdminAddFieldChoice() {
-  setChrome({ title: 'Add New Field', showBack: true, showLogout: true });
-  app.innerHTML = `
+function renderAdminAddFieldChoice(params = {}, container = app, { onOpenTool } = {}) {
+  if (container === app) setChrome({ title: 'Add New Field', showBack: true, showLogout: true });
+  container.innerHTML = `
     <div class="card">
       <h3>What kind of thing is this?</h3>
       <p class="muted">This decides where it's stored and how reports treat it — pick carefully, it's not easily changed later.</p>
@@ -1786,13 +1852,19 @@ function renderAdminAddFieldChoice() {
       <h3>🧩 Component</h3>
       <p class="muted">A part tracked over time with condition + replacement history — like Roof or HVAC. Every audit adds a new event; "current state" is the newest one.</p>
     </div>`;
-  document.getElementById('choicePropertyBtn').addEventListener('click', () => go('adminPropertyFields', { openAdd: true }));
-  document.getElementById('choiceComponentBtn').addEventListener('click', () => go('adminComponentTypes', { openAdd: true }));
+  container.querySelector('#choicePropertyBtn').addEventListener('click', () => {
+    if (onOpenTool) onOpenTool('adminPropertyFields', { openAdd: true });
+    else go('adminPropertyFields', { openAdd: true });
+  });
+  container.querySelector('#choiceComponentBtn').addEventListener('click', () => {
+    if (onOpenTool) onOpenTool('adminComponentTypes', { openAdd: true });
+    else go('adminComponentTypes', { openAdd: true });
+  });
 }
 
-async function renderAdminPropertyFields({ openAdd } = {}) {
-  setChrome({ title: 'Property Fields', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAdminPropertyFields({ openAdd } = {}, container = app) {
+  if (container === app) setChrome({ title: 'Property Fields', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { fields } = await api('/api/pg/admin/property-fields');
   const rows = fields.map((f) => `
     <div class="list-item" style="cursor:default">
@@ -1800,7 +1872,7 @@ async function renderAdminPropertyFields({ openAdd } = {}) {
       <button class="btn btn-secondary toggle-active" data-id="${f.id}" data-next="${!f.active}">${f.active ? 'Deactivate' : 'Activate'}</button>
     </div>`).join('') || '<p class="muted">No property fields yet.</p>';
 
-  app.innerHTML = `
+  container.innerHTML = `
     <div class="card"><h3>Property Fields</h3><p class="muted">Stable single-value facts about an asset (like Has Key). ${fields.filter(f=>!f.column_name).length} of these are flexibly stored (added here, no schema change); ${fields.filter(f=>f.column_name).length} are original built-in fields.</p></div>
     ${rows}
     <div class="card">
@@ -1821,20 +1893,20 @@ async function renderAdminPropertyFields({ openAdd } = {}) {
       </form>
     </div>`;
 
-  document.querySelector('#addFieldForm [name="label"]').addEventListener('input', (e) => {
-    const keyInput = document.querySelector('#addFieldForm [name="fieldKey"]');
+  container.querySelector('#addFieldForm [name="label"]').addEventListener('input', (e) => {
+    const keyInput = container.querySelector('#addFieldForm [name="fieldKey"]');
     if (!keyInput.dataset.touched) keyInput.value = e.target.value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
   });
-  document.querySelector('#addFieldForm [name="fieldKey"]').addEventListener('input', (e) => { e.target.dataset.touched = 'true'; });
+  container.querySelector('#addFieldForm [name="fieldKey"]').addEventListener('input', (e) => { e.target.dataset.touched = 'true'; });
 
-  document.querySelectorAll('.toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+  container.querySelectorAll('.toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
     const action = btn.dataset.next === 'true' ? 'Reactivate' : 'Deactivate';
     if (!await confirmDialog(`${action} this field? ${action === 'Deactivate' ? 'It will stop appearing in the audit form and Edit Asset screen (existing data is kept).' : 'It will reappear in the audit form.'}`)) return;
     await api(`/api/pg/admin/property-fields/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.next === 'true' }) });
-    renderAdminPropertyFields();
+    renderAdminPropertyFields({}, container);
   }));
 
-  document.getElementById('addFieldForm').addEventListener('submit', async (e) => {
+  container.querySelector('#addFieldForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const inputType = fd.get('inputType');
@@ -1843,14 +1915,14 @@ async function renderAdminPropertyFields({ openAdd } = {}) {
       await api('/api/pg/admin/property-fields', { method: 'POST', body: JSON.stringify({ fieldKey: fd.get('fieldKey'), label: fd.get('label'), inputType, options }) });
       toast('Field created — available immediately in the audit form');
       state.options = null; // force refresh of cached options (building types etc. unaffected, but keep it simple)
-      renderAdminPropertyFields();
+      renderAdminPropertyFields({}, container);
     } catch (err) { toast(err.message); }
   });
 }
 
-async function renderAdminComponentTypes({ openAdd } = {}) {
-  setChrome({ title: 'Component Types', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAdminComponentTypes({ openAdd } = {}, container = app) {
+  if (container === app) setChrome({ title: 'Component Types', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { componentTypes } = await api('/api/pg/admin/component-types');
   const rows = componentTypes.map((c) => `
     <div class="list-item" style="cursor:default">
@@ -1858,7 +1930,7 @@ async function renderAdminComponentTypes({ openAdd } = {}) {
       <label class="muted" style="display:flex;align-items:center;gap:6px"><input type="checkbox" class="prompt-toggle" data-type="${escapeHtml(c.component_type)}" ${c.prompted_in_audit ? 'checked' : ''}/> prompted in audit</label>
     </div>`).join('') || '<p class="muted">No component types yet.</p>';
 
-  app.innerHTML = `
+  container.innerHTML = `
     <div class="card"><h3>Component Types</h3><p class="muted">Parts tracked over time with condition + replacement history. "Prompted in audit" controls whether the walkthrough asks about it (currently gated on Free Standing Building = Yes for all prompted types).</p></div>
     ${rows}
     <div class="card">
@@ -1872,7 +1944,7 @@ async function renderAdminComponentTypes({ openAdd } = {}) {
       </form>
     </div>`;
 
-  document.querySelectorAll('.prompt-toggle').forEach((cb) => cb.addEventListener('change', async () => {
+  container.querySelectorAll('.prompt-toggle').forEach((cb) => cb.addEventListener('change', async () => {
     if (!await confirmDialog(`${cb.checked ? 'Start' : 'Stop'} prompting for "${cb.dataset.type}" during the audit walkthrough (when Free Standing Building = Yes)?`)) {
       cb.checked = !cb.checked;
       return;
@@ -1881,7 +1953,7 @@ async function renderAdminComponentTypes({ openAdd } = {}) {
     toast('Updated');
   }));
 
-  document.getElementById('addCompForm').addEventListener('submit', async (e) => {
+  container.querySelector('#addCompForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
@@ -1895,14 +1967,14 @@ async function renderAdminComponentTypes({ openAdd } = {}) {
         }),
       });
       toast('Component type created');
-      renderAdminComponentTypes();
+      renderAdminComponentTypes({}, container);
     } catch (err) { toast(err.message); }
   });
 }
 
-async function renderAdminBuildingTypes() {
-  setChrome({ title: 'Building Types', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAdminBuildingTypes(container = app) {
+  if (container === app) setChrome({ title: 'Building Types', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { buildingTypes } = await api('/api/pg/admin/building-types');
   const rows = buildingTypes.map((b) => `
     <div class="list-item" style="cursor:default">
@@ -1910,7 +1982,7 @@ async function renderAdminBuildingTypes() {
       <button class="btn btn-secondary delete-bt" data-id="${b.Id}">Delete</button>
     </div>`).join('');
 
-  app.innerHTML = `
+  container.innerHTML = `
     <div class="card"><h3>Building Types</h3></div>
     ${rows}
     <div class="card">
@@ -1921,24 +1993,24 @@ async function renderAdminBuildingTypes() {
       </form>
     </div>`;
 
-  document.querySelectorAll('.delete-bt').forEach((btn) => btn.addEventListener('click', async () => {
+  container.querySelectorAll('.delete-bt').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog('Delete this building type? Only works if no assets currently use it.')) return;
-    try { await api(`/api/pg/admin/building-types/${btn.dataset.id}`, { method: 'DELETE' }); renderAdminBuildingTypes(); }
+    try { await api(`/api/pg/admin/building-types/${btn.dataset.id}`, { method: 'DELETE' }); renderAdminBuildingTypes(container); }
     catch (err) { toast(err.message); }
   }));
-  document.getElementById('addBtForm').addEventListener('submit', async (e) => {
+  container.querySelector('#addBtForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const name = new FormData(e.target).get('name');
     try {
       await api('/api/pg/admin/building-types', { method: 'POST', body: JSON.stringify({ name }) });
-      renderAdminBuildingTypes();
+      renderAdminBuildingTypes(container);
     } catch (err) { toast(err.message); }
   });
 }
 
-async function renderAdminApplicability() {
-  setChrome({ title: 'Applicability Matrix', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAdminApplicability(container = app) {
+  if (container === app) setChrome({ title: 'Applicability Matrix', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { buildingTypes, questionKeys, matrix } = await api('/api/pg/admin/applicability');
   const header = questionKeys.map((q) => `<th>${escapeHtml(q.label)}</th>`).join('');
   const rows = matrix.map((row) => `
@@ -1947,7 +2019,7 @@ async function renderAdminApplicability() {
       ${row.cells.map((c) => `<td style="text-align:center"><input type="checkbox" class="applies-cb" data-bt="${row.buildingTypeId}" data-qk="${escapeHtml(c.questionKey)}" ${c.applies ? 'checked' : ''}/></td>`).join('')}
     </tr>`).join('');
 
-  app.innerHTML = `
+  container.innerHTML = `
     <div class="card"><h3>Applicability Matrix</h3>
       <p class="muted">Unchecked = that question/component is skipped for that building type during the audit. Checked (default) = it applies.</p>
     </div>
@@ -1955,16 +2027,16 @@ async function renderAdminApplicability() {
       <table class="report-table matrix-table"><thead><tr><th>Building Type</th>${header}</tr></thead><tbody>${rows}</tbody></table>
     </div>`;
 
-  app.querySelectorAll('.applies-cb').forEach((cb) => cb.addEventListener('change', async () => {
+  container.querySelectorAll('.applies-cb').forEach((cb) => cb.addEventListener('change', async () => {
     try {
       await api('/api/pg/admin/applicability', { method: 'PUT', body: JSON.stringify({ buildingTypeId: Number(cb.dataset.bt), questionKey: cb.dataset.qk, applies: cb.checked }) });
     } catch (err) { toast(err.message); cb.checked = !cb.checked; }
   }));
 }
 
-async function renderAdminSubAreas() {
-  setChrome({ title: 'Component Sub-Areas', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAdminSubAreas(container = app) {
+  if (container === app) setChrome({ title: 'Component Sub-Areas', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { subAreas } = await api('/api/pg/admin/sub-areas');
   const byType = new Map();
   subAreas.forEach((s) => { if (!byType.has(s.component_type)) byType.set(s.component_type, []); byType.get(s.component_type).push(s); });
@@ -1973,7 +2045,7 @@ async function renderAdminSubAreas() {
       ${areas.map((a) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(a.sub_area)}</span><button class="btn btn-secondary delete-sa" data-id="${a.id}" data-name="${escapeHtml(a.sub_area)}" data-type="${escapeHtml(type)}">Delete</button></div>`).join('')}
     </div>`).join('') || '<p class="muted">No sub-areas defined yet.</p>';
 
-  app.innerHTML = `
+  container.innerHTML = `
     <div class="card"><h3>Component Sub-Areas</h3><p class="muted">Optional named parts of a component (e.g. Floor → NE Corner). A component with none behaves as a single whole.</p></div>
     ${groups}
     <div class="card">
@@ -1985,18 +2057,18 @@ async function renderAdminSubAreas() {
       </form>
     </div>`;
 
-  document.querySelectorAll('.delete-sa').forEach((btn) => btn.addEventListener('click', async () => {
+  container.querySelectorAll('.delete-sa').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Delete sub-area "${btn.dataset.name}" from ${btn.dataset.type}? This cannot be undone from the app — you'd need to re-add it manually.`)) return;
     await api(`/api/pg/admin/sub-areas/${btn.dataset.id}`, { method: 'DELETE' });
     toast('Sub-area deleted');
-    renderAdminSubAreas();
+    renderAdminSubAreas(container);
   }));
-  document.getElementById('addSaForm').addEventListener('submit', async (e) => {
+  container.querySelector('#addSaForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
       await api('/api/pg/admin/sub-areas', { method: 'POST', body: JSON.stringify({ componentType: fd.get('componentType'), subArea: fd.get('subArea') }) });
-      renderAdminSubAreas();
+      renderAdminSubAreas(container);
     } catch (err) { toast(err.message); }
   });
 }
@@ -2341,9 +2413,9 @@ async function renderCalendarEventDetail({ id }) {
 
 // ---------- Admin: Checklist Templates ----------
 
-async function renderAdminChecklistTemplates() {
-  setChrome({ title: 'Checklist Templates', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderAdminChecklistTemplates(container = app) {
+  if (container === app) setChrome({ title: 'Checklist Templates', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { templates } = await api('/api/pg/checklist-templates');
   let editingId = null;
 
@@ -2410,17 +2482,17 @@ async function renderAdminChecklistTemplates() {
       ${list}
       ${editingId === 'new' ? formHtml(null) : `<div class="btn-row" style="margin:4px 0 16px"><button class="btn btn-secondary" id="newChecklistBtn">+ New Checklist</button></div>`}
       ${typeof editingId === 'number' ? formHtml(templates.find((t) => t.Id === editingId)) : ''}
-    `);
+    `, container);
     wire();
   }
 
   function wire() {
-    document.getElementById('newChecklistBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
-    app.querySelectorAll('.cl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
-    app.querySelectorAll('.cf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
-    const stepsContainer = document.querySelector('.cf-steps');
+    container.querySelector('#newChecklistBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
+    container.querySelectorAll('.cl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
+    container.querySelectorAll('.cf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
+    const stepsContainer = container.querySelector('.cf-steps');
     if (stepsContainer) {
-      document.querySelector('.cf-add-step').addEventListener('click', () => {
+      container.querySelector('.cf-add-step').addEventListener('click', () => {
         stepsContainer.insertAdjacentHTML('beforeend', stepRowHtml());
         wireStepRow();
       });
@@ -2437,14 +2509,14 @@ async function renderAdminChecklistTemplates() {
       });
     }
 
-    app.querySelectorAll('.cl-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    container.querySelectorAll('.cl-delete').forEach((btn) => btn.addEventListener('click', async () => {
       if (!await confirmDialog(`Delete checklist "${btn.dataset.name}"? Any WOs/events already using it keep their own copy of the steps.`)) return;
       await api(`/api/pg/checklist-templates/${btn.dataset.id}`, { method: 'DELETE' });
       toast('Checklist deleted');
-      renderAdminChecklistTemplates();
+      renderAdminChecklistTemplates(container);
     }));
 
-    app.querySelectorAll('.cf-save').forEach((btn) => btn.addEventListener('click', async () => {
+    container.querySelectorAll('.cf-save').forEach((btn) => btn.addEventListener('click', async () => {
       const card = btn.closest('.card');
       const name = card.querySelector('.cf-name').value.trim();
       if (!name) { toast('Name is required'); return; }
@@ -2462,7 +2534,7 @@ async function renderAdminChecklistTemplates() {
       try {
         await api(id ? `/api/pg/checklist-templates/${id}` : '/api/pg/checklist-templates', { method: id ? 'PATCH' : 'POST', body: JSON.stringify({ name, steps }) });
         toast(id ? 'Checklist updated' : 'Checklist created');
-        renderAdminChecklistTemplates();
+        renderAdminChecklistTemplates(container);
       } catch (err) { toast(err.message); }
     }));
   }
@@ -2507,16 +2579,17 @@ function matchesScheduleFilter(w, key) {
   return true;
 }
 
-async function renderWorkOrders(params = {}) {
-  setChrome({ title: 'Work Orders', showBack: false, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder } = {}) {
+  if (container === app) setChrome({ title: 'Work Orders', showBack: false, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const { workOrders } = await api('/api/pg/work-orders');
   let cols = getWoColumnPrefs();
   let statusFilter = params.status || null;
   let scheduleFilter = params.schedule || null;
+  let selectedWoId = null;
 
   function draw() {
-    const mode = getTableViewMode();
+    const mode = onOpenWorkOrder ? 'cards' : getTableViewMode();
     const visibleWOs = workOrders.filter((w) =>
       (!statusFilter || w.Status === statusFilter) && (!scheduleFilter || matchesScheduleFilter(w, scheduleFilter)));
     const cardRows = visibleWOs.map((w) => {
@@ -2529,7 +2602,7 @@ async function renderWorkOrders(params = {}) {
       if (cols.dateCreated && w['Date Reported']) bits.push(`Created ${formatDateNice(w['Date Reported'])}`);
       if (cols.estHours && w['Estimated Hours'] != null) bits.push(`${w['Estimated Hours']}h est.`);
       if (cols.estCost && w['Estimated Cost'] != null) bits.push(`$${Number(w['Estimated Cost']).toLocaleString()} est.`);
-      return `<div class="list-item" style="flex-wrap:wrap" data-id="${w.Id}">
+      return `<div class="list-item ${onOpenWorkOrder && selectedWoId === w.Id ? 'cal-strip-selected' : ''}" style="flex-wrap:wrap" data-id="${w.Id}">
         <span>${escapeHtml(w.Title)}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}</span>
         ${cols.status ? `<span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status || '')}</span>` : ''}
       </div>`;
@@ -2555,7 +2628,7 @@ async function renderWorkOrders(params = {}) {
     setApp(`
       <div class="btn-row" style="margin-bottom:12px;justify-content:space-between">
         <button class="btn btn-primary" id="newWoBtnTop">+ New Work Order</button>
-        ${tableViewToggleHtml(mode)}
+        ${onOpenWorkOrder ? '' : tableViewToggleHtml(mode)}
       </div>
       ${filterLabel ? `<div class="btn-row" style="margin:-6px 0 12px"><button class="btn btn-secondary" id="clearWoFilter">✕ Filtered: ${escapeHtml(filterLabel)}</button></div>` : ''}
       ${mode === 'table' ? `
@@ -2573,14 +2646,17 @@ async function renderWorkOrders(params = {}) {
             <tbody>${tableRows || `<tr><td colspan="${visibleCols.length + 1}" class="muted">${filterLabel ? 'Nothing matches this filter.' : 'No work orders yet.'}</td></tr>`}</tbody>
           </table>
         </div>` : cardRows}
-    `);
+    `, container);
 
-    document.getElementById('newWoBtnTop').addEventListener('click', () => go('newWorkOrder', {}));
-    document.getElementById('clearWoFilter')?.addEventListener('click', () => { statusFilter = null; scheduleFilter = null; draw(); });
-    app.querySelectorAll('.list-item[data-id], tr.clickable-row').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.id })));
+    container.querySelector('#newWoBtnTop').addEventListener('click', () => go('newWorkOrder', {}));
+    container.querySelector('#clearWoFilter')?.addEventListener('click', () => { statusFilter = null; scheduleFilter = null; draw(); });
+    container.querySelectorAll('.list-item[data-id], tr.clickable-row').forEach((el) => el.addEventListener('click', () => {
+      if (onOpenWorkOrder) { selectedWoId = Number(el.dataset.id); draw(); onOpenWorkOrder(el.dataset.id); }
+      else go('workOrderDetail', { id: el.dataset.id });
+    }));
     wireTableViewToggle(draw);
-    app.querySelectorAll('.col-toggle').forEach((cb) => cb.addEventListener('click', (e) => e.stopPropagation()));
-    app.querySelectorAll('.col-toggle').forEach((cb) => cb.addEventListener('change', () => {
+    container.querySelectorAll('.col-toggle').forEach((cb) => cb.addEventListener('click', (e) => e.stopPropagation()));
+    container.querySelectorAll('.col-toggle').forEach((cb) => cb.addEventListener('change', () => {
       cols = { ...cols, [cb.dataset.col]: cb.checked };
       localStorage.setItem('campAuditWoColumns', JSON.stringify(cols));
       draw();
@@ -2826,9 +2902,9 @@ function wireFundingFields(root, fundingEntities, wo, getCurrentAsset) {
   return { getPicker: () => picker };
 }
 
-async function renderWorkOrderDetail({ id }) {
-  setChrome({ title: 'Work Order', showBack: true, showLogout: true });
-  app.innerHTML = LOADING_HTML;
+async function renderWorkOrderDetail({ id }, container = app) {
+  if (container === app) setChrome({ title: 'Work Order', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
   const [detail, allVolunteers, allVendors, skillsRes, tplRes, campaignRes, cabinRes, otherRes] = await Promise.all([
     api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'), api('/api/pg/skills'),
     api('/api/pg/checklist-templates'),
@@ -2882,7 +2958,7 @@ async function renderWorkOrderDetail({ id }) {
   const availableVols = allVolunteers.volunteers.filter((v) => !assignedVolIds.has(v.Id));
   const availableVens = allVendors.vendors.filter((v) => !assignedVenIds.has(v.Id));
 
-  app.innerHTML = `
+  container.innerHTML = `
     <div class="card">
       <h3>${escapeHtml(wo.Title)}</h3>
       ${wo['Scheduled Date'] ? `<p class="muted"><a href="#" id="viewOnCalendarLink">📅 View on Calendar (${new Date(wo['Scheduled Date']).toLocaleDateString('default', { month: 'long', year: 'numeric' })})</a></p>` : ''}
@@ -2980,10 +3056,10 @@ async function renderWorkOrderDetail({ id }) {
       </div>
     </div>`;
 
-  const assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'), { initialAsset: wo.Asset });
-  const fundingFieldsCtrl = wireFundingFields(document.getElementById('woFieldsForm'), fundingEntities, wo, () => assetPicker.getSelected());
+  const assetPicker = mountAssetCombobox(container.querySelector('#woAssetPicker'), { initialAsset: wo.Asset });
+  const fundingFieldsCtrl = wireFundingFields(container.querySelector('#woFieldsForm'), fundingEntities, wo, () => assetPicker.getSelected());
 
-  document.getElementById('woFieldsForm').addEventListener('submit', async (e) => {
+  container.querySelector('#woFieldsForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!await confirmDialog('Save changes to this work order?')) return;
     const fd = new FormData(e.target);
@@ -3004,11 +3080,11 @@ async function renderWorkOrderDetail({ id }) {
         fundingSource, fundingRefId,
       }) });
       toast('Work order updated');
-      renderWorkOrderDetail({ id });
+      renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
 
-  document.getElementById('duplicateWoBtn').addEventListener('click', async () => {
+  container.querySelector('#duplicateWoBtn').addEventListener('click', async () => {
     try {
       const result = await api(`/api/pg/work-orders/${id}/duplicate`, { method: 'POST' });
       toast('Work order duplicated');
@@ -3016,32 +3092,32 @@ async function renderWorkOrderDetail({ id }) {
     } catch (err) { toast(err.message); }
   });
 
-  document.getElementById('viewOnCalendarLink')?.addEventListener('click', (e) => {
+  container.querySelector('#viewOnCalendarLink')?.addEventListener('click', (e) => {
     e.preventDefault();
     const d = new Date(wo['Scheduled Date']);
     go('calendar', { month: d.getMonth(), year: d.getFullYear(), fromWorkOrderId: id, fromWorkOrderTitle: wo.Title });
   });
 
-  document.getElementById('addTaskBtn').addEventListener('click', async () => {
-    const input = document.querySelector('.new-task-input');
+  container.querySelector('#addTaskBtn').addEventListener('click', async () => {
+    const input = container.querySelector('.new-task-input');
     const description = input.value.trim();
     if (!description) return;
     try {
       await api(`/api/pg/work-orders/${id}/tasks`, { method: 'POST', body: JSON.stringify({ description }) });
-      renderWorkOrderDetail({ id });
+      renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
-  app.querySelectorAll('.task-toggle').forEach((cb) => cb.addEventListener('change', async () => {
-    try { await api(`/api/pg/work-order-tasks/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderWorkOrderDetail({ id }); }
+  container.querySelectorAll('.task-toggle').forEach((cb) => cb.addEventListener('change', async () => {
+    try { await api(`/api/pg/work-order-tasks/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   }));
-  app.querySelectorAll('.delete-task').forEach((btn) => btn.addEventListener('click', async () => {
+  container.querySelectorAll('.delete-task').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Delete task "${btn.dataset.label}"?`)) return;
-    try { await api(`/api/pg/work-order-tasks/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
+    try { await api(`/api/pg/work-order-tasks/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   }));
 
-  document.getElementById('addLogEntryForm').addEventListener('submit', async (e) => {
+  container.querySelector('#addLogEntryForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const note = fd.get('note').trim();
@@ -3051,113 +3127,113 @@ async function renderWorkOrderDetail({ id }) {
         note, hours: fd.get('hours') || undefined, statusChange: fd.get('statusChange') || undefined,
       }) });
       toast('Log entry added');
-      renderWorkOrderDetail({ id });
+      renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
-  app.querySelectorAll('.delete-log-entry').forEach((btn) => btn.addEventListener('click', async () => {
+  container.querySelectorAll('.delete-log-entry').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Delete this log entry? "${btn.dataset.label}"`)) return;
-    try { await api(`/api/pg/work-order-log/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
+    try { await api(`/api/pg/work-order-log/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   }));
 
-  document.getElementById('attachChecklistBtn')?.addEventListener('click', async () => {
-    const templateId = document.getElementById('checklistTplPicker').value;
+  container.querySelector('#attachChecklistBtn')?.addEventListener('click', async () => {
+    const templateId = container.querySelector('#checklistTplPicker').value;
     if (!templateId) { toast('Choose a checklist first'); return; }
     try {
       await api(`/api/pg/work-orders/${id}/checklist`, { method: 'POST', body: JSON.stringify({ templateId: Number(templateId) }) });
-      renderWorkOrderDetail({ id });
+      renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
-  document.getElementById('removeChecklistBtn')?.addEventListener('click', async () => {
+  container.querySelector('#removeChecklistBtn')?.addEventListener('click', async () => {
     if (!await confirmDialog('Remove this checklist from the work order? Progress will be lost.')) return;
-    try { await api(`/api/pg/checklist-instances/${checklist.Id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
+    try { await api(`/api/pg/checklist-instances/${checklist.Id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   });
-  app.querySelectorAll('.checklist-step-toggle').forEach((cb) => cb.addEventListener('change', async () => {
-    try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderWorkOrderDetail({ id }); }
+  container.querySelectorAll('.checklist-step-toggle').forEach((cb) => cb.addEventListener('change', async () => {
+    try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   }));
 
-  document.getElementById('completeWoBtn').addEventListener('click', async () => {
+  container.querySelector('#completeWoBtn').addEventListener('click', async () => {
     if (!await confirmDialog(`Complete this Work Order? Any pending "asset field update" entries will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;
     try {
       await api(`/api/pg/work-orders/${id}/complete`, { method: 'POST' });
       toast('Work order completed — asset updated');
-      renderWorkOrderDetail({ id });
+      renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
 
-  document.getElementById('addJobLineForm').addEventListener('submit', async (e) => {
+  container.querySelector('#addJobLineForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
       await api(`/api/pg/work-orders/${id}/asset-updates`, { method: 'POST', body: JSON.stringify({ targetField: fd.get('targetField'), newValue: fd.get('newValue') }) });
-      renderWorkOrderDetail({ id });
+      renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
 
-  app.querySelectorAll('.delete-au').forEach((btn) => btn.addEventListener('click', async () => {
+  container.querySelectorAll('.delete-au').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Delete the "${btn.dataset.label}" field update?`)) return;
-    try { await api(`/api/pg/work-orders/${id}/asset-updates/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
+    try { await api(`/api/pg/work-orders/${id}/asset-updates/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   }));
 
-  document.getElementById('assignVolForm').addEventListener('submit', async (e) => {
+  container.querySelector('#assignVolForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const volunteerId = new FormData(e.target).get('volunteerId');
     if (!volunteerId) return;
     await api(`/api/pg/work-orders/${id}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: Number(volunteerId) }) });
-    renderWorkOrderDetail({ id });
+    renderWorkOrderDetail({ id }, container);
   });
-  document.getElementById('assignVenForm').addEventListener('submit', async (e) => {
+  container.querySelector('#assignVenForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const vendorId = new FormData(e.target).get('vendorId');
     if (!vendorId) return;
     await api(`/api/pg/work-orders/${id}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: Number(vendorId) }) });
-    renderWorkOrderDetail({ id });
+    renderWorkOrderDetail({ id }, container);
   });
 
-  document.getElementById('newVolToggle').addEventListener('click', () => openCrewAddBox('newVolBox', 'newVenBox'));
-  document.getElementById('newVenToggle').addEventListener('click', () => openCrewAddBox('newVenBox', 'newVolBox'));
-  wireSkillChipToggle(document.getElementById('newVolSkills'));
-  wireSkillChipToggle(document.getElementById('newVenSkills'));
-  app.querySelectorAll('.add-skill-btn').forEach(wireAddSkillButton);
-  wirePhoneFormatting(app);
-  document.getElementById('newVolSave').addEventListener('click', async () => {
-    const name = document.getElementById('newVolName').value.trim();
+  container.querySelector('#newVolToggle').addEventListener('click', () => openCrewAddBox('newVolBox', 'newVenBox'));
+  container.querySelector('#newVenToggle').addEventListener('click', () => openCrewAddBox('newVenBox', 'newVolBox'));
+  wireSkillChipToggle(container.querySelector('#newVolSkills'));
+  wireSkillChipToggle(container.querySelector('#newVenSkills'));
+  container.querySelectorAll('.add-skill-btn').forEach(wireAddSkillButton);
+  wirePhoneFormatting(container);
+  container.querySelector('#newVolSave').addEventListener('click', async () => {
+    const name = container.querySelector('#newVolName').value.trim();
     if (!name) { toast('Name is required'); return; }
     try {
       const { volunteer } = await api('/api/pg/volunteers', { method: 'POST', body: JSON.stringify({
-        name, phone: document.getElementById('newVolPhone').value.trim(),
-        skill: selectedSkillsOf(document.getElementById('newVolSkills')),
+        name, phone: container.querySelector('#newVolPhone').value.trim(),
+        skill: selectedSkillsOf(container.querySelector('#newVolSkills')),
       }) });
       await api(`/api/pg/work-orders/${id}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: volunteer.Id }) });
       toast('Volunteer added and assigned');
-      renderWorkOrderDetail({ id });
+      renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
-  document.getElementById('newVenSave').addEventListener('click', async () => {
-    const name = document.getElementById('newVenName').value.trim();
+  container.querySelector('#newVenSave').addEventListener('click', async () => {
+    const name = container.querySelector('#newVenName').value.trim();
     if (!name) { toast('Name is required'); return; }
     try {
       const { vendor } = await api('/api/pg/vendors', { method: 'POST', body: JSON.stringify({
-        name, phone: document.getElementById('newVenPhone').value.trim(),
-        specialty: selectedSkillsOf(document.getElementById('newVenSkills')),
+        name, phone: container.querySelector('#newVenPhone').value.trim(),
+        specialty: selectedSkillsOf(container.querySelector('#newVenSkills')),
       }) });
       await api(`/api/pg/work-orders/${id}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: vendor.Id }) });
       toast('Vendor added and assigned');
-      renderWorkOrderDetail({ id });
+      renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
-  app.querySelectorAll('.unassign-vol').forEach((btn) => btn.addEventListener('click', async () => {
+  container.querySelectorAll('.unassign-vol').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Remove ${btn.dataset.name} from this work order?`)) return;
     await api(`/api/pg/work-orders/${id}/volunteers/${btn.dataset.id}`, { method: 'DELETE' });
-    renderWorkOrderDetail({ id });
+    renderWorkOrderDetail({ id }, container);
   }));
-  app.querySelectorAll('.unassign-ven').forEach((btn) => btn.addEventListener('click', async () => {
+  container.querySelectorAll('.unassign-ven').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Remove ${btn.dataset.name} from this work order?`)) return;
     await api(`/api/pg/work-orders/${id}/vendors/${btn.dataset.id}`, { method: 'DELETE' });
-    renderWorkOrderDetail({ id });
+    renderWorkOrderDetail({ id }, container);
   }));
 }
 
