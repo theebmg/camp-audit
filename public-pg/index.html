@@ -204,17 +204,37 @@
     .inline-add-row select, .inline-add-row input { flex: 1 1 0%; width: 0 !important; min-width: 0; }
     .inline-add-row .btn { flex: 0 0 auto !important; width: auto !important; white-space: nowrap; }
 
-    /* Calendar/scheduler */
+    /* Calendar/scheduler — the calendar is the main feature here: it gets a
+       generous share of the (now-widened) page width, with an unscheduled-WO
+       sidebar alongside it rather than stacked below on wide screens. */
+    .cal-header { display: flex; align-items: center; justify-content: center; gap: 18px; margin-bottom: 14px; }
+    .cal-header h3 { margin: 0; min-width: 200px; text-align: center; }
+    .cal-layout { display: flex; gap: 18px; align-items: flex-start; }
+    .cal-main { flex: 3; min-width: 0; }
+    .cal-sidebar { flex: 1; min-width: 240px; max-width: 340px; }
+    @media (max-width: 900px) { .cal-layout { flex-direction: column; } .cal-sidebar { max-width: none; width: 100%; } }
     .cal-scroll { overflow-x: auto; }
-    .cal-grid { display: grid; grid-template-columns: repeat(7, minmax(110px, 1fr)); gap: 1px;
+    .cal-grid { display: grid; grid-template-columns: repeat(7, minmax(100px, 1fr)); gap: 1px;
       background: var(--border); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
     .cal-head { background: var(--surface-alt); padding: 6px 8px; font-size: 0.78rem; font-weight: 700; color: var(--muted); text-align: center; }
-    .cal-cell { background: var(--surface); min-height: 90px; padding: 6px; }
-    .cal-cell.cal-empty { background: var(--bg); }
+    .cal-cell { background: var(--surface); min-height: 120px; padding: 6px; cursor: pointer; transition: background-color 0.15s ease; }
+    .cal-cell:hover { background: var(--surface-alt); }
+    .cal-cell.cal-empty { background: var(--bg); cursor: default; }
+    .cal-cell.cal-empty:hover { background: var(--bg); }
     .cal-cell.cal-today { background: var(--accent-soft); }
     .cal-daynum { font-size: 0.78rem; font-weight: 700; color: var(--muted); margin-bottom: 4px; }
     .cal-entry { cursor: pointer; margin-bottom: 3px; }
     .cal-entry .pill { display: block; text-align: left; white-space: normal; line-height: 1.3; }
+
+    /* Day slide-out panel — opened by clicking a day cell's background. */
+    .day-panel-overlay { position: fixed; inset: 0; background: rgba(10, 12, 20, 0.35); z-index: 900; animation: modalFadeIn 0.15s ease; }
+    .day-panel {
+      position: fixed; top: 0; right: 0; height: 100%; width: min(400px, 92vw);
+      background: var(--surface); border-left: 1px solid var(--border); box-shadow: var(--shadow-md);
+      z-index: 901; overflow-y: auto; padding: 20px; animation: dayPanelSlideIn 0.2s ease;
+    }
+    .day-panel-entry { cursor: pointer; }
+    @keyframes dayPanelSlideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
   </style>
 </head>
 <body>

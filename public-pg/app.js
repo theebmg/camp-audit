@@ -1616,6 +1616,36 @@ async function renderAdminSubAreas() {
 
 // ---------- Calendar / Scheduler ----------
 
+// Slide-out panel from the right, listing one day's scheduled WOs/events —
+// opened by clicking a day cell's background (not one of its entry pills,
+// which still navigate straight to that WO/event as before).
+function openDayPanel(dateKey, entries) {
+  closeDayPanel();
+  const label = new Date(`${dateKey}T00:00:00`).toLocaleDateString('default', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  const overlay = document.createElement('div');
+  overlay.className = 'day-panel-overlay';
+  overlay.id = 'dayPanelOverlay';
+  overlay.innerHTML = `
+    <div class="day-panel">
+      <div class="btn-row" style="justify-content:space-between;align-items:center;margin-top:0">
+        <h3 style="margin:0">${escapeHtml(label)}</h3>
+        <button class="btn btn-secondary" id="closeDayPanelBtn">✕</button>
+      </div>
+      ${entries.length ? entries.map((e) => e.type === 'wo'
+        ? `<div class="list-item day-panel-entry" data-wo-id="${e.Id}"><span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.Title)}</span><span class="pill ${woStatusPillClass(e.Status)}">${escapeHtml(e.Status)}</span></div>`
+        : `<div class="list-item day-panel-entry" data-event-id="${e.Id}"><span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`
+      ).join('') : '<p class="muted">Nothing scheduled this day.</p>'}
+      <div class="btn-row"><button class="btn btn-primary" id="dayPanelAddEventBtn">+ Add Event This Day</button></div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) closeDayPanel(); });
+  document.getElementById('closeDayPanelBtn').addEventListener('click', closeDayPanel);
+  document.getElementById('dayPanelAddEventBtn').addEventListener('click', () => { closeDayPanel(); go('newCalendarEvent', { date: dateKey }); });
+  overlay.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => { closeDayPanel(); go('workOrderDetail', { id: el.dataset.woId }); }));
+  overlay.querySelectorAll('[data-event-id]').forEach((el) => el.addEventListener('click', () => { closeDayPanel(); go('calendarEventDetail', { id: el.dataset.eventId }); }));
+}
+function closeDayPanel() { document.getElementById('dayPanelOverlay')?.remove(); }
+
 async function renderCalendar(params = {}) {
   setChrome({ title: 'Calendar', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
@@ -1623,8 +1653,10 @@ async function renderCalendar(params = {}) {
   let viewMonth = params.month != null ? Number(params.month) : now.getMonth();
   let viewYear = params.year != null ? Number(params.year) : now.getFullYear();
   const todayKey = now.toISOString().slice(0, 10);
+  let dayEntriesMap = new Map(); // dateKey -> entries[], refreshed each draw(); read by the day-cell click handler
 
   async function draw() {
+    closeDayPanel();
     app.innerHTML = LOADING_HTML;
     const firstOfMonth = new Date(viewYear, viewMonth, 1);
     const startWeekday = firstOfMonth.getDay();
@@ -1637,21 +1669,19 @@ async function renderCalendar(params = {}) {
       api('/api/pg/work-orders'), api(`/api/pg/calendar-events?from=${fromStr}&to=${toStr}`),
     ]);
 
-    const byDate = new Map();
-    const unscheduled = [];
+    dayEntriesMap = new Map();
     for (const w of workOrders) {
       const sd = w['Scheduled Date'];
-      if (!sd) { unscheduled.push(w); continue; }
+      if (!sd) continue;
       const key = sd.slice(0, 10);
-      if (key < fromStr || key > toStr) continue; // different month, don't clutter "Unscheduled"... but keep visible via nav
-      if (!byDate.has(key)) byDate.set(key, []);
-      byDate.get(key).push({ type: 'wo', ...w });
+      if (key < fromStr || key > toStr) continue;
+      if (!dayEntriesMap.has(key)) dayEntriesMap.set(key, []);
+      dayEntriesMap.get(key).push({ type: 'wo', ...w });
     }
     for (const occ of occurrences) {
-      if (!byDate.has(occ.OccurrenceDate)) byDate.set(occ.OccurrenceDate, []);
-      byDate.get(occ.OccurrenceDate).push({ type: 'event', ...occ });
+      if (!dayEntriesMap.has(occ.OccurrenceDate)) dayEntriesMap.set(occ.OccurrenceDate, []);
+      dayEntriesMap.get(occ.OccurrenceDate).push({ type: 'event', ...occ });
     }
-    // WOs scheduled outside this month (shouldn't normally happen since we filtered) — recompute unscheduled properly across ALL WOs regardless of month
     const allUnscheduled = workOrders.filter((w) => !w['Scheduled Date']);
 
     const entryHtml = (e) => e.type === 'wo'
@@ -1662,31 +1692,40 @@ async function renderCalendar(params = {}) {
     for (let i = 0; i < startWeekday; i++) cells.push('<div class="cal-cell cal-empty"></div>');
     for (let d = 1; d <= daysInMonth; d++) {
       const dateKey = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-      const entries = byDate.get(dateKey) || [];
-      cells.push(`<div class="cal-cell ${dateKey === todayKey ? 'cal-today' : ''}">
+      const entries = dayEntriesMap.get(dateKey) || [];
+      const shown = entries.slice(0, 3);
+      const overflow = entries.length - shown.length;
+      cells.push(`<div class="cal-cell ${dateKey === todayKey ? 'cal-today' : ''}" data-date="${dateKey}">
         <div class="cal-daynum">${d}</div>
-        ${entries.map(entryHtml).join('')}
+        ${shown.map(entryHtml).join('')}
+        ${overflow > 0 ? `<div class="muted" style="font-size:0.75rem">+${overflow} more</div>` : ''}
       </div>`);
     }
 
     setApp(`
-      <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
-        <button class="btn btn-secondary" id="prevMonthBtn">← Prev</button>
-        <h3 style="margin:0">${monthLabel}</h3>
-        <button class="btn btn-secondary" id="nextMonthBtn">Next →</button>
+      <div class="cal-header">
+        <button class="btn btn-secondary" id="prevMonthBtn">‹ Prev</button>
+        <h3>${monthLabel}</h3>
+        <button class="btn btn-secondary" id="nextMonthBtn">Next ›</button>
       </div>
-      <div class="btn-row" style="margin-bottom:12px"><button class="btn btn-primary" id="addEventBtn">+ Add Event</button></div>
-      <div class="cal-scroll"><div class="cal-grid">
-        ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => `<div class="cal-head">${d}</div>`).join('')}
-        ${cells.join('')}
-      </div></div>
-      ${allUnscheduled.length ? `<div class="card"><h3>Unscheduled Work Orders (${allUnscheduled.length})</h3>
-        <p class="muted">Set a Scheduled Date on a work order to place it on the calendar.</p>
-        ${allUnscheduled.map((w) => `<div class="list-item" data-wo-id="${w.Id}">
-          <span>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</span>
-          <span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status)}</span>
-        </div>`).join('')}
-      </div>` : ''}`);
+      <div class="cal-layout">
+        <div class="cal-main">
+          <div class="btn-row" style="margin-bottom:12px"><button class="btn btn-primary" id="addEventBtn">+ Add Event</button></div>
+          <div class="cal-scroll"><div class="cal-grid">
+            ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => `<div class="cal-head">${d}</div>`).join('')}
+            ${cells.join('')}
+          </div></div>
+        </div>
+        <div class="cal-sidebar">
+          <div class="card"><h3>Unscheduled Work Orders${allUnscheduled.length ? ` (${allUnscheduled.length})` : ''}</h3>
+            <p class="muted">Set a Scheduled Date on a work order to place it on the calendar.</p>
+            ${allUnscheduled.length ? allUnscheduled.map((w) => `<div class="list-item" data-wo-id="${w.Id}">
+              <span>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</span>
+              <span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status)}</span>
+            </div>`).join('') : '<p class="muted">None — everything is scheduled. 🎉</p>'}
+          </div>
+        </div>
+      </div>`);
     wire();
   }
 
@@ -1699,7 +1738,13 @@ async function renderCalendar(params = {}) {
     });
     document.getElementById('addEventBtn').addEventListener('click', () => go('newCalendarEvent', {}));
     app.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
-    app.querySelectorAll('[data-event-id]').forEach((el) => el.addEventListener('click', () => go('calendarEventDetail', { id: el.dataset.eventId })));
+    app.querySelectorAll('.cal-entry[data-event-id]').forEach((el) => el.addEventListener('click', (e) => {
+      e.stopPropagation(); go('calendarEventDetail', { id: el.dataset.eventId });
+    }));
+    app.querySelectorAll('.cal-cell[data-date]').forEach((cell) => cell.addEventListener('click', (e) => {
+      if (e.target.closest('.cal-entry')) return; // entry clicks navigate directly, handled above
+      openDayPanel(cell.dataset.date, dayEntriesMap.get(cell.dataset.date) || []);
+    }));
   }
 
   draw();
