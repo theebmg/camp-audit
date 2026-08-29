@@ -184,10 +184,10 @@
     .pane-row { display: flex; align-items: stretch; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
     .pane { min-width: 0; padding: 14px; overflow-y: auto; max-height: calc(100vh - 150px); }
     .pane + .pane { border-left: 1px solid var(--border); }
-    .pane-locations { flex: 0 0 280px; }
-    .pane-assets { flex: 0 0 280px; }
-    .pane-wo-list { flex: 0 0 380px; }
-    .pane-detail { flex: 1 1 auto; }
+    .pane-locations { flex: 1 1 280px; min-width: 280px; }
+    .pane-assets { flex: 1 1 280px; min-width: 280px; }
+    .pane-wo-list { flex: 1 1 380px; min-width: 380px; }
+    .pane-detail { flex: 2 1 400px; min-width: 320px; }
     .pane .card { box-shadow: none; border-color: var(--border); }
     @media (max-width: 640px) { .cal-strip { grid-template-columns: repeat(7, minmax(0,1fr)); } .cal-strip-event { display: none; } }
 
