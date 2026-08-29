@@ -192,10 +192,19 @@
     /* Every "list" pane (browse columns, not the detail pane) shares one
        fixed min-width so a row's fixed-width bits (pill, button) always have
        room and nothing spills past the tile's border — same rule everywhere
-       rather than a different guess per pane. */
-    .pane-locations, .pane-assets, .pane-wo-list { flex: 1 1 320px; min-width: 320px; }
-    .pane-detail { flex: 2 1 400px; min-width: 320px; }
+       rather than a different guess per pane. They also cap out with
+       max-width: past a comfortable name/title column there's no benefit to
+       growing further, so leftover space on wide monitors goes to the detail
+       pane instead of stretching list rows into mostly-empty tiles. */
+    .pane-locations, .pane-assets, .pane-wo-list { flex: 1 1 380px; min-width: 380px; max-width: 560px; }
+    .pane-detail { flex: 1 1 400px; min-width: 380px; }
     .pane .card { box-shadow: none; border-color: var(--border); }
+    /* style.css caps main#app at 1200px for every other view (dashboard,
+       capital plan, etc. all read better centered/narrower) — but a
+       drill-down's whole point is fitting several panes side by side, so let
+       it use the full window on wide monitors instead of leaving most of a
+       27"+ screen empty. */
+    main#app:has(.pane-row) { max-width: none; }
     @media (max-width: 640px) { .cal-strip { grid-template-columns: repeat(7, minmax(0,1fr)); } .cal-strip-event { display: none; } }
 
     /* Motion: cards/list-items/nav get a soft hover + a fade-in when a view

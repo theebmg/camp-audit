@@ -90,7 +90,14 @@ const LOADING_HTML = '<div class="loading-wrap"><div class="spinner"></div><span
 // three cramped columns. Narrow screens keep the existing one-view-at-a-time
 // behavior untouched — renderLocations/renderAssetsInLocation/renderAssetDetail
 // all still work exactly as before when called with no container override.
-const DRILLDOWN_MIN_WIDTH = 1100;
+// 3-pane views (Locations, Admin) need real headroom above each pane's
+// 380px floor before a location/tool name reliably fits without ellipsis —
+// measured against real data, 1750 is where that's true for all but the
+// rare outlier name. Below it, the single-view + breadcrumb-trail
+// navigation (see renderBreadcrumbs) handles it instead, which is the
+// better experience on a laptop-width window anyway rather than 3 cramped
+// columns.
+const DRILLDOWN_MIN_WIDTH = 1750;
 const DRILLDOWN_VIEWS = new Set(['locations', 'workOrders', 'admin']); // views with a pane variant to swap to/from on resize
 
 // ---- Theme (Light/Dark/System) + accent color — persisted per-browser.
@@ -386,6 +393,38 @@ function fadeInApp() {
   app.classList.add('view-fade');
 }
 
+// Below the drill-down width, panes collapse to one full-page view at a
+// time (see DRILLDOWN_VIEWS) — the only way back is the single "back" arrow,
+// one hop per tap. On a phone, a location -> asset -> asset detail chain is
+// three taps to get back to the top; a breadcrumb trail lets you jump to any
+// ancestor directly instead. Wide screens don't need this (the panes are all
+// visible at once), so it's narrow-only.
+function breadcrumbLabel({ view, params }) {
+  if (view === 'assetsInLocation') return params.name || 'Assets';
+  if (view === 'assetDetail') return params.name || 'Asset';
+  if (view === 'workOrderDetail') return params.title || 'Work Order';
+  if (view === 'adminCategory') return ADMIN_CATEGORIES[params.category]?.title || 'Category';
+  if (ADMIN_TOOL_LABELS[view]) return ADMIN_TOOL_LABELS[view];
+  return NAV_ITEMS.find((n) => n.view === view)?.label || view;
+}
+function renderBreadcrumbs() {
+  if (window.innerWidth >= DRILLDOWN_MIN_WIDTH || state.stack.length < 2) { breadcrumbsEl.hidden = true; return; }
+  breadcrumbsEl.hidden = false;
+  breadcrumbsEl.innerHTML = state.stack.map((entry, i) => {
+    const label = escapeHtml(breadcrumbLabel(entry));
+    return (i > 0 ? '<span class="crumb-sep">›</span>' : '') + (i === state.stack.length - 1
+      ? `<span class="crumb-current">${label}</span>`
+      : `<a href="#" class="crumb-link" data-idx="${i}">${label}</a>`);
+  }).join('');
+  breadcrumbsEl.querySelectorAll('.crumb-link').forEach((el) => el.addEventListener('click', (e) => {
+    e.preventDefault();
+    const idx = Number(el.dataset.idx);
+    const target = state.stack[idx];
+    state.stack = state.stack.slice(0, idx + 1);
+    render(target.view, target.params);
+  }));
+}
+
 async function render(view, params = {}) {
   try {
     if (view === 'login') { await renderLogin(); return fadeInApp(); }
@@ -393,7 +432,7 @@ async function render(view, params = {}) {
     if (!state.options) state.options = await api('/api/pg/options');
     renderSidebar(view);
     setChrome({ title: '', showBack: state.stack.length > 1, showLogout: true });
-    breadcrumbsEl.hidden = true;
+    renderBreadcrumbs();
     const handlers = {
       dashboard: () => renderDashboard(),
       locations: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderLocationsDrilldown() : renderLocations()),
@@ -848,13 +887,13 @@ async function renderAssetsInLocation({ id, name }, container = app, { onOpenAss
   let selectedAssetId = null;
   const draw = () => {
     container.innerHTML = assets.length ? assets.map((a) => `
-      <div class="list-item ${onOpenAsset && selectedAssetId === a.Id ? 'cal-strip-selected' : ''}" data-id="${a.Id}">
+      <div class="list-item ${onOpenAsset && selectedAssetId === a.Id ? 'cal-strip-selected' : ''}" data-id="${a.Id}" data-name="${escapeHtml(a.Name)}">
         <span>🏚️ ${escapeHtml(a.Name)}</span>
         <span class="pill">${escapeHtml(a['Asset type'] || '')}</span>
       </div>`).join('') : '<p class="muted">No assets in this location.</p>';
     container.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => {
       if (onOpenAsset) { selectedAssetId = Number(el.dataset.id); draw(); onOpenAsset(el.dataset.id); }
-      else go('assetDetail', { id: el.dataset.id });
+      else go('assetDetail', { id: el.dataset.id, name: el.dataset.name });
     }));
   };
   draw();
@@ -1527,6 +1566,11 @@ const ADMIN_CATEGORIES = {
     ],
   },
 };
+// Flat view -> label lookup for the breadcrumb trail (see renderBreadcrumbs) —
+// every leaf tool across every category, in one map.
+const ADMIN_TOOL_LABELS = Object.fromEntries(
+  Object.values(ADMIN_CATEGORIES).flatMap((cat) => cat.items.map((item) => [item.view, item.label])),
+);
 
 async function renderAdminHub(container = app, { onOpenCategory } = {}) {
   if (container === app) setChrome({ title: 'Admin', showBack: false, showLogout: true });
