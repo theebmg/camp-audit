@@ -328,6 +328,7 @@ async function render(view, params = {}) {
       maintenanceLog: () => renderMaintenanceLog(),
       editAsset: () => renderEditAsset(params),
       admin: () => renderAdminHub(),
+      adminCategory: () => renderAdminCategory(params),
       adminAddFieldChoice: () => renderAdminAddFieldChoice(),
       adminPropertyFields: () => renderAdminPropertyFields(params),
       adminComponentTypes: () => renderAdminComponentTypes(params),
@@ -1059,22 +1060,61 @@ async function renderEditAsset({ id }) {
 
 // ---------- Admin ----------
 
+const ADMIN_CATEGORIES = {
+  assets: {
+    icon: '🏚️', title: 'Assets & Schema', description: 'Fields, components, building types — no deploy needed',
+    items: [
+      { view: 'adminAddFieldChoice', icon: '➕', label: 'Add New Field' },
+      { view: 'adminPropertyFields', icon: '🏷️', label: 'Property Fields' },
+      { view: 'adminComponentTypes', icon: '🧩', label: 'Component Types' },
+      { view: 'adminBuildingTypes', icon: '🏛️', label: 'Building Types' },
+      { view: 'adminApplicability', icon: '✅', label: 'Applicability Matrix' },
+      { view: 'adminSubAreas', icon: '📐', label: 'Component Sub-Areas' },
+    ],
+  },
+  workOrders: {
+    icon: '🧾', title: 'Work Orders', description: 'Templates and checklists for repeatable work',
+    items: [
+      { view: 'adminWoTemplates', icon: '🧾', label: 'Work Order Templates' },
+      { view: 'adminChecklistTemplates', icon: '✅', label: 'Checklist Templates' },
+    ],
+  },
+  accounts: {
+    icon: '👤', title: 'Accounts', description: 'Who can log in, and what they can see',
+    items: [
+      { view: 'adminUsers', icon: '👤', label: 'Users' },
+    ],
+  },
+  system: {
+    icon: '🕘', title: 'System', description: 'What has been done across the app',
+    items: [
+      { view: 'activityLog', icon: '🕘', label: 'Activity Log' },
+    ],
+  },
+};
+
 async function renderAdminHub() {
   setChrome({ title: 'Admin', showBack: false, showLogout: true });
   app.innerHTML = `
-    <div class="card"><h3>Schema & Configuration</h3>
-      <p class="muted">Everything here takes effect immediately — no deploy, no restart.</p></div>
-    <div class="list-item" data-view="adminAddFieldChoice">➕ Add New Field</div>
-    <div class="list-item" data-view="adminPropertyFields">🏷️ Property Fields</div>
-    <div class="list-item" data-view="adminComponentTypes">🧩 Component Types</div>
-    <div class="list-item" data-view="adminBuildingTypes">🏛️ Building Types</div>
-    <div class="list-item" data-view="adminApplicability">✅ Applicability Matrix</div>
-    <div class="list-item" data-view="adminSubAreas">📐 Component Sub-Areas</div>
-    <div class="list-item" data-view="adminWoTemplates">🧾 Work Order Templates</div>
-    <div class="list-item" data-view="adminChecklistTemplates">✅ Checklist Templates</div>
-    <div class="card" style="margin-top:14px"><h3>Accounts</h3></div>
-    <div class="list-item" data-view="adminUsers">👤 Users</div>
-    <div class="list-item" data-view="activityLog">🕘 Activity Log</div>`;
+    <div class="admin-category-grid">
+      ${Object.entries(ADMIN_CATEGORIES).map(([key, cat]) => `
+        <div class="admin-category-card" data-category="${key}">
+          <div class="admin-category-icon">${cat.icon}</div>
+          <h3>${escapeHtml(cat.title)}</h3>
+          <p class="muted">${escapeHtml(cat.description)}</p>
+          <p class="muted" style="font-size:0.78rem">${cat.items.length} item${cat.items.length === 1 ? '' : 's'}</p>
+        </div>`).join('')}
+    </div>`;
+  app.querySelectorAll('.admin-category-card').forEach((el) => el.addEventListener('click', () => go('adminCategory', { category: el.dataset.category })));
+}
+
+async function renderAdminCategory({ category }) {
+  const cat = ADMIN_CATEGORIES[category];
+  setChrome({ title: cat?.title || 'Admin', showBack: true, showLogout: true });
+  if (!cat) { app.innerHTML = '<p class="muted">Unknown category.</p>'; return; }
+  app.innerHTML = `
+    <div class="card"><p class="muted">${escapeHtml(cat.description)}</p></div>
+    ${cat.items.map((item) => `<div class="list-item" data-view="${item.view}">${item.icon} ${escapeHtml(item.label)}</div>`).join('')}`;
   app.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
 }
 
@@ -1154,6 +1194,12 @@ async function renderAdminUsers() {
       ${u ? '' : `<div class="field-row"><label>Username</label><input class="u-username" required /></div>`}
       <div class="field-row"><label>Email (optional)</label><input class="u-email" type="email" value="${escapeHtml(u?.Email || '')}" /></div>
       <div class="field-row"><label>${u ? 'New Password (leave blank to keep current)' : 'Password'}</label><input class="u-password" type="password" ${u ? '' : 'required'} /></div>
+      <div class="field-row"><label>Role</label>
+        <select class="u-role">
+          <option value="standard" ${(!u || u.Role === 'standard') ? 'selected' : ''}>Standard — sees only their own Dashboard activity</option>
+          <option value="admin" ${u?.Role === 'admin' ? 'selected' : ''}>Admin — sees everyone's Dashboard activity</option>
+        </select>
+      </div>
       ${u ? `<div class="field-row"><label style="display:flex;align-items:center;gap:8px;font-weight:400"><input type="checkbox" class="u-active" ${u.Active ? 'checked' : ''} style="width:auto" /> Active (unchecked = can't log in)</label></div>` : ''}
       <div class="btn-row">
         <button class="btn btn-primary u-save" data-id="${u?.Id ?? ''}">Save</button>
@@ -1166,7 +1212,7 @@ async function renderAdminUsers() {
     setApp(`
       ${users.map((u) => `
         <div class="list-item" style="cursor:default">
-          <div><strong>${escapeHtml(u.Username)}</strong>${!u.Active ? ' <span class="pill">inactive</span>' : ''}
+          <div><strong>${escapeHtml(u.Username)}</strong> <span class="pill ${u.Role === 'admin' ? 'good' : ''}">${escapeHtml(u.Role)}</span>${!u.Active ? ' <span class="pill">inactive</span>' : ''}
             <div class="muted">${escapeHtml(u.Email || 'no email on file')}</div></div>
           <div class="btn-row" style="margin-top:0">
             <button class="btn btn-secondary edit-user" data-id="${u.Id}">Edit</button>
@@ -1189,17 +1235,18 @@ async function renderAdminUsers() {
       const isNew = !id;
       const password = card.querySelector('.u-password').value;
       const email = card.querySelector('.u-email').value.trim();
+      const role = card.querySelector('.u-role').value;
       try {
         if (isNew) {
           const username = card.querySelector('.u-username').value.trim();
           if (!username) { toast('Username is required'); return; }
           if (password.length < 6) { toast('Password must be at least 6 characters'); return; }
-          await api('/api/pg/users', { method: 'POST', body: JSON.stringify({ username, password, email }) });
+          await api('/api/pg/users', { method: 'POST', body: JSON.stringify({ username, password, email, role }) });
           toast('User added');
         } else {
           if (password && password.length < 6) { toast('Password must be at least 6 characters'); return; }
           const active = card.querySelector('.u-active').checked;
-          await api(`/api/pg/users/${id}`, { method: 'PATCH', body: JSON.stringify({ email, password: password || undefined, active }) });
+          await api(`/api/pg/users/${id}`, { method: 'PATCH', body: JSON.stringify({ email, password: password || undefined, active, role }) });
           toast('User saved');
         }
         renderAdminUsers();
@@ -1988,20 +2035,95 @@ async function renderAdminChecklistTemplates() {
 
 // ---------- Work Orders ----------
 
+const WO_LIST_COLUMNS = [
+  { key: 'asset', label: 'Asset', default: true },
+  { key: 'status', label: 'Status', default: true },
+  { key: 'priority', label: 'Priority', default: true },
+  { key: 'daysSinceCreated', label: 'Days Since Created', default: true },
+  { key: 'scheduledDate', label: 'Scheduled Date', default: true },
+  { key: 'dateCreated', label: 'Date Created', default: false },
+  { key: 'estHours', label: 'Est. Hours', default: false },
+  { key: 'estCost', label: 'Est. Cost', default: false },
+];
+function getWoColumnPrefs() {
+  const defaults = Object.fromEntries(WO_LIST_COLUMNS.map((c) => [c.key, c.default]));
+  try {
+    const raw = localStorage.getItem('campAuditWoColumns');
+    return raw ? { ...defaults, ...JSON.parse(raw) } : defaults;
+  } catch { return defaults; }
+}
+function daysSince(dateStr) {
+  if (!dateStr) return null;
+  return Math.floor((Date.now() - new Date(dateStr).getTime()) / 86400000);
+}
+
 async function renderWorkOrders() {
   setChrome({ title: 'Work Orders', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
   const { workOrders } = await api('/api/pg/work-orders');
-  const rows = workOrders.map((w) => `
-    <div class="list-item" data-id="${w.Id}">
-      <span>${escapeHtml(w.Title)}${w.Asset ? ` <span class="muted">— ${escapeHtml(w.Asset.Name)}</span>` : ''}</span>
-      <span class="pill ${w.Status === 'Done' ? 'good' : w.Priority === 'Urgent' || w.Priority === 'High' ? 'warn' : ''}">${escapeHtml(w.Status || '')} · ${escapeHtml(w.Priority || '')}</span>
-    </div>`).join('') || '<p class="muted">No work orders yet.</p>';
-  app.innerHTML = `
-    <div class="btn-row" style="margin-bottom:12px"><button class="btn btn-primary" id="newWoBtnTop">+ New Work Order</button></div>
-    ${rows}`;
-  document.getElementById('newWoBtnTop').addEventListener('click', () => go('newWorkOrder', {}));
-  app.querySelectorAll('.list-item[data-id]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.id })));
+  let cols = getWoColumnPrefs();
+
+  function draw() {
+    const mode = getTableViewMode();
+    const cardRows = workOrders.map((w) => {
+      const days = daysSince(w['Date Reported']);
+      return `<div class="list-item" data-id="${w.Id}">
+        <span>${escapeHtml(w.Title)}${w.Asset ? ` <span class="muted">— ${escapeHtml(w.Asset.Name)}</span>` : ''}
+          ${days != null ? `<span class="muted"> · ${days}d old</span>` : ''}</span>
+        <span class="pill ${w.Status === 'Done' ? 'good' : w.Priority === 'Urgent' || w.Priority === 'High' ? 'warn' : ''}">${escapeHtml(w.Status || '')} · ${escapeHtml(w.Priority || '')}</span>
+      </div>`;
+    }).join('') || '<p class="muted">No work orders yet.</p>';
+
+    const tableRows = workOrders.map((w) => {
+      const days = daysSince(w['Date Reported']);
+      return `<tr class="clickable-row" data-id="${w.Id}">
+        <td data-label="Title">${escapeHtml(w.Title)}</td>
+        ${cols.asset ? `<td data-label="Asset">${escapeHtml(w.Asset?.Name || '—')}</td>` : ''}
+        ${cols.status ? `<td data-label="Status"><span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status || '')}</span></td>` : ''}
+        ${cols.priority ? `<td data-label="Priority">${escapeHtml(w.Priority || '')}</td>` : ''}
+        ${cols.daysSinceCreated ? `<td data-label="Days Since Created">${days != null ? days : '—'}</td>` : ''}
+        ${cols.scheduledDate ? `<td data-label="Scheduled Date">${formatDateNice(w['Scheduled Date']) || '—'}</td>` : ''}
+        ${cols.dateCreated ? `<td data-label="Date Created">${formatDateNice(w['Date Reported']) || '—'}</td>` : ''}
+        ${cols.estHours ? `<td data-label="Est. Hours">${w['Estimated Hours'] ?? '—'}</td>` : ''}
+        ${cols.estCost ? `<td data-label="Est. Cost">${w['Estimated Cost'] ? '$' + Number(w['Estimated Cost']).toLocaleString() : '—'}</td>` : ''}
+      </tr>`;
+    }).join('');
+    const visibleCols = WO_LIST_COLUMNS.filter((c) => cols[c.key]);
+
+    setApp(`
+      <div class="btn-row" style="margin-bottom:12px;justify-content:space-between">
+        <button class="btn btn-primary" id="newWoBtnTop">+ New Work Order</button>
+        ${tableViewToggleHtml(mode)}
+      </div>
+      ${mode === 'table' ? `
+        <details class="card" style="margin-bottom:12px">
+          <summary style="cursor:pointer;font-weight:700">Columns</summary>
+          <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px">
+            ${WO_LIST_COLUMNS.map((c) => `<label style="display:flex;align-items:center;gap:6px;font-weight:400">
+              <input type="checkbox" class="col-toggle" data-col="${c.key}" ${cols[c.key] ? 'checked' : ''} style="width:auto" /> ${escapeHtml(c.label)}
+            </label>`).join('')}
+          </div>
+        </details>
+        <div class="card" style="overflow-x:auto">
+          <table class="report-table">
+            <thead><tr><th>Title</th>${visibleCols.map((c) => `<th>${escapeHtml(c.label)}</th>`).join('')}</tr></thead>
+            <tbody>${tableRows || `<tr><td colspan="${visibleCols.length + 1}" class="muted">No work orders yet.</td></tr>`}</tbody>
+          </table>
+        </div>` : cardRows}
+    `);
+
+    document.getElementById('newWoBtnTop').addEventListener('click', () => go('newWorkOrder', {}));
+    app.querySelectorAll('.list-item[data-id], tr.clickable-row').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.id })));
+    wireTableViewToggle(draw);
+    app.querySelectorAll('.col-toggle').forEach((cb) => cb.addEventListener('click', (e) => e.stopPropagation()));
+    app.querySelectorAll('.col-toggle').forEach((cb) => cb.addEventListener('change', () => {
+      cols = { ...cols, [cb.dataset.col]: cb.checked };
+      localStorage.setItem('campAuditWoColumns', JSON.stringify(cols));
+      draw();
+    }));
+  }
+
+  draw();
 }
 
 async function renderNewWorkOrder({ assetId, assetName }) {
