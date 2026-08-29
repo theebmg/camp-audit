@@ -122,6 +122,47 @@
     .admin-category-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); border-color: var(--accent); }
     .admin-category-icon { font-size: 2rem; margin-bottom: 8px; }
     .admin-category-card h3 { margin: 0 0 4px; }
+
+    /* Capital Plan budget charts — scoped tokens per the dataviz method, kept
+       separate from the app's own --accent/--pop/etc. so a chart's identity
+       colors never depend on which page they're rendered next to. */
+    .viz-root {
+      --viz-series-1: #2a78d6; --viz-series-2: #eb6834; --viz-series-3: #1baf7a;
+      --viz-status-good: #0ca30c; --viz-status-warning: #fab219; --viz-status-serious: #ec835a; --viz-status-critical: #d03b3b;
+      --viz-track: #e1e0d9; --viz-ink: var(--text); --viz-ink-muted: var(--muted);
+    }
+    :root:not([data-theme="light"]) .viz-root {
+      --viz-series-1: #3987e5; --viz-series-2: #d95926; --viz-series-3: #199e70;
+      --viz-status-good: #0ca30c; --viz-status-warning: #fab219; --viz-status-serious: #ec835a; --viz-status-critical: #d03b3b;
+      --viz-track: #2c2c2a;
+    }
+    :root[data-theme="dark"] .viz-root {
+      --viz-series-1: #3987e5; --viz-series-2: #d95926; --viz-series-3: #199e70;
+      --viz-track: #2c2c2a;
+    }
+    .viz-bar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .viz-bar-label { width: 130px; flex-shrink: 0; font-size: 0.85rem; color: var(--viz-ink-muted); text-align: right; }
+    .viz-bar-track { flex: 1; height: 22px; background: var(--viz-track); border-radius: 4px; position: relative; overflow: visible; }
+    .viz-bar-fill {
+      height: 100%; border-radius: 0 4px 4px 0; min-width: 3px;
+      transition: width 0.3s ease; cursor: pointer;
+    }
+    .viz-bar-fill.viz-bar-full { border-radius: 4px; }
+    .viz-bar-value { margin-left: 8px; font-size: 0.85rem; font-weight: 700; color: var(--viz-ink); white-space: nowrap; }
+    .viz-legend { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; font-size: 0.8rem; color: var(--viz-ink-muted); }
+    .viz-legend-key { display: inline-flex; align-items: center; gap: 5px; }
+    .viz-legend-swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+    .viz-meter-track { height: 28px; background: var(--viz-track); border-radius: 6px; overflow: hidden; position: relative; }
+    .viz-meter-fill { height: 100%; border-radius: 0 6px 6px 0; transition: width 0.3s ease; }
+    .viz-meter-fill.viz-meter-full { border-radius: 6px; }
+    .viz-meter-caption { display: flex; justify-content: space-between; margin-top: 6px; font-size: 0.82rem; color: var(--viz-ink-muted); }
+    .viz-tooltip {
+      position: absolute; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      box-shadow: var(--shadow-md); padding: 8px 10px; font-size: 0.8rem; pointer-events: none; z-index: 60;
+      white-space: nowrap; opacity: 0; transition: opacity 0.1s ease;
+    }
+    .viz-tooltip.visible { opacity: 1; }
+    .viz-tooltip .viz-tooltip-value { font-weight: 800; color: var(--viz-ink); }
     @media (max-width: 640px) { .cal-strip { grid-template-columns: repeat(7, minmax(0,1fr)); } .cal-strip-event { display: none; } }
 
     /* Motion: cards/list-items/nav get a soft hover + a fade-in when a view

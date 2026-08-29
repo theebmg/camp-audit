@@ -964,6 +964,84 @@ async function renderAssetHistory({ id }) {
 
 function moneyFmt(n) { return '$' + Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 0 }); }
 
+// Shared hover/focus tooltip for any [data-tooltip] element inside root — one
+// floating tooltip element reused across charts. Label text is untrusted
+// (comes from user-entered names), so it goes in via textContent, never HTML.
+function wireVizTooltips(root) {
+  let tipEl = document.getElementById('vizTooltip');
+  if (!tipEl) {
+    tipEl = document.createElement('div');
+    tipEl.className = 'viz-tooltip';
+    tipEl.id = 'vizTooltip';
+    document.body.appendChild(tipEl);
+  }
+  function show(el, x, y) {
+    tipEl.textContent = el.dataset.tooltip;
+    tipEl.style.left = `${x + 14}px`;
+    tipEl.style.top = `${y + 14}px`;
+    tipEl.classList.add('visible');
+  }
+  function hide() { tipEl.classList.remove('visible'); }
+  root.querySelectorAll('[data-tooltip]').forEach((el) => {
+    el.addEventListener('pointermove', (e) => show(el, e.clientX, e.clientY));
+    el.addEventListener('pointerenter', (e) => show(el, e.clientX, e.clientY));
+    el.addEventListener('pointerleave', hide);
+    el.addEventListener('focus', () => { const r = el.getBoundingClientRect(); show(el, r.left, r.bottom); });
+    el.addEventListener('blur', hide);
+  });
+}
+
+// "A single ratio against a limit" -> a meter, fill colored by severity
+// (good -> warning -> serious -> critical) against how many years of the
+// operating budget the pending work would consume.
+function statusColorForRatio(ratio) {
+  if (ratio == null || ratio < 0.5) return 'var(--viz-status-good)';
+  if (ratio < 1) return 'var(--viz-status-warning)';
+  if (ratio < 2) return 'var(--viz-status-serious)';
+  return 'var(--viz-status-critical)';
+}
+function operatingBudgetMeterHtml(ob) {
+  const ratio = ob.AnnualOperatingBudget > 0 ? ob.PendingCost / ob.AnnualOperatingBudget : null;
+  const pct = ratio != null ? Math.min(ratio * 100, 100) : 0;
+  const color = statusColorForRatio(ratio);
+  const tooltip = `Pending ${moneyFmt(ob.PendingCost)} of ${moneyFmt(ob.AnnualOperatingBudget)} annual budget${ratio != null ? ` (${Math.round(ratio * 100)}%)` : ''}`;
+  return `<div class="viz-root" style="margin-top:14px">
+    <div class="viz-meter-track" tabindex="0" data-tooltip="${escapeHtml(tooltip)}">
+      <div class="viz-meter-fill ${pct >= 100 ? 'viz-meter-full' : ''}" style="width:${pct}%;background:${color}"></div>
+    </div>
+    <div class="viz-meter-caption">
+      <span>${moneyFmt(ob.PendingCost)} pending</span>
+      <span>${moneyFmt(ob.AnnualOperatingBudget)} annual budget</span>
+    </div>
+  </div>`;
+}
+
+// Three named funding pools ARE the subject here (identity, not magnitude
+// alone) -> categorical color, first three slots (all-pairs validated).
+function fundingComparisonChartHtml(budgetOverview) {
+  const items = [
+    { key: 'campaign', label: 'Capital Campaign', total: budgetOverview.CapitalCampaignTotal, color: 'var(--viz-series-1)' },
+    { key: 'cabin', label: 'Cabin-Holder', total: budgetOverview.CabinHolderTotal, color: 'var(--viz-series-2)' },
+    { key: 'other', label: 'Other', total: budgetOverview.OtherTotal, color: 'var(--viz-series-3)' },
+  ];
+  if (items.every((i) => i.total === 0)) return '<p class="muted">No capital campaign, cabin-holder, or other-category costs tagged to work orders yet.</p>';
+  const max = Math.max(...items.map((i) => i.total), 1);
+  return `<div class="viz-root">
+    <div class="viz-legend">${items.map((i) => `<span class="viz-legend-key"><span class="viz-legend-swatch" style="background:${i.color}"></span>${escapeHtml(i.label)}</span>`).join('')}</div>
+    ${items.map((i) => {
+      const pct = Math.max((i.total / max) * 100, i.total > 0 ? 2 : 0);
+      return `<div class="viz-bar-row">
+        <div class="viz-bar-label">${escapeHtml(i.label)}</div>
+        <div class="viz-bar-track">
+          <div class="viz-bar-fill scroll-to-fund-card ${pct >= 99 ? 'viz-bar-full' : ''}" data-kind="${i.key}" tabindex="0"
+            style="width:${pct}%;background:${i.color}" data-tooltip="${escapeHtml(i.label)}: ${moneyFmt(i.total)}"></div>
+        </div>
+        <span class="viz-bar-value">${moneyFmt(i.total)}</span>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+
 const FUNDING_GROUP_META = {
   campaign: { title: 'Capital Campaign Projects', icon: '🏗️', endpoint: 'budget/capital-campaign-projects', singular: 'Project' },
   other: { title: 'Other', icon: '🗂️', endpoint: 'budget/other-categories', singular: 'Category' },
@@ -994,14 +1072,16 @@ async function renderCapitalPlan() {
         <p class="muted">Pending operating-budget work (not yet Done) totals <strong>${moneyFmt(ob.PendingCost)}</strong>${
           ob.YearsToCover != null ? ` — <strong>${ob.YearsToCover.toFixed(1)} years</strong> of the current operating budget.` : ' (set an annual operating budget above to see years-to-cover)'
         }</p>
+        ${operatingBudgetMeterHtml(ob)}
       `}
-    </div>`;
+    </div>
+    <div class="card"><h3>📊 Capital Campaign / Cabin-Holder / Other — cost comparison</h3>${fundingComparisonChartHtml(budgetOverview)}</div>`;
   }
 
   function fundingGroupHtml(kind, groups) {
     const meta = FUNDING_GROUP_META[kind];
     const total = groups.reduce((s, g) => s + g.Total, 0);
-    return `<div class="card">
+    return `<div class="card" id="fundingCard-${kind}">
       <h3>${meta.icon} ${meta.title}${groups.length ? ` — ${moneyFmt(total)} total` : ''}</h3>
       ${groups.length ? groups.map((g) => `
         <details class="reveal" style="margin-bottom:8px">
@@ -1066,6 +1146,10 @@ async function renderCapitalPlan() {
   }
 
   function wire() {
+    wireVizTooltips(app);
+    app.querySelectorAll('.viz-bar-fill.scroll-to-fund-card').forEach((el) => el.addEventListener('click', () => {
+      document.getElementById(`fundingCard-${el.dataset.kind}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }));
     document.getElementById('editBudgetBtn')?.addEventListener('click', () => { editingBudget = true; draw(); });
     document.getElementById('cancelBudgetBtn')?.addEventListener('click', () => { editingBudget = false; draw(); });
     document.getElementById('saveBudgetBtn')?.addEventListener('click', async () => {
