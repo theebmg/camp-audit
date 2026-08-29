@@ -443,6 +443,7 @@ export async function resolveAssetNote(noteId, resolved = true) {
     `UPDATE asset_notes SET resolved = $1 WHERE id = $2 RETURNING *`,
     [resolved, noteId]
   );
+  if (rows[0]) await logActivity({ action: 'toggled', entityType: 'asset_note', entityId: rows[0].id, entityLabel: rows[0].note, details: resolved ? 'resolved' : 'reopened' });
   return rows[0] || null;
 }
 
@@ -569,6 +570,9 @@ export async function adminUpdateComponentType(componentType, { eventTypeOptions
      WHERE component_type = $1 RETURNING *`,
     [componentType, eventTypeOptions ?? null, conditionOptions ?? null, promptedInAudit ?? null, sortOrder ?? null]
   );
+  if (rows[0] && promptedInAudit !== undefined && promptedInAudit !== null) {
+    await logActivity({ action: 'toggled', entityType: 'component_type', entityLabel: componentType, details: promptedInAudit ? 'now prompted in audit' : 'no longer prompted in audit' });
+  }
   return rows[0] || null;
 }
 
@@ -621,6 +625,11 @@ export async function adminSetApplicability(buildingTypeId, questionKey, applies
      ON CONFLICT (building_type_id, question_key) DO UPDATE SET applies = EXCLUDED.applies`,
     [buildingTypeId, questionKey, applies]
   );
+  const bt = await pool.query('SELECT name FROM building_types WHERE id = $1', [buildingTypeId]);
+  await logActivity({
+    action: 'toggled', entityType: 'applicability', entityLabel: `${questionKey} — ${bt.rows[0]?.name || `building type #${buildingTypeId}`}`,
+    details: applies ? 'applies' : "doesn't apply",
+  });
 }
 
 export async function adminListSubAreas() {
@@ -1106,6 +1115,13 @@ export async function updateWorkOrderTask(id, { description, done }) {
     'UPDATE work_order_tasks SET description = COALESCE($2,description), done = COALESCE($3,done) WHERE id = $1 RETURNING *',
     [id, description ?? null, done ?? null]
   );
+  if (rows[0]) {
+    if (done !== undefined && done !== null) {
+      await logActivity({ action: 'toggled', entityType: 'task', entityId: rows[0].id, entityLabel: rows[0].description, details: done ? 'checked' : 'unchecked' });
+    } else if (description) {
+      await logActivity({ action: 'updated', entityType: 'task', entityId: rows[0].id, entityLabel: rows[0].description });
+    }
+  }
   return rows[0] ? { Id: rows[0].id, Description: rows[0].description, Done: rows[0].done, SortOrder: rows[0].sort_order } : null;
 }
 export async function deleteWorkOrderTask(id) {
@@ -1413,6 +1429,7 @@ export async function toggleChecklistStep(stepId, done) {
     'UPDATE checklist_instance_steps SET done = $2, done_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1 RETURNING *',
     [stepId, done]
   );
+  if (rows[0]) await logActivity({ action: 'toggled', entityType: 'checklist_step', entityId: rows[0].id, entityLabel: rows[0].step_text, details: done ? 'checked' : 'unchecked' });
   return rows[0] || null;
 }
 

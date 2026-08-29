@@ -948,17 +948,27 @@ async function renderAdminHub() {
 const ACTIVITY_ACTION_PILL = {
   created: 'good', deleted: 'bad', deactivated: 'bad', updated: '', completed: 'good', reactivated: 'good',
 };
+// "Routine toggles" (checking a task/checklist step, flipping an
+// applicability-matrix cell, ...) are logged with action 'toggled' — high
+// frequency, low stakes. Whether to show them by default is remembered per
+// browser, same persisted-preference pattern as getTableViewMode().
+function getShowToggleActivity() {
+  return localStorage.getItem('campAuditShowToggleActivity') === 'true';
+}
 async function renderActivityLog() {
   setChrome({ title: 'Activity Log', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
   const { entries } = await api('/api/pg/activity-log?limit=300');
   let actionFilter = null;
   let typeFilter = null;
+  let showToggles = getShowToggleActivity();
 
   function draw() {
-    const actions = [...new Set(entries.map((e) => e.Action))].sort();
-    const types = [...new Set(entries.map((e) => e.EntityType))].sort();
-    const visible = entries.filter((e) => (!actionFilter || e.Action === actionFilter) && (!typeFilter || e.EntityType === typeFilter));
+    const base = showToggles ? entries : entries.filter((e) => e.Action !== 'toggled');
+    const actions = [...new Set(base.map((e) => e.Action))].sort();
+    const types = [...new Set(base.map((e) => e.EntityType))].sort();
+    const visible = base.filter((e) => (!actionFilter || e.Action === actionFilter) && (!typeFilter || e.EntityType === typeFilter));
+    const hiddenCount = entries.length - base.length;
     const rows = visible.map((e) => `
       <tr>
         <td data-label="When">${new Date(e.OccurredAt).toLocaleString()}</td>
@@ -971,9 +981,13 @@ async function renderActivityLog() {
     setApp(`
       <div class="card">
         <p class="muted">Most recent ${entries.length} events. Deleted records stay listed here even though the record itself is gone.</p>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+        <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;align-items:center">
           <select id="actionFilter"><option value="">All actions</option>${actions.map((a) => `<option value="${a}" ${actionFilter === a ? 'selected' : ''}>${a}</option>`).join('')}</select>
           <select id="typeFilter"><option value="">All types</option>${types.map((t) => `<option value="${t}" ${typeFilter === t ? 'selected' : ''}>${t.replace(/_/g, ' ')}</option>`).join('')}</select>
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400">
+            <input type="checkbox" id="showTogglesChk" ${showToggles ? 'checked' : ''} style="width:auto" />
+            Show routine toggles${!showToggles && hiddenCount ? ` (${hiddenCount} hidden)` : ''}
+          </label>
         </div>
       </div>
       <div class="card" style="overflow-x:auto">
@@ -984,6 +998,12 @@ async function renderActivityLog() {
       </div>`);
     document.getElementById('actionFilter').addEventListener('change', (e) => { actionFilter = e.target.value || null; draw(); });
     document.getElementById('typeFilter').addEventListener('change', (e) => { typeFilter = e.target.value || null; draw(); });
+    document.getElementById('showTogglesChk').addEventListener('change', (e) => {
+      showToggles = e.target.checked;
+      localStorage.setItem('campAuditShowToggleActivity', String(showToggles));
+      actionFilter = null; typeFilter = null; // avoid landing on a filter value that just disappeared
+      draw();
+    });
   }
 
   draw();
