@@ -440,7 +440,14 @@ function getDashboardWidgetPrefs() {
 }
 
 function startOfWeek(d) { const s = new Date(d); s.setDate(s.getDate() - s.getDay()); return s; }
-function isoDate(d) { return d.toISOString().slice(0, 10); }
+// Local calendar-date key (YYYY-MM-DD) — NOT toISOString(), which converts to
+// UTC first and silently shifts the date by a day in any timezone west of
+// UTC (most of the US) whenever the local time-of-day pushes across the UTC
+// day boundary. Matches how the Calendar month view already builds its date
+// strings, and how the server's plain `date` columns compare.
+function isoDate(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 
 async function renderDashboard() {
   setChrome({ title: 'Dashboard', showBack: false, showLogout: true });
@@ -1938,7 +1945,7 @@ async function renderCalendar(params = {}) {
   const now = new Date();
   let viewMonth = params.month != null ? Number(params.month) : now.getMonth();
   let viewYear = params.year != null ? Number(params.year) : now.getFullYear();
-  const todayKey = now.toISOString().slice(0, 10);
+  const todayKey = isoDate(now);
   let dayEntriesMap = new Map(); // dateKey -> entries[], refreshed each draw(); read by the day-cell click handler
 
   async function draw() {
@@ -2397,7 +2404,7 @@ const WO_SCHEDULE_FILTER_LABELS = { pastDue: 'Past Due', dueToday: 'Due Today', 
 function matchesScheduleFilter(w, key) {
   if (w.Status === 'Done') return false;
   const sd = w['Scheduled Date'] ? w['Scheduled Date'].slice(0, 10) : null;
-  const todayStr = new Date().toISOString().slice(0, 10);
+  const todayStr = isoDate(new Date());
   if (key === 'unscheduled') return !sd;
   if (!sd) return false;
   if (key === 'pastDue') return sd < todayStr;
