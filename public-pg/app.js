@@ -2432,9 +2432,83 @@ const FUNDING_SOURCE_LABELS = {
 const FUNDING_SOURCE_ENDPOINT = {
   capital_campaign: 'budget/capital-campaign-projects', cabin_holder: 'budget/cabin-holders', other: 'budget/other-categories',
 };
-function fundingFieldsHtml(wo, fundingEntities) {
+// Search-as-you-type combobox for linking a Capital Campaign Project /
+// Cabin-Holder / Other category — same interaction pattern as
+// mountAssetCombobox (type to search; if it doesn't exist, an inline
+// "+ Add new" form creates it on the fly with its full fields).
+function mountFundingCombobox(container, { kind, entities, initialEntity = null, onSelect = () => {} }) {
+  let selected = initialEntity;
+  container.classList.add('ac-wrap');
+  container.innerHTML = `
+    <input type="text" class="ac-input" autocomplete="off" placeholder="Search or create a ${escapeHtml(FUNDING_SOURCE_LABELS[kind])}…"
+      value="${initialEntity ? escapeHtml(initialEntity.Name) : ''}" />
+    <div class="ac-results" hidden></div>`;
+  const input = container.querySelector('.ac-input');
+  const resultsEl = container.querySelector('.ac-results');
+
+  function renderResults(query) {
+    const q = query.toLowerCase();
+    const matches = entities.filter((ent) => ent.Name.toLowerCase().includes(q));
+    const rows = matches.map((ent) => `
+      <div class="ac-item" data-id="${ent.Id}" data-name="${escapeHtml(ent.Name)}">
+        ${escapeHtml(ent.Name)}${ent.Description ? ` <span class="muted">— ${escapeHtml(ent.Description)}</span>` : ''}
+      </div>`).join('');
+    const addRow = query ? `<div class="ac-item ac-add" data-add-name="${escapeHtml(query)}">➕ Create new ${escapeHtml(FUNDING_SOURCE_LABELS[kind])} "${escapeHtml(query)}"…</div>` : '';
+    resultsEl.innerHTML = rows + addRow;
+    resultsEl.hidden = false;
+    resultsEl.querySelectorAll('.ac-item[data-id]').forEach((el) => el.addEventListener('click', () => {
+      selected = entities.find((ent) => ent.Id === Number(el.dataset.id));
+      input.value = el.dataset.name;
+      resultsEl.hidden = true;
+      onSelect(selected);
+    }));
+    resultsEl.querySelector('.ac-add')?.addEventListener('click', () => showQuickCreateForm(resultsEl.querySelector('.ac-add').dataset.addName));
+  }
+
+  function showQuickCreateForm(name) {
+    resultsEl.innerHTML = `<div class="ac-item" style="cursor:default">
+      <div class="field-row" style="margin-bottom:8px"><label>Name</label><input class="ac-new-name" value="${escapeHtml(name)}" /></div>
+      <div class="field-row" style="margin-bottom:8px"><label>Description (optional)</label><textarea class="ac-new-desc"></textarea></div>
+      <div class="btn-row" style="margin-top:0">
+        <button type="button" class="btn btn-primary ac-create-confirm">Create</button>
+        <button type="button" class="btn btn-secondary ac-create-cancel">Cancel</button>
+      </div>
+    </div>`;
+    resultsEl.querySelector('.ac-create-cancel').addEventListener('click', () => { resultsEl.hidden = true; });
+    resultsEl.querySelector('.ac-create-confirm').addEventListener('click', async () => {
+      const finalName = resultsEl.querySelector('.ac-new-name').value.trim();
+      if (!finalName) { toast('Name is required'); return; }
+      const description = resultsEl.querySelector('.ac-new-desc').value.trim();
+      try {
+        const { item } = await api(`/api/pg/${FUNDING_SOURCE_ENDPOINT[kind]}`, { method: 'POST', body: JSON.stringify({ name: finalName, description, notes: description }) });
+        entities.push(item);
+        selected = item;
+        input.value = item.Name;
+        resultsEl.hidden = true;
+        toast(`${FUNDING_SOURCE_LABELS[kind]} "${item.Name}" created`);
+        onSelect(selected);
+      } catch (err) { toast(err.message); }
+    });
+  }
+
+  input.addEventListener('input', () => {
+    selected = null;
+    onSelect(null);
+    const q = input.value.trim();
+    if (!q) { resultsEl.hidden = true; return; }
+    renderResults(q);
+  });
+  input.addEventListener('focus', () => { if (input.value.trim()) renderResults(input.value.trim()); });
+  document.addEventListener('click', (e) => { if (!container.contains(e.target)) resultsEl.hidden = true; });
+
+  return {
+    getSelected: () => selected,
+    setSelected: (ent) => { selected = ent; input.value = ent ? ent.Name : ''; resultsEl.hidden = true; },
+  };
+}
+
+function fundingFieldsHtml(wo) {
   const hasTarget = wo.FundingSource && wo.FundingSource !== 'operating_budget';
-  const entities = fundingEntities[wo.FundingSource] || [];
   return `
     <div class="field-row"><label>Funding Source</label>
       <select name="fundingSource" id="fundingSource">
@@ -2443,30 +2517,23 @@ function fundingFieldsHtml(wo, fundingEntities) {
     </div>
     <div class="field-row" id="fundingRefRow" ${hasTarget ? '' : 'hidden'}>
       <label id="fundingRefLabel">${FUNDING_SOURCE_LABELS[wo.FundingSource] || ''}</label>
-      <select name="fundingRefId" id="fundingRefId">
-        <option value="">— choose —</option>
-        ${entities.map((ent) => `<option value="${ent.Id}" ${wo.FundingRefId === ent.Id ? 'selected' : ''}>${escapeHtml(ent.Name)}</option>`).join('')}
-        <option value="__new__">+ Create new…</option>
-      </select>
-      <div id="fundingRefNewBox" hidden style="margin-top:8px">
-        <input id="fundingRefNewName" placeholder="Name…" />
-        <button type="button" class="btn btn-secondary" id="fundingRefNewSave" style="margin-top:6px">Create</button>
-      </div>
+      <div id="fundingRefPicker"></div>
     </div>`;
 }
-function wireFundingFields(root, fundingEntities) {
+function wireFundingFields(root, fundingEntities, wo, getCurrentAsset) {
   const sourceSelect = root.querySelector('#fundingSource');
   const refRow = root.querySelector('#fundingRefRow');
   const refLabel = root.querySelector('#fundingRefLabel');
-  const refSelect = root.querySelector('#fundingRefId');
-  const newBox = root.querySelector('#fundingRefNewBox');
-  const newNameInput = root.querySelector('#fundingRefNewName');
+  const pickerEl = root.querySelector('#fundingRefPicker');
+  let picker = null;
 
-  function populateRef(source, selectedId) {
-    const entities = fundingEntities[source] || [];
-    refSelect.innerHTML = `<option value="">— choose —</option>
-      ${entities.map((ent) => `<option value="${ent.Id}" ${selectedId === ent.Id ? 'selected' : ''}>${escapeHtml(ent.Name)}</option>`).join('')}
-      <option value="__new__">+ Create new…</option>`;
+  function mountPicker(kind, initialEntity) {
+    picker = mountFundingCombobox(pickerEl, { kind, entities: fundingEntities[kind] || [], initialEntity });
+  }
+  if (sourceSelect.value !== 'operating_budget') {
+    const known = fundingEntities[sourceSelect.value]?.find((e) => e.Id === wo.FundingRefId);
+    const initial = known || (wo.FundingRefId ? { Id: wo.FundingRefId, Name: wo.FundingRefLabel } : null);
+    mountPicker(sourceSelect.value, initial);
   }
 
   sourceSelect.addEventListener('change', () => {
@@ -2474,26 +2541,33 @@ function wireFundingFields(root, fundingEntities) {
     if (source === 'operating_budget') { refRow.hidden = true; return; }
     refRow.hidden = false;
     refLabel.textContent = FUNDING_SOURCE_LABELS[source];
-    populateRef(source, null);
-    newBox.hidden = true;
+    mountPicker(source, null);
+    // Cabin-holder auto-link: if the WO's asset already has a lodge-holder
+    // name on file, find (or create) the matching cabin-holder and select
+    // it automatically — the whole point being one less manual step.
+    if (source === 'cabin_holder') autoLinkCabinHolder();
   });
-  refSelect.addEventListener('change', () => {
-    newBox.hidden = refSelect.value !== '__new__';
-  });
-  root.querySelector('#fundingRefNewSave')?.addEventListener('click', async () => {
-    const name = newNameInput.value.trim();
-    if (!name) { toast('Name is required'); return; }
-    const source = sourceSelect.value;
-    const endpoint = FUNDING_SOURCE_ENDPOINT[source];
-    try {
-      const { item } = await api(`/api/pg/${endpoint}`, { method: 'POST', body: JSON.stringify({ name }) });
-      fundingEntities[source] = [...(fundingEntities[source] || []), item];
-      populateRef(source, item.Id);
-      newBox.hidden = true;
-      newNameInput.value = '';
-      toast(`${FUNDING_SOURCE_LABELS[source]} "${name}" created`);
-    } catch (err) { toast(err.message); }
-  });
+
+  async function autoLinkCabinHolder() {
+    const asset = getCurrentAsset() || wo.Asset;
+    const lodgeHolder = asset?.LodgeHolder?.trim();
+    if (!lodgeHolder) return;
+    const list = fundingEntities.cabin_holder || [];
+    let match = list.find((c) => c.Name.toLowerCase() === lodgeHolder.toLowerCase());
+    if (!match) {
+      try {
+        const { item } = await api('/api/pg/budget/cabin-holders', { method: 'POST', body: JSON.stringify({ name: lodgeHolder }) });
+        list.push(item);
+        match = item;
+        toast(`Linked cabin-holder "${lodgeHolder}" (created from this asset's records)`);
+      } catch (err) { toast(err.message); return; }
+    } else {
+      toast(`Linked cabin-holder "${match.Name}" (from this asset's records)`);
+    }
+    picker?.setSelected(match);
+  }
+
+  return { getPicker: () => picker };
 }
 
 async function renderWorkOrderDetail({ id }) {
@@ -2570,7 +2644,7 @@ async function renderWorkOrderDetail({ id }) {
         <div class="field-row"><label>Actual Hours</label><input name="actualHours" type="number" value="${wo['Actual Hours'] ?? ''}" /></div>
         <div class="field-row"><label>Estimated Cost</label><input name="estimatedCost" type="number" step="0.01" value="${wo['Estimated Cost'] ?? ''}" /></div>
         <div class="field-row"><label>Actual Cost</label><input name="actualCost" type="number" step="0.01" value="${wo['Actual Cost'] ?? ''}" /></div>
-        ${fundingFieldsHtml(wo, fundingEntities)}
+        ${fundingFieldsHtml(wo)}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       <div class="btn-row">
@@ -2651,7 +2725,7 @@ async function renderWorkOrderDetail({ id }) {
     </div>`;
 
   const assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'), { initialAsset: wo.Asset });
-  wireFundingFields(document.getElementById('woFieldsForm'), fundingEntities);
+  const fundingFieldsCtrl = wireFundingFields(document.getElementById('woFieldsForm'), fundingEntities, wo, () => assetPicker.getSelected());
 
   document.getElementById('woFieldsForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -2659,8 +2733,9 @@ async function renderWorkOrderDetail({ id }) {
     const fd = new FormData(e.target);
     const newAsset = assetPicker.getSelected();
     const fundingSource = fd.get('fundingSource');
-    const fundingRefId = fundingSource === 'operating_budget' ? '' : fd.get('fundingRefId');
-    if (fundingSource !== 'operating_budget' && (!fundingRefId || fundingRefId === '__new__')) {
+    const fundingRefEntity = fundingSource === 'operating_budget' ? null : fundingFieldsCtrl.getPicker()?.getSelected();
+    const fundingRefId = fundingSource === 'operating_budget' ? '' : fundingRefEntity?.Id;
+    if (fundingSource !== 'operating_budget' && !fundingRefId) {
       toast(`Choose a ${FUNDING_SOURCE_LABELS[fundingSource]} to link this to`); return;
     }
     try {

@@ -861,7 +861,7 @@ async function getWorkOrderAssignees(woId) {
 
 export async function getWorkOrderDetail(woId) {
   const { rows } = await pool.query(
-    `SELECT w.*, a.name AS asset_name, l.name AS location_name FROM work_orders w
+    `SELECT w.*, a.name AS asset_name, a.lodge_holder AS asset_lodge_holder, l.name AS location_name FROM work_orders w
      LEFT JOIN assets a ON a.id = w.asset_id LEFT JOIN locations l ON l.id = w.location_id
      WHERE w.id = $1`,
     [woId]
@@ -878,7 +878,7 @@ export async function getWorkOrderDetail(woId) {
       'Estimated Hours': w.estimated_hours, 'Actual Hours': w.actual_hours,
       'Estimated Cost': w.estimated_cost, 'Actual Cost': w.actual_cost,
       Description: w.description,
-      Asset: w.asset_id ? { Id: w.asset_id, Name: w.asset_name } : null,
+      Asset: w.asset_id ? { Id: w.asset_id, Name: w.asset_name, LodgeHolder: w.asset_lodge_holder } : null,
       Location: w.location_id ? { Id: w.location_id, Name: w.location_name } : null,
       FundingSource: w.funding_source, FundingRefId: w.funding_ref_id, FundingRefLabel: fundingRefLabel,
     },
