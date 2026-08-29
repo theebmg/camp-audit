@@ -85,6 +85,59 @@ function setApp(html) {
 
 const LOADING_HTML = '<div class="loading-wrap"><div class="spinner"></div><span>Loading…</span></div>';
 
+// ---- Theme (Light/Dark/System) + accent color — persisted per-browser.
+// ACCENT_PRESETS is set by an early inline <script> in index.html (applied
+// before first paint, to avoid a flash of the wrong colors); this is the
+// same object, just referenced here for the interactive picker.
+function getThemeChoice() {
+  const saved = localStorage.getItem('campAuditTheme');
+  return saved === 'light' || saved === 'dark' ? saved : 'system';
+}
+function getEffectiveTheme() {
+  const choice = getThemeChoice();
+  if (choice !== 'system') return choice;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+function applyAccent(key) {
+  const preset = window.ACCENT_PRESETS[key];
+  if (!preset) return;
+  const v = preset[getEffectiveTheme()];
+  const root = document.documentElement.style;
+  root.setProperty('--accent', v[0]); root.setProperty('--accent-dark', v[1]);
+  root.setProperty('--accent-soft', v[2]); root.setProperty('--accent-text', v[3]);
+}
+function applyTheme(choice) {
+  if (choice === 'system') { document.documentElement.removeAttribute('data-theme'); localStorage.removeItem('campAuditTheme'); }
+  else { document.documentElement.setAttribute('data-theme', choice); localStorage.setItem('campAuditTheme', choice); }
+  const accentKey = localStorage.getItem('campAuditAccent');
+  if (accentKey) applyAccent(accentKey); // re-resolve for the new effective theme
+}
+function renderThemePicker() {
+  const el = document.getElementById('themePicker');
+  if (!el) return;
+  const choice = getThemeChoice();
+  const accentKey = localStorage.getItem('campAuditAccent') || 'green';
+  el.innerHTML = `
+    <div class="view-toggle">
+      ${['system', 'light', 'dark'].map((c) => `<button type="button" class="view-toggle-btn theme-choice-btn ${choice === c ? 'active' : ''}" data-choice="${c}">${c === 'system' ? '🖥️ System' : c === 'light' ? '☀️ Light' : '🌙 Dark'}</button>`).join('')}
+    </div>
+    <div class="accent-swatches">
+      ${Object.entries(window.ACCENT_PRESETS).map(([key, preset]) => `<button type="button" class="accent-swatch ${accentKey === key ? 'active' : ''}" data-accent="${key}" style="background:${preset.light[0]}" title="${key}"></button>`).join('')}
+    </div>`;
+  el.querySelectorAll('.theme-choice-btn').forEach((btn) => btn.addEventListener('click', () => {
+    applyTheme(btn.dataset.choice);
+    renderThemePicker();
+  }));
+  el.querySelectorAll('.accent-swatch').forEach((btn) => btn.addEventListener('click', () => {
+    localStorage.setItem('campAuditAccent', btn.dataset.accent);
+    applyAccent(btn.dataset.accent);
+    renderThemePicker();
+  }));
+}
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => {
+  if (getThemeChoice() === 'system') { const k = localStorage.getItem('campAuditAccent'); if (k) applyAccent(k); }
+});
+
 // ---- Table/Cards view toggle (Maintenance Log & Capital Plan) — persists
 // per-browser via localStorage; defaults by screen width on first visit.
 function getTableViewMode() {
@@ -3017,6 +3070,8 @@ async function renderCrew() {
 }
 
 // ---------- Boot ----------
+
+renderThemePicker();
 
 (async function boot() {
   try {

@@ -20,7 +20,33 @@
   --shadow-sm: 0 1px 2px rgba(20, 20, 40, 0.05), 0 1px 1px rgba(20, 20, 40, 0.04);
   --shadow-md: 0 8px 24px rgba(20, 20, 40, 0.08);
   --sidebar-w: 240px;
+  color-scheme: light;
 }
+
+/* Explicit dark override (Theme picker in the sidebar) — wins regardless of
+   OS preference. Kept in sync with the prefers-color-scheme block below;
+   the :not([data-theme="light"]) guard on that block lets THIS one win when
+   both could otherwise apply. */
+:root[data-theme="dark"] {
+  --bg: #12141c;
+  --surface: #1b1e2a;
+  --surface-alt: #242838;
+  --border: #2c3040;
+  --text: #eef0f6;
+  --muted: #9298b0;
+  --accent: #34d399;
+  --accent-dark: #10b981;
+  --accent-text: #0b1410;
+  --accent-soft: #163628;
+  --pop: #fb923c;
+  --pop-soft: #3a2413;
+  --danger: #f87171;
+  --danger-soft: #3a1f1f;
+  --warn: #fbbf24;
+  --warn-soft: #3a2f13;
+  color-scheme: dark;
+}
+:root[data-theme="dark"] .topbar { background: rgba(18, 20, 28, 0.88); }
 
 * { box-sizing: border-box; }
 
@@ -532,7 +558,7 @@ label {
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #12141c;
     --surface: #1b1e2a;
     --surface-alt: #242838;
@@ -549,6 +575,7 @@ label {
     --danger-soft: #3a1f1f;
     --warn: #fbbf24;
     --warn-soft: #3a2f13;
+    color-scheme: dark;
   }
-  .topbar { background: rgba(18, 20, 28, 0.88); }
+  :root:not([data-theme="light"]) .topbar { background: rgba(18, 20, 28, 0.88); }
 }

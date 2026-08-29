@@ -8,10 +8,9 @@
   <style>
     /* Small additions specific to this preview build — kept separate from the
        shared style.css so the live app's stylesheet is never touched. */
-    :root { color-scheme: light; } /* forces native form controls (incl. the
-      unstylable <select> dropdown popup) to render with light/dark-legible
-      colors regardless of OS dark mode — without this, some browsers draw the
-      popup with a dark background but don't flip the text color to match. */
+    /* color-scheme (light vs dark, for native form-control legibility incl.
+       the unstylable <select> dropdown popup) is now set per-theme-state in
+       the shared style.css, alongside the Theme picker in the sidebar. */
     .pg-banner {
       background: var(--pop-soft); color: #7c2d12; font-size: 0.82rem; font-weight: 600;
       padding: 8px 16px; text-align: center; border-bottom: 1px solid var(--border);
@@ -99,6 +98,18 @@
       margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .bucket-tile.clickable-tile { cursor: pointer; }
+
+    /* Theme picker — sidebar footer, above the signed-in-as line */
+    .theme-picker { margin-bottom: 12px; }
+    .theme-picker .view-toggle { width: 100%; }
+    .theme-picker .view-toggle-btn { flex: 1; }
+    .accent-swatches { display: flex; gap: 8px; margin-top: 8px; }
+    .accent-swatch {
+      width: 22px; height: 22px; border-radius: 50%; cursor: pointer; border: 2px solid transparent;
+      padding: 0; transition: transform 0.1s ease, border-color 0.1s ease;
+    }
+    .accent-swatch:hover { transform: scale(1.12); }
+    .accent-swatch.active { border-color: var(--text); }
 
     /* Admin hub — category cards that stack left-to-right, wrapping down as
        the viewport allows. */
@@ -237,6 +248,35 @@
     .day-panel-entry { cursor: pointer; }
     @keyframes dayPanelSlideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
   </style>
+  <script>
+    // Applied before body paints, so there's no flash of the wrong theme or
+    // accent color. ACCENT_PRESETS is duplicated (small) in app.js, which
+    // owns the picker UI and re-applies the right variant when the theme
+    // toggle changes — this copy only needs to render the very first frame.
+    window.ACCENT_PRESETS = {
+      green:  { light: ['#10b981', '#059669', '#d1fae5', '#ffffff'], dark: ['#34d399', '#10b981', '#163628', '#0b1410'] },
+      blue:   { light: ['#3b82f6', '#2563eb', '#dbeafe', '#ffffff'], dark: ['#60a5fa', '#3b82f6', '#1e3a5f', '#0b1420'] },
+      purple: { light: ['#8b5cf6', '#7c3aed', '#ede9fe', '#ffffff'], dark: ['#a78bfa', '#8b5cf6', '#2e1f4d', '#160f26'] },
+      orange: { light: ['#f97316', '#ea580c', '#ffedd5', '#ffffff'], dark: ['#fb923c', '#f97316', '#3a2413', '#1f1206'] },
+      rose:   { light: ['#f43f5e', '#e11d48', '#ffe4e6', '#ffffff'], dark: ['#fb7185', '#f43f5e', '#3a1520', '#1f0a0f'] },
+    };
+    (function () {
+      try {
+        var theme = localStorage.getItem('campAuditTheme'); // 'light' | 'dark' | null (system)
+        if (theme === 'light' || theme === 'dark') document.documentElement.setAttribute('data-theme', theme);
+        var resolved = theme === 'light' || theme === 'dark' ? theme
+          : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        var accentKey = localStorage.getItem('campAuditAccent');
+        var preset = accentKey && window.ACCENT_PRESETS[accentKey];
+        if (preset) {
+          var v = preset[resolved];
+          var root = document.documentElement.style;
+          root.setProperty('--accent', v[0]); root.setProperty('--accent-dark', v[1]);
+          root.setProperty('--accent-soft', v[2]); root.setProperty('--accent-text', v[3]);
+        }
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body>
   <div class="pg-banner">🚧 Postgres migration preview — separate database from the main app, safe to click around</div>
@@ -249,6 +289,7 @@
       </div>
       <div class="sidebar-nav" id="sidebarNav"></div>
       <div class="sidebar-footer">
+        <div class="theme-picker" id="themePicker"></div>
         <div class="sidebar-user" id="sidebarUser"></div>
         <button id="logoutBtn" class="sidebar-logout" hidden>Log Out</button>
       </div>
