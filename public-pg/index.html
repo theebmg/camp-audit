@@ -32,8 +32,13 @@
     .muted { color: var(--muted); font-size: 0.85rem; }
 
     /* Locations list — fixed columns so the type pill and Edit button land in
-       the same spot on every row, instead of shifting with pill-text width. */
-    .list-item.loc-row { display: grid; grid-template-columns: 1fr 110px 90px; gap: 10px; }
+       the same spot on every row, instead of shifting with pill-text width.
+       minmax(0, 1fr) lets the name column shrink below its text's natural
+       width instead of forcing the whole row wider than its container (a
+       plain 1fr's implicit min-width is auto/min-content, which pushed the
+       Edit button outside the tile's border on long names or narrow panes). */
+    .list-item.loc-row { display: grid; grid-template-columns: minmax(0, 1fr) 110px 90px; gap: 10px; align-items: center; }
+    .loc-row .loc-open { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .loc-row .pill { text-align: center; }
     .loc-row .edit-location { text-align: center; }
     .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 0.75rem; font-weight: 700;
@@ -184,9 +189,11 @@
     .pane-row { display: flex; align-items: stretch; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--surface); }
     .pane { min-width: 0; padding: 14px; overflow-y: auto; max-height: calc(100vh - 150px); }
     .pane + .pane { border-left: 1px solid var(--border); }
-    .pane-locations { flex: 1 1 280px; min-width: 280px; }
-    .pane-assets { flex: 1 1 280px; min-width: 280px; }
-    .pane-wo-list { flex: 1 1 380px; min-width: 380px; }
+    /* Every "list" pane (browse columns, not the detail pane) shares one
+       fixed min-width so a row's fixed-width bits (pill, button) always have
+       room and nothing spills past the tile's border — same rule everywhere
+       rather than a different guess per pane. */
+    .pane-locations, .pane-assets, .pane-wo-list { flex: 1 1 320px; min-width: 320px; }
     .pane-detail { flex: 2 1 400px; min-width: 320px; }
     .pane .card { box-shadow: none; border-color: var(--border); }
     @media (max-width: 640px) { .cal-strip { grid-template-columns: repeat(7, minmax(0,1fr)); } .cal-strip-event { display: none; } }
