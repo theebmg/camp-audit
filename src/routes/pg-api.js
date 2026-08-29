@@ -37,6 +37,8 @@ import {
   getChecklistInstanceForWorkOrder, getChecklistInstanceForCalendarEvent,
   attachChecklistToWorkOrder, attachChecklistToCalendarEvent, detachChecklistInstance, toggleChecklistStep,
   getChecklistInstanceForExport,
+  listUsers, countActiveUsers, createUser, updateUser, deleteUser,
+  listActivityLog,
 } from '../db.js';
 
 const router = express.Router();
@@ -671,6 +673,74 @@ router.get('/checklist-instances/:id/pdf', async (req, res, next) => {
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${instance.Name.replace(/[^a-z0-9]+/gi, '-')}.pdf"`);
     res.send(pdf);
+  } catch (e) { next(e); }
+});
+
+// ---- Users (Admin tab — replaces editing APP_USERS/SQL by hand) ----
+// Any logged-in user can manage accounts here; this app has no separate
+// admin role — the whole tab is already behind the login session.
+
+router.get('/users', async (req, res, next) => {
+  try { res.json({ users: await listUsers() }); } catch (e) { next(e); }
+});
+
+router.post('/users', async (req, res, next) => {
+  try {
+    const { username, password, email } = req.body || {};
+    if (!username || !username.trim()) return res.status(400).json({ ok: false, error: 'Username is required' });
+    if (!password || password.length < 6) return res.status(400).json({ ok: false, error: 'Password must be at least 6 characters' });
+    const user = await createUser({ username: username.trim(), password, email: (email || '').trim() });
+    res.json({ ok: true, user });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ ok: false, error: 'That username is already taken' });
+    next(e);
+  }
+});
+
+router.patch('/users/:id', async (req, res, next) => {
+  try {
+    const { email, password, active } = req.body || {};
+    if (password !== undefined && password !== '' && password.length < 6) {
+      return res.status(400).json({ ok: false, error: 'Password must be at least 6 characters' });
+    }
+    if (active === false) {
+      const activeCount = await countActiveUsers();
+      const target = (await listUsers()).find((u) => u.Id === Number(req.params.id));
+      if (target?.Active && activeCount <= 1) {
+        return res.status(400).json({ ok: false, error: 'Cannot deactivate the last active user — you would be locked out' });
+      }
+    }
+    const user = await updateUser(req.params.id, {
+      email: email !== undefined ? email.trim() : undefined,
+      password: password || undefined,
+      active: active !== undefined ? !!active : undefined,
+    });
+    if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+    res.json({ ok: true, user });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ ok: false, error: 'That username is already taken' });
+    next(e);
+  }
+});
+
+router.delete('/users/:id', async (req, res, next) => {
+  try {
+    const target = (await listUsers()).find((u) => u.Id === Number(req.params.id));
+    if (!target) return res.status(404).json({ ok: false, error: 'User not found' });
+    if (target.Active && (await countActiveUsers()) <= 1) {
+      return res.status(400).json({ ok: false, error: 'Cannot delete the last active user — you would be locked out' });
+    }
+    await deleteUser(req.params.id);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ---- Activity log ("what has been done") ----
+
+router.get('/activity-log', async (req, res, next) => {
+  try {
+    const { entityType, action, limit } = req.query;
+    res.json({ entries: await listActivityLog({ entityType, action, limit: limit ? Number(limit) : undefined }) });
   } catch (e) { next(e); }
 });
 

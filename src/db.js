@@ -12,6 +12,8 @@
 // NocoDB's own database is untouched.
 
 import pg from 'pg';
+import crypto from 'crypto';
+import { currentUsername } from './requestContext.js';
 
 const { Pool } = pg;
 
@@ -31,6 +33,38 @@ export async function pingDb() {
   return res.rows[0];
 }
 
+// ── Activity log ("what has been done") ─────────────────────────────────
+// Called from mutating functions below, right after a create/update/delete
+// succeeds. Never allowed to fail the calling operation — a logging hiccup
+// shouldn't block the actual mutation.
+export async function logActivity({ action, entityType, entityId, entityLabel, details }) {
+  try {
+    await pool.query(
+      `INSERT INTO activity_log (username, action, entity_type, entity_id, entity_label, details)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [currentUsername(), action, entityType, entityId ?? null, entityLabel ?? null, details ?? null]
+    );
+  } catch (e) {
+    console.error('activity log insert failed:', e.message);
+  }
+}
+
+export async function listActivityLog({ limit = 200, entityType, action } = {}) {
+  const clauses = []; const vals = []; let i = 1;
+  if (entityType) { clauses.push(`entity_type = $${i++}`); vals.push(entityType); }
+  if (action) { clauses.push(`action = $${i++}`); vals.push(action); }
+  vals.push(limit);
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const { rows } = await pool.query(
+    `SELECT * FROM activity_log ${where} ORDER BY occurred_at DESC LIMIT $${i}`,
+    vals
+  );
+  return rows.map((r) => ({
+    Id: r.id, OccurredAt: r.occurred_at, Username: r.username, Action: r.action,
+    EntityType: r.entity_type, EntityId: r.entity_id, EntityLabel: r.entity_label, Details: r.details,
+  }));
+}
+
 // ── Locations / Assets (read) ───────────────────────────────────────────
 
 function locationRowShape(r) {
@@ -47,6 +81,7 @@ export async function createLocation({ name, parentLocationId, locationType, not
     `INSERT INTO locations (name, parent_location_id, location_type, notes) VALUES ($1,$2,$3,$4) RETURNING *`,
     [name, parentLocationId || null, locationType || null, notes || null]
   );
+  await logActivity({ action: 'created', entityType: 'location', entityId: rows[0].id, entityLabel: rows[0].name });
   return locationRowShape(rows[0]);
 }
 
@@ -55,6 +90,7 @@ export async function updateLocation(id, { name, parentLocationId, locationType,
     `UPDATE locations SET name = $2, parent_location_id = $3, location_type = $4, notes = $5 WHERE id = $1 RETURNING *`,
     [id, name, parentLocationId || null, locationType || null, notes || null]
   );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'location', entityId: rows[0].id, entityLabel: rows[0].name });
   return rows[0] ? locationRowShape(rows[0]) : null;
 }
 
@@ -398,6 +434,7 @@ export async function createAssetNote(assetId, { note, photoUrl = null, createdB
     `INSERT INTO asset_notes (asset_id, note, photo_url, created_by) VALUES ($1,$2,$3,$4) RETURNING *`,
     [assetId, note, photoUrl, createdBy]
   );
+  await logActivity({ action: 'created', entityType: 'asset_note', entityId: rows[0].id, entityLabel: note, details: `On asset #${assetId}` });
   return rows[0];
 }
 
@@ -460,7 +497,9 @@ export async function updateAssetFull(assetId, { core = {}, properties = {} }) {
   } finally {
     client.release();
   }
-  return getAssetDetail(assetId);
+  const detail = await getAssetDetail(assetId);
+  await logActivity({ action: 'updated', entityType: 'asset', entityId: Number(assetId), entityLabel: detail?.asset?.Name });
+  return detail;
 }
 
 // ── Admin: schema/config CRUD — the point of "fully customizable, no deploy
@@ -481,6 +520,7 @@ export async function adminCreatePropertyField({ fieldKey, label, inputType, opt
      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
     [fieldKey, label, inputType, options, sortOrder]
   );
+  await logActivity({ action: 'created', entityType: 'property_field', entityId: rows[0].id, entityLabel: rows[0].label });
   return rows[0];
 }
 
@@ -492,6 +532,12 @@ export async function adminUpdatePropertyField(id, { label, options, active, sor
      WHERE id = $1 RETURNING *`,
     [id, label ?? null, options ?? null, active ?? null, sortOrder ?? null]
   );
+  if (rows[0]) {
+    await logActivity({
+      action: active === false ? 'deactivated' : active === true ? 'reactivated' : 'updated',
+      entityType: 'property_field', entityId: rows[0].id, entityLabel: rows[0].label,
+    });
+  }
   return rows[0] || null;
 }
 
@@ -509,6 +555,7 @@ export async function adminCreateComponentType({ componentType, eventTypeOptions
      VALUES ($1,$2,$3,$4,$5) RETURNING *`,
     [componentType, eventTypeOptions, conditionOptions, promptedInAudit, sortOrder]
   );
+  await logActivity({ action: 'created', entityType: 'component_type', entityLabel: rows[0].component_type });
   return rows[0];
 }
 
@@ -527,6 +574,7 @@ export async function adminUpdateComponentType(componentType, { eventTypeOptions
 
 export async function adminCreateBuildingType(name) {
   const { rows } = await pool.query('INSERT INTO building_types (name) VALUES ($1) RETURNING *', [name]);
+  await logActivity({ action: 'created', entityType: 'building_type', entityId: rows[0].id, entityLabel: rows[0].name });
   return rows[0];
 }
 
@@ -537,7 +585,8 @@ export async function adminDeleteBuildingType(id) {
     err.status = 400;
     throw err;
   }
-  await pool.query('DELETE FROM building_types WHERE id = $1', [id]);
+  const { rows } = await pool.query('DELETE FROM building_types WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'building_type', entityId: Number(id), entityLabel: rows[0].name });
 }
 
 // Full applicability matrix: every (building type × question key) pair the
@@ -584,11 +633,13 @@ export async function adminCreateSubArea(componentType, subArea, sortOrder = 100
     'INSERT INTO component_sub_areas (component_type, sub_area, sort_order) VALUES ($1,$2,$3) RETURNING *',
     [componentType, subArea, sortOrder]
   );
+  await logActivity({ action: 'created', entityType: 'sub_area', entityId: rows[0].id, entityLabel: `${subArea} (${componentType})` });
   return rows[0];
 }
 
 export async function adminDeleteSubArea(id) {
-  await pool.query('DELETE FROM component_sub_areas WHERE id = $1', [id]);
+  const { rows } = await pool.query('DELETE FROM component_sub_areas WHERE id = $1 RETURNING sub_area, component_type', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'sub_area', entityId: Number(id), entityLabel: `${rows[0].sub_area} (${rows[0].component_type})` });
 }
 
 // ── Work Orders + Asset Updates write-back (brief's Phase 2) ───────────────
@@ -696,6 +747,7 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
       );
     }
     await client.query('COMMIT');
+    await logActivity({ action: 'created', entityType: 'work_order', entityId: woId, entityLabel: title });
     return { workOrderId: woId, assetUpdates: created };
   } catch (e) {
     await client.query('ROLLBACK');
@@ -720,7 +772,9 @@ export async function updateWorkOrder(woId, fields) {
   vals.push(woId);
   const { rowCount } = await pool.query(`UPDATE work_orders SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
   if (!rowCount) return null;
-  return getWorkOrderDetail(woId);
+  const detail = await getWorkOrderDetail(woId);
+  await logActivity({ action: 'updated', entityType: 'work_order', entityId: Number(woId), entityLabel: detail?.workOrder?.Title });
+  return detail;
 }
 
 // Fresh copy: same title (+ " (Copy)"), asset, location, priority, description,
@@ -749,6 +803,7 @@ export async function duplicateWorkOrder(woId) {
       );
     }
     await client.query('COMMIT');
+    await logActivity({ action: 'created', entityType: 'work_order', entityId: newId, entityLabel: `${w.title} (Copy)`, details: `Duplicated from Work Order #${woId}` });
     return newId;
   } catch (e) {
     await client.query('ROLLBACK');
@@ -776,6 +831,7 @@ export async function createWorkOrderTemplate({ name, defaultTitle, defaultPrior
      VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
     [name, defaultTitle || null, defaultPriority || null, defaultDescription || null, JSON.stringify(taskDefaults), JSON.stringify(jobLineDefaults)]
   );
+  await logActivity({ action: 'created', entityType: 'work_order_template', entityId: rows[0].id, entityLabel: rows[0].name });
   return templateRowShape(rows[0]);
 }
 export async function updateWorkOrderTemplate(id, { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults }) {
@@ -788,10 +844,12 @@ export async function updateWorkOrderTemplate(id, { name, defaultTitle, defaultP
     [id, name ?? null, defaultTitle ?? null, defaultPriority ?? null, defaultDescription ?? null,
       taskDefaults ? JSON.stringify(taskDefaults) : null, jobLineDefaults ? JSON.stringify(jobLineDefaults) : null]
   );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'work_order_template', entityId: rows[0].id, entityLabel: rows[0].name });
   return rows[0] ? templateRowShape(rows[0]) : null;
 }
 export async function deleteWorkOrderTemplate(id) {
-  await pool.query('DELETE FROM work_order_templates WHERE id = $1', [id]);
+  const { rows } = await pool.query('DELETE FROM work_order_templates WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'work_order_template', entityId: Number(id), entityLabel: rows[0].name });
 }
 
 // targetField is a property-field LABEL (matches an asset_property_fields.label),
@@ -810,14 +868,16 @@ export async function addAssetUpdateToWorkOrder(woId, targetField, newValue) {
     `INSERT INTO asset_updates (work_order_id, target_field, new_value, applied) VALUES ($1,$2,$3,false) RETURNING *`,
     [woId, targetField, String(newValue ?? '')]
   );
+  await logActivity({ action: 'created', entityType: 'asset_update', entityId: rows[0].id, entityLabel: `${targetField} → ${newValue}`, details: `On Work Order #${woId}` });
   return rows[0];
 }
 
 export async function deleteAssetUpdate(auId) {
-  const { rows } = await pool.query('SELECT applied FROM asset_updates WHERE id = $1', [auId]);
+  const { rows } = await pool.query('SELECT applied, target_field, new_value, work_order_id FROM asset_updates WHERE id = $1', [auId]);
   if (!rows[0]) return { notFound: true };
   if (rows[0].applied) return { alreadyApplied: true };
   await pool.query('DELETE FROM asset_updates WHERE id = $1', [auId]);
+  await logActivity({ action: 'deleted', entityType: 'asset_update', entityId: Number(auId), entityLabel: `${rows[0].target_field} → ${rows[0].new_value}`, details: `On Work Order #${rows[0].work_order_id}` });
   return { ok: true };
 }
 
@@ -865,6 +925,10 @@ export async function completeWorkOrder(woId) {
     client.release();
   }
   const detail = await getWorkOrderDetail(woId);
+  await logActivity({
+    action: 'completed', entityType: 'work_order', entityId: Number(woId), entityLabel: detail?.workOrder?.Title,
+    details: appliedIds.length ? `Applied ${appliedIds.length} asset field update(s)` : undefined,
+  });
   return { ...detail, appliedUpdateIds: appliedIds };
 }
 
@@ -909,6 +973,7 @@ export async function createVolunteer({ name, phone, email, address, skill = [] 
     `INSERT INTO volunteers (name, phone, email, address, skill) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
     [name, phone || null, email || null, address || null, skill]
   );
+  await logActivity({ action: 'created', entityType: 'volunteer', entityId: rows[0].id, entityLabel: rows[0].name });
   return volunteerRowShape(rows[0]);
 }
 export async function updateVolunteer(id, { name, phone, email, address, skill }) {
@@ -918,18 +983,23 @@ export async function updateVolunteer(id, { name, phone, email, address, skill }
      WHERE id = $1 RETURNING *`,
     [id, name ?? null, phone ?? null, email ?? null, address ?? null, skill ?? null]
   );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'volunteer', entityId: rows[0].id, entityLabel: rows[0].name });
   return rows[0] ? volunteerRowShape(rows[0]) : null;
 }
 // Hard-deletes only if never assigned to a Work Order (mirrors
 // adminDeleteBuildingType's block-if-in-use pattern); otherwise deactivates
 // so WO assignment history isn't silently lost.
 export async function removeVolunteer(id) {
+  const nameRes = await pool.query('SELECT name FROM volunteers WHERE id = $1', [id]);
+  const name = nameRes.rows[0]?.name;
   const used = await pool.query('SELECT count(*) FROM work_order_volunteers WHERE volunteer_id = $1', [id]);
   if (Number(used.rows[0].count) > 0) {
     await pool.query('UPDATE volunteers SET active = false WHERE id = $1', [id]);
+    await logActivity({ action: 'deactivated', entityType: 'volunteer', entityId: Number(id), entityLabel: name });
     return { deactivated: true };
   }
   await pool.query('DELETE FROM volunteers WHERE id = $1', [id]);
+  await logActivity({ action: 'deleted', entityType: 'volunteer', entityId: Number(id), entityLabel: name });
   return { deleted: true };
 }
 
@@ -944,6 +1014,7 @@ export async function createVendor({ name, phone, email, address, specialty = []
     `INSERT INTO vendors (name, phone, email, address, specialty) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
     [name, phone || null, email || null, address || null, specialty]
   );
+  await logActivity({ action: 'created', entityType: 'vendor', entityId: rows[0].id, entityLabel: rows[0].name });
   return vendorRowShape(rows[0]);
 }
 export async function updateVendor(id, { name, phone, email, address, specialty }) {
@@ -953,15 +1024,20 @@ export async function updateVendor(id, { name, phone, email, address, specialty 
      WHERE id = $1 RETURNING *`,
     [id, name ?? null, phone ?? null, email ?? null, address ?? null, specialty ?? null]
   );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'vendor', entityId: rows[0].id, entityLabel: rows[0].name });
   return rows[0] ? vendorRowShape(rows[0]) : null;
 }
 export async function removeVendor(id) {
+  const nameRes = await pool.query('SELECT name FROM vendors WHERE id = $1', [id]);
+  const name = nameRes.rows[0]?.name;
   const used = await pool.query('SELECT count(*) FROM work_order_vendors WHERE vendor_id = $1', [id]);
   if (Number(used.rows[0].count) > 0) {
     await pool.query('UPDATE vendors SET active = false WHERE id = $1', [id]);
+    await logActivity({ action: 'deactivated', entityType: 'vendor', entityId: Number(id), entityLabel: name });
     return { deactivated: true };
   }
   await pool.query('DELETE FROM vendors WHERE id = $1', [id]);
+  await logActivity({ action: 'deleted', entityType: 'vendor', entityId: Number(id), entityLabel: name });
   return { deleted: true };
 }
 
@@ -999,6 +1075,7 @@ export async function createAssetQuick({ name, locationId, assetType }) {
     [name, locationId || null, assetType || null]
   );
   const r = rows[0];
+  await logActivity({ action: 'created', entityType: 'asset', entityId: r.id, entityLabel: r.name });
   return { Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: null };
 }
 
@@ -1021,6 +1098,7 @@ export async function createWorkOrderTask(woId, description) {
     'INSERT INTO work_order_tasks (work_order_id, description, sort_order) VALUES ($1,$2,$3) RETURNING *',
     [woId, description, maxRows[0].next]
   );
+  await logActivity({ action: 'created', entityType: 'task', entityId: rows[0].id, entityLabel: rows[0].description, details: `On Work Order #${woId}` });
   return { Id: rows[0].id, Description: rows[0].description, Done: rows[0].done, SortOrder: rows[0].sort_order };
 }
 export async function updateWorkOrderTask(id, { description, done }) {
@@ -1031,7 +1109,8 @@ export async function updateWorkOrderTask(id, { description, done }) {
   return rows[0] ? { Id: rows[0].id, Description: rows[0].description, Done: rows[0].done, SortOrder: rows[0].sort_order } : null;
 }
 export async function deleteWorkOrderTask(id) {
-  await pool.query('DELETE FROM work_order_tasks WHERE id = $1', [id]);
+  const { rows } = await pool.query('DELETE FROM work_order_tasks WHERE id = $1 RETURNING description, work_order_id', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'task', entityId: Number(id), entityLabel: rows[0].description, details: `On Work Order #${rows[0].work_order_id}` });
 }
 
 // ── Calendar Events — independent of Work Orders (optional link either way).
@@ -1125,6 +1204,7 @@ export async function createCalendarEvent({ title, description, eventDate, recur
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
     [title, description || null, eventDate, recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null, workOrderTaskId || null]
   );
+  await logActivity({ action: 'created', entityType: 'calendar_event', entityId: rows[0].id, entityLabel: rows[0].title });
   return calendarEventRowShape(rows[0]);
 }
 
@@ -1139,11 +1219,15 @@ export async function updateCalendarEvent(id, fields) {
   if (!setCols.length) return getCalendarEvent(id);
   vals.push(id);
   const { rowCount } = await pool.query(`UPDATE calendar_events SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
-  return rowCount ? getCalendarEvent(id) : null;
+  if (!rowCount) return null;
+  const event = await getCalendarEvent(id);
+  await logActivity({ action: 'updated', entityType: 'calendar_event', entityId: Number(id), entityLabel: event?.Title });
+  return event;
 }
 
 export async function deleteCalendarEvent(id) {
-  await pool.query('DELETE FROM calendar_events WHERE id = $1', [id]);
+  const { rows } = await pool.query('DELETE FROM calendar_events WHERE id = $1 RETURNING title', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'calendar_event', entityId: Number(id), entityLabel: rows[0].title });
 }
 
 // ── Checklists — simple ORDERED steps (no branching, v1 scope). Templates are
@@ -1206,7 +1290,9 @@ export async function createChecklistTemplate({ name, steps = [] }) {
     await client.query('ROLLBACK'); throw e;
   } finally { client.release(); }
   const all = await listChecklistTemplates();
-  return all.find((t) => t.Id === id) || null;
+  const created = all.find((t) => t.Id === id) || null;
+  await logActivity({ action: 'created', entityType: 'checklist_template', entityId: id, entityLabel: name });
+  return created;
 }
 
 export async function updateChecklistTemplate(id, { name, steps }) {
@@ -1223,11 +1309,14 @@ export async function updateChecklistTemplate(id, { name, steps }) {
     await client.query('ROLLBACK'); throw e;
   } finally { client.release(); }
   const all = await listChecklistTemplates();
-  return all.find((t) => t.Id === Number(id)) || null;
+  const updated = all.find((t) => t.Id === Number(id)) || null;
+  if (updated) await logActivity({ action: 'updated', entityType: 'checklist_template', entityId: Number(id), entityLabel: updated.Name });
+  return updated;
 }
 
 export async function deleteChecklistTemplate(id) {
-  await pool.query('DELETE FROM checklist_templates WHERE id = $1', [id]);
+  const { rows } = await pool.query('DELETE FROM checklist_templates WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'checklist_template', entityId: Number(id), entityLabel: rows[0].name });
 }
 
 async function getChecklistInstanceFull(instanceId) {
@@ -1286,6 +1375,8 @@ async function attachChecklist({ templateId, workOrderId, calendarEventId }) {
       }
     }
     await client.query('COMMIT');
+    const details = workOrderId ? `On Work Order #${workOrderId}` : calendarEventId ? `On Calendar Event #${calendarEventId}` : undefined;
+    await logActivity({ action: 'created', entityType: 'checklist_instance', entityId: instanceId, entityLabel: tpl.rows[0].name, details });
     return getChecklistInstanceFull(instanceId);
   } catch (e) {
     await client.query('ROLLBACK'); throw e;
@@ -1311,7 +1402,11 @@ export async function getChecklistInstanceForExport(instanceId) {
 }
 
 export async function detachChecklistInstance(instanceId) {
-  await pool.query('DELETE FROM checklist_instances WHERE id = $1', [instanceId]);
+  const { rows } = await pool.query('DELETE FROM checklist_instances WHERE id = $1 RETURNING name, work_order_id, calendar_event_id', [instanceId]);
+  if (rows[0]) {
+    const details = rows[0].work_order_id ? `From Work Order #${rows[0].work_order_id}` : rows[0].calendar_event_id ? `From Calendar Event #${rows[0].calendar_event_id}` : undefined;
+    await logActivity({ action: 'deleted', entityType: 'checklist_instance', entityId: Number(instanceId), entityLabel: rows[0].name, details });
+  }
 }
 export async function toggleChecklistStep(stepId, done) {
   const { rows } = await pool.query(
@@ -1319,4 +1414,78 @@ export async function toggleChecklistStep(stepId, done) {
     [stepId, done]
   );
   return rows[0] || null;
+}
+
+// ── Login accounts (replaces the single APP_USERS env-var pair) ────────────
+// password_hash is "salt:derivedKeyHex" from Node's built-in scrypt — no new
+// dependency, no plaintext at rest.
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+function verifyPassword(password, stored) {
+  const [salt, hashHex] = (stored || '').split(':');
+  if (!salt || !hashHex) return false;
+  const storedBuf = Buffer.from(hashHex, 'hex');
+  const derivedBuf = crypto.scryptSync(password, salt, storedBuf.length);
+  return storedBuf.length === derivedBuf.length && crypto.timingSafeEqual(storedBuf, derivedBuf);
+}
+function userRowShape(r) {
+  return { Id: r.id, Username: r.username, Email: r.email, Active: r.active };
+}
+
+export async function listUsers() {
+  const { rows } = await pool.query('SELECT id, username, email, active FROM users ORDER BY username');
+  return rows.map(userRowShape);
+}
+
+export async function countActiveUsers() {
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM users WHERE active');
+  return rows[0].n;
+}
+
+export async function createUser({ username, password, email }) {
+  const { rows } = await pool.query(
+    'INSERT INTO users (username, password_hash, email) VALUES ($1,$2,$3) RETURNING id, username, email, active',
+    [username, hashPassword(password), email || null]
+  );
+  await logActivity({ action: 'created', entityType: 'user', entityId: rows[0].id, entityLabel: rows[0].username });
+  return userRowShape(rows[0]);
+}
+
+export async function updateUser(id, { email, password, active }) {
+  const sets = []; const vals = []; let i = 1;
+  if (email !== undefined) { sets.push(`email = $${i++}`); vals.push(email || null); }
+  if (password) { sets.push(`password_hash = $${i++}`); vals.push(hashPassword(password)); }
+  if (active !== undefined) { sets.push(`active = $${i++}`); vals.push(active); }
+  if (!sets.length) {
+    const { rows } = await pool.query('SELECT id, username, email, active FROM users WHERE id = $1', [id]);
+    return rows[0] ? userRowShape(rows[0]) : null;
+  }
+  vals.push(id);
+  const { rows } = await pool.query(
+    `UPDATE users SET ${sets.join(', ')} WHERE id = $${i} RETURNING id, username, email, active`,
+    vals
+  );
+  if (rows[0]) {
+    // Never log the password itself — just note that a reset happened.
+    const notes = [password ? 'password reset' : null, active === false ? 'deactivated' : active === true ? 'reactivated' : null].filter(Boolean);
+    await logActivity({ action: 'updated', entityType: 'user', entityId: rows[0].id, entityLabel: rows[0].username, details: notes.join(', ') || undefined });
+  }
+  return rows[0] ? userRowShape(rows[0]) : null;
+}
+
+export async function deleteUser(id) {
+  const { rows } = await pool.query('DELETE FROM users WHERE id = $1 RETURNING username', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'user', entityId: Number(id), entityLabel: rows[0].username });
+}
+
+export async function verifyUserCredentials(username, password) {
+  const { rows } = await pool.query('SELECT id, username, password_hash, active FROM users WHERE username = $1', [username]);
+  const u = rows[0];
+  if (!u || !u.active) return null;
+  if (!verifyPassword(password, u.password_hash)) return null;
+  return { Id: u.id, Username: u.username };
 }

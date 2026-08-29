@@ -5,7 +5,8 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 
 import { getTableMeta, listRecords, TABLES } from './nocodb.js';
-import { pingDb } from './db.js';
+import { pingDb, verifyUserCredentials } from './db.js';
+import { requestContext } from './requestContext.js';
 import apiRouter from './routes/api.js';
 import manageRouter from './routes/manage.js';
 import reportsRouter from './routes/reports.js';
@@ -24,22 +25,20 @@ app.use(session({
   cookie: { httpOnly: true, sameSite: 'lax', maxAge: 1000 * 60 * 60 * 12 },
 }));
 
-function loadUsers() {
-  const raw = process.env.APP_USERS || '';
-  const users = {};
-  raw.split(',').map(s => s.trim()).filter(Boolean).forEach(pair => {
-    const i = pair.indexOf(':');
-    if (i > 0) users[pair.slice(0, i)] = pair.slice(i + 1);
-  });
-  return users;
-}
-const USERS = loadUsers();
-
-app.post('/login', (req, res) => {
+// Accounts live in the `users` table (Admin > Users) — see db.js's
+// verifyUserCredentials/hashPassword. Replaces the old APP_USERS env-var pair.
+app.post('/login', async (req, res) => {
   const { username, password } = req.body || {};
-  if (USERS[username] && USERS[username] === password) {
-    req.session.user = username;
-    return res.json({ ok: true, user: username });
+  if (!username || !password) return res.status(401).json({ ok: false, error: 'Invalid credentials' });
+  try {
+    const user = await verifyUserCredentials(username, password);
+    if (user) {
+      req.session.user = user.Username;
+      return res.json({ ok: true, user: user.Username });
+    }
+  } catch (e) {
+    console.error('Login check failed:', e.message);
+    return res.status(500).json({ ok: false, error: 'Login temporarily unavailable' });
   }
   res.status(401).json({ ok: false, error: 'Invalid credentials' });
 });
@@ -49,7 +48,9 @@ app.post('/logout', (req, res) => {
 });
 
 function requireAuth(req, res, next) {
-  if (req.session?.user) return next();
+  if (req.session?.user) {
+    return requestContext.run({ username: req.session.user }, next);
+  }
   res.status(401).json({ ok: false, error: 'Not authenticated' });
 }
 
@@ -104,5 +105,4 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`camp-audit listening on :${PORT}`);
-  console.log(`Users configured: ${Object.keys(USERS).join(', ') || '(none — set APP_USERS)'}`);
 });

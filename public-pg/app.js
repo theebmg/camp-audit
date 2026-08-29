@@ -30,6 +30,40 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// In-page replacement for the browser's window.confirm — a floating modal
+// instead of native browser chrome. Resolves true/false the same way, so
+// every call site just becomes `await confirmDialog(...)`.
+function confirmDialog(message, { confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = true } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" role="alertdialog" aria-modal="true">
+        <p class="modal-message">${escapeHtml(message)}</p>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:18px">
+          <button type="button" class="btn btn-secondary modal-cancel">${escapeHtml(cancelLabel)}</button>
+          <button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'} modal-confirm">${escapeHtml(confirmLabel)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+
+    function close(result) {
+      document.removeEventListener('keydown', onKeydown);
+      overlay.remove();
+      resolve(result);
+    }
+    function onKeydown(e) {
+      if (e.key === 'Escape') close(false);
+      if (e.key === 'Enter') close(true);
+    }
+    overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(false); });
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => close(false));
+    overlay.querySelector('.modal-confirm').addEventListener('click', () => close(true));
+    document.addEventListener('keydown', onKeydown);
+    overlay.querySelector('.modal-confirm').focus();
+  });
+}
+
 // Sets #app's content and replays the fade-in — every view render should go
 // through this instead of `app.innerHTML =` directly, so view swaps feel like
 // transitions rather than instant flashes.
@@ -300,6 +334,8 @@ async function render(view, params = {}) {
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
       crew: () => renderCrew(),
+      adminUsers: () => renderAdminUsers(),
+      activityLog: () => renderActivityLog(),
     };
     if (handlers[view]) {
       await handlers[view]();
@@ -458,9 +494,13 @@ async function renderAssetsInLocation({ id, name }) {
   app.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => go('assetDetail', { id: el.dataset.id })));
 }
 
+// Four visually distinct tiers, worst to best: bad (red) > pop (orange) >
+// warn (amber) > good (green). Fair sits a full tier below Good/Excellent —
+// previously it was lumped in with Good and looked identical.
 function conditionPillClass(c) {
-  if (['Good', 'Excellent', 'Fair'].includes(c)) return 'good';
-  if (['Poor'].includes(c)) return 'warn';
+  if (['Good', 'Excellent'].includes(c)) return 'good';
+  if (['Fair'].includes(c)) return 'warn';
+  if (['Poor'].includes(c)) return 'pop';
   if (['Failed', 'Critical'].includes(c)) return 'bad';
   return '';
 }
@@ -579,7 +619,7 @@ async function renderAssetDetail({ id }) {
   app.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
   document.getElementById('buildingTypeSelect').addEventListener('change', async (e) => {
     const label = e.target.options[e.target.selectedIndex].text;
-    if (!confirm(`Change building type to "${label}"? This affects which questions apply to this asset.`)) {
+    if (!await confirmDialog(`Change building type to "${label}"? This affects which questions apply to this asset.`)) {
       e.target.value = asset.buildingTypeId ?? '';
       return;
     }
@@ -865,7 +905,7 @@ async function renderEditAsset({ id }) {
   document.getElementById('cancelEditBtn').addEventListener('click', goBack);
   document.getElementById('editAssetForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    if (!confirm(`Save these changes to "${asset.Name}"?`)) return;
+    if (!await confirmDialog(`Save these changes to "${asset.Name}"?`)) return;
     const fd = new FormData(e.target);
     const core = {
       name: fd.get('core_name'), asset_type: fd.get('core_asset_type'),
@@ -898,8 +938,131 @@ async function renderAdminHub() {
     <div class="list-item" data-view="adminApplicability">✅ Applicability Matrix</div>
     <div class="list-item" data-view="adminSubAreas">📐 Component Sub-Areas</div>
     <div class="list-item" data-view="adminWoTemplates">🧾 Work Order Templates</div>
-    <div class="list-item" data-view="adminChecklistTemplates">✅ Checklist Templates</div>`;
+    <div class="list-item" data-view="adminChecklistTemplates">✅ Checklist Templates</div>
+    <div class="card" style="margin-top:14px"><h3>Accounts</h3></div>
+    <div class="list-item" data-view="adminUsers">👤 Users</div>
+    <div class="list-item" data-view="activityLog">🕘 Activity Log</div>`;
   app.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
+}
+
+const ACTIVITY_ACTION_PILL = {
+  created: 'good', deleted: 'bad', deactivated: 'bad', updated: '', completed: 'good', reactivated: 'good',
+};
+async function renderActivityLog() {
+  setChrome({ title: 'Activity Log', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const { entries } = await api('/api/pg/activity-log?limit=300');
+  let actionFilter = null;
+  let typeFilter = null;
+
+  function draw() {
+    const actions = [...new Set(entries.map((e) => e.Action))].sort();
+    const types = [...new Set(entries.map((e) => e.EntityType))].sort();
+    const visible = entries.filter((e) => (!actionFilter || e.Action === actionFilter) && (!typeFilter || e.EntityType === typeFilter));
+    const rows = visible.map((e) => `
+      <tr>
+        <td data-label="When">${new Date(e.OccurredAt).toLocaleString()}</td>
+        <td data-label="Who">${escapeHtml(e.Username || '—')}</td>
+        <td data-label="Action"><span class="pill ${ACTIVITY_ACTION_PILL[e.Action] || ''}">${escapeHtml(e.Action)}</span></td>
+        <td data-label="Type">${escapeHtml(e.EntityType.replace(/_/g, ' '))}</td>
+        <td data-label="What">${escapeHtml(e.EntityLabel || '—')}</td>
+        <td data-label="Details">${escapeHtml(e.Details || '')}</td>
+      </tr>`).join('');
+    setApp(`
+      <div class="card">
+        <p class="muted">Most recent ${entries.length} events. Deleted records stay listed here even though the record itself is gone.</p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">
+          <select id="actionFilter"><option value="">All actions</option>${actions.map((a) => `<option value="${a}" ${actionFilter === a ? 'selected' : ''}>${a}</option>`).join('')}</select>
+          <select id="typeFilter"><option value="">All types</option>${types.map((t) => `<option value="${t}" ${typeFilter === t ? 'selected' : ''}>${t.replace(/_/g, ' ')}</option>`).join('')}</select>
+        </div>
+      </div>
+      <div class="card" style="overflow-x:auto">
+        <table class="report-table">
+          <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Type</th><th>What</th><th>Details</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="6" class="muted">No activity recorded yet.</td></tr>'}</tbody>
+        </table>
+      </div>`);
+    document.getElementById('actionFilter').addEventListener('change', (e) => { actionFilter = e.target.value || null; draw(); });
+    document.getElementById('typeFilter').addEventListener('change', (e) => { typeFilter = e.target.value || null; draw(); });
+  }
+
+  draw();
+}
+
+async function renderAdminUsers() {
+  setChrome({ title: 'Users', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const { users } = await api('/api/pg/users');
+  let editing = null; // 'new' | { id } | null
+
+  function editFormHtml(u) {
+    return `<div class="card">
+      <h3>${u ? `Edit "${escapeHtml(u.Username)}"` : 'Add User'}</h3>
+      ${u ? '' : `<div class="field-row"><label>Username</label><input class="u-username" required /></div>`}
+      <div class="field-row"><label>Email (optional)</label><input class="u-email" type="email" value="${escapeHtml(u?.Email || '')}" /></div>
+      <div class="field-row"><label>${u ? 'New Password (leave blank to keep current)' : 'Password'}</label><input class="u-password" type="password" ${u ? '' : 'required'} /></div>
+      ${u ? `<div class="field-row"><label style="display:flex;align-items:center;gap:8px;font-weight:400"><input type="checkbox" class="u-active" ${u.Active ? 'checked' : ''} style="width:auto" /> Active (unchecked = can't log in)</label></div>` : ''}
+      <div class="btn-row">
+        <button class="btn btn-primary u-save" data-id="${u?.Id ?? ''}">Save</button>
+        <button class="btn btn-secondary u-cancel">Cancel</button>
+      </div>
+    </div>`;
+  }
+
+  function draw() {
+    setApp(`
+      ${users.map((u) => `
+        <div class="list-item" style="cursor:default">
+          <div><strong>${escapeHtml(u.Username)}</strong>${!u.Active ? ' <span class="pill">inactive</span>' : ''}
+            <div class="muted">${escapeHtml(u.Email || 'no email on file')}</div></div>
+          <div class="btn-row" style="margin-top:0">
+            <button class="btn btn-secondary edit-user" data-id="${u.Id}">Edit</button>
+            <button class="btn btn-secondary delete-user" data-id="${u.Id}" data-name="${escapeHtml(u.Username)}">Delete</button>
+          </div>
+        </div>`).join('') || '<p class="muted">No accounts yet.</p>'}
+      ${editing === 'new' ? editFormHtml(null) : `<div class="btn-row" style="margin-top:10px"><button class="btn btn-secondary" id="addUserBtn">+ Add User</button></div>`}
+      ${editing?.id ? editFormHtml(users.find((u) => u.Id === editing.id)) : ''}
+    `);
+    wire();
+  }
+
+  function wire() {
+    document.getElementById('addUserBtn')?.addEventListener('click', () => { editing = 'new'; draw(); });
+    app.querySelectorAll('.edit-user').forEach((btn) => btn.addEventListener('click', () => { editing = { id: Number(btn.dataset.id) }; draw(); }));
+    app.querySelectorAll('.u-cancel').forEach((btn) => btn.addEventListener('click', () => { editing = null; draw(); }));
+    app.querySelectorAll('.u-save').forEach((btn) => btn.addEventListener('click', async () => {
+      const card = btn.closest('.card');
+      const id = btn.dataset.id;
+      const isNew = !id;
+      const password = card.querySelector('.u-password').value;
+      const email = card.querySelector('.u-email').value.trim();
+      try {
+        if (isNew) {
+          const username = card.querySelector('.u-username').value.trim();
+          if (!username) { toast('Username is required'); return; }
+          if (password.length < 6) { toast('Password must be at least 6 characters'); return; }
+          await api('/api/pg/users', { method: 'POST', body: JSON.stringify({ username, password, email }) });
+          toast('User added');
+        } else {
+          if (password && password.length < 6) { toast('Password must be at least 6 characters'); return; }
+          const active = card.querySelector('.u-active').checked;
+          await api(`/api/pg/users/${id}`, { method: 'PATCH', body: JSON.stringify({ email, password: password || undefined, active }) });
+          toast('User saved');
+        }
+        renderAdminUsers();
+      } catch (err) { toast(err.message); }
+    }));
+    app.querySelectorAll('.delete-user').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!await confirmDialog(`Permanently delete the account "${btn.dataset.name}"? This cannot be undone.`)) return;
+      try {
+        await api(`/api/pg/users/${btn.dataset.id}`, { method: 'DELETE' });
+        toast('User deleted');
+        renderAdminUsers();
+      } catch (err) { toast(err.message); }
+    }));
+  }
+
+  draw();
 }
 
 async function renderAdminWoTemplates() {
@@ -985,7 +1148,7 @@ async function renderAdminWoTemplates() {
     wireRemoveButtons();
 
     app.querySelectorAll('.tpl-delete').forEach((btn) => btn.addEventListener('click', async () => {
-      if (!confirm(`Delete template "${btn.dataset.name}"? This won't affect any work orders already created from it.`)) return;
+      if (!await confirmDialog(`Delete template "${btn.dataset.name}"? This won't affect any work orders already created from it.`)) return;
       await api(`/api/pg/work-order-templates/${btn.dataset.id}`, { method: 'DELETE' });
       toast('Template deleted');
       renderAdminWoTemplates();
@@ -1079,7 +1242,7 @@ async function renderAdminPropertyFields({ openAdd } = {}) {
 
   document.querySelectorAll('.toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
     const action = btn.dataset.next === 'true' ? 'Reactivate' : 'Deactivate';
-    if (!confirm(`${action} this field? ${action === 'Deactivate' ? 'It will stop appearing in the audit form and Edit Asset screen (existing data is kept).' : 'It will reappear in the audit form.'}`)) return;
+    if (!await confirmDialog(`${action} this field? ${action === 'Deactivate' ? 'It will stop appearing in the audit form and Edit Asset screen (existing data is kept).' : 'It will reappear in the audit form.'}`)) return;
     await api(`/api/pg/admin/property-fields/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.next === 'true' }) });
     renderAdminPropertyFields();
   }));
@@ -1123,7 +1286,7 @@ async function renderAdminComponentTypes({ openAdd } = {}) {
     </div>`;
 
   document.querySelectorAll('.prompt-toggle').forEach((cb) => cb.addEventListener('change', async () => {
-    if (!confirm(`${cb.checked ? 'Start' : 'Stop'} prompting for "${cb.dataset.type}" during the audit walkthrough (when Free Standing Building = Yes)?`)) {
+    if (!await confirmDialog(`${cb.checked ? 'Start' : 'Stop'} prompting for "${cb.dataset.type}" during the audit walkthrough (when Free Standing Building = Yes)?`)) {
       cb.checked = !cb.checked;
       return;
     }
@@ -1172,7 +1335,7 @@ async function renderAdminBuildingTypes() {
     </div>`;
 
   document.querySelectorAll('.delete-bt').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!confirm('Delete this building type? Only works if no assets currently use it.')) return;
+    if (!await confirmDialog('Delete this building type? Only works if no assets currently use it.')) return;
     try { await api(`/api/pg/admin/building-types/${btn.dataset.id}`, { method: 'DELETE' }); renderAdminBuildingTypes(); }
     catch (err) { toast(err.message); }
   }));
@@ -1236,7 +1399,7 @@ async function renderAdminSubAreas() {
     </div>`;
 
   document.querySelectorAll('.delete-sa').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!confirm(`Delete sub-area "${btn.dataset.name}" from ${btn.dataset.type}? This cannot be undone from the app — you'd need to re-add it manually.`)) return;
+    if (!await confirmDialog(`Delete sub-area "${btn.dataset.name}" from ${btn.dataset.type}? This cannot be undone from the app — you'd need to re-add it manually.`)) return;
     await api(`/api/pg/admin/sub-areas/${btn.dataset.id}`, { method: 'DELETE' });
     toast('Sub-area deleted');
     renderAdminSubAreas();
@@ -1504,7 +1667,7 @@ async function renderCalendarEventDetail({ id }) {
   document.getElementById('viewWoBtn')?.addEventListener('click', () => go('workOrderDetail', { id: ev.WorkOrderId }));
   document.getElementById('eventForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    if (!confirm('Save changes to this event?')) return;
+    if (!await confirmDialog('Save changes to this event?')) return;
     const fd = new FormData(e.target);
     try {
       await api(`/api/pg/calendar-events/${id}`, { method: 'PATCH', body: JSON.stringify({
@@ -1518,7 +1681,7 @@ async function renderCalendarEventDetail({ id }) {
     } catch (err) { toast(err.message); }
   });
   document.getElementById('deleteEventBtn').addEventListener('click', async () => {
-    if (!confirm(`Delete "${ev.Title}"? This removes all its recurrences from the calendar.`)) return;
+    if (!await confirmDialog(`Delete "${ev.Title}"? This removes all its recurrences from the calendar.`)) return;
     try { await api(`/api/pg/calendar-events/${id}`, { method: 'DELETE' }); toast('Event deleted'); go('calendar', {}, { replace: true }); }
     catch (err) { toast(err.message); }
   });
@@ -1529,7 +1692,7 @@ async function renderCalendarEventDetail({ id }) {
     catch (err) { toast(err.message); }
   });
   document.getElementById('removeChecklistBtn')?.addEventListener('click', async () => {
-    if (!confirm('Remove this checklist? Progress will be lost.')) return;
+    if (!await confirmDialog('Remove this checklist? Progress will be lost.')) return;
     try { await api(`/api/pg/checklist-instances/${checklist.Id}`, { method: 'DELETE' }); renderCalendarEventDetail({ id }); }
     catch (err) { toast(err.message); }
   });
@@ -1638,7 +1801,7 @@ async function renderAdminChecklistTemplates() {
     }
 
     app.querySelectorAll('.cl-delete').forEach((btn) => btn.addEventListener('click', async () => {
-      if (!confirm(`Delete checklist "${btn.dataset.name}"? Any WOs/events already using it keep their own copy of the steps.`)) return;
+      if (!await confirmDialog(`Delete checklist "${btn.dataset.name}"? Any WOs/events already using it keep their own copy of the steps.`)) return;
       await api(`/api/pg/checklist-templates/${btn.dataset.id}`, { method: 'DELETE' });
       toast('Checklist deleted');
       renderAdminChecklistTemplates();
@@ -1910,7 +2073,7 @@ async function renderWorkOrderDetail({ id }) {
 
   document.getElementById('woFieldsForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    if (!confirm('Save changes to this work order?')) return;
+    if (!await confirmDialog('Save changes to this work order?')) return;
     const fd = new FormData(e.target);
     const newAsset = assetPicker.getSelected();
     try {
@@ -1954,7 +2117,7 @@ async function renderWorkOrderDetail({ id }) {
     catch (err) { toast(err.message); }
   }));
   app.querySelectorAll('.delete-task').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!confirm(`Delete task "${btn.dataset.label}"?`)) return;
+    if (!await confirmDialog(`Delete task "${btn.dataset.label}"?`)) return;
     try { await api(`/api/pg/work-order-tasks/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
     catch (err) { toast(err.message); }
   }));
@@ -1968,7 +2131,7 @@ async function renderWorkOrderDetail({ id }) {
     } catch (err) { toast(err.message); }
   });
   document.getElementById('removeChecklistBtn')?.addEventListener('click', async () => {
-    if (!confirm('Remove this checklist from the work order? Progress will be lost.')) return;
+    if (!await confirmDialog('Remove this checklist from the work order? Progress will be lost.')) return;
     try { await api(`/api/pg/checklist-instances/${checklist.Id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
     catch (err) { toast(err.message); }
   });
@@ -1978,7 +2141,7 @@ async function renderWorkOrderDetail({ id }) {
   }));
 
   document.getElementById('completeWoBtn').addEventListener('click', async () => {
-    if (!confirm(`Complete this Work Order? Any pending "asset field update" entries will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;
+    if (!await confirmDialog(`Complete this Work Order? Any pending "asset field update" entries will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;
     try {
       await api(`/api/pg/work-orders/${id}/complete`, { method: 'POST' });
       toast('Work order completed — asset updated');
@@ -1996,7 +2159,7 @@ async function renderWorkOrderDetail({ id }) {
   });
 
   app.querySelectorAll('.delete-au').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!confirm(`Delete the "${btn.dataset.label}" field update?`)) return;
+    if (!await confirmDialog(`Delete the "${btn.dataset.label}" field update?`)) return;
     try { await api(`/api/pg/work-orders/${id}/asset-updates/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }); }
     catch (err) { toast(err.message); }
   }));
@@ -2049,12 +2212,12 @@ async function renderWorkOrderDetail({ id }) {
     } catch (err) { toast(err.message); }
   });
   app.querySelectorAll('.unassign-vol').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!confirm(`Remove ${btn.dataset.name} from this work order?`)) return;
+    if (!await confirmDialog(`Remove ${btn.dataset.name} from this work order?`)) return;
     await api(`/api/pg/work-orders/${id}/volunteers/${btn.dataset.id}`, { method: 'DELETE' });
     renderWorkOrderDetail({ id });
   }));
   app.querySelectorAll('.unassign-ven').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!confirm(`Remove ${btn.dataset.name} from this work order?`)) return;
+    if (!await confirmDialog(`Remove ${btn.dataset.name} from this work order?`)) return;
     await api(`/api/pg/work-orders/${id}/vendors/${btn.dataset.id}`, { method: 'DELETE' });
     renderWorkOrderDetail({ id });
   }));
@@ -2091,12 +2254,12 @@ function resetCrewAddBox(boxId) {
   box.querySelectorAll('.skill-chip.selected').forEach((c) => c.classList.remove('selected'));
   box.hidden = true;
 }
-function openCrewAddBox(openId, otherId) {
+async function openCrewAddBox(openId, otherId) {
   const otherBox = document.getElementById(otherId);
   if (!otherBox.hidden) {
     if (crewAddBoxHasData(otherId)) {
       const label = otherId === 'newVolBox' ? 'volunteer' : 'vendor';
-      if (!confirm(`You have unsaved new-${label} info entered. Discard it and continue?`)) return;
+      if (!await confirmDialog(`You have unsaved new-${label} info entered. Discard it and continue?`)) return;
     }
     resetCrewAddBox(otherId);
   }
@@ -2272,7 +2435,7 @@ async function renderCrew() {
       };
       if (!fields.name) { toast('Name is required'); return; }
       const isNew = !id;
-      if (!isNew && !confirm(`Save changes to "${fields.name}"?`)) return;
+      if (!isNew && !await confirmDialog(`Save changes to "${fields.name}"?`)) return;
       try {
         const base = kind === 'vol' ? '/api/pg/volunteers' : '/api/pg/vendors';
         await api(isNew ? base : `${base}/${id}`, { method: isNew ? 'POST' : 'PATCH', body: JSON.stringify(fields) });
@@ -2286,7 +2449,7 @@ async function renderCrew() {
       const msg = isActive
         ? `Remove ${btn.dataset.name}? If they have work order history they'll be deactivated (kept for records, hidden from new assignments); otherwise deleted entirely.`
         : `Permanently delete ${btn.dataset.name}? This cannot be undone.`;
-      if (!confirm(msg)) return;
+      if (!await confirmDialog(msg)) return;
       const base = btn.dataset.kind === 'vol' ? '/api/pg/volunteers' : '/api/pg/vendors';
       try {
         const result = await api(`${base}/${btn.dataset.id}`, { method: 'DELETE' });
