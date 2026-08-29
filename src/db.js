@@ -715,12 +715,38 @@ export async function deleteOtherBudgetCategory(id) {
   if (rows[0]) await logActivity({ action: 'deleted', entityType: 'other_budget_category', entityId: Number(id), entityLabel: rows[0].name });
 }
 
+// The roster is derived, not hand-entered: every distinct assets.lodge_holder
+// value should have a matching cabin_holders row. Called before every list
+// read so a newly-set lodge_holder shows up next time the page loads, with
+// no separate "sync" action for anyone to remember to run. Idempotent
+// (ON CONFLICT DO NOTHING against the name unique constraint).
+export async function syncCabinHoldersFromAssets() {
+  await pool.query(`
+    INSERT INTO cabin_holders (name)
+    SELECT DISTINCT trim(lodge_holder) FROM assets
+    WHERE lodge_holder IS NOT NULL AND trim(lodge_holder) != ''
+    ON CONFLICT (name) DO NOTHING
+  `);
+}
+
 export async function listCabinHolders() {
-  const { rows } = await pool.query('SELECT id, name, notes AS description FROM cabin_holders ORDER BY name');
-  return rows.map(fundingEntityRowShape);
+  await syncCabinHoldersFromAssets();
+  const { rows } = await pool.query(`
+    SELECT ch.id, ch.name, ch.notes AS description,
+      COALESCE(json_agg(json_build_object('Id', a.id, 'Name', a.name)) FILTER (WHERE a.id IS NOT NULL), '[]') AS linked_assets
+    FROM cabin_holders ch
+    LEFT JOIN assets a ON lower(trim(a.lodge_holder)) = lower(ch.name)
+    GROUP BY ch.id, ch.name, ch.notes
+    ORDER BY ch.name
+  `);
+  return rows.map((r) => ({ ...fundingEntityRowShape(r), LinkedAssets: r.linked_assets }));
 }
 export async function createCabinHolder({ name, notes }) {
-  const { rows } = await pool.query('INSERT INTO cabin_holders (name, notes) VALUES ($1,$2) RETURNING *', [name, notes || null]);
+  const { rows } = await pool.query(
+    `INSERT INTO cabin_holders (name, notes) VALUES ($1,$2)
+     ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING *`,
+    [name, notes || null]
+  );
   await logActivity({ action: 'created', entityType: 'cabin_holder', entityId: rows[0].id, entityLabel: rows[0].name });
   return { Id: rows[0].id, Name: rows[0].name, Description: rows[0].notes };
 }

@@ -1146,10 +1146,11 @@ async function renderCapitalPlan() {
       ${groups.length ? groups.map((g) => `
         <details class="reveal" style="margin-bottom:8px">
           <summary style="cursor:pointer;display:flex;justify-content:space-between;gap:10px;padding:8px 0">
-            <span>${escapeHtml(g.Name)}</span><strong>${moneyFmt(g.Total)}</strong>
+            <span>${escapeHtml(g.Name)}${g.LinkedAssets?.length ? ` <span class="muted">— ${g.LinkedAssets.map((a) => escapeHtml(a.Name)).join(', ')}</span>` : ''}</span><strong>${moneyFmt(g.Total)}</strong>
           </summary>
           <div style="padding:4px 0 8px 16px">
             ${g.Description ? `<p class="muted">${escapeHtml(g.Description)}</p>` : ''}
+            ${g.LinkedAssets?.length ? `<p class="muted">Linked asset${g.LinkedAssets.length > 1 ? 's' : ''}: ${g.LinkedAssets.map((a) => `<a href="#" class="budget-asset-link" data-asset-id="${a.Id}">${escapeHtml(a.Name)}</a>`).join(', ')}</p>` : ''}
             ${g.Items.length ? g.Items.map((it) => `<div class="list-item budget-wo-link" data-wo-id="${it.WorkOrderId}">
               <span>${escapeHtml(it.Title)}</span>
               <span class="pill ${woStatusPillClass(it.Status)}">${escapeHtml(it.Status)} · ${moneyFmt(it.Cost)}</span>
@@ -1248,6 +1249,7 @@ async function renderCapitalPlan() {
       } catch (err) { toast(err.message); }
     }));
     app.querySelectorAll('.budget-wo-link').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
+    app.querySelectorAll('.budget-asset-link').forEach((el) => el.addEventListener('click', (e) => { e.preventDefault(); go('assetDetail', { id: el.dataset.assetId }); }));
 
     app.querySelectorAll('.bucket-tile').forEach((tile) => tile.addEventListener('click', () => {
       activeBucket = activeBucket === tile.dataset.bucket ? null : tile.dataset.bucket;
