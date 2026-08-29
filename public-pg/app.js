@@ -1537,6 +1537,8 @@ async function renderReports(params = {}) {
   let openGroups = new Set();
   let columnsPickerOpen = false;
   let rows = [];
+  let sortKey = null;
+  let sortDir = 'asc';
 
   async function loadSchema() {
     const { columns: cols } = await api(`/api/pg/reports/schema?entity=${entity}`);
@@ -1544,6 +1546,30 @@ async function renderReports(params = {}) {
     selectedFilters = {};
     visibleColumns = new Set(columns.filter((c) => c.default).map((c) => c.key));
     openGroups = new Set(columns[0] ? [columns[0].group] : []);
+    sortKey = null;
+    sortDir = 'asc';
+  }
+
+  // Null/empty values always sort to the bottom regardless of direction —
+  // reads more like "unanswered" being set aside than "less than everything."
+  // Numeric-looking values compare as numbers so e.g. Window Count sorts
+  // 2, 4, 10 instead of 10, 2, 4.
+  function sortedRows() {
+    if (!sortKey) return rows;
+    const dir = sortDir === 'desc' ? -1 : 1;
+    return [...rows].sort((a, b) => {
+      const av = a[sortKey];
+      const bv = b[sortKey];
+      const aEmpty = av == null || av === '';
+      const bEmpty = bv == null || bv === '';
+      if (aEmpty && bEmpty) return 0;
+      if (aEmpty) return 1;
+      if (bEmpty) return -1;
+      const an = Number(av);
+      const bn = Number(bv);
+      if (!Number.isNaN(an) && !Number.isNaN(bn) && av !== '' && bv !== '') return (an - bn) * dir;
+      return String(av).localeCompare(String(bv)) * dir;
+    });
   }
 
   async function loadData() {
@@ -1617,8 +1643,8 @@ async function renderReports(params = {}) {
           </div>
           <div class="card" style="overflow-x:auto">
             <table class="report-table">
-              <thead><tr>${visibleCols.map((c) => `<th>${escapeHtml(c.label)}</th>`).join('')}</tr></thead>
-              <tbody>${rows.length ? rows.map((r) => `
+              <thead><tr>${visibleCols.map((c) => `<th class="sortable-col ${sortKey === c.key ? 'sorted' : ''}" data-sort-key="${escapeHtml(c.key)}">${escapeHtml(c.label)}<span class="sort-arrow">${sortKey === c.key ? (sortDir === 'desc' ? '▼' : '▲') : ''}</span></th>`).join('')}</tr></thead>
+              <tbody>${rows.length ? sortedRows().map((r) => `
                 <tr class="clickable-row" data-id="${r._id}" data-entity="${r._entity}">
                   ${visibleCols.map((c) => `<td data-label="${escapeHtml(c.label)}">${escapeHtml(r[c.key] == null ? '—' : String(r[c.key]))}</td>`).join('')}
                 </tr>`).join('') : `<tr><td colspan="${visibleCols.length || 1}" class="muted">No matching records.</td></tr>`}</tbody>
@@ -1655,6 +1681,12 @@ async function renderReports(params = {}) {
       if (!selectedFilters[key]) selectedFilters[key] = new Set();
       if (cb.checked) selectedFilters[key].add(cb.value); else selectedFilters[key].delete(cb.value);
       await loadData();
+      draw();
+    }));
+    app.querySelectorAll('.sortable-col').forEach((th) => th.addEventListener('click', () => {
+      const key = th.dataset.sortKey;
+      if (sortKey === key) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+      else { sortKey = key; sortDir = 'asc'; }
       draw();
     }));
     app.querySelectorAll('tr.clickable-row[data-id]').forEach((tr) => tr.addEventListener('click', () => {

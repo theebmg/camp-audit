@@ -235,6 +235,10 @@
     table.report-table th, table.report-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
     table.report-table tr.clickable-row { cursor: pointer; transition: background-color 0.15s ease; }
     table.report-table tr.clickable-row:hover { background: var(--surface-alt); }
+    table.report-table th.sortable-col { cursor: pointer; user-select: none; white-space: nowrap; }
+    table.report-table th.sortable-col:hover { background: var(--surface-alt); }
+    table.report-table th.sortable-col.sorted { color: var(--accent-dark); }
+    table.report-table th .sort-arrow { display: inline-block; width: 12px; margin-left: 3px; font-size: 0.7rem; }
 
     /* Applicability Matrix only — inherently a 2D grid, so it keeps a sticky
        first column + horizontal scroll rather than the card-mode toggle. */
