@@ -1138,26 +1138,38 @@ async function renderCapitalPlan() {
     <div class="card"><h3>📊 Capital Campaign / Cabin-Holder / Other — cost comparison</h3>${fundingComparisonChartHtml(budgetOverview)}</div>`;
   }
 
+  function fundingEntityRowHtml(kind, g) {
+    return `<details class="reveal" style="margin-bottom:8px">
+      <summary style="cursor:pointer;display:flex;justify-content:space-between;gap:10px;padding:8px 0">
+        <span>${escapeHtml(g.Name)}${g.LinkedAssets?.length ? ` <span class="muted">— ${g.LinkedAssets.map((a) => escapeHtml(a.Name)).join(', ')}</span>` : ''}</span><strong>${moneyFmt(g.Total)}</strong>
+      </summary>
+      <div style="padding:4px 0 8px 16px">
+        ${g.Description ? `<p class="muted">${escapeHtml(g.Description)}</p>` : ''}
+        ${g.LinkedAssets?.length ? `<p class="muted">Linked asset${g.LinkedAssets.length > 1 ? 's' : ''}: ${g.LinkedAssets.map((a) => `<a href="#" class="budget-asset-link" data-asset-id="${a.Id}">${escapeHtml(a.Name)}</a>`).join(', ')}</p>` : ''}
+        ${g.Items.length ? g.Items.map((it) => `<div class="list-item budget-wo-link" data-wo-id="${it.WorkOrderId}">
+          <span>${escapeHtml(it.Title)}</span>
+          <span class="pill ${woStatusPillClass(it.Status)}">${escapeHtml(it.Status)} · ${moneyFmt(it.Cost)}</span>
+        </div>`).join('') : '<p class="muted">No work orders tagged to this yet.</p>'}
+        <div class="btn-row"><button class="btn btn-secondary delete-fund-entity" data-kind="${kind}" data-id="${g.Id}" data-name="${escapeHtml(g.Name)}">Delete</button></div>
+      </div>
+    </details>`;
+  }
+
   function fundingGroupHtml(kind, groups) {
     const meta = FUNDING_GROUP_META[kind];
     const total = groups.reduce((s, g) => s + g.Total, 0);
+    const withCost = groups.filter((g) => g.Total > 0);
+    const zeroCost = groups.filter((g) => g.Total === 0);
     return `<div class="card" id="fundingCard-${kind}">
       <h3>${meta.icon} ${meta.title}${groups.length ? ` — ${moneyFmt(total)} total` : ''}</h3>
-      ${groups.length ? groups.map((g) => `
-        <details class="reveal" style="margin-bottom:8px">
-          <summary style="cursor:pointer;display:flex;justify-content:space-between;gap:10px;padding:8px 0">
-            <span>${escapeHtml(g.Name)}${g.LinkedAssets?.length ? ` <span class="muted">— ${g.LinkedAssets.map((a) => escapeHtml(a.Name)).join(', ')}</span>` : ''}</span><strong>${moneyFmt(g.Total)}</strong>
-          </summary>
-          <div style="padding:4px 0 8px 16px">
-            ${g.Description ? `<p class="muted">${escapeHtml(g.Description)}</p>` : ''}
-            ${g.LinkedAssets?.length ? `<p class="muted">Linked asset${g.LinkedAssets.length > 1 ? 's' : ''}: ${g.LinkedAssets.map((a) => `<a href="#" class="budget-asset-link" data-asset-id="${a.Id}">${escapeHtml(a.Name)}</a>`).join(', ')}</p>` : ''}
-            ${g.Items.length ? g.Items.map((it) => `<div class="list-item budget-wo-link" data-wo-id="${it.WorkOrderId}">
-              <span>${escapeHtml(it.Title)}</span>
-              <span class="pill ${woStatusPillClass(it.Status)}">${escapeHtml(it.Status)} · ${moneyFmt(it.Cost)}</span>
-            </div>`).join('') : '<p class="muted">No work orders tagged to this yet.</p>'}
-            <div class="btn-row"><button class="btn btn-secondary delete-fund-entity" data-kind="${kind}" data-id="${g.Id}" data-name="${escapeHtml(g.Name)}">Delete</button></div>
-          </div>
-        </details>`).join('') : `<p class="muted">None yet.</p>`}
+      <div class="funding-scroll">
+        ${withCost.length ? withCost.map((g) => fundingEntityRowHtml(kind, g)).join('') : (groups.length ? '' : `<p class="muted">None yet.</p>`)}
+        ${zeroCost.length ? `
+          <details style="margin-top:4px">
+            <summary class="muted" style="cursor:pointer">Show ${zeroCost.length} more with $0 total</summary>
+            <div style="margin-top:6px">${zeroCost.map((g) => fundingEntityRowHtml(kind, g)).join('')}</div>
+          </details>` : ''}
+      </div>
       ${addingKind === kind ? `
         <div class="field-row"><label>${meta.singular} Name</label><input id="newFundEntityName" required /></div>
         <div class="field-row"><label>Description (optional)</label><textarea id="newFundEntityDesc"></textarea></div>
