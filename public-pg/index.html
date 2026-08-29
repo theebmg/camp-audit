@@ -31,6 +31,12 @@
       margin-bottom: 8px; cursor: pointer; }
     .list-item:hover { background: var(--surface-alt); }
     .muted { color: var(--muted); font-size: 0.85rem; }
+
+    /* Locations list — fixed columns so the type pill and Edit button land in
+       the same spot on every row, instead of shifting with pill-text width. */
+    .list-item.loc-row { display: grid; grid-template-columns: 1fr 110px 90px; gap: 10px; }
+    .loc-row .pill { text-align: center; }
+    .loc-row .edit-location { text-align: center; }
     .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 0.75rem; font-weight: 700;
       background: var(--surface-alt); color: var(--muted); }
     .pill.good { background: var(--accent-soft); color: var(--accent-dark); }
@@ -75,7 +81,7 @@
     .matrix-table th { white-space: nowrap; }
     .matrix-table input[type="checkbox"], input[type="checkbox"] { width: 18px; height: 18px; cursor: pointer; }
 
-    /* Table/Cards view toggle — Maintenance Log & Capital Plan only. Default
+    /* Table/Cards view toggle — Maintenance Log, Capital Plan & Crew. Default
        picked by screen width on first visit; overridden choice persists via
        localStorage (see getTableViewMode() in app.js). */
     .view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm);

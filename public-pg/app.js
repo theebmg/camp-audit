@@ -374,8 +374,8 @@ async function renderLocations() {
   function draw() {
     setApp(`
       ${locations.map((l) => `
-        <div class="list-item" data-id="${l.Id}" data-name="${escapeHtml(l.Name)}">
-          <span class="loc-open" style="cursor:pointer;flex:1">📍 ${escapeHtml(l.Name)}</span>
+        <div class="list-item loc-row" data-id="${l.Id}" data-name="${escapeHtml(l.Name)}">
+          <span class="loc-open">📍 ${escapeHtml(l.Name)}</span>
           <span class="pill">${escapeHtml(l['Location Type'] || '')}</span>
           <button class="btn btn-secondary edit-location" data-id="${l.Id}">Edit</button>
         </div>`).join('')}
