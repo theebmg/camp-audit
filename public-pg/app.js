@@ -909,11 +909,70 @@ async function renderAssetHistory({ id }) {
       </div>`).join('') : '<p class="muted">No history yet.</p>');
 }
 
+function moneyFmt(n) { return '$' + Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 0 }); }
+
+const FUNDING_GROUP_META = {
+  campaign: { title: 'Capital Campaign Projects', icon: '🏗️', endpoint: 'budget/capital-campaign-projects', singular: 'Project' },
+  other: { title: 'Other', icon: '🗂️', endpoint: 'budget/other-categories', singular: 'Category' },
+  cabin: { title: 'Cabin-Holder Ledger', icon: '🏘️', endpoint: 'budget/cabin-holders', singular: 'Cabin-Holder' },
+};
+
 async function renderCapitalPlan() {
   setChrome({ title: 'Capital Plan', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const { rows, summary } = await api('/api/pg/capital-plan');
-  let activeBucket = null; // client-side filter — no re-fetch needed, data's already in hand
+  const [{ rows, summary }, budgetOverview] = await Promise.all([
+    api('/api/pg/capital-plan'), api('/api/pg/budget/overview'),
+  ]);
+  let activeBucket = null;
+  let editingBudget = false;
+  let addingKind = null; // 'campaign' | 'other' | 'cabin' | null
+
+  function budgetSectionHtml() {
+    const ob = budgetOverview.OperatingBudget;
+    return `<div class="card">
+      <h3>💰 Operating Budget</h3>
+      <p class="muted">Money sourced from the camp's annual operating budget — separate from capital campaigns, cabin-holder-funded work, and other categories below.</p>
+      ${editingBudget ? `
+        <div class="field-row"><label>Annual Operating Budget</label><input id="annualBudgetInput" type="number" step="100" value="${ob.AnnualOperatingBudget}" /></div>
+        <div class="btn-row"><button class="btn btn-primary" id="saveBudgetBtn">Save</button><button class="btn btn-secondary" id="cancelBudgetBtn">Cancel</button></div>
+      ` : `
+        <p>Annual Operating Budget: <strong>${moneyFmt(ob.AnnualOperatingBudget)}</strong>
+          <button class="btn btn-secondary" id="editBudgetBtn" style="margin-left:8px">Edit</button></p>
+        <p class="muted">Pending operating-budget work (not yet Done) totals <strong>${moneyFmt(ob.PendingCost)}</strong>${
+          ob.YearsToCover != null ? ` — <strong>${ob.YearsToCover.toFixed(1)} years</strong> of the current operating budget.` : ' (set an annual operating budget above to see years-to-cover)'
+        }</p>
+      `}
+    </div>`;
+  }
+
+  function fundingGroupHtml(kind, groups) {
+    const meta = FUNDING_GROUP_META[kind];
+    const total = groups.reduce((s, g) => s + g.Total, 0);
+    return `<div class="card">
+      <h3>${meta.icon} ${meta.title}${groups.length ? ` — ${moneyFmt(total)} total` : ''}</h3>
+      ${groups.length ? groups.map((g) => `
+        <details class="reveal" style="margin-bottom:8px">
+          <summary style="cursor:pointer;display:flex;justify-content:space-between;gap:10px;padding:8px 0">
+            <span>${escapeHtml(g.Name)}</span><strong>${moneyFmt(g.Total)}</strong>
+          </summary>
+          <div style="padding:4px 0 8px 16px">
+            ${g.Description ? `<p class="muted">${escapeHtml(g.Description)}</p>` : ''}
+            ${g.Items.length ? g.Items.map((it) => `<div class="list-item budget-wo-link" data-wo-id="${it.WorkOrderId}">
+              <span>${escapeHtml(it.Title)}</span>
+              <span class="pill ${woStatusPillClass(it.Status)}">${escapeHtml(it.Status)} · ${moneyFmt(it.Cost)}</span>
+            </div>`).join('') : '<p class="muted">No work orders tagged to this yet.</p>'}
+            <div class="btn-row"><button class="btn btn-secondary delete-fund-entity" data-kind="${kind}" data-id="${g.Id}" data-name="${escapeHtml(g.Name)}">Delete</button></div>
+          </div>
+        </details>`).join('') : `<p class="muted">None yet.</p>`}
+      ${addingKind === kind ? `
+        <div class="field-row"><label>${meta.singular} Name</label><input id="newFundEntityName" required /></div>
+        <div class="field-row"><label>Description (optional)</label><textarea id="newFundEntityDesc"></textarea></div>
+        <div class="btn-row">
+          <button class="btn btn-primary save-fund-entity" data-kind="${kind}">Save</button>
+          <button class="btn btn-secondary" id="cancelFundEntityBtn">Cancel</button>
+        </div>` : `<div class="btn-row"><button class="btn btn-secondary add-fund-entity" data-kind="${kind}">+ Add ${meta.singular}</button></div>`}
+    </div>`;
+  }
 
   function draw() {
     const mode = getTableViewMode();
@@ -933,7 +992,14 @@ async function renderCapitalPlan() {
         <td data-label="Est. Cost">${r.estReplacementCost ? '$' + Number(r.estReplacementCost).toLocaleString() : '—'}</td>
         <td data-label="Bucket"><span class="pill ${bucketColorKey(r.bucket) === 'neutral' ? '' : bucketColorKey(r.bucket)}">${escapeHtml(r.bucket)}</span></td>
       </tr>`).join('');
+
     setApp(`
+      ${budgetSectionHtml()}
+      ${fundingGroupHtml('campaign', budgetOverview.CapitalCampaignProjects)}
+      ${fundingGroupHtml('cabin', budgetOverview.CabinHolders)}
+      ${fundingGroupHtml('other', budgetOverview.OtherCategories)}
+
+      <div class="card"><h3>📐 Component Replacement Forecast</h3><p class="muted">Upcoming component replacements by urgency — independent of funding source above.</p></div>
       <div class="summary-buckets">${buckets}</div>
       ${tableViewToggleHtml(mode)}
       ${activeBucket ? `<div style="margin-bottom:10px"><button class="btn btn-secondary" id="clearBucketFilter">✕ Clear filter: ${escapeHtml(activeBucket)}</button></div>` : ''}
@@ -947,12 +1013,49 @@ async function renderCapitalPlan() {
   }
 
   function wire() {
+    document.getElementById('editBudgetBtn')?.addEventListener('click', () => { editingBudget = true; draw(); });
+    document.getElementById('cancelBudgetBtn')?.addEventListener('click', () => { editingBudget = false; draw(); });
+    document.getElementById('saveBudgetBtn')?.addEventListener('click', async () => {
+      const val = Number(document.getElementById('annualBudgetInput').value);
+      if (Number.isNaN(val) || val < 0) { toast('Enter a valid amount'); return; }
+      try {
+        await api('/api/pg/budget/settings', { method: 'PUT', body: JSON.stringify({ annualOperatingBudget: val }) });
+        toast('Operating budget updated');
+        renderCapitalPlan();
+      } catch (err) { toast(err.message); }
+    });
+
+    app.querySelectorAll('.add-fund-entity').forEach((btn) => btn.addEventListener('click', () => { addingKind = btn.dataset.kind; draw(); }));
+    document.getElementById('cancelFundEntityBtn')?.addEventListener('click', () => { addingKind = null; draw(); });
+    app.querySelectorAll('.save-fund-entity').forEach((btn) => btn.addEventListener('click', async () => {
+      const name = document.getElementById('newFundEntityName').value.trim();
+      if (!name) { toast('Name is required'); return; }
+      const description = document.getElementById('newFundEntityDesc').value.trim();
+      const endpoint = FUNDING_GROUP_META[btn.dataset.kind].endpoint;
+      try {
+        await api(`/api/pg/${endpoint}`, { method: 'POST', body: JSON.stringify({ name, description, notes: description }) });
+        toast(`${FUNDING_GROUP_META[btn.dataset.kind].singular} added`);
+        addingKind = null;
+        renderCapitalPlan();
+      } catch (err) { toast(err.message); }
+    }));
+    app.querySelectorAll('.delete-fund-entity').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!await confirmDialog(`Delete "${btn.dataset.name}"? Work orders tagged to it must be reassigned first.`)) return;
+      const endpoint = FUNDING_GROUP_META[btn.dataset.kind].endpoint;
+      try {
+        await api(`/api/pg/${endpoint}/${btn.dataset.id}`, { method: 'DELETE' });
+        toast('Deleted');
+        renderCapitalPlan();
+      } catch (err) { toast(err.message); }
+    }));
+    app.querySelectorAll('.budget-wo-link').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
+
     app.querySelectorAll('.bucket-tile').forEach((tile) => tile.addEventListener('click', () => {
       activeBucket = activeBucket === tile.dataset.bucket ? null : tile.dataset.bucket;
       draw();
     }));
     document.getElementById('clearBucketFilter')?.addEventListener('click', () => { activeBucket = null; draw(); });
-    app.querySelectorAll('.clickable-row').forEach((tr) => tr.addEventListener('click', () => go('assetDetail', { id: tr.dataset.assetId })));
+    app.querySelectorAll('tr.clickable-row').forEach((tr) => tr.addEventListener('click', () => go('assetDetail', { id: tr.dataset.assetId })));
     wireTableViewToggle(draw);
   }
 
@@ -2263,15 +2366,87 @@ async function renderNewWorkOrder({ assetId, assetName }) {
   });
 }
 
+const FUNDING_SOURCE_LABELS = {
+  operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other',
+};
+const FUNDING_SOURCE_ENDPOINT = {
+  capital_campaign: 'budget/capital-campaign-projects', cabin_holder: 'budget/cabin-holders', other: 'budget/other-categories',
+};
+function fundingFieldsHtml(wo, fundingEntities) {
+  const hasTarget = wo.FundingSource && wo.FundingSource !== 'operating_budget';
+  const entities = fundingEntities[wo.FundingSource] || [];
+  return `
+    <div class="field-row"><label>Funding Source</label>
+      <select name="fundingSource" id="fundingSource">
+        ${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}" ${wo.FundingSource === k ? 'selected' : ''}>${v}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field-row" id="fundingRefRow" ${hasTarget ? '' : 'hidden'}>
+      <label id="fundingRefLabel">${FUNDING_SOURCE_LABELS[wo.FundingSource] || ''}</label>
+      <select name="fundingRefId" id="fundingRefId">
+        <option value="">— choose —</option>
+        ${entities.map((ent) => `<option value="${ent.Id}" ${wo.FundingRefId === ent.Id ? 'selected' : ''}>${escapeHtml(ent.Name)}</option>`).join('')}
+        <option value="__new__">+ Create new…</option>
+      </select>
+      <div id="fundingRefNewBox" hidden style="margin-top:8px">
+        <input id="fundingRefNewName" placeholder="Name…" />
+        <button type="button" class="btn btn-secondary" id="fundingRefNewSave" style="margin-top:6px">Create</button>
+      </div>
+    </div>`;
+}
+function wireFundingFields(root, fundingEntities) {
+  const sourceSelect = root.querySelector('#fundingSource');
+  const refRow = root.querySelector('#fundingRefRow');
+  const refLabel = root.querySelector('#fundingRefLabel');
+  const refSelect = root.querySelector('#fundingRefId');
+  const newBox = root.querySelector('#fundingRefNewBox');
+  const newNameInput = root.querySelector('#fundingRefNewName');
+
+  function populateRef(source, selectedId) {
+    const entities = fundingEntities[source] || [];
+    refSelect.innerHTML = `<option value="">— choose —</option>
+      ${entities.map((ent) => `<option value="${ent.Id}" ${selectedId === ent.Id ? 'selected' : ''}>${escapeHtml(ent.Name)}</option>`).join('')}
+      <option value="__new__">+ Create new…</option>`;
+  }
+
+  sourceSelect.addEventListener('change', () => {
+    const source = sourceSelect.value;
+    if (source === 'operating_budget') { refRow.hidden = true; return; }
+    refRow.hidden = false;
+    refLabel.textContent = FUNDING_SOURCE_LABELS[source];
+    populateRef(source, null);
+    newBox.hidden = true;
+  });
+  refSelect.addEventListener('change', () => {
+    newBox.hidden = refSelect.value !== '__new__';
+  });
+  root.querySelector('#fundingRefNewSave')?.addEventListener('click', async () => {
+    const name = newNameInput.value.trim();
+    if (!name) { toast('Name is required'); return; }
+    const source = sourceSelect.value;
+    const endpoint = FUNDING_SOURCE_ENDPOINT[source];
+    try {
+      const { item } = await api(`/api/pg/${endpoint}`, { method: 'POST', body: JSON.stringify({ name }) });
+      fundingEntities[source] = [...(fundingEntities[source] || []), item];
+      populateRef(source, item.Id);
+      newBox.hidden = true;
+      newNameInput.value = '';
+      toast(`${FUNDING_SOURCE_LABELS[source]} "${name}" created`);
+    } catch (err) { toast(err.message); }
+  });
+}
+
 async function renderWorkOrderDetail({ id }) {
   setChrome({ title: 'Work Order', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const [detail, allVolunteers, allVendors, skillsRes, tplRes] = await Promise.all([
+  const [detail, allVolunteers, allVendors, skillsRes, tplRes, campaignRes, cabinRes, otherRes] = await Promise.all([
     api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'), api('/api/pg/skills'),
     api('/api/pg/checklist-templates'),
+    api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
   ]);
   const allSkills = skillsRes.skills.map((s) => s.Name);
   const checklistTemplates = tplRes.templates;
+  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
   const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
 
@@ -2324,6 +2499,7 @@ async function renderWorkOrderDetail({ id }) {
         <div class="field-row"><label>Actual Hours</label><input name="actualHours" type="number" value="${wo['Actual Hours'] ?? ''}" /></div>
         <div class="field-row"><label>Estimated Cost</label><input name="estimatedCost" type="number" step="0.01" value="${wo['Estimated Cost'] ?? ''}" /></div>
         <div class="field-row"><label>Actual Cost</label><input name="actualCost" type="number" step="0.01" value="${wo['Actual Cost'] ?? ''}" /></div>
+        ${fundingFieldsHtml(wo, fundingEntities)}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       <div class="btn-row">
@@ -2390,12 +2566,18 @@ async function renderWorkOrderDetail({ id }) {
     </div>`;
 
   const assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'), { initialAsset: wo.Asset });
+  wireFundingFields(document.getElementById('woFieldsForm'), fundingEntities);
 
   document.getElementById('woFieldsForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!await confirmDialog('Save changes to this work order?')) return;
     const fd = new FormData(e.target);
     const newAsset = assetPicker.getSelected();
+    const fundingSource = fd.get('fundingSource');
+    const fundingRefId = fundingSource === 'operating_budget' ? '' : fd.get('fundingRefId');
+    if (fundingSource !== 'operating_budget' && (!fundingRefId || fundingRefId === '__new__')) {
+      toast(`Choose a ${FUNDING_SOURCE_LABELS[fundingSource]} to link this to`); return;
+    }
     try {
       await api(`/api/pg/work-orders/${id}`, { method: 'PATCH', body: JSON.stringify({
         assetId: newAsset ? newAsset.Id : (wo.Asset ? wo.Asset.Id : ''),
@@ -2403,6 +2585,7 @@ async function renderWorkOrderDetail({ id }) {
         scheduledDate: fd.get('scheduledDate') || '',
         estimatedHours: fd.get('estimatedHours'), actualHours: fd.get('actualHours'),
         estimatedCost: fd.get('estimatedCost'), actualCost: fd.get('actualCost'),
+        fundingSource, fundingRefId,
       }) });
       toast('Work order updated');
       renderWorkOrderDetail({ id });

@@ -652,6 +652,139 @@ export async function adminDeleteSubArea(id) {
   if (rows[0]) await logActivity({ action: 'deleted', entityType: 'sub_area', entityId: Number(id), entityLabel: `${rows[0].sub_area} (${rows[0].component_type})` });
 }
 
+// ── Budget separation: operating budget vs. capital campaigns vs.
+//    cabin-holder-funded work vs. user-defined "other" categories. Cost
+//    estimates for board presentation/planning — NOT an accounting system;
+//    "cost" per WO is COALESCE(actual_cost, estimated_cost) throughout. ────
+
+export async function getBudgetSettings() {
+  const { rows } = await pool.query('SELECT annual_operating_budget FROM budget_settings ORDER BY id LIMIT 1');
+  return { AnnualOperatingBudget: Number(rows[0]?.annual_operating_budget || 0) };
+}
+export async function updateBudgetSettings(annualOperatingBudget) {
+  await pool.query(
+    `UPDATE budget_settings SET annual_operating_budget = $1, updated_at = now()
+     WHERE id = (SELECT id FROM budget_settings ORDER BY id LIMIT 1)`,
+    [annualOperatingBudget]
+  );
+  await logActivity({ action: 'updated', entityType: 'budget_settings', entityLabel: 'Annual Operating Budget', details: `$${Number(annualOperatingBudget).toLocaleString()}` });
+  return getBudgetSettings();
+}
+
+function fundingEntityRowShape(r) { return { Id: r.id, Name: r.name, Description: r.description }; }
+
+export async function listCapitalCampaignProjects() {
+  const { rows } = await pool.query('SELECT id, name, description FROM capital_campaign_projects ORDER BY name');
+  return rows.map(fundingEntityRowShape);
+}
+export async function createCapitalCampaignProject({ name, description }) {
+  const { rows } = await pool.query('INSERT INTO capital_campaign_projects (name, description) VALUES ($1,$2) RETURNING *', [name, description || null]);
+  await logActivity({ action: 'created', entityType: 'capital_campaign_project', entityId: rows[0].id, entityLabel: rows[0].name });
+  return fundingEntityRowShape(rows[0]);
+}
+export async function updateCapitalCampaignProject(id, { name, description }) {
+  const { rows } = await pool.query('UPDATE capital_campaign_projects SET name = COALESCE($2,name), description = $3 WHERE id = $1 RETURNING *', [id, name || null, description ?? null]);
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'capital_campaign_project', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] ? fundingEntityRowShape(rows[0]) : null;
+}
+export async function deleteCapitalCampaignProject(id) {
+  const inUse = await pool.query(`SELECT count(*) FROM work_orders WHERE funding_source = 'capital_campaign' AND funding_ref_id = $1`, [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} work order(s) still reference this project — reassign them first`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM capital_campaign_projects WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'capital_campaign_project', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+export async function listOtherBudgetCategories() {
+  const { rows } = await pool.query('SELECT id, name, description FROM other_budget_categories ORDER BY name');
+  return rows.map(fundingEntityRowShape);
+}
+export async function createOtherBudgetCategory({ name, description }) {
+  const { rows } = await pool.query('INSERT INTO other_budget_categories (name, description) VALUES ($1,$2) RETURNING *', [name, description || null]);
+  await logActivity({ action: 'created', entityType: 'other_budget_category', entityId: rows[0].id, entityLabel: rows[0].name });
+  return fundingEntityRowShape(rows[0]);
+}
+export async function updateOtherBudgetCategory(id, { name, description }) {
+  const { rows } = await pool.query('UPDATE other_budget_categories SET name = COALESCE($2,name), description = $3 WHERE id = $1 RETURNING *', [id, name || null, description ?? null]);
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'other_budget_category', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] ? fundingEntityRowShape(rows[0]) : null;
+}
+export async function deleteOtherBudgetCategory(id) {
+  const inUse = await pool.query(`SELECT count(*) FROM work_orders WHERE funding_source = 'other' AND funding_ref_id = $1`, [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} work order(s) still reference this category — reassign them first`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM other_budget_categories WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'other_budget_category', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+export async function listCabinHolders() {
+  const { rows } = await pool.query('SELECT id, name, notes AS description FROM cabin_holders ORDER BY name');
+  return rows.map(fundingEntityRowShape);
+}
+export async function createCabinHolder({ name, notes }) {
+  const { rows } = await pool.query('INSERT INTO cabin_holders (name, notes) VALUES ($1,$2) RETURNING *', [name, notes || null]);
+  await logActivity({ action: 'created', entityType: 'cabin_holder', entityId: rows[0].id, entityLabel: rows[0].name });
+  return { Id: rows[0].id, Name: rows[0].name, Description: rows[0].notes };
+}
+export async function updateCabinHolder(id, { name, notes }) {
+  const { rows } = await pool.query('UPDATE cabin_holders SET name = COALESCE($2,name), notes = $3 WHERE id = $1 RETURNING *', [id, name || null, notes ?? null]);
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'cabin_holder', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] ? { Id: rows[0].id, Name: rows[0].name, Description: rows[0].notes } : null;
+}
+export async function deleteCabinHolder(id) {
+  const inUse = await pool.query(`SELECT count(*) FROM work_orders WHERE funding_source = 'cabin_holder' AND funding_ref_id = $1`, [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} work order(s) still reference this cabin-holder — reassign them first`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM cabin_holders WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'cabin_holder', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+// The whole "Budget" section of Capital Plan in one call: operating-budget
+// years-to-cover, and itemized-with-rollup views for each funding source.
+export async function getBudgetOverview() {
+  const settings = await getBudgetSettings();
+
+  const opRes = await pool.query(`
+    SELECT id, title, status, priority, COALESCE(actual_cost, estimated_cost, 0) AS cost
+    FROM work_orders WHERE funding_source = 'operating_budget' AND COALESCE(actual_cost, estimated_cost, 0) > 0
+    ORDER BY status != 'Done', id DESC
+  `);
+  const pendingOpCost = opRes.rows.filter((r) => r.status !== 'Done').reduce((s, r) => s + Number(r.cost), 0);
+  const totalOpCost = opRes.rows.reduce((s, r) => s + Number(r.cost), 0);
+
+  async function itemizedGroups(fundingSource, entities) {
+    const woRes = await pool.query(
+      `SELECT id, title, status, funding_ref_id, COALESCE(actual_cost, estimated_cost, 0) AS cost
+       FROM work_orders WHERE funding_source = $1`,
+      [fundingSource]
+    );
+    return entities.map((ent) => {
+      const items = woRes.rows.filter((r) => r.funding_ref_id === ent.Id).map((r) => ({
+        WorkOrderId: r.id, Title: r.title, Status: r.status, Cost: Number(r.cost),
+      }));
+      return { ...ent, Items: items, Total: items.reduce((s, i) => s + i.Cost, 0) };
+    });
+  }
+
+  const [campaignProjects, otherCategories, cabinHolders] = await Promise.all([
+    listCapitalCampaignProjects().then((ents) => itemizedGroups('capital_campaign', ents)),
+    listOtherBudgetCategories().then((ents) => itemizedGroups('other', ents)),
+    listCabinHolders().then((ents) => itemizedGroups('cabin_holder', ents)),
+  ]);
+
+  return {
+    OperatingBudget: {
+      AnnualOperatingBudget: settings.AnnualOperatingBudget,
+      PendingCost: pendingOpCost,
+      TotalCost: totalOpCost,
+      YearsToCover: settings.AnnualOperatingBudget > 0 ? pendingOpCost / settings.AnnualOperatingBudget : null,
+    },
+    CapitalCampaignProjects: campaignProjects,
+    CapitalCampaignTotal: campaignProjects.reduce((s, p) => s + p.Total, 0),
+    OtherCategories: otherCategories,
+    OtherTotal: otherCategories.reduce((s, p) => s + p.Total, 0),
+    CabinHolders: cabinHolders,
+    CabinHolderTotal: cabinHolders.reduce((s, p) => s + p.Total, 0),
+  };
+}
+
 // ── Work Orders + Asset Updates write-back (brief's Phase 2) ───────────────
 
 // Dashboard aggregate: status breakdown + schedule-vs-today breakdown for
@@ -735,7 +868,9 @@ export async function getWorkOrderDetail(woId) {
   );
   const w = rows[0];
   if (!w) return null;
-  const [assetUpdates, assignees] = await Promise.all([getAssetUpdatesForWorkOrder(woId), getWorkOrderAssignees(woId)]);
+  const [assetUpdates, assignees, fundingRefLabel] = await Promise.all([
+    getAssetUpdatesForWorkOrder(woId), getWorkOrderAssignees(woId), getFundingRefLabel(w.funding_source, w.funding_ref_id),
+  ]);
   return {
     workOrder: {
       Id: w.id, Title: w.title, Status: w.status, Priority: w.priority,
@@ -745,10 +880,21 @@ export async function getWorkOrderDetail(woId) {
       Description: w.description,
       Asset: w.asset_id ? { Id: w.asset_id, Name: w.asset_name } : null,
       Location: w.location_id ? { Id: w.location_id, Name: w.location_name } : null,
+      FundingSource: w.funding_source, FundingRefId: w.funding_ref_id, FundingRefLabel: fundingRefLabel,
     },
     assetUpdates,
     ...assignees,
   };
+}
+
+// funding_ref_id points at a different table depending on funding_source
+// (no real FK possible across three target tables — see migration 0016).
+async function getFundingRefLabel(fundingSource, fundingRefId) {
+  if (!fundingRefId) return null;
+  const table = { capital_campaign: 'capital_campaign_projects', cabin_holder: 'cabin_holders', other: 'other_budget_categories' }[fundingSource];
+  if (!table) return null;
+  const { rows } = await pool.query(`SELECT name FROM ${table} WHERE id = $1`, [fundingRefId]);
+  return rows[0]?.name || null;
 }
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -797,7 +943,8 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
 
 export async function updateWorkOrder(woId, fields) {
   const allowed = ['title', 'description', 'priority', 'status', 'date_reported', 'date_completed',
-    'scheduled_date', 'asset_id', 'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost'];
+    'scheduled_date', 'asset_id', 'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost',
+    'funding_source', 'funding_ref_id'];
   const setCols = [];
   const vals = [];
   let i = 1;

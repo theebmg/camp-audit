@@ -40,6 +40,10 @@ import {
   getChecklistInstanceForExport,
   listUsers, countActiveUsers, countActiveAdmins, createUser, updateUser, deleteUser,
   listActivityLog,
+  getBudgetSettings, updateBudgetSettings, getBudgetOverview,
+  listCapitalCampaignProjects, createCapitalCampaignProject, updateCapitalCampaignProject, deleteCapitalCampaignProject,
+  listOtherBudgetCategories, createOtherBudgetCategory, updateOtherBudgetCategory, deleteOtherBudgetCategory,
+  listCabinHolders, createCabinHolder, updateCabinHolder, deleteCabinHolder,
 } from '../db.js';
 
 const router = express.Router();
@@ -224,6 +228,63 @@ router.get('/capital-plan', async (req, res, next) => {
     const { rows, summary } = await buildCapitalPlanPg({ componentType, condition });
     res.json({ rows, summary });
   } catch (e) { next(e); }
+});
+
+// ---- Budget separation: operating budget vs. capital campaigns vs.
+//      cabin-holder-funded work vs. user-defined "other" categories ----
+
+router.get('/budget/overview', async (req, res, next) => {
+  try { res.json(await getBudgetOverview()); } catch (e) { next(e); }
+});
+router.get('/budget/settings', async (req, res, next) => {
+  try { res.json(await getBudgetSettings()); } catch (e) { next(e); }
+});
+router.put('/budget/settings', async (req, res, next) => {
+  try {
+    const { annualOperatingBudget } = req.body || {};
+    if (annualOperatingBudget == null || Number.isNaN(Number(annualOperatingBudget))) {
+      return res.status(400).json({ ok: false, error: 'annualOperatingBudget must be a number' });
+    }
+    res.json({ ok: true, settings: await updateBudgetSettings(Number(annualOperatingBudget)) });
+  } catch (e) { next(e); }
+});
+
+// Capital Campaign Projects, Other Categories, and Cabin-Holders are all the
+// same shape (name/description, cost-itemized via work_orders) — one
+// generic set of routes per funding-entity type.
+function fundingEntityRoutes(path, { list, create, update, remove }) {
+  router.get(`/${path}`, async (req, res, next) => {
+    try { res.json({ items: await list() }); } catch (e) { next(e); }
+  });
+  router.post(`/${path}`, async (req, res, next) => {
+    try {
+      const { name, description, notes } = req.body || {};
+      if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+      res.json({ ok: true, item: await create({ name: name.trim(), description, notes }) });
+    } catch (e) { next(e); }
+  });
+  router.patch(`/${path}/:id`, async (req, res, next) => {
+    try {
+      const { name, description, notes } = req.body || {};
+      const item = await update(req.params.id, { name: name?.trim(), description, notes });
+      if (!item) return res.status(404).json({ ok: false, error: 'Not found' });
+      res.json({ ok: true, item });
+    } catch (e) { next(e); }
+  });
+  router.delete(`/${path}/:id`, async (req, res, next) => {
+    try { await remove(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+  });
+}
+fundingEntityRoutes('budget/capital-campaign-projects', {
+  list: listCapitalCampaignProjects, create: createCapitalCampaignProject,
+  update: updateCapitalCampaignProject, remove: deleteCapitalCampaignProject,
+});
+fundingEntityRoutes('budget/other-categories', {
+  list: listOtherBudgetCategories, create: createOtherBudgetCategory,
+  update: updateOtherBudgetCategory, remove: deleteOtherBudgetCategory,
+});
+fundingEntityRoutes('budget/cabin-holders', {
+  list: listCabinHolders, create: createCabinHolder, update: updateCabinHolder, remove: deleteCabinHolder,
 });
 
 // ---- Admin: schema/config management ----
@@ -417,6 +478,8 @@ router.patch('/work-orders/:id', async (req, res, next) => {
     if (body.actualHours !== undefined) fields.actual_hours = body.actualHours === '' ? null : Math.round(Number(body.actualHours));
     if (body.estimatedCost !== undefined) fields.estimated_cost = body.estimatedCost === '' ? null : Number(body.estimatedCost);
     if (body.actualCost !== undefined) fields.actual_cost = body.actualCost === '' ? null : Number(body.actualCost);
+    if (body.fundingSource != null) fields.funding_source = body.fundingSource;
+    if (body.fundingRefId !== undefined) fields.funding_ref_id = body.fundingRefId === '' ? null : Number(body.fundingRefId);
     const detail = await updateWorkOrder(req.params.id, fields);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
     res.json({ ok: true, ...detail });
