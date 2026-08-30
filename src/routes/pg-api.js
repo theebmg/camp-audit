@@ -46,6 +46,7 @@ import {
   listOtherBudgetCategories, createOtherBudgetCategory, updateOtherBudgetCategory, deleteOtherBudgetCategory,
   listCabinHolders, createCabinHolder, updateCabinHolder, deleteCabinHolder,
   getAssetsReportRawData, getWorkOrdersReportRawData, getWorkOrderLogReportRawData,
+  listReportFavorites, createReportFavorite, deleteReportFavorite,
 } from '../db.js';
 import {
   buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows,
@@ -287,6 +288,26 @@ router.get('/reports/export', async (req, res, next) => {
     res.setHeader('Content-Disposition', `attachment; filename="${req.query.entity}-report.csv"`);
     res.send(csv);
   } catch (e) { next(e); }
+});
+
+router.get('/reports/favorites', async (req, res, next) => {
+  try {
+    if (!req.query.entity) return res.status(400).json({ ok: false, error: 'entity is required' });
+    res.json({ favorites: await listReportFavorites(req.query.entity) });
+  } catch (e) { next(e); }
+});
+
+router.post('/reports/favorites', async (req, res, next) => {
+  try {
+    const { entity, label, filters, visibleColumns, sortKey, sortDir } = req.body || {};
+    if (!entity || !label?.trim()) return res.status(400).json({ ok: false, error: 'A name for this view is required' });
+    const favorite = await createReportFavorite({ entity, label: label.trim(), filters, visibleColumns, sortKey, sortDir });
+    res.json({ ok: true, favorite });
+  } catch (e) { next(e); }
+});
+
+router.delete('/reports/favorites/:id', async (req, res, next) => {
+  try { await deleteReportFavorite(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 router.get('/capital-plan', async (req, res, next) => {

@@ -340,6 +340,13 @@
     .report-chip input { width: auto; margin: 0; }
     .report-date-range { display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: var(--surface-alt); border-radius: var(--radius-sm); }
     .report-date-range input[type="date"] { flex: 1; min-width: 0; padding: 6px 8px; font-size: 0.82rem; }
+    .report-fav-chip { display: inline-flex; align-items: stretch; }
+    .report-fav-chip .report-fav-btn { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+    .report-fav-delete { border: none; background: var(--surface-alt); color: var(--muted); cursor: pointer;
+      padding: 0 10px; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; border-left: 1px solid var(--border); }
+    .report-fav-delete:hover { background: var(--danger-soft); color: var(--danger); }
+    .report-fav-input { flex: 1; min-width: 200px; padding: 10px 12px; border: 1px solid var(--border);
+      border-radius: var(--radius-sm); font-size: 0.95rem; font-family: inherit; background: var(--surface); color: var(--text); }
     .report-columns-picker { position: relative; display: inline-block; }
     .report-columns-picker summary { list-style: none; cursor: pointer; }
     .report-columns-picker summary::-webkit-details-marker { display: none; }

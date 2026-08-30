@@ -1592,6 +1592,8 @@ async function renderReports(params = {}) {
   let rows = [];
   let sortKey = null;
   let sortDir = 'asc';
+  let favorites = [];
+  let savingFavorite = false;
 
   async function loadSchema() {
     const { columns: cols } = await api(`/api/pg/reports/schema?entity=${entity}`);
@@ -1601,6 +1603,12 @@ async function renderReports(params = {}) {
     openGroups = new Set(columns[0] ? [columns[0].group] : []);
     sortKey = null;
     sortDir = 'asc';
+    savingFavorite = false;
+  }
+
+  async function loadFavorites() {
+    const { favorites: f } = await api(`/api/pg/reports/favorites?entity=${entity}`);
+    favorites = f;
   }
 
   function filtersPayload() {
@@ -1610,6 +1618,14 @@ async function renderReports(params = {}) {
       else if (v && (v.from || v.to)) filters[k] = v;
     }
     return filters;
+  }
+
+  // The inverse of filtersPayload() — turns a saved favorite's plain-JSON
+  // filters back into the Set/range shapes selectedFilters actually uses.
+  function filtersFromSaved(saved) {
+    const result = {};
+    for (const [k, v] of Object.entries(saved || {})) result[k] = Array.isArray(v) ? new Set(v) : v;
+    return result;
   }
 
   // Null/empty values always sort to the bottom regardless of direction —
@@ -1671,10 +1687,21 @@ async function renderReports(params = {}) {
           ${REPORT_ENTITIES.map((e) => `<button type="button" class="view-toggle-btn entity-switch ${entity === e.key ? 'active' : ''}" data-entity="${e.key}">${escapeHtml(e.label)}</button>`).join('')}
         </div>
         <p class="muted" style="margin-top:10px;margin-bottom:0">A full custom report builder is planned for later — this covers filtering and exporting what's already here.</p>
-        ${presets.length || hasActiveFilters ? `
-          <div class="btn-row" style="margin-top:10px">
-            ${presets.map((p, i) => `<button type="button" class="btn btn-secondary report-preset-btn" data-preset-idx="${i}">${escapeHtml(p.label)}</button>`).join('')}
-            ${hasActiveFilters ? `<button type="button" class="btn btn-secondary" id="clearFiltersBtn">✕ Clear Filters</button>` : ''}
+        <div class="btn-row" style="margin-top:10px;align-items:center">
+          ${presets.map((p, i) => `<button type="button" class="btn btn-secondary report-preset-btn" data-preset-idx="${i}">${escapeHtml(p.label)}</button>`).join('')}
+          ${favorites.map((f) => `
+            <span class="report-fav-chip">
+              <button type="button" class="btn btn-secondary report-fav-btn" data-fav-id="${f.Id}">★ ${escapeHtml(f.Label)}</button>
+              <button type="button" class="report-fav-delete" data-fav-id="${f.Id}" title="Delete this favorite">✕</button>
+            </span>`).join('')}
+          ${hasActiveFilters ? `<button type="button" class="btn btn-secondary" id="clearFiltersBtn">✕ Clear Filters</button>` : ''}
+          ${!savingFavorite ? `<button type="button" class="btn btn-secondary" id="saveFavoriteBtn">☆ Save as Favorite…</button>` : ''}
+        </div>
+        ${savingFavorite ? `
+          <div class="btn-row" style="margin-top:8px">
+            <input type="text" id="favLabelInput" class="report-fav-input" placeholder="Name this view — e.g. &quot;Open &amp; Urgent&quot;…" autofocus />
+            <button type="button" class="btn btn-primary" id="confirmSaveFavoriteBtn">Save</button>
+            <button type="button" class="btn btn-secondary" id="cancelSaveFavoriteBtn">Cancel</button>
           </div>` : ''}
       </div>
       <div class="reports-layout">
@@ -1742,7 +1769,7 @@ async function renderReports(params = {}) {
         columnsPickerOpen = false;
         app.innerHTML = LOADING_HTML;
         await loadSchema();
-        await loadData();
+        await Promise.all([loadData(), loadFavorites()]);
         draw();
       });
     });
@@ -1780,6 +1807,40 @@ async function renderReports(params = {}) {
       await loadData();
       draw();
     });
+    document.getElementById('saveFavoriteBtn')?.addEventListener('click', () => { savingFavorite = true; draw(); });
+    document.getElementById('cancelSaveFavoriteBtn')?.addEventListener('click', () => { savingFavorite = false; draw(); });
+    document.getElementById('favLabelInput')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') document.getElementById('confirmSaveFavoriteBtn').click();
+    });
+    document.getElementById('confirmSaveFavoriteBtn')?.addEventListener('click', async () => {
+      const label = document.getElementById('favLabelInput').value.trim();
+      if (!label) { toast('Name this view first'); return; }
+      try {
+        await api('/api/pg/reports/favorites', { method: 'POST', body: JSON.stringify({
+          entity, label, filters: filtersPayload(), visibleColumns: [...visibleColumns], sortKey, sortDir,
+        }) });
+        savingFavorite = false;
+        await loadFavorites();
+        toast(`Saved "${label}"`);
+        draw();
+      } catch (err) { toast(err.message); }
+    });
+    app.querySelectorAll('.report-fav-btn').forEach((btn) => btn.addEventListener('click', async () => {
+      const fav = favorites.find((f) => f.Id === Number(btn.dataset.favId));
+      if (!fav) return;
+      selectedFilters = filtersFromSaved(fav.Filters);
+      if (fav.VisibleColumns?.length) visibleColumns = new Set(fav.VisibleColumns);
+      sortKey = fav.SortKey || null;
+      sortDir = fav.SortDir || 'asc';
+      await loadData();
+      draw();
+    }));
+    app.querySelectorAll('.report-fav-delete').forEach((btn) => btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await api(`/api/pg/reports/favorites/${btn.dataset.favId}`, { method: 'DELETE' });
+      await loadFavorites();
+      draw();
+    }));
     app.querySelectorAll('.sortable-col').forEach((th) => th.addEventListener('click', () => {
       const key = th.dataset.sortKey;
       if (sortKey === key) sortDir = sortDir === 'asc' ? 'desc' : 'asc';
@@ -1793,7 +1854,7 @@ async function renderReports(params = {}) {
   }
 
   await loadSchema();
-  await loadData();
+  await Promise.all([loadData(), loadFavorites()]);
   draw();
 }
 

@@ -572,6 +572,32 @@ export async function getWorkOrderLogReportRawData() {
   return { logEntries: rows };
 }
 
+// Saved Reports-tab filter combinations ("favorites") — scoped to the
+// current session's username so each person's list is their own, same
+// attribution pattern as activity_log/audit flags.
+export async function listReportFavorites(entity) {
+  const { rows } = await pool.query(
+    `SELECT id, label, filters, visible_columns, sort_key, sort_dir FROM report_favorites
+     WHERE username = $1 AND entity = $2 ORDER BY id`,
+    [currentUsername(), entity]
+  );
+  return rows.map((r) => ({ Id: r.id, Label: r.label, Filters: r.filters, VisibleColumns: r.visible_columns, SortKey: r.sort_key, SortDir: r.sort_dir }));
+}
+
+export async function createReportFavorite({ entity, label, filters, visibleColumns, sortKey, sortDir }) {
+  const { rows } = await pool.query(
+    `INSERT INTO report_favorites (username, entity, label, filters, visible_columns, sort_key, sort_dir)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, label, filters, visible_columns, sort_key, sort_dir`,
+    [currentUsername(), entity, label, JSON.stringify(filters || {}), visibleColumns ? JSON.stringify(visibleColumns) : null, sortKey || null, sortDir || null]
+  );
+  const r = rows[0];
+  return { Id: r.id, Label: r.label, Filters: r.filters, VisibleColumns: r.visible_columns, SortKey: r.sort_key, SortDir: r.sort_dir };
+}
+
+export async function deleteReportFavorite(id) {
+  await pool.query('DELETE FROM report_favorites WHERE id = $1 AND username = $2', [id, currentUsername()]);
+}
+
 // ── Ad-hoc field notes (pressure-relief valve — see migration brief's "Ad-hoc
 //    notes & field creation" section). Just INSERT/UPDATE — no schema risk. ──
 
