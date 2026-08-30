@@ -159,3 +159,21 @@ export function rowsToCsv(rows, columnKeys) {
   const lines = rows.map((r) => columnKeys.map((k) => esc(r[k])).join(','));
   return [header, ...lines].join('\r\n');
 }
+
+// Two saved views are "the same" once each column's selected values are
+// sorted (so checking the same boxes in a different order doesn't count as
+// different) and the columns themselves are in a stable order — used to
+// block saving an exact duplicate favorite. Mirrored in app.js since the
+// frontend also wants an instant check before round-tripping to the server.
+function normalizeFiltersForCompare(filters) {
+  const out = {};
+  for (const [k, v] of Object.entries(filters || {})) {
+    if (Array.isArray(v)) { if (v.length) out[k] = [...v].sort(); }
+    else if (v && (v.from || v.to)) out[k] = { from: v.from || null, to: v.to || null };
+  }
+  return out;
+}
+export function canonicalFiltersKey(filters) {
+  const norm = normalizeFiltersForCompare(filters);
+  return JSON.stringify(Object.keys(norm).sort().map((k) => [k, norm[k]]));
+}

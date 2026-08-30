@@ -51,7 +51,7 @@ import {
 import {
   buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows,
   assetColumnSpecs, WORK_ORDER_COLUMN_SPECS, WORK_ORDER_LOG_COLUMN_SPECS,
-  columnDefsFromRows, applyReportFilters, rowsToCsv,
+  columnDefsFromRows, applyReportFilters, rowsToCsv, canonicalFiltersKey,
 } from '../reports.js';
 
 const router = express.Router();
@@ -301,6 +301,11 @@ router.post('/reports/favorites', async (req, res, next) => {
   try {
     const { entity, label, filters, visibleColumns, sortKey, sortDir } = req.body || {};
     if (!entity || !label?.trim()) return res.status(400).json({ ok: false, error: 'A name for this view is required' });
+    if (!filters || !Object.keys(filters).length) return res.status(400).json({ ok: false, error: 'Apply at least one filter before saving a favorite' });
+    const existing = await listReportFavorites(entity);
+    const key = canonicalFiltersKey(filters);
+    const dupe = existing.find((f) => canonicalFiltersKey(f.Filters) === key);
+    if (dupe) return res.status(409).json({ ok: false, error: `You already have a favorite with these exact filters: "${dupe.Label}"` });
     const favorite = await createReportFavorite({ entity, label: label.trim(), filters, visibleColumns, sortKey, sortDir });
     res.json({ ok: true, favorite });
   } catch (e) { next(e); }

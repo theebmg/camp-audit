@@ -1628,6 +1628,19 @@ async function renderReports(params = {}) {
     return result;
   }
 
+  // Two saved views are "the same" once each column's selected values are
+  // sorted (order doesn't matter) and columns are in a stable order — an
+  // instant client-side check before round-tripping to the server, which
+  // enforces the same rule (mirrored in reports.js's canonicalFiltersKey).
+  function canonicalFiltersKey(filters) {
+    const norm = {};
+    for (const [k, v] of Object.entries(filters || {})) {
+      if (Array.isArray(v)) { if (v.length) norm[k] = [...v].sort(); }
+      else if (v && (v.from || v.to)) norm[k] = { from: v.from || null, to: v.to || null };
+    }
+    return JSON.stringify(Object.keys(norm).sort().map((k) => [k, norm[k]]));
+  }
+
   // Null/empty values always sort to the bottom regardless of direction —
   // reads more like "unanswered" being set aside than "less than everything."
   // Numeric-looking values compare as numbers so e.g. Window Count sorts
@@ -1695,7 +1708,7 @@ async function renderReports(params = {}) {
               <button type="button" class="report-fav-delete" data-fav-id="${f.Id}" title="Delete this favorite">✕</button>
             </span>`).join('')}
           ${hasActiveFilters ? `<button type="button" class="btn btn-secondary" id="clearFiltersBtn">✕ Clear Filters</button>` : ''}
-          ${!savingFavorite ? `<button type="button" class="btn btn-secondary" id="saveFavoriteBtn">☆ Save as Favorite…</button>` : ''}
+          ${!savingFavorite && hasActiveFilters ? `<button type="button" class="btn btn-secondary" id="saveFavoriteBtn">☆ Save as Favorite…</button>` : ''}
         </div>
         ${savingFavorite ? `
           <div class="btn-row" style="margin-top:8px">
@@ -1815,9 +1828,13 @@ async function renderReports(params = {}) {
     document.getElementById('confirmSaveFavoriteBtn')?.addEventListener('click', async () => {
       const label = document.getElementById('favLabelInput').value.trim();
       if (!label) { toast('Name this view first'); return; }
+      const payload = filtersPayload();
+      const key = canonicalFiltersKey(payload);
+      const dupe = favorites.find((f) => canonicalFiltersKey(f.Filters) === key);
+      if (dupe) { toast(`You already have a favorite with these exact filters: "${dupe.Label}"`); return; }
       try {
         await api('/api/pg/reports/favorites', { method: 'POST', body: JSON.stringify({
-          entity, label, filters: filtersPayload(), visibleColumns: [...visibleColumns], sortKey, sortDir,
+          entity, label, filters: payload, visibleColumns: [...visibleColumns], sortKey, sortDir,
         }) });
         savingFavorite = false;
         await loadFavorites();
