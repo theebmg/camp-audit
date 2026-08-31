@@ -1423,7 +1423,11 @@ export async function updateVolunteer(id, { name, phone, email, address, skill }
 export async function removeVolunteer(id) {
   const nameRes = await pool.query('SELECT name FROM volunteers WHERE id = $1', [id]);
   const name = nameRes.rows[0]?.name;
-  const used = await pool.query('SELECT count(*) FROM work_order_volunteers WHERE volunteer_id = $1', [id]);
+  const used = await pool.query(
+    `SELECT (SELECT count(*) FROM work_order_volunteers WHERE volunteer_id = $1)
+           + (SELECT count(*) FROM crew_session_volunteers WHERE volunteer_id = $1) AS count`,
+    [id]
+  );
   if (Number(used.rows[0].count) > 0) {
     await pool.query('UPDATE volunteers SET active = false WHERE id = $1', [id]);
     await logActivity({ action: 'deactivated', entityType: 'volunteer', entityId: Number(id), entityLabel: name });
@@ -1461,7 +1465,11 @@ export async function updateVendor(id, { name, phone, email, address, specialty 
 export async function removeVendor(id) {
   const nameRes = await pool.query('SELECT name FROM vendors WHERE id = $1', [id]);
   const name = nameRes.rows[0]?.name;
-  const used = await pool.query('SELECT count(*) FROM work_order_vendors WHERE vendor_id = $1', [id]);
+  const used = await pool.query(
+    `SELECT (SELECT count(*) FROM work_order_vendors WHERE vendor_id = $1)
+           + (SELECT count(*) FROM crew_session_vendors WHERE vendor_id = $1) AS count`,
+    [id]
+  );
   if (Number(used.rows[0].count) > 0) {
     await pool.query('UPDATE vendors SET active = false WHERE id = $1', [id]);
     await logActivity({ action: 'deactivated', entityType: 'vendor', entityId: Number(id), entityLabel: name });
@@ -1470,6 +1478,151 @@ export async function removeVendor(id) {
   await pool.query('DELETE FROM vendors WHERE id = $1', [id]);
   await logActivity({ action: 'deleted', entityType: 'vendor', entityId: Number(id), entityLabel: name });
   return { deleted: true };
+}
+
+// ── Crew Sessions — attendance-based hours tracking, independent of Work
+//    Orders. A session is a dated block of work — optionally tied to a WO,
+//    optionally just a free-text `activity` label (e.g. "Mowing") — with one
+//    hours figure credited to everyone who attended (see migration 0022:
+//    hours already lived at the session/note level for WOs, never
+//    per-person; this generalizes that to standalone work too). "Jobs" for a
+//    person = distinct work_order_id across their sessions; standalone
+//    activities don't count as a job. ──────────────────────────────────────
+
+function crewSessionRowShape(r) {
+  return {
+    Id: r.id, WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title,
+    Activity: r.activity, Date: r.session_date, Hours: r.hours != null ? Number(r.hours) : null,
+    Note: r.note, Username: r.username, CreatedAt: r.created_at,
+    Volunteers: r.volunteer_names || [], Vendors: r.vendor_names || [],
+  };
+}
+
+const CREW_SESSION_SELECT = `
+  SELECT cs.*, w.title AS wo_title,
+         COALESCE(ARRAY_AGG(DISTINCT v.name) FILTER (WHERE v.name IS NOT NULL), '{}') AS volunteer_names,
+         COALESCE(ARRAY_AGG(DISTINCT vd.name) FILTER (WHERE vd.name IS NOT NULL), '{}') AS vendor_names
+  FROM crew_sessions cs
+  LEFT JOIN work_orders w ON w.id = cs.work_order_id
+  LEFT JOIN crew_session_volunteers csv ON csv.session_id = cs.id
+  LEFT JOIN volunteers v ON v.id = csv.volunteer_id
+  LEFT JOIN crew_session_vendors csd ON csd.session_id = cs.id
+  LEFT JOIN vendors vd ON vd.id = csd.vendor_id`;
+
+async function getCrewSessionById(id) {
+  const { rows } = await pool.query(`${CREW_SESSION_SELECT} WHERE cs.id = $1 GROUP BY cs.id, w.title`, [id]);
+  return rows[0] ? crewSessionRowShape(rows[0]) : null;
+}
+
+export async function listCrewSessionsForWorkOrder(woId) {
+  const { rows } = await pool.query(
+    `${CREW_SESSION_SELECT} WHERE cs.work_order_id = $1 GROUP BY cs.id, w.title ORDER BY cs.session_date DESC, cs.created_at DESC`,
+    [woId]
+  );
+  return rows.map(crewSessionRowShape);
+}
+
+// A session needs either a Work Order or a free-text activity label —
+// enforced here, not in the DB, so the error message can be specific.
+export async function createCrewSession({ workOrderId, activity, sessionDate, hours, note, volunteerIds = [], vendorIds = [] }) {
+  if (!workOrderId && !activity) throw new Error('A session needs either a Work Order or an activity label');
+  const client = await pool.connect();
+  let sessionId;
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO crew_sessions (work_order_id, activity, session_date, hours, note, username)
+       VALUES ($1,$2,COALESCE($3,CURRENT_DATE),$4,$5,$6) RETURNING id`,
+      [workOrderId || null, activity || null, sessionDate || null, hours ?? null, note || null, currentUsername()]
+    );
+    sessionId = rows[0].id;
+    for (const vId of volunteerIds) {
+      await client.query('INSERT INTO crew_session_volunteers (session_id, volunteer_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [sessionId, vId]);
+    }
+    for (const vdId of vendorIds) {
+      await client.query('INSERT INTO crew_session_vendors (session_id, vendor_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [sessionId, vdId]);
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  await logActivity({
+    action: 'created', entityType: 'crew_session', entityId: sessionId,
+    entityLabel: activity || `Work Order #${workOrderId}`,
+    details: [hours ? `${hours}h` : null, `${volunteerIds.length + vendorIds.length} attendee(s)`].filter(Boolean).join(', '),
+  });
+  return getCrewSessionById(sessionId);
+}
+
+export async function deleteCrewSession(id) {
+  const { rows } = await pool.query('DELETE FROM crew_sessions WHERE id = $1 RETURNING activity, work_order_id', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'crew_session', entityId: Number(id), entityLabel: rows[0].activity || `Work Order #${rows[0].work_order_id}` });
+}
+
+// "Progress made" per person — one row per session, mirrors
+// getWorkOrderLogReportRawData's shape/ordering for the Reports tab.
+export async function getCrewSessionReportRawData() {
+  const { rows } = await pool.query(
+    `SELECT cs.*, w.title AS wo_title, a.name AS asset_name, loc.name AS location_name,
+            COALESCE(ARRAY_AGG(DISTINCT v.name) FILTER (WHERE v.name IS NOT NULL), '{}') AS volunteer_names,
+            COALESCE(ARRAY_AGG(DISTINCT vd.name) FILTER (WHERE vd.name IS NOT NULL), '{}') AS vendor_names
+     FROM crew_sessions cs
+     LEFT JOIN work_orders w ON w.id = cs.work_order_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN locations loc ON loc.id = w.location_id
+     LEFT JOIN crew_session_volunteers csv ON csv.session_id = cs.id
+     LEFT JOIN volunteers v ON v.id = csv.volunteer_id
+     LEFT JOIN crew_session_vendors csd ON csd.session_id = cs.id
+     LEFT JOIN vendors vd ON vd.id = csd.vendor_id
+     GROUP BY cs.id, w.title, a.name, loc.name
+     ORDER BY cs.session_date DESC, cs.created_at DESC`
+  );
+  return { sessions: rows.map((r) => ({ ...crewSessionRowShape(r), AssetName: r.asset_name, LocationName: r.location_name })) };
+}
+
+// Per-person totals for the Hours report — LEFT JOINs from volunteers/vendors
+// (not crew_sessions) so everyone shows even with 0 hours in range, with the
+// date filter applied in the JOIN condition rather than WHERE so people with
+// no sessions in range aren't dropped entirely. `from`/`to` are plain
+// YYYY-MM-DD strings (or null for open-ended) — never build these with
+// `.toISOString()` client-side, see app.js's isoDate() comment.
+export async function getCrewHoursSummary({ from, to } = {}) {
+  const params = [from || null, to || null];
+  const shape = (r) => ({ Id: r.id, Name: r.name, Active: r.active, Sessions: Number(r.sessions), Jobs: Number(r.jobs), Hours: Number(r.hours) });
+  const [volRes, venRes] = await Promise.all([
+    pool.query(
+      `SELECT v.id, v.name, v.active,
+              COUNT(DISTINCT cs.id) AS sessions,
+              COUNT(DISTINCT cs.work_order_id) AS jobs,
+              COALESCE(SUM(cs.hours), 0) AS hours
+       FROM volunteers v
+       LEFT JOIN crew_session_volunteers csv ON csv.volunteer_id = v.id
+       LEFT JOIN crew_sessions cs ON cs.id = csv.session_id
+         AND ($1::date IS NULL OR cs.session_date >= $1)
+         AND ($2::date IS NULL OR cs.session_date <= $2)
+       GROUP BY v.id, v.name, v.active
+       ORDER BY hours DESC, v.name`,
+      params
+    ),
+    pool.query(
+      `SELECT vd.id, vd.name, vd.active,
+              COUNT(DISTINCT cs.id) AS sessions,
+              COUNT(DISTINCT cs.work_order_id) AS jobs,
+              COALESCE(SUM(cs.hours), 0) AS hours
+       FROM vendors vd
+       LEFT JOIN crew_session_vendors csd ON csd.vendor_id = vd.id
+       LEFT JOIN crew_sessions cs ON cs.id = csd.session_id
+         AND ($1::date IS NULL OR cs.session_date >= $1)
+         AND ($2::date IS NULL OR cs.session_date <= $2)
+       GROUP BY vd.id, vd.name, vd.active
+       ORDER BY hours DESC, vd.name`,
+      params
+    ),
+  ]);
+  return { volunteers: volRes.rows.map(shape), vendors: venRes.rows.map(shape) };
 }
 
 // ── Skill catalog — shared by volunteers.skill and vendors.specialty. Same

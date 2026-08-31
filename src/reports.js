@@ -69,6 +69,34 @@ export function buildWorkOrderLogReportRows({ logEntries }) {
   }));
 }
 
+// One row per Crew Session — a dated block of volunteer/vendor work,
+// optionally tied to a Work Order (see migration 0022). "Job" here means
+// tied to a Work Order; a standalone activity like "Mowing" shows in its own
+// Activity column instead.
+export function buildCrewSessionReportRows({ sessions }) {
+  return sessions.map((s) => ({
+    Date: s.Date, 'Work Order': s.WorkOrderTitle || null, Activity: s.Activity || null,
+    Asset: s.AssetName, Location: s.LocationName, Hours: s.Hours,
+    Volunteers: s.Volunteers.join(', ') || null, Vendors: s.Vendors.join(', ') || null,
+    Note: s.Note, 'Logged By': s.Username,
+    _id: s.WorkOrderId || null,
+    _entity: s.WorkOrderId ? 'workOrder' : null,
+  }));
+}
+
+export const CREW_SESSION_COLUMN_SPECS = [
+  { key: 'Date', label: 'Date', group: 'Crew Session', type: 'date', default: true },
+  { key: 'Work Order', label: 'Work Order', group: 'Crew Session', default: true },
+  { key: 'Activity', label: 'Activity', group: 'Crew Session', default: true },
+  { key: 'Asset', label: 'Asset', group: 'Crew Session' },
+  { key: 'Location', label: 'Location', group: 'Crew Session' },
+  { key: 'Hours', label: 'Hours', group: 'Crew Session', default: true },
+  { key: 'Volunteers', label: 'Volunteers', group: 'Crew', default: true },
+  { key: 'Vendors', label: 'Vendors', group: 'Crew' },
+  { key: 'Note', label: 'Note', group: 'Crew Session' },
+  { key: 'Logged By', label: 'Logged By', group: 'Crew Session' },
+];
+
 export function assetColumnSpecs(propertyFields, componentTypeOptions) {
   const specs = [
     { key: 'Asset Name', label: 'Asset Name', group: 'Asset Info', default: true },

@@ -46,11 +46,12 @@ import {
   listOtherBudgetCategories, createOtherBudgetCategory, updateOtherBudgetCategory, deleteOtherBudgetCategory,
   listCabinHolders, createCabinHolder, updateCabinHolder, deleteCabinHolder,
   getAssetsReportRawData, getWorkOrdersReportRawData, getWorkOrderLogReportRawData,
+  listCrewSessionsForWorkOrder, createCrewSession, deleteCrewSession, getCrewSessionReportRawData, getCrewHoursSummary,
   listReportFavorites, createReportFavorite, deleteReportFavorite,
 } from '../db.js';
 import {
-  buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows,
-  assetColumnSpecs, WORK_ORDER_COLUMN_SPECS, WORK_ORDER_LOG_COLUMN_SPECS,
+  buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows, buildCrewSessionReportRows,
+  assetColumnSpecs, WORK_ORDER_COLUMN_SPECS, WORK_ORDER_LOG_COLUMN_SPECS, CREW_SESSION_COLUMN_SPECS,
   columnDefsFromRows, applyReportFilters, rowsToCsv, canonicalFiltersKey,
 } from '../reports.js';
 
@@ -251,6 +252,10 @@ async function getReportRowsAndSpecs(entity) {
   if (entity === 'workOrderLog') {
     const raw = await getWorkOrderLogReportRawData();
     return { rows: buildWorkOrderLogReportRows(raw), specs: WORK_ORDER_LOG_COLUMN_SPECS };
+  }
+  if (entity === 'crewSessions') {
+    const raw = await getCrewSessionReportRawData();
+    return { rows: buildCrewSessionReportRows(raw), specs: CREW_SESSION_COLUMN_SPECS };
   }
   return null;
 }
@@ -510,10 +515,11 @@ router.get('/work-orders/:id', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    const [tasks, checklist, logEntries] = await Promise.all([
+    const [tasks, checklist, logEntries, crewSessions] = await Promise.all([
       listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id), listWorkOrderLogEntries(req.params.id),
+      listCrewSessionsForWorkOrder(req.params.id),
     ]);
-    res.json({ ...detail, tasks, checklist, logEntries });
+    res.json({ ...detail, tasks, checklist, logEntries, crewSessions });
   } catch (e) { next(e); }
 });
 
@@ -529,6 +535,31 @@ router.post('/work-orders/:id/log', async (req, res, next) => {
 });
 router.delete('/work-order-log/:id', async (req, res, next) => {
   try { await deleteWorkOrderLogEntry(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Crew Sessions — attendance-based hours, optionally tied to a Work
+// Order (workOrderId) or standalone (activity label instead) ----
+
+router.post('/crew-sessions', async (req, res, next) => {
+  try {
+    const { workOrderId, activity, sessionDate, hours, note, volunteerIds, vendorIds } = req.body || {};
+    if (!workOrderId && !(activity || '').trim()) {
+      return res.status(400).json({ ok: false, error: 'A session needs either a Work Order or an activity label' });
+    }
+    const session = await createCrewSession({
+      workOrderId: workOrderId || null, activity: activity?.trim() || null,
+      sessionDate: sessionDate || null, hours: hours ? Number(hours) : null, note: note?.trim() || null,
+      volunteerIds: (volunteerIds || []).map(Number), vendorIds: (vendorIds || []).map(Number),
+    });
+    res.json({ ok: true, session });
+  } catch (e) { next(e); }
+});
+router.delete('/crew-sessions/:id', async (req, res, next) => {
+  try { await deleteCrewSession(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.get('/crew-hours/summary', async (req, res, next) => {
+  try { res.json(await getCrewHoursSummary({ from: req.query.from || null, to: req.query.to || null })); } catch (e) { next(e); }
 });
 
 // ---- Work Order Tasks (free-text job lines — the default way to add work) ----

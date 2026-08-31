@@ -325,6 +325,7 @@ const NAV_ITEMS = [
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
   { icon: '👷', label: 'Crew', view: 'crew' },
+  { icon: '🕒', label: 'Hours', view: 'crewHours' },
   { icon: '📋', label: 'Maintenance Log', view: 'maintenanceLog' },
   { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
   { icon: '📊', label: 'Reports', view: 'reports' },
@@ -464,6 +465,7 @@ async function render(view, params = {}) {
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
       crew: () => renderCrew(),
+      crewHours: () => renderCrewHours(),
       adminUsers: () => renderAdminUsers(),
       activityLog: () => renderActivityLog(),
     };
@@ -1552,6 +1554,7 @@ const REPORT_ENTITIES = [
   { key: 'assets', label: 'Assets' },
   { key: 'workOrders', label: 'Work Orders' },
   { key: 'workOrderLog', label: 'Progress Log' },
+  { key: 'crewSessions', label: 'Crew Sessions' },
 ];
 
 // One-click canned filter combinations for the most common "which report do
@@ -3365,7 +3368,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
   const allSkills = skillsRes.skills.map((s) => s.Name);
   const checklistTemplates = tplRes.templates;
   const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
-  const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist, logEntries } = detail;
+  const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist, logEntries, crewSessions } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
 
   const taskRows = tasks.map((t) => `
@@ -3404,6 +3407,16 @@ async function renderWorkOrderDetail({ id }, container = app) {
       <div class="field-row"><select id="checklistTplPicker"><option value="">— choose a checklist —</option>${checklistTemplates.map((t) => `<option value="${t.Id}">${escapeHtml(t.Name)} (${t.Steps.length} steps)</option>`).join('')}</select></div>
       <button class="btn btn-secondary" id="attachChecklistBtn">Attach Checklist</button>
     </div>` : '');
+
+  const crewSessionRows = crewSessions.map((s) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start">
+      <div style="flex:1;min-width:200px">
+        <div>${new Date(s.Date).toLocaleDateString()}${s.Hours != null ? ` · ${s.Hours}h` : ''}</div>
+        <div class="muted">${[...s.Volunteers, ...s.Vendors].map(escapeHtml).join(', ') || 'No attendees recorded'}</div>
+        ${s.Note ? `<div class="muted">${escapeHtml(s.Note)}</div>` : ''}
+      </div>
+      <button class="btn btn-secondary delete-crew-session" data-id="${s.Id}" style="align-self:center">Delete</button>
+    </div>`).join('') || '<p class="muted">No sessions logged yet.</p>';
 
   const assignedVolIds = new Set(volunteers.map((v) => v.Id));
   const assignedVenIds = new Set(vendors.map((v) => v.Id));
@@ -3507,6 +3520,25 @@ async function renderWorkOrderDetail({ id }, container = app) {
         </div>
         <button type="button" class="btn btn-primary" id="newVenSave">Add & Assign</button>
       </div>
+    </div>
+
+    <div class="card">
+      <h3>Crew Sessions</h3>
+      <p class="muted">Attendance-based hours — who was here, and for how long, each time work happened on this job. Feeds the Hours report.</p>
+      ${crewSessionRows}
+      ${(volunteers.length || vendors.length) ? `
+      <form id="addCrewSessionForm" style="margin-top:10px">
+        <div class="field-row"><label>Date</label><input name="sessionDate" type="date" value="${isoDate(new Date())}" required /></div>
+        <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
+        <div class="field-row"><label>Who was here?</label>
+          <div class="skill-chips" id="sessionAttendeeChips">
+            ${volunteers.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="vol" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
+            ${vendors.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="ven" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
+          </div>
+        </div>
+        <div class="field-row"><label>Note (optional)</label><input name="note" placeholder="Anything worth noting" /></div>
+        <button class="btn btn-primary" type="submit">Log Session</button>
+      </form>` : '<p class="muted">Assign crew above before logging a session.</p>'}
     </div>`;
 
   const assetPicker = mountAssetCombobox(container.querySelector('#woAssetPicker'), { initialAsset: wo.Asset });
@@ -3586,6 +3618,27 @@ async function renderWorkOrderDetail({ id }, container = app) {
   container.querySelectorAll('.delete-log-entry').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Delete this log entry? "${btn.dataset.label}"`)) return;
     try { await api(`/api/pg/work-order-log/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
+    catch (err) { toast(err.message); }
+  }));
+
+  container.querySelectorAll('.crew-attendee-chip').forEach((chip) => chip.addEventListener('click', () => chip.classList.toggle('selected')));
+  container.querySelector('#addCrewSessionForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const chips = [...container.querySelectorAll('.crew-attendee-chip.selected')];
+    try {
+      await api('/api/pg/crew-sessions', { method: 'POST', body: JSON.stringify({
+        workOrderId: Number(id), sessionDate: fd.get('sessionDate'), hours: fd.get('hours') || undefined, note: fd.get('note') || undefined,
+        volunteerIds: chips.filter((c) => c.dataset.kind === 'vol').map((c) => Number(c.dataset.id)),
+        vendorIds: chips.filter((c) => c.dataset.kind === 'ven').map((c) => Number(c.dataset.id)),
+      }) });
+      toast('Session logged');
+      renderWorkOrderDetail({ id }, container);
+    } catch (err) { toast(err.message); }
+  });
+  container.querySelectorAll('.delete-crew-session').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog('Delete this session?')) return;
+    try { await api(`/api/pg/crew-sessions/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   }));
 
@@ -3774,6 +3827,160 @@ function wireAddSkillButton(button) {
       input.value = '';
     } catch (err) { toast(err.message); }
   });
+}
+
+// Sessions -> hours/jobs leaderboard, so "who's our most faithful volunteer"
+// is a sort, not a spreadsheet. Period math always builds YYYY-MM-DD bounds
+// with isoDate() (see its comment) — never .toISOString() — to avoid the
+// same timezone bug fixed once already for the This Week dashboard widget.
+const CREW_HOURS_PERIODS = [
+  { key: 'month', label: 'This Month' },
+  { key: 'year', label: 'This Year' },
+  { key: 'all', label: 'All Time' },
+  { key: 'custom', label: 'Custom Range' },
+];
+function crewHoursPeriodBounds(period, customFrom, customTo) {
+  const now = new Date();
+  if (period === 'month') return { from: isoDate(new Date(now.getFullYear(), now.getMonth(), 1)), to: isoDate(now) };
+  if (period === 'year') return { from: isoDate(new Date(now.getFullYear(), 0, 1)), to: isoDate(now) };
+  if (period === 'custom') return { from: customFrom || null, to: customTo || null };
+  return { from: null, to: null };
+}
+
+function downloadCsv(csv, filename) {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function crewHoursCsv(rows) {
+  const esc = (v) => { const s = v == null ? '' : String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const header = ['Name', 'Sessions', 'Jobs', 'Hours'].join(',');
+  const lines = rows.map((r) => [r.Name, r.Sessions, r.Jobs, r.Hours].map(esc).join(','));
+  return [header, ...lines].join('\r\n');
+}
+
+async function renderCrewHours() {
+  setChrome({ title: 'Hours', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const [volsRes, vensRes] = await Promise.all([api('/api/pg/volunteers'), api('/api/pg/vendors')]);
+  const volunteers = volsRes.volunteers;
+  const vendors = vensRes.vendors;
+  let period = 'year';
+  let customFrom = '';
+  let customTo = '';
+  let sortDir = 'desc'; // Hours, descending — surfaces the most faithful volunteers first
+  let summary = null;
+
+  function personTableHtml(rows, emptyMsg) {
+    const sorted = [...rows].sort((a, b) => (sortDir === 'desc' ? b.Hours - a.Hours : a.Hours - b.Hours));
+    const trs = sorted.map((r) => `
+      <tr>
+        <td data-label="Name">${escapeHtml(r.Name)}${!r.Active ? ' <span class="pill">inactive</span>' : ''}</td>
+        <td data-label="Sessions">${r.Sessions}</td>
+        <td data-label="Jobs">${r.Jobs}</td>
+        <td data-label="Hours">${r.Hours}</td>
+      </tr>`).join('');
+    return `<div style="overflow-x:auto"><table class="report-table">
+      <thead><tr><th>Name</th><th>Sessions</th><th>Jobs</th><th class="sort-hours" style="cursor:pointer">Hours ${sortDir === 'desc' ? '▾' : '▴'}</th></tr></thead>
+      <tbody>${trs || `<tr><td colspan="4" class="muted">${emptyMsg}</td></tr>`}</tbody>
+    </table></div>`;
+  }
+
+  async function loadSummary() {
+    const { from, to } = crewHoursPeriodBounds(period, customFrom, customTo);
+    const qs = new URLSearchParams();
+    if (from) qs.set('from', from);
+    if (to) qs.set('to', to);
+    summary = await api(`/api/pg/crew-hours/summary?${qs.toString()}`);
+  }
+
+  function draw() {
+    setApp(`
+      <div class="card">
+        <h3>Log Activity</h3>
+        <p class="muted">For work that never becomes a Work Order — mowing, grounds cleanup, a general workday. Time tied to a specific Work Order is logged from that Work Order's page instead.</p>
+        <form id="logActivityForm">
+          <div class="field-row"><label>Date</label><input name="sessionDate" type="date" value="${isoDate(new Date())}" required /></div>
+          <div class="field-row"><label>Activity</label><input name="activity" required placeholder="e.g. Mowing, Grounds Cleanup" /></div>
+          <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
+          <div class="field-row"><label>Who was here?</label>
+            <div class="skill-chips" id="activityAttendeeChips">
+              ${volunteers.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="vol" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
+              ${vendors.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="ven" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
+            </div>
+          </div>
+          <div class="field-row"><label>Note (optional)</label><input name="note" /></div>
+          <button class="btn btn-primary" type="submit">Log Activity</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h3>Hours Summary</h3>
+        <div class="btn-row" style="margin-top:0">
+          ${CREW_HOURS_PERIODS.map((p) => `<button type="button" class="btn ${period === p.key ? 'btn-primary' : 'btn-secondary'} period-btn" data-period="${p.key}">${p.label}</button>`).join('')}
+        </div>
+        ${period === 'custom' ? `
+        <div class="field-row"><label>From</label><input type="date" id="customFrom" value="${customFrom}" /></div>
+        <div class="field-row"><label>To</label><input type="date" id="customTo" value="${customTo}" /></div>
+        ` : ''}
+        <div class="btn-row" style="margin:10px 0 0"><button type="button" class="btn btn-secondary" id="exportVolCsv">Export Volunteers CSV</button><button type="button" class="btn btn-secondary" id="exportVenCsv">Export Vendors CSV</button></div>
+
+        <h4 style="margin:16px 0 6px">Volunteers</h4>
+        ${personTableHtml(summary.volunteers, 'No volunteer activity in this period.')}
+
+        <h4 style="margin:16px 0 6px">Vendors</h4>
+        ${personTableHtml(summary.vendors, 'No vendor activity in this period.')}
+      </div>
+    `);
+    wire();
+  }
+
+  function wire() {
+    app.querySelectorAll('.period-btn').forEach((btn) => btn.addEventListener('click', async () => {
+      period = btn.dataset.period;
+      if (period !== 'custom') { app.innerHTML = LOADING_HTML; await loadSummary(); }
+      draw();
+    }));
+    app.querySelector('#customFrom')?.addEventListener('change', async (e) => {
+      customFrom = e.target.value; app.innerHTML = LOADING_HTML; await loadSummary(); draw();
+    });
+    app.querySelector('#customTo')?.addEventListener('change', async (e) => {
+      customTo = e.target.value; app.innerHTML = LOADING_HTML; await loadSummary(); draw();
+    });
+    app.querySelectorAll('.sort-hours').forEach((th) => th.addEventListener('click', () => {
+      sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+      draw();
+    }));
+    app.querySelectorAll('.crew-attendee-chip').forEach((chip) => chip.addEventListener('click', () => chip.classList.toggle('selected')));
+    app.querySelector('#exportVolCsv')?.addEventListener('click', () => downloadCsv(crewHoursCsv(summary.volunteers), 'volunteer-hours.csv'));
+    app.querySelector('#exportVenCsv')?.addEventListener('click', () => downloadCsv(crewHoursCsv(summary.vendors), 'vendor-hours.csv'));
+    app.querySelector('#logActivityForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const activity = fd.get('activity').trim();
+      if (!activity) return;
+      const chips = [...app.querySelectorAll('.crew-attendee-chip.selected')];
+      try {
+        await api('/api/pg/crew-sessions', { method: 'POST', body: JSON.stringify({
+          activity, sessionDate: fd.get('sessionDate'), hours: fd.get('hours') || undefined, note: fd.get('note') || undefined,
+          volunteerIds: chips.filter((c) => c.dataset.kind === 'vol').map((c) => Number(c.dataset.id)),
+          vendorIds: chips.filter((c) => c.dataset.kind === 'ven').map((c) => Number(c.dataset.id)),
+        }) });
+        toast('Activity logged');
+        app.innerHTML = LOADING_HTML;
+        await loadSummary();
+        draw();
+      } catch (err) { toast(err.message); }
+    });
+  }
+
+  await loadSummary();
+  draw();
 }
 
 async function renderCrew() {
