@@ -323,6 +323,7 @@ const NAV_ITEMS = [
   { icon: '📝', label: 'Start Audit', view: 'auditPicker' },
   { icon: '📍', label: 'Locations', view: 'locations' },
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
+  { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
   { icon: '👷', label: 'Crew', view: 'crew' },
   { icon: '🕒', label: 'Hours', view: 'crewHours' },
@@ -406,6 +407,7 @@ function breadcrumbLabel({ view, params }) {
   if (view === 'assetsInLocation') return params.name || 'Assets';
   if (view === 'assetDetail') return params.name || 'Asset';
   if (view === 'workOrderDetail') return params.title || 'Work Order';
+  if (view === 'requestDetail') return params.label || 'Request';
   if (view === 'adminCategory') return ADMIN_CATEGORIES[params.category]?.title || 'Category';
   if (ADMIN_TOOL_LABELS[view]) return ADMIN_TOOL_LABELS[view];
   return NAV_ITEMS.find((n) => n.view === view)?.label || view;
@@ -468,6 +470,9 @@ async function render(view, params = {}) {
       crewHours: () => renderCrewHours(),
       adminUsers: () => renderAdminUsers(),
       activityLog: () => renderActivityLog(),
+      requests: () => renderRequests(params),
+      requestDetail: () => renderRequestDetail(params),
+      adminRequestFields: () => renderAdminRequestFields(),
     };
     if (handlers[view]) {
       await handlers[view]();
@@ -1964,6 +1969,12 @@ const ADMIN_CATEGORIES = {
       { view: 'adminChecklistTemplates', icon: '✅', label: 'Checklist Templates' },
     ],
   },
+  requests: {
+    icon: '🧰', title: 'Maintenance Requests', description: 'What shows on the public request form, and what\'s required',
+    items: [
+      { view: 'adminRequestFields', icon: '🏷️', label: 'Request Form Fields' },
+    ],
+  },
   accounts: {
     icon: '👤', title: 'Accounts', description: 'Who can log in, and what they can see',
     items: [
@@ -2371,6 +2382,83 @@ async function renderAdminPropertyFields({ openAdd } = {}, container = app) {
       toast('Field created — available immediately in the audit form');
       state.options = null; // force refresh of cached options (building types etc. unaffected, but keep it simple)
       renderAdminPropertyFields({}, container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+const REQUEST_FIELD_TYPE_LABELS = { text: 'Free text', textarea: 'Long text', select: 'Single choice', multiselect: 'Multiple choice', number: 'Number', date: 'Date', checkbox: 'Yes/No' };
+
+async function renderAdminRequestFields(container = app) {
+  if (container === app) setChrome({ title: 'Request Form Fields', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { fields } = await api('/api/pg/admin/request-fields');
+  const rows = fields.map((f) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap">
+      <span><strong>${escapeHtml(f.label)}</strong> <span class="muted">(${escapeHtml(f.field_key)}) — ${escapeHtml(REQUEST_FIELD_TYPE_LABELS[f.input_type] || f.input_type)}${f.options?.length ? ': ' + f.options.map(escapeHtml).join(', ') : ''}${f.column_name ? ' · built-in' : ''}</span></span>
+      <span class="btn-row" style="margin:0">
+        <label style="display:flex;align-items:center;gap:6px;font-weight:400;font-size:0.85rem">
+          <input type="checkbox" class="toggle-required" data-id="${f.id}" ${f.required ? 'checked' : ''} style="width:auto" /> Required
+        </label>
+        <button class="btn btn-secondary toggle-active" data-id="${f.id}" data-next="${!f.active}">${f.active ? 'Hide' : 'Show'}</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No request fields yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Request Form Fields</h3><p class="muted">Controls what appears on the public maintenance request form (audit.fracturedrv.com/request), in this order, and whether each is required. "Built-in" fields (name, email, location, description) can be hidden or made optional but not deleted — everything else is a field you added.</p></div>
+    ${rows}
+    <div class="card">
+      <h3>Add Another Field</h3>
+      <form id="addReqFieldForm">
+        <div class="field-row"><label>Label</label><input name="label" placeholder="e.g. Best time to reach you" required /></div>
+        <div class="field-row"><label>Field Key (lowercase, no spaces)</label><input name="fieldKey" placeholder="e.g. best_time" pattern="[a-z][a-z0-9_]*" required /></div>
+        <div class="field-row"><label>Type</label>
+          <select name="inputType">
+            <option value="text">Free text</option>
+            <option value="textarea">Long text</option>
+            <option value="select">Single choice (select)</option>
+            <option value="multiselect">Multiple choice (multiselect)</option>
+            <option value="number">Number</option>
+            <option value="date">Date</option>
+            <option value="checkbox">Yes/No (checkbox)</option>
+          </select>
+        </div>
+        <div class="field-row"><label>Options (comma-separated, if applicable)</label><input name="options" placeholder="e.g. Morning, Afternoon, Evening" /></div>
+        <div class="field-row"><label style="display:flex;align-items:center;gap:8px;font-weight:400"><input type="checkbox" name="required" style="width:auto" /> Required</label></div>
+        <button class="btn btn-primary" type="submit">Create Field</button>
+      </form>
+    </div>`;
+
+  container.querySelector('#addReqFieldForm [name="label"]').addEventListener('input', (e) => {
+    const keyInput = container.querySelector('#addReqFieldForm [name="fieldKey"]');
+    if (!keyInput.dataset.touched) keyInput.value = e.target.value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  });
+  container.querySelector('#addReqFieldForm [name="fieldKey"]').addEventListener('input', (e) => { e.target.dataset.touched = 'true'; });
+
+  container.querySelectorAll('.toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    const action = btn.dataset.next === 'true' ? 'Show' : 'Hide';
+    if (!await confirmDialog(`${action} this field on the public request form?`, { danger: false })) return;
+    await api(`/api/pg/admin/request-fields/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.next === 'true' }) });
+    renderAdminRequestFields(container);
+  }));
+
+  container.querySelectorAll('.toggle-required').forEach((cb) => cb.addEventListener('change', async () => {
+    try {
+      await api(`/api/pg/admin/request-fields/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ required: cb.checked }) });
+      toast(cb.checked ? 'Field is now required' : 'Field is now optional');
+    } catch (err) { toast(err.message); cb.checked = !cb.checked; }
+  }));
+
+  container.querySelector('#addReqFieldForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const inputType = fd.get('inputType');
+    const options = fd.get('options').split(',').map((s) => s.trim()).filter(Boolean);
+    try {
+      await api('/api/pg/admin/request-fields', { method: 'POST', body: JSON.stringify({
+        fieldKey: fd.get('fieldKey'), label: fd.get('label'), inputType, options, required: fd.get('required') === 'on',
+      }) });
+      toast('Field created — available immediately on the public request form');
+      renderAdminRequestFields(container);
     } catch (err) { toast(err.message); }
   });
 }
@@ -3119,6 +3207,175 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
   }
 
   draw();
+}
+
+function requestStatusPillClass(status) {
+  if (status === 'approved') return 'good';
+  if (status === 'denied') return 'bad';
+  if (status === 'converted') return 'pop';
+  if (status === 'submitted') return 'warn';
+  return ''; // closed = neutral
+}
+
+const REQUEST_STATUSES = ['submitted', 'approved', 'denied', 'converted', 'closed'];
+
+async function renderRequests(params = {}, container = app) {
+  if (container === app) setChrome({ title: 'Requests', showBack: false, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  let statusFilter = params.status || null;
+
+  async function draw() {
+    const { requests } = await api(`/api/pg/requests${statusFilter ? `?status=${statusFilter}` : ''}`);
+    const rows = requests.map((r) => `
+      <div class="list-item" style="flex-wrap:wrap" data-id="${r.Id}">
+        <span>
+          <strong>${escapeHtml(r.RequesterName || r.RequesterEmail || 'Unknown')}</strong>
+          ${r.Description ? `<div class="muted" style="font-weight:400">${escapeHtml(r.Description.slice(0, 90))}${r.Description.length > 90 ? '…' : ''}</div>` : ''}
+          <div class="muted" style="font-weight:400">${[r.LocationName, formatDateNice(r.CreatedAt)].filter(Boolean).join(' · ')}</div>
+        </span>
+        <span>
+          ${r.Priority ? `<span class="pill">${escapeHtml(r.Priority)}</span>` : ''}
+          <span class="pill ${requestStatusPillClass(r.Status)}">${escapeHtml(r.Status)}</span>
+        </span>
+      </div>`).join('') || `<p class="muted">${statusFilter ? 'Nothing matches this filter.' : 'No requests yet.'}</p>`;
+
+    setApp(`
+      <div class="card">
+        <p class="muted">Submitted through the public form at <strong>/request</strong> — never automatically turned into a Work Order. Review each one below and, if warranted, convert it.</p>
+      </div>
+      <div class="btn-row" style="margin-bottom:12px;flex-wrap:wrap">
+        <button class="btn ${!statusFilter ? 'btn-primary' : 'btn-secondary'}" data-status="">All</button>
+        ${REQUEST_STATUSES.map((s) => `<button class="btn ${statusFilter === s ? 'btn-primary' : 'btn-secondary'}" data-status="${s}">${s[0].toUpperCase() + s.slice(1)}</button>`).join('')}
+      </div>
+      ${rows}
+    `, container);
+
+    container.querySelectorAll('[data-status]').forEach((btn) => btn.addEventListener('click', () => { statusFilter = btn.dataset.status || null; draw(); }));
+    container.querySelectorAll('.list-item[data-id]').forEach((el) => el.addEventListener('click', () =>
+      go('requestDetail', { id: el.dataset.id, label: `Request #${el.dataset.id}` })));
+  }
+
+  draw();
+}
+
+async function renderRequestDetail({ id }, container = app) {
+  if (container === app) setChrome({ title: 'Request', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const [{ request }, { messages }] = await Promise.all([
+    api(`/api/pg/requests/${id}`), api(`/api/pg/requests/${id}/messages`),
+  ]);
+
+  const photosHtml = request.Photos.length
+    ? `<div style="display:flex;flex-wrap:wrap;gap:8px">${request.Photos.map((p) => `<a href="${escapeHtml(p.Url)}" target="_blank" rel="noopener"><img src="${escapeHtml(p.Url)}" alt="" style="width:100px;height:100px;object-fit:cover;border-radius:8px" /></a>`).join('')}</div>`
+    : '<p class="muted">No photos attached.</p>';
+
+  const customFieldsHtml = request.CustomFields.length
+    ? request.CustomFields.map((f) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(f.label)}</span><span>${escapeHtml(f.value)}</span></div>`).join('')
+    : '';
+
+  const messagesHtml = messages.length
+    ? messages.map((m) => `
+      <div class="list-item" style="cursor:default;flex-direction:column;align-items:flex-start;gap:4px">
+        <div style="display:flex;justify-content:space-between;width:100%;gap:8px">
+          <strong>${escapeHtml(m.Subject)}</strong>
+          <span class="pill ${m.Status === 'failed' ? 'bad' : 'good'}">${m.Status === 'failed' ? 'Failed' : 'Sent'}</span>
+        </div>
+        <div class="muted">To ${escapeHtml(m.ToEmail)} · ${escapeHtml(m.SentBy)} · ${new Date(m.CreatedAt).toLocaleString()}</div>
+        <div style="white-space:pre-wrap">${escapeHtml(m.Body)}</div>
+        ${m.Error ? `<div class="muted" style="color:var(--danger)">${escapeHtml(m.Error)}</div>` : ''}
+      </div>`).join('')
+    : '<p class="muted">No messages sent yet.</p>';
+
+  container.innerHTML = `
+    <div class="card">
+      <h3>${escapeHtml(request.RequesterName || request.RequesterEmail)}</h3>
+      <p class="muted">${escapeHtml(request.RequesterEmail)}${request.RequesterPhone ? ' · ' + escapeHtml(request.RequesterPhone) : ''}</p>
+      <div class="list-item" style="cursor:default"><span>Location</span><span>${escapeHtml(request.LocationName || '—')}</span></div>
+      <div class="list-item" style="cursor:default"><span>Priority</span><span>${escapeHtml(request.Priority || '—')}</span></div>
+      <div class="list-item" style="cursor:default"><span>Submitted</span><span>${new Date(request.CreatedAt).toLocaleString()}</span></div>
+      <h4 style="margin:14px 0 6px">Description</h4>
+      <p>${escapeHtml(request.Description || '—')}</p>
+      ${customFieldsHtml ? `<h4 style="margin:14px 0 6px">Additional Details</h4>${customFieldsHtml}` : ''}
+      <h4 style="margin:14px 0 6px">Photos</h4>
+      ${photosHtml}
+    </div>
+
+    <div class="card">
+      <h3>Review</h3>
+      ${request.WorkOrderId ? `<p class="muted">Converted to <a href="#" id="viewWoLink">Work Order #${request.WorkOrderId}</a>${request.WorkOrderTitle ? ': ' + escapeHtml(request.WorkOrderTitle) : ''}.</p>` : ''}
+      <form id="statusForm">
+        <div class="field-row"><label>Status</label>
+          <select name="status">${REQUEST_STATUSES.map((s) => `<option value="${s}" ${request.Status === s ? 'selected' : ''}>${s[0].toUpperCase() + s.slice(1)}</option>`).join('')}</select>
+        </div>
+        <div class="field-row"><label>Review Note (optional — included in the notification email)</label><textarea name="reviewNote">${escapeHtml(request.ReviewNote || '')}</textarea></div>
+        <div class="field-row"><label style="display:flex;align-items:center;gap:8px;font-weight:400"><input type="checkbox" name="notify" checked style="width:auto" /> Email the requester about this change</label></div>
+        <button class="btn btn-primary" type="submit">Save Status</button>
+      </form>
+      ${request.Status === 'approved' && !request.WorkOrderId ? `
+        <div class="btn-row" style="margin-top:12px">
+          <button class="btn btn-secondary" id="convertBtn">Convert to Work Order</button>
+        </div>` : ''}
+      ${request.ReviewedBy ? `<p class="muted" style="margin-top:10px">Last reviewed by ${escapeHtml(request.ReviewedBy)} on ${new Date(request.ReviewedAt).toLocaleString()}</p>` : ''}
+    </div>
+
+    <div class="card">
+      <h3>Link to Asset (optional)</h3>
+      <p class="muted">Not shown on the public form — link internally once you know which asset this is about, so a converted Work Order points at it.</p>
+      <div id="assetPickerWrap"></div>
+    </div>
+
+    <div class="card">
+      <h3>Email</h3>
+      ${messagesHtml}
+      <form id="sendMessageForm" style="margin-top:10px">
+        <div class="field-row"><label>Subject</label><input name="subject" required value="Re: your maintenance request (Ref #${id})" /></div>
+        <div class="field-row"><label>Message</label><textarea name="body" required placeholder="Write a message to ${escapeHtml(request.RequesterName || request.RequesterEmail)}…"></textarea></div>
+        <button class="btn btn-primary" type="submit">Send Email</button>
+      </form>
+    </div>`;
+
+  mountAssetCombobox(container.querySelector('#assetPickerWrap'), {
+    initialAsset: request.AssetId ? { Id: request.AssetId, Name: request.AssetName } : null,
+    onSelect: async (asset) => {
+      try {
+        await api(`/api/pg/requests/${id}/asset`, { method: 'PATCH', body: JSON.stringify({ assetId: asset?.Id || null }) });
+        toast(asset ? `Linked to ${asset.Name}` : 'Asset link cleared');
+      } catch (err) { toast(err.message); }
+    },
+  });
+
+  container.querySelector('#viewWoLink')?.addEventListener('click', (e) => { e.preventDefault(); go('workOrderDetail', { id: request.WorkOrderId }); });
+
+  container.querySelector('#statusForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api(`/api/pg/requests/${id}/status`, { method: 'PATCH', body: JSON.stringify({
+        status: fd.get('status'), reviewNote: fd.get('reviewNote'), notify: fd.get('notify') === 'on',
+      }) });
+      toast('Saved');
+      renderRequestDetail({ id }, container);
+    } catch (err) { toast(err.message); }
+  });
+
+  container.querySelector('#convertBtn')?.addEventListener('click', async () => {
+    if (!await confirmDialog('Create a Work Order from this request? This is separate from approving — it actually creates the job.', { danger: false, confirmLabel: 'Convert' })) return;
+    try {
+      const { workOrderId } = await api(`/api/pg/requests/${id}/convert`, { method: 'POST', body: JSON.stringify({}) });
+      toast('Work Order created');
+      go('workOrderDetail', { id: workOrderId }, { replace: true });
+    } catch (err) { toast(err.message); }
+  });
+
+  container.querySelector('#sendMessageForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api(`/api/pg/requests/${id}/messages`, { method: 'POST', body: JSON.stringify({ subject: fd.get('subject'), body: fd.get('body') }) });
+      toast('Email sent');
+      renderRequestDetail({ id }, container);
+    } catch (err) { toast(err.message); }
+  });
 }
 
 async function renderNewWorkOrder({ assetId, assetName }) {

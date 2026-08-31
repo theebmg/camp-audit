@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Camp Sychar — Maintenance Request</title>
+  <link rel="stylesheet" href="/style.css" />
+  <style>
+    /* Standalone public page — deliberately NOT part of the authenticated SPA
+       shell (public-pg/app.js). No sidebar, no login. Reuses the shared
+       style.css tokens/buttons but defines its own layout + a few classes
+       that otherwise live in the SPA's own <style> block. */
+    body { display: flex; justify-content: center; padding: 24px 16px 60px; }
+    .wrap { width: 100%; max-width: 560px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 20px; margin-bottom: 14px; box-shadow: var(--shadow-sm); }
+    .card h1 { font-size: 1.3rem; margin: 0 0 6px; }
+    .card p.muted { color: var(--muted); margin: 0; font-size: 0.92rem; }
+    .field-row { margin-bottom: 16px; }
+    .field-row label { display: block; font-weight: 600; font-size: 0.9rem; margin-bottom: 6px; }
+    .field-row .help { color: var(--muted); font-size: 0.82rem; margin-top: 4px; }
+    .field-row input[type=text], .field-row input[type=number], .field-row input[type=date],
+    .field-row select, .field-row textarea {
+      width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+      font-size: 1rem; font-family: inherit; background: var(--surface); color: var(--text);
+    }
+    .field-row textarea { min-height: 90px; resize: vertical; }
+    .checkbox-row { display: flex; align-items: center; gap: 8px; }
+    .checkbox-row input { width: auto; }
+    .req-mark { color: var(--danger); margin-left: 3px; }
+    .hp-field { position: absolute; left: -9999px; opacity: 0; height: 0; overflow: hidden; }
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; width: 100%;
+      padding: 13px 16px; border-radius: var(--radius-sm); border: none; font-size: 1rem; font-weight: 600;
+      cursor: pointer; font-family: inherit; }
+    .error-banner { background: var(--danger-soft); color: var(--danger); border-radius: var(--radius-sm);
+      padding: 10px 14px; margin-bottom: 14px; font-size: 0.9rem; display: none; }
+    .success-card { text-align: center; padding: 40px 20px; }
+    .success-card .big-check { font-size: 3rem; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>🧰 Camp Sychar Maintenance Request</h1>
+      <p class="muted">Spotted something that needs fixing? Let us know below — we'll email you as we review it.</p>
+    </div>
+    <div id="formArea"><div class="card"><p class="muted">Loading…</p></div></div>
+  </div>
+  <script>
+    const $ = (sel, el = document) => el.querySelector(sel);
+    const formArea = $('#formArea');
+
+    function escapeHtml(s) {
+      return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    function fieldInputHtml(f) {
+      const req = f.required ? '<span class="req-mark">*</span>' : '';
+      const help = f.helpText ? `<div class="help">${escapeHtml(f.helpText)}</div>` : '';
+      const label = `<label>${escapeHtml(f.label)}${req}</label>`;
+      const name = `field__${f.fieldKey}`;
+      let control = '';
+      switch (f.inputType) {
+        case 'textarea':
+          control = `<textarea name="${name}" ${f.required ? 'required' : ''}></textarea>`;
+          break;
+        case 'select':
+          control = `<select name="${name}" ${f.required ? 'required' : ''}>
+            <option value="">— select —</option>
+            ${(f.options || []).map((o) => `<option value="${escapeHtml(o)}">${escapeHtml(o)}</option>`).join('')}
+          </select>`;
+          break;
+        case 'multiselect':
+          control = (f.options || []).map((o) => `
+            <div class="checkbox-row" style="margin-bottom:6px">
+              <input type="checkbox" name="${name}" value="${escapeHtml(o)}" id="${name}__${escapeHtml(o)}" />
+              <label for="${name}__${escapeHtml(o)}" style="margin:0;font-weight:400">${escapeHtml(o)}</label>
+            </div>`).join('');
+          break;
+        case 'number':
+          control = `<input type="number" name="${name}" ${f.required ? 'required' : ''} />`;
+          break;
+        case 'date':
+          control = `<input type="date" name="${name}" ${f.required ? 'required' : ''} />`;
+          break;
+        case 'checkbox':
+          return `<div class="field-row"><div class="checkbox-row">
+            <input type="checkbox" name="${name}" id="${name}" />
+            <label for="${name}" style="margin:0">${escapeHtml(f.label)}${req}</label>
+          </div>${help}</div>`;
+        case 'location':
+          control = `<select name="${name}" ${f.required ? 'required' : ''}><option value="">— select a location —</option></select>`;
+          break;
+        default:
+          control = `<input type="text" name="${name}" ${f.required ? 'required' : ''} />`;
+      }
+      return `<div class="field-row" data-field-key="${escapeHtml(f.fieldKey)}">${label}${control}${help}</div>`;
+    }
+
+    async function init() {
+      let fields, locations;
+      try {
+        [{ fields }, { locations }] = await Promise.all([
+          fetch('/api/request-portal/fields').then((r) => r.json()),
+          fetch('/api/request-portal/locations').then((r) => r.json()),
+        ]);
+      } catch (e) {
+        formArea.innerHTML = '<div class="card"><p class="muted">Sorry — the request form couldn\'t load. Please try again shortly.</p></div>';
+        return;
+      }
+
+      formArea.innerHTML = `
+        <form id="reqForm">
+          <div class="card">
+            <div class="error-banner" id="errorBanner"></div>
+            ${fields.map(fieldInputHtml).join('')}
+            <div class="field-row">
+              <label>Photos (optional)</label>
+              <input type="file" name="photos" accept="image/*" capture="environment" multiple />
+            </div>
+            <!-- Honeypot: real users never see or fill this in -->
+            <div class="hp-field"><label>Company</label><input type="text" name="company" tabindex="-1" autocomplete="off" /></div>
+            <button class="btn btn-primary" type="submit" id="submitBtn">Submit Request</button>
+          </div>
+        </form>`;
+
+      const locationSelects = formArea.querySelectorAll('select[name="field__location"]');
+      locationSelects.forEach((sel) => {
+        sel.insertAdjacentHTML('beforeend', locations.map((l) => `<option value="${l.Id}">${escapeHtml(l.Name)}</option>`).join(''));
+      });
+
+      $('#reqForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const errorBanner = $('#errorBanner');
+        errorBanner.style.display = 'none';
+        const submitBtn = $('#submitBtn');
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Submitting…';
+        try {
+          const fd = new FormData(e.target);
+          const values = {};
+          for (const f of fields) {
+            const name = `field__${f.fieldKey}`;
+            if (f.inputType === 'multiselect') {
+              values[f.fieldKey] = fd.getAll(name);
+            } else if (f.inputType === 'checkbox') {
+              values[f.fieldKey] = fd.get(name) ? 'Yes' : 'No';
+            } else {
+              values[f.fieldKey] = fd.get(name) || '';
+            }
+          }
+
+          const photoFiles = fd.getAll('photos').filter((f) => f && f.size);
+          const photoUrls = [];
+          for (const file of photoFiles) {
+            const upFd = new FormData();
+            upFd.append('photo', file);
+            const res = await fetch('/api/request-portal/upload', { method: 'POST', body: upFd });
+            const body = await res.json();
+            if (res.ok && body.ok) photoUrls.push(body.url);
+          }
+
+          const res = await fetch('/api/request-portal/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ values, photoUrls, company: fd.get('company') || '' }),
+          });
+          const body = await res.json();
+          if (!res.ok || body.ok === false) throw new Error(body.error || 'Something went wrong — please try again.');
+
+          formArea.innerHTML = `
+            <div class="card success-card">
+              <div class="big-check">✅</div>
+              <h1>Request received</h1>
+              <p class="muted">Reference #${body.id}. We'll follow up by email as it's reviewed.</p>
+            </div>`;
+        } catch (err) {
+          errorBanner.textContent = err.message;
+          errorBanner.style.display = 'block';
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Submit Request';
+        }
+      });
+    }
+
+    init();
+  </script>
+</body>
+</html>

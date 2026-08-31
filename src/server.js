@@ -11,6 +11,7 @@ import apiRouter from './routes/api.js';
 import manageRouter from './routes/manage.js';
 import reportsRouter from './routes/reports.js';
 import pgApiRouter from './routes/pg-api.js';
+import requestPortalRouter from './routes/request-portal.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -87,12 +88,21 @@ app.get('/db-health', async (req, res) => {
 // Postgres-backed parallel API (migration in progress) — additive, does not
 // replace /api. See toClaudeCode/camp-cmms-postgres-migration-brief.md.
 app.use('/api/pg', requireAuth, pgApiRouter);
+// Maintenance Request Portal's public submit endpoints — deliberately NOT
+// behind requireAuth; anyone with the link can submit a request. Review,
+// approve/deny, and convert-to-Work-Order stay under /api/pg (authenticated).
+// Mounted BEFORE the '/api' catch-all below: Express matches app.use paths
+// by prefix, so '/api' would otherwise intercept '/api/request-portal/*'
+// requests and reject them with requireAuth before this router ever saw them.
+app.use('/api/request-portal', requestPortalRouter);
 app.use('/api', requireAuth, apiRouter);
 app.use('/api/manage', requireAuth, manageRouter);
 app.use('/api/reports', requireAuth, reportsRouter);
 // Postgres frontend preview — separate static bundle, mounted at /next so the
 // live UI at / is completely untouched. Shares /style.css from public/.
 app.use('/next', express.static(path.join(__dirname, '..', 'public-pg')));
+// Friendly public URL for the request form (no login) — same file as /next/request.html.
+app.get('/request', (req, res) => res.sendFile(path.join(__dirname, '..', 'public-pg', 'request.html')));
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // JSON error handler — without this, an uncaught error anywhere in the API routes

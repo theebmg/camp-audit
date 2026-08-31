@@ -48,7 +48,11 @@ import {
   getAssetsReportRawData, getWorkOrdersReportRawData, getWorkOrderLogReportRawData,
   listCrewSessionsForWorkOrder, createCrewSession, deleteCrewSession, getCrewSessionReportRawData, getCrewHoursSummary,
   listReportFavorites, createReportFavorite, deleteReportFavorite,
+  adminListRequestFields, adminCreateRequestField, adminUpdateRequestField,
+  listMaintenanceRequests, getMaintenanceRequestDetail, updateMaintenanceRequestStatus,
+  convertRequestToWorkOrder, linkRequestToAsset, listRequestMessages, createRequestMessage,
 } from '../db.js';
+import { sendMail, mailIsConfigured } from '../mailer.js';
 import {
   buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows, buildCrewSessionReportRows,
   assetColumnSpecs, WORK_ORDER_COLUMN_SPECS, WORK_ORDER_LOG_COLUMN_SPECS, CREW_SESSION_COLUMN_SPECS,
@@ -502,6 +506,41 @@ router.delete('/admin/sub-areas/:id', async (req, res, next) => {
   try {
     await adminDeleteSubArea(req.params.id);
     res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// Maintenance Request Portal's field builder — same "no schema change" shape
+// as Property Fields, but a separate catalog (maintenance_request_fields)
+// since these fields drive the PUBLIC form, not the audit.
+const REQUEST_FIELD_TYPES = ['text', 'textarea', 'select', 'multiselect', 'number', 'date', 'checkbox'];
+
+router.get('/admin/request-fields', async (req, res, next) => {
+  try { res.json({ fields: await adminListRequestFields() }); } catch (e) { next(e); }
+});
+
+router.post('/admin/request-fields', async (req, res, next) => {
+  try {
+    const { fieldKey, label, inputType, options, required, helpText } = req.body || {};
+    if (!fieldKey || !label || !REQUEST_FIELD_TYPES.includes(inputType)) {
+      return res.status(400).json({ ok: false, error: 'fieldKey, label, and a valid inputType are required' });
+    }
+    if (!/^[a-z][a-z0-9_]*$/.test(fieldKey)) {
+      return res.status(400).json({ ok: false, error: 'fieldKey must be lowercase snake_case (e.g. gate_code)' });
+    }
+    const field = await adminCreateRequestField({ fieldKey, label, inputType, options: options || [], required: !!required, helpText });
+    res.json({ ok: true, field });
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ ok: false, error: `A field with key "${req.body?.fieldKey}" already exists` });
+    next(e);
+  }
+});
+
+router.patch('/admin/request-fields/:id', async (req, res, next) => {
+  try {
+    const { label, options, required, active, sortOrder, helpText } = req.body || {};
+    const field = await adminUpdateRequestField(req.params.id, { label, options, required, active, sortOrder, helpText });
+    if (!field) return res.status(404).json({ ok: false, error: 'Field not found' });
+    res.json({ ok: true, field });
   } catch (e) { next(e); }
 });
 
@@ -978,6 +1017,111 @@ router.delete('/users/:id', async (req, res, next) => {
     }
     await deleteUser(req.params.id);
     res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ---- Maintenance Request Portal (review side — the public submit endpoints
+//      live in routes/request-portal.js, unauthenticated) ----
+//
+// A request is NEVER auto-converted to a Work Order. Status moves only on a
+// reviewer's deliberate action here, and "approved" is just a status — the
+// separate /convert endpoint is what actually creates the Work Order.
+
+function requestStatusEmail(request, status, reviewNote) {
+  const greeting = `Hi${request.RequesterName ? ' ' + request.RequesterName : ''},`;
+  const note = reviewNote ? `\n\nNote from our team:\n${reviewNote}` : '';
+  const sign = '\n\n— Camp Sychar Maintenance';
+  switch (status) {
+    case 'approved':
+      return { subject: `Your maintenance request has been approved (Ref #${request.Id})`, text: `${greeting}\n\nGood news — your maintenance request has been approved and is in our queue.${note}${sign}` };
+    case 'denied':
+      return { subject: `Update on your maintenance request (Ref #${request.Id})`, text: `${greeting}\n\nWe've reviewed your maintenance request and won't be moving forward with it at this time.${note}${sign}` };
+    case 'converted':
+      return { subject: `Your maintenance request is being worked on (Ref #${request.Id})`, text: `${greeting}\n\nYour maintenance request has been approved and a work order has been created for it.${note}${sign}` };
+    case 'closed':
+      return { subject: `Your maintenance request has been closed (Ref #${request.Id})`, text: `${greeting}\n\nYour maintenance request (Ref #${request.Id}) has been closed.${note}${sign}` };
+    default:
+      return null;
+  }
+}
+
+async function notifyRequester(request, status, reviewNote) {
+  const content = requestStatusEmail(request, status, reviewNote);
+  if (!content || !request.RequesterEmail) return;
+  if (!mailIsConfigured()) {
+    await createRequestMessage(request.Id, { ...content, body: content.text, toEmail: request.RequesterEmail, sentBy: 'system', status: 'failed', error: 'Email not configured' });
+    return;
+  }
+  try {
+    await sendMail({ to: request.RequesterEmail, subject: content.subject, text: content.text });
+    await createRequestMessage(request.Id, { subject: content.subject, body: content.text, toEmail: request.RequesterEmail, sentBy: 'system' });
+  } catch (e) {
+    await createRequestMessage(request.Id, { subject: content.subject, body: content.text, toEmail: request.RequesterEmail, sentBy: 'system', status: 'failed', error: e.message });
+  }
+}
+
+router.get('/requests', async (req, res, next) => {
+  try { res.json({ requests: await listMaintenanceRequests({ status: req.query.status }) }); } catch (e) { next(e); }
+});
+
+router.get('/requests/:id', async (req, res, next) => {
+  try {
+    const request = await getMaintenanceRequestDetail(req.params.id);
+    if (!request) return res.status(404).json({ ok: false, error: 'Request not found' });
+    res.json({ request });
+  } catch (e) { next(e); }
+});
+
+router.patch('/requests/:id/status', async (req, res, next) => {
+  try {
+    const { status, reviewNote, notify = true } = req.body || {};
+    if (status && !['submitted', 'approved', 'denied', 'converted', 'closed'].includes(status)) {
+      return res.status(400).json({ ok: false, error: 'Invalid status' });
+    }
+    const request = await updateMaintenanceRequestStatus(req.params.id, { status, reviewNote });
+    if (!request) return res.status(404).json({ ok: false, error: 'Request not found' });
+    if (status && notify) await notifyRequester(request, status, reviewNote);
+    res.json({ ok: true, request });
+  } catch (e) { next(e); }
+});
+
+router.patch('/requests/:id/asset', async (req, res, next) => {
+  try {
+    const request = await linkRequestToAsset(req.params.id, req.body?.assetId || null);
+    if (!request) return res.status(404).json({ ok: false, error: 'Request not found' });
+    res.json({ ok: true, request });
+  } catch (e) { next(e); }
+});
+
+// The one deliberate bridge from Requests into Work Orders. Never automatic.
+router.post('/requests/:id/convert', async (req, res, next) => {
+  try {
+    const result = await convertRequestToWorkOrder(req.params.id, { scheduledDate: req.body?.scheduledDate });
+    if (!result) return res.status(404).json({ ok: false, error: 'Request not found' });
+    await notifyRequester(result.request, 'converted', req.body?.reviewNote);
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
+router.get('/requests/:id/messages', async (req, res, next) => {
+  try { res.json({ messages: await listRequestMessages(req.params.id) }); } catch (e) { next(e); }
+});
+
+// Free-form email from inside the app — "or allow me to email from inside."
+router.post('/requests/:id/messages', async (req, res, next) => {
+  try {
+    const { subject, body } = req.body || {};
+    if (!subject?.trim() || !body?.trim()) return res.status(400).json({ ok: false, error: 'subject and body are required' });
+    const request = await getMaintenanceRequestDetail(req.params.id);
+    if (!request) return res.status(404).json({ ok: false, error: 'Request not found' });
+    try {
+      await sendMail({ to: request.RequesterEmail, subject, text: body });
+      const message = await createRequestMessage(request.Id, { subject, body, toEmail: request.RequesterEmail, sentBy: currentUsername() || 'unknown' });
+      res.json({ ok: true, message });
+    } catch (e) {
+      await createRequestMessage(request.Id, { subject, body, toEmail: request.RequesterEmail, sentBy: currentUsername() || 'unknown', status: 'failed', error: e.message });
+      res.status(502).json({ ok: false, error: `Email failed to send: ${e.message}` });
+    }
   } catch (e) { next(e); }
 });
 

@@ -2091,3 +2091,267 @@ export async function verifyUserCredentials(username, password) {
   if (!verifyPassword(password, u.password_hash)) return null;
   return { Id: u.id, Username: u.username, Role: u.role };
 }
+
+// ── Maintenance Request Portal ──────────────────────────────────────────
+// Public submissions land here, never as Work Orders — see migration 0021.
+// Field configurability mirrors asset_property_fields (0005): a request field
+// with column_name set writes a real column on maintenance_requests; one with
+// column_name null is EAV-backed in maintenance_request_field_values. Mailing
+// is intentionally NOT done in this module (same boundary discipline as
+// storage.js for Spaces) — routes call mailer.js themselves and log the
+// result via createRequestMessage.
+
+function requestRowShape(r) {
+  return {
+    Id: r.id, Status: r.status,
+    RequesterName: r.requester_name, RequesterEmail: r.requester_email, RequesterPhone: r.requester_phone,
+    LocationId: r.location_id, LocationName: r.location_name ?? null,
+    AssetId: r.asset_id, AssetName: r.asset_name ?? null,
+    Priority: r.priority, Description: r.description,
+    PublicToken: r.public_token, WorkOrderId: r.work_order_id, WorkOrderTitle: r.work_order_title ?? null,
+    ReviewedBy: r.reviewed_by, ReviewedAt: r.reviewed_at, ReviewNote: r.review_note,
+    CreatedAt: r.created_at, UpdatedAt: r.updated_at,
+  };
+}
+
+// Active fields only — what the public form renders.
+export async function getRequestFormFields() {
+  const { rows } = await pool.query(
+    `SELECT field_key, label, input_type, options, required, help_text, column_name
+     FROM maintenance_request_fields WHERE active ORDER BY sort_order`
+  );
+  return rows.map((r) => ({
+    fieldKey: r.field_key, label: r.label, inputType: r.input_type,
+    options: r.options, required: r.required, helpText: r.help_text, columnName: r.column_name,
+  }));
+}
+
+export async function adminListRequestFields() {
+  const { rows } = await pool.query(
+    `SELECT id, field_key, label, input_type, options, required, active, sort_order, help_text, column_name
+     FROM maintenance_request_fields ORDER BY sort_order`
+  );
+  return rows;
+}
+
+export async function adminCreateRequestField({ fieldKey, label, inputType, options = [], required = false, sortOrder = 100, helpText }) {
+  const { rows } = await pool.query(
+    `INSERT INTO maintenance_request_fields (field_key, label, input_type, options, required, sort_order, help_text)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [fieldKey, label, inputType, options, required, sortOrder, helpText || null]
+  );
+  await logActivity({ action: 'created', entityType: 'request_field', entityId: rows[0].id, entityLabel: rows[0].label });
+  return rows[0];
+}
+
+export async function adminUpdateRequestField(id, { label, options, required, active, sortOrder, helpText }) {
+  const { rows } = await pool.query(
+    `UPDATE maintenance_request_fields SET
+       label = COALESCE($2, label), options = COALESCE($3, options),
+       required = COALESCE($4, required), active = COALESCE($5, active),
+       sort_order = COALESCE($6, sort_order), help_text = COALESCE($7, help_text)
+     WHERE id = $1 RETURNING *`,
+    [id, label ?? null, options ?? null, required ?? null, active ?? null, sortOrder ?? null, helpText ?? null]
+  );
+  if (rows[0]) {
+    await logActivity({
+      action: active === false ? 'deactivated' : active === true ? 'reactivated' : 'updated',
+      entityType: 'request_field', entityId: rows[0].id, entityLabel: rows[0].label,
+    });
+  }
+  return rows[0] || null;
+}
+
+const REQUEST_CORE_COLUMNS = new Set(['requester_name', 'requester_email', 'requester_phone', 'location_id', 'priority', 'description']);
+
+// values: { [fieldKey]: string | string[] }. Unknown/inactive field keys are
+// silently ignored — validated against the LIVE active-field catalog, not
+// whatever the client happened to submit.
+export async function createMaintenanceRequest({ values = {}, photoUrls = [] }) {
+  const fields = await getRequestFormFields();
+  const missing = fields.filter((f) => f.required && !String(values[f.fieldKey] ?? '').trim());
+  if (missing.length) {
+    const err = new Error(`Missing required field(s): ${missing.map((f) => f.label).join(', ')}`);
+    err.status = 400;
+    throw err;
+  }
+
+  const core = { requester_name: null, requester_email: null, requester_phone: null, location_id: null, priority: null, description: null };
+  const extra = [];
+  for (const f of fields) {
+    const raw = values[f.fieldKey];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const value = Array.isArray(raw) ? raw.join(', ') : String(raw);
+    if (f.columnName && REQUEST_CORE_COLUMNS.has(f.columnName)) {
+      core[f.columnName] = f.columnName === 'location_id' ? (Number(value) || null) : value;
+    } else if (!f.columnName) {
+      extra.push({ fieldKey: f.fieldKey, value });
+    }
+  }
+  if (!core.requester_email) {
+    const err = new Error('An email address is required so we can respond.');
+    err.status = 400;
+    throw err;
+  }
+
+  const token = crypto.randomUUID();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO maintenance_requests
+         (requester_name, requester_email, requester_phone, location_id, priority, description, public_token)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [core.requester_name, core.requester_email, core.requester_phone, core.location_id, core.priority, core.description, token]
+    );
+    const request = rows[0];
+    for (const e of extra) {
+      await client.query(
+        `INSERT INTO maintenance_request_field_values (request_id, field_key, value) VALUES ($1,$2,$3)`,
+        [request.id, e.fieldKey, e.value]
+      );
+    }
+    for (const url of photoUrls) {
+      await client.query(`INSERT INTO maintenance_request_photos (request_id, photo_url) VALUES ($1,$2)`, [request.id, url]);
+    }
+    await client.query('COMMIT');
+    await logActivity({
+      action: 'created', entityType: 'maintenance_request', entityId: request.id,
+      entityLabel: core.requester_name || core.requester_email,
+      details: core.description ? core.description.slice(0, 120) : undefined,
+    });
+    return requestRowShape(request);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function listMaintenanceRequests({ status } = {}) {
+  const params = [];
+  let where = '';
+  if (status) { params.push(status); where = 'WHERE r.status = $1'; }
+  const { rows } = await pool.query(
+    `SELECT r.*, l.name AS location_name, a.name AS asset_name
+     FROM maintenance_requests r
+     LEFT JOIN locations l ON l.id = r.location_id
+     LEFT JOIN assets a ON a.id = r.asset_id
+     ${where}
+     ORDER BY r.created_at DESC`,
+    params
+  );
+  return rows.map(requestRowShape);
+}
+
+export async function getMaintenanceRequestDetail(id) {
+  const { rows } = await pool.query(
+    `SELECT r.*, l.name AS location_name, a.name AS asset_name, w.title AS work_order_title
+     FROM maintenance_requests r
+     LEFT JOIN locations l ON l.id = r.location_id
+     LEFT JOIN assets a ON a.id = r.asset_id
+     LEFT JOIN work_orders w ON w.id = r.work_order_id
+     WHERE r.id = $1`,
+    [id]
+  );
+  if (!rows[0]) return null;
+  const request = requestRowShape(rows[0]);
+
+  const fieldDefs = await adminListRequestFields(); // include inactive — old values may reference a since-retired field
+  const fieldByKey = new Map(fieldDefs.map((f) => [f.field_key, f]));
+  const { rows: valueRows } = await pool.query(
+    `SELECT field_key, value FROM maintenance_request_field_values WHERE request_id = $1`, [id]
+  );
+  request.CustomFields = valueRows.map((v) => ({
+    fieldKey: v.field_key, label: fieldByKey.get(v.field_key)?.label || v.field_key, value: v.value,
+  }));
+
+  const { rows: photoRows } = await pool.query(
+    `SELECT id, photo_url, created_at FROM maintenance_request_photos WHERE request_id = $1 ORDER BY id`, [id]
+  );
+  request.Photos = photoRows.map((p) => ({ Id: p.id, Url: p.photo_url, CreatedAt: p.created_at }));
+
+  return request;
+}
+
+export async function listRequestMessages(requestId) {
+  const { rows } = await pool.query(
+    `SELECT id, subject, body, to_email, sent_by, status, error, created_at
+     FROM maintenance_request_messages WHERE request_id = $1 ORDER BY created_at`,
+    [requestId]
+  );
+  return rows.map((m) => ({
+    Id: m.id, Subject: m.subject, Body: m.body, ToEmail: m.to_email,
+    SentBy: m.sent_by, Status: m.status, Error: m.error, CreatedAt: m.created_at,
+  }));
+}
+
+// Logs an email the caller already attempted to send (or failed to). Never
+// throws on its own — a logging hiccup shouldn't mask the original send result.
+export async function createRequestMessage(requestId, { subject, body, toEmail, sentBy, status = 'sent', error = null }) {
+  const { rows } = await pool.query(
+    `INSERT INTO maintenance_request_messages (request_id, subject, body, to_email, sent_by, status, error)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [requestId, subject, body, toEmail, sentBy, status, error]
+  );
+  await logActivity({
+    action: 'sent', entityType: 'maintenance_request_message', entityId: rows[0].id, entityLabel: subject,
+    details: `To ${toEmail}, on Request #${requestId}${status === 'failed' ? ' (FAILED)' : ''}`,
+  });
+  return rows[0];
+}
+
+export async function updateMaintenanceRequestStatus(id, { status, reviewNote }) {
+  const { rows } = await pool.query(
+    `UPDATE maintenance_requests SET
+       status = COALESCE($2, status), review_note = COALESCE($3, review_note),
+       reviewed_by = $4, reviewed_at = now()
+     WHERE id = $1 RETURNING *`,
+    [id, status ?? null, reviewNote ?? null, currentUsername()]
+  );
+  if (rows[0]) {
+    await logActivity({
+      action: 'updated', entityType: 'maintenance_request', entityId: rows[0].id,
+      entityLabel: rows[0].requester_name || rows[0].requester_email,
+      details: status ? `status → ${status}` : 'review note updated',
+    });
+  }
+  return rows[0] ? requestRowShape(rows[0]) : null;
+}
+
+export async function linkRequestToAsset(id, assetId) {
+  const { rows } = await pool.query(
+    `UPDATE maintenance_requests SET asset_id = $2 WHERE id = $1 RETURNING *`,
+    [id, assetId || null]
+  );
+  return rows[0] ? requestRowShape(rows[0]) : null;
+}
+
+// Deliberate, explicit action — never automatic. Creates a real Work Order
+// pre-filled from the request, and marks the request converted + linked.
+export async function convertRequestToWorkOrder(id, { scheduledDate } = {}) {
+  const { rows } = await pool.query(`SELECT * FROM maintenance_requests WHERE id = $1`, [id]);
+  const request = rows[0];
+  if (!request) return null;
+  if (request.work_order_id) {
+    const err = new Error('This request has already been converted to a Work Order');
+    err.status = 400;
+    throw err;
+  }
+  const title = `Request #${request.id}: ${(request.description || 'Maintenance request').slice(0, 80)}`;
+  const wo = await createWorkOrder({
+    title, assetId: request.asset_id, locationId: request.location_id,
+    priority: request.priority || 'Medium', description: request.description, scheduledDate,
+  });
+  const { rows: updated } = await pool.query(
+    `UPDATE maintenance_requests SET status = 'converted', work_order_id = $2, reviewed_by = $3, reviewed_at = now()
+     WHERE id = $1 RETURNING *`,
+    [id, wo.workOrderId, currentUsername()]
+  );
+  await logActivity({
+    action: 'converted', entityType: 'maintenance_request', entityId: id,
+    entityLabel: request.requester_name || request.requester_email, details: `→ Work Order #${wo.workOrderId}`,
+  });
+  return { request: requestRowShape(updated[0]), workOrderId: wo.workOrderId };
+}
