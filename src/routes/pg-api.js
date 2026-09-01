@@ -33,6 +33,8 @@ import {
   listVendors, createVendor, updateVendor, removeVendor,
   listSkills, createSkill, searchAssetsLive, createAssetQuick,
   listWorkOrderTasks, createWorkOrderTask, updateWorkOrderTask, deleteWorkOrderTask,
+  listWorkOrderPhotos, createWorkOrderPhoto, deleteWorkOrderPhoto,
+  listWorkOrderTaskPhotosForWorkOrder, createWorkOrderTaskPhoto, deleteWorkOrderTaskPhoto,
   listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
   listChecklistTemplates, createChecklistTemplate, updateChecklistTemplate, deleteChecklistTemplate,
@@ -554,12 +556,36 @@ router.get('/work-orders/:id', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    const [tasks, checklist, logEntries, crewSessions] = await Promise.all([
+    const [tasks, checklist, logEntries, crewSessions, photos, taskPhotosByTask] = await Promise.all([
       listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id), listWorkOrderLogEntries(req.params.id),
-      listCrewSessionsForWorkOrder(req.params.id),
+      listCrewSessionsForWorkOrder(req.params.id), listWorkOrderPhotos(req.params.id), listWorkOrderTaskPhotosForWorkOrder(req.params.id),
     ]);
-    res.json({ ...detail, tasks, checklist, logEntries, crewSessions });
+    for (const t of tasks) t.Photos = taskPhotosByTask.get(t.Id) || [];
+    res.json({ ...detail, tasks, checklist, logEntries, crewSessions, photos });
   } catch (e) { next(e); }
+});
+
+// ---- Work Order / Task photos ("solution" photos — proof a job got done) ----
+
+router.post('/work-orders/:id/photos', async (req, res, next) => {
+  try {
+    const { photoUrl, caption } = req.body || {};
+    if (!photoUrl) return res.status(400).json({ ok: false, error: 'photoUrl is required' });
+    res.json({ ok: true, photo: await createWorkOrderPhoto(req.params.id, { photoUrl, caption }) });
+  } catch (e) { next(e); }
+});
+router.delete('/work-order-photos/:photoId', async (req, res, next) => {
+  try { await deleteWorkOrderPhoto(req.params.photoId); res.json({ ok: true }); } catch (e) { next(e); }
+});
+router.post('/work-order-tasks/:taskId/photos', async (req, res, next) => {
+  try {
+    const { photoUrl } = req.body || {};
+    if (!photoUrl) return res.status(400).json({ ok: false, error: 'photoUrl is required' });
+    res.json({ ok: true, photo: await createWorkOrderTaskPhoto(req.params.taskId, photoUrl) });
+  } catch (e) { next(e); }
+});
+router.delete('/work-order-task-photos/:photoId', async (req, res, next) => {
+  try { await deleteWorkOrderTaskPhoto(req.params.photoId); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 router.post('/work-orders/:id/log', async (req, res, next) => {

@@ -1704,6 +1704,72 @@ export async function deleteWorkOrderTask(id) {
   if (rows[0]) await logActivity({ action: 'deleted', entityType: 'task', entityId: Number(id), entityLabel: rows[0].description, details: `On Work Order #${rows[0].work_order_id}` });
 }
 
+// ── Work Order / Task photos — "solution" photos (proof a job got done),
+//    distinct from every other photo locus in the schema (all audit/evidence:
+//    condition_findings = problem found, asset_photos/asset_components =
+//    asset reference/condition history, maintenance_request_photos = what the
+//    public reported). Storage here is uncapped by design — the report/export
+//    layer (reports.js + pdf.js) decides how many of these to show, not the
+//    schema. ────────────────────────────────────────────────────────────────
+
+export async function listWorkOrderPhotos(woId) {
+  const { rows } = await pool.query(
+    'SELECT id, photo_url, caption, sort_order, created_at FROM work_order_photos WHERE work_order_id = $1 ORDER BY sort_order, id',
+    [woId]
+  );
+  return rows.map((r) => ({ Id: r.id, Url: r.photo_url, Caption: r.caption, SortOrder: r.sort_order, CreatedAt: r.created_at }));
+}
+export async function createWorkOrderPhoto(woId, { photoUrl, caption }) {
+  const { rows: maxRows } = await pool.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM work_order_photos WHERE work_order_id = $1', [woId]);
+  const { rows } = await pool.query(
+    'INSERT INTO work_order_photos (work_order_id, photo_url, caption, sort_order, created_by) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+    [woId, photoUrl, caption || null, maxRows[0].next, currentUsername()]
+  );
+  await logActivity({ action: 'added photo to', entityType: 'work_order', entityId: Number(woId) });
+  return { Id: rows[0].id, Url: rows[0].photo_url, Caption: rows[0].caption, SortOrder: rows[0].sort_order, CreatedAt: rows[0].created_at };
+}
+export async function deleteWorkOrderPhoto(id) {
+  const { rows } = await pool.query('DELETE FROM work_order_photos WHERE id = $1 RETURNING work_order_id', [id]);
+  if (rows[0]) await logActivity({ action: 'removed photo from', entityType: 'work_order', entityId: rows[0].work_order_id });
+}
+
+export async function listWorkOrderTaskPhotos(taskId) {
+  const { rows } = await pool.query(
+    'SELECT id, photo_url, sort_order, created_at FROM work_order_task_photos WHERE task_id = $1 ORDER BY sort_order, id',
+    [taskId]
+  );
+  return rows.map((r) => ({ Id: r.id, Url: r.photo_url, SortOrder: r.sort_order, CreatedAt: r.created_at }));
+}
+// Fetches photos for every task on a WO in one query, keyed by task_id — the
+// WO detail view lists photos per task without an N+1 round trip per line.
+export async function listWorkOrderTaskPhotosForWorkOrder(woId) {
+  const { rows } = await pool.query(
+    `SELECT p.id, p.task_id, p.photo_url, p.sort_order, p.created_at FROM work_order_task_photos p
+     JOIN work_order_tasks t ON t.id = p.task_id WHERE t.work_order_id = $1 ORDER BY p.sort_order, p.id`,
+    [woId]
+  );
+  const byTask = new Map();
+  for (const r of rows) {
+    const list = byTask.get(r.task_id) || [];
+    list.push({ Id: r.id, Url: r.photo_url, SortOrder: r.sort_order, CreatedAt: r.created_at });
+    byTask.set(r.task_id, list);
+  }
+  return byTask;
+}
+export async function createWorkOrderTaskPhoto(taskId, photoUrl) {
+  const { rows: maxRows } = await pool.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM work_order_task_photos WHERE task_id = $1', [taskId]);
+  const { rows } = await pool.query(
+    'INSERT INTO work_order_task_photos (task_id, photo_url, sort_order, created_by) VALUES ($1,$2,$3,$4) RETURNING *',
+    [taskId, photoUrl, maxRows[0].next, currentUsername()]
+  );
+  const taskRes = await pool.query('SELECT description, work_order_id FROM work_order_tasks WHERE id = $1', [taskId]);
+  await logActivity({ action: 'added photo to', entityType: 'task', entityId: Number(taskId), entityLabel: taskRes.rows[0]?.description, details: `On Work Order #${taskRes.rows[0]?.work_order_id}` });
+  return { Id: rows[0].id, Url: rows[0].photo_url, SortOrder: rows[0].sort_order, CreatedAt: rows[0].created_at };
+}
+export async function deleteWorkOrderTaskPhoto(id) {
+  await pool.query('DELETE FROM work_order_task_photos WHERE id = $1', [id]);
+}
+
 // ── Calendar Events — independent of Work Orders (optional link either way).
 //    Recurrence is expanded on read for whatever date range is requested;
 //    no occurrence rows are stored. ──────────────────────────────────────────

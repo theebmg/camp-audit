@@ -3625,17 +3625,38 @@ async function renderWorkOrderDetail({ id }, container = app) {
   const allSkills = skillsRes.skills.map((s) => s.Name);
   const checklistTemplates = tplRes.templates;
   const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
-  const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist, logEntries, crewSessions } = detail;
+  const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist, logEntries, crewSessions, photos } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
 
+  // Small (56px) thumbnails, unbounded count — the schema doesn't cap how
+  // many "solution" photos a task or WO can have; only the report/export
+  // picker later limits how many actually go on the page.
+  const taskPhotoThumbs = (taskId, taskPhotos = []) => `
+    ${taskPhotos.map((p) => `
+      <div class="photo-thumb" style="width:56px;height:56px">
+        <img src="${p.Url}" alt="" />
+        <button type="button" class="photo-remove delete-task-photo" data-id="${p.Id}">&times;</button>
+      </div>`).join('')}
+    <button type="button" class="btn btn-secondary add-task-photo-btn" data-task-id="${taskId}" style="padding:4px 8px;font-size:0.8rem">📷 Add Photo</button>
+    <input type="file" class="task-photo-input" data-task-id="${taskId}" accept="image/*" capture="environment" multiple hidden />`;
+
   const taskRows = tasks.map((t) => `
-    <div class="list-item" style="cursor:default">
+    <div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start">
       <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
         <input type="checkbox" class="task-toggle" data-id="${t.Id}" ${t.Done ? 'checked' : ''} />
         <span style="${t.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(t.Description)}</span>
       </label>
       <button class="btn btn-secondary delete-task" data-id="${t.Id}" data-label="${escapeHtml(t.Description)}">Delete</button>
+      <div style="flex-basis:100%;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px">
+        ${taskPhotoThumbs(t.Id, t.Photos)}
+      </div>
     </div>`).join('') || '<p class="muted">No tasks yet — add the scope of work below.</p>';
+
+  const woPhotoRows = (photos || []).map((p) => `
+    <div class="photo-thumb">
+      <img src="${p.Url}" alt="${escapeHtml(p.Caption || '')}" />
+      <button type="button" class="photo-remove delete-wo-photo" data-id="${p.Id}">&times;</button>
+    </div>`).join('');
 
   const WO_STATUS_OPTIONS = ['Open', 'In Progress', 'On Hold', 'Urgent', 'Done'];
   const logRows = logEntries.map((e) => `
@@ -3709,8 +3730,16 @@ async function renderWorkOrderDetail({ id }, container = app) {
     </div>
 
     <div class="card">
+      <h3>Photos</h3>
+      <p class="muted">Finished-work photos for this job — "before/after/finished" shots, distinct from audit/condition photos. These are what a Reports export can attach.</p>
+      ${photos?.length ? `<div class="photo-grid">${woPhotoRows}</div>` : '<p class="muted">No photos yet.</p>'}
+      <input type="file" id="woPhotoInput" accept="image/*" capture="environment" multiple hidden />
+      <button type="button" class="btn btn-secondary" id="addWoPhotoBtn">+ Add Photo</button>
+    </div>
+
+    <div class="card">
       <h3>Tasks</h3>
-      <p class="muted">The scope of work — plain checklist items, not tied to any audit field.</p>
+      <p class="muted">The scope of work — plain checklist items, not tied to any audit field. Each task can carry its own completion photos too.</p>
       ${taskRows}
       <div class="inline-add-row"><input class="new-task-input" placeholder="Add a task…" /><button type="button" class="btn btn-secondary" id="addTaskBtn">+</button></div>
     </div>
@@ -3856,6 +3885,45 @@ async function renderWorkOrderDetail({ id }, container = app) {
   container.querySelectorAll('.delete-task').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Delete task "${btn.dataset.label}"?`)) return;
     try { await api(`/api/pg/work-order-tasks/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
+    catch (err) { toast(err.message); }
+  }));
+
+  container.querySelector('#addWoPhotoBtn')?.addEventListener('click', () => container.querySelector('#woPhotoInput').click());
+  container.querySelector('#woPhotoInput')?.addEventListener('change', async (e) => {
+    const files = [...e.target.files];
+    if (!files.length) return;
+    try {
+      for (const file of files) {
+        const url = await uploadPhotoFile(file, 'work-orders', id);
+        await api(`/api/pg/work-orders/${id}/photos`, { method: 'POST', body: JSON.stringify({ photoUrl: url }) });
+      }
+      renderWorkOrderDetail({ id }, container);
+    } catch (err) { toast(err.message); }
+  });
+  container.querySelectorAll('.delete-wo-photo').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog('Delete this photo?')) return;
+    try { await api(`/api/pg/work-order-photos/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
+    catch (err) { toast(err.message); }
+  }));
+
+  container.querySelectorAll('.add-task-photo-btn').forEach((btn) => btn.addEventListener('click', () => {
+    container.querySelector(`.task-photo-input[data-task-id="${btn.dataset.taskId}"]`).click();
+  }));
+  container.querySelectorAll('.task-photo-input').forEach((input) => input.addEventListener('change', async (e) => {
+    const files = [...e.target.files];
+    if (!files.length) return;
+    const taskId = input.dataset.taskId;
+    try {
+      for (const file of files) {
+        const url = await uploadPhotoFile(file, 'work-order-tasks', taskId);
+        await api(`/api/pg/work-order-tasks/${taskId}/photos`, { method: 'POST', body: JSON.stringify({ photoUrl: url }) });
+      }
+      renderWorkOrderDetail({ id }, container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.delete-task-photo').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog('Delete this photo?')) return;
+    try { await api(`/api/pg/work-order-task-photos/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   }));
 
