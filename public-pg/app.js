@@ -3404,6 +3404,10 @@ async function renderNewWorkOrder({ assetId, assetName }) {
           <select name="priority"><option>Low</option><option selected>Medium</option><option>High</option><option>Urgent</option></select>
         </div>
         <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" /></div>
+        <div class="field-row"><label>Responsible Party</label>
+          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="responsibleSelf" style="margin-right:6px" />Self</label>
+          <p class="muted" style="margin-top:4px">Volunteers/Vendors are assigned after creation, from the work order's detail page.</p>
+        </div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
         <div class="field-row"><label>Tasks (scope of work)</label>
           <div class="task-rows"></div>
@@ -3463,6 +3467,7 @@ async function renderNewWorkOrder({ assetId, assetName }) {
       const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({
         title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description'),
         scheduledDate: fd.get('scheduledDate') || undefined, tasks, assetUpdates,
+        responsibleSelf: fd.has('responsibleSelf'),
       }) });
       toast('Work order created');
       go('workOrderDetail', { id: result.workOrderId }, { replace: true });
@@ -3713,6 +3718,13 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <div class="field-row"><label>Priority</label>
           <select name="priority">${['Low', 'Medium', 'High', 'Urgent'].map((s) => `<option ${wo.Priority === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         </div>
+        <div class="field-row"><label>Responsible Party</label>
+          <div class="skill-chips">
+            <label class="skill-chip ${wo.ResponsibleSelf ? 'selected' : ''}" style="cursor:pointer"><input type="checkbox" name="responsibleSelf" style="margin-right:6px" ${wo.ResponsibleSelf ? 'checked' : ''} />Self</label>
+            <span class="pill ${volunteers.length ? 'good' : ''}" title="Set in Assigned Crew below">Volunteer${volunteers.length ? '' : ' (none assigned)'}</span>
+            <span class="pill ${vendors.length ? 'good' : ''}" title="Set in Assigned Crew below">Vendor${vendors.length ? '' : ' (none assigned)'}</span>
+          </div>
+        </div>
         <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" value="${(wo['Scheduled Date'] || '').slice(0, 10)}" /></div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(wo.Description || '')}</textarea></div>
         <div class="field-row"><label>Estimated Hours</label><input name="estimatedHours" type="number" value="${wo['Estimated Hours'] ?? ''}" /></div>
@@ -3830,6 +3842,11 @@ async function renderWorkOrderDetail({ id }, container = app) {
   const assetPicker = mountAssetCombobox(container.querySelector('#woAssetPicker'), { initialAsset: wo.Asset });
   const fundingFieldsCtrl = wireFundingFields(container.querySelector('#woFieldsForm'), fundingEntities, wo, () => assetPicker.getSelected());
 
+  const selfCheckbox = container.querySelector('input[name="responsibleSelf"]');
+  selfCheckbox?.addEventListener('change', () => {
+    selfCheckbox.closest('.skill-chip').classList.toggle('selected', selfCheckbox.checked);
+  });
+
   container.querySelector('#woFieldsForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!await confirmDialog('Save changes to this work order?')) return;
@@ -3849,6 +3866,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
         estimatedHours: fd.get('estimatedHours'), actualHours: fd.get('actualHours'),
         estimatedCost: fd.get('estimatedCost'), actualCost: fd.get('actualCost'),
         fundingSource, fundingRefId,
+        responsibleSelf: fd.has('responsibleSelf'),
       }) });
       toast('Work order updated');
       renderWorkOrderDetail({ id }, container);

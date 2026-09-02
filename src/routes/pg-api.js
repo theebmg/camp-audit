@@ -650,9 +650,9 @@ router.delete('/work-order-tasks/:taskId', async (req, res, next) => {
 
 router.post('/work-orders', async (req, res, next) => {
   try {
-    const { title, assetId, locationId, priority, description, scheduledDate, assetUpdates, tasks } = req.body || {};
+    const { title, assetId, locationId, priority, description, scheduledDate, responsibleSelf, assetUpdates, tasks } = req.body || {};
     if (!title) return res.status(400).json({ ok: false, error: 'title is required' });
-    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates, tasks });
+    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, responsibleSelf, assetUpdates, tasks });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
@@ -683,6 +683,7 @@ router.patch('/work-orders/:id', async (req, res, next) => {
     if (body.actualCost !== undefined) fields.actual_cost = body.actualCost === '' ? null : Number(body.actualCost);
     if (body.fundingSource != null) fields.funding_source = body.fundingSource;
     if (body.fundingRefId !== undefined) fields.funding_ref_id = body.fundingRefId === '' ? null : Number(body.fundingRefId);
+    if (body.responsibleSelf !== undefined) fields.responsible_self = !!body.responsibleSelf;
     const detail = await updateWorkOrder(req.params.id, fields);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
     res.json({ ok: true, ...detail });

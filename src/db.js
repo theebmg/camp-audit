@@ -1084,6 +1084,7 @@ export async function getWorkOrderDetail(woId) {
       'Estimated Hours': w.estimated_hours, 'Actual Hours': w.actual_hours,
       'Estimated Cost': w.estimated_cost, 'Actual Cost': w.actual_cost,
       Description: w.description,
+      ResponsibleSelf: w.responsible_self,
       Asset: w.asset_id ? { Id: w.asset_id, Name: w.asset_name, LodgeHolder: w.asset_lodge_holder } : null,
       Location: w.location_id ? { Id: w.location_id, Name: w.location_name } : null,
       FundingSource: w.funding_source, FundingRefId: w.funding_ref_id, FundingRefLabel: fundingRefLabel,
@@ -1105,7 +1106,7 @@ async function getFundingRefLabel(fundingSource, fundingRefId) {
 
 const today = () => new Date().toISOString().slice(0, 10);
 
-export async function createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates = [], tasks = [] }) {
+export async function createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, responsibleSelf, assetUpdates = [], tasks = [] }) {
   const propertyFields = await getAssetPropertyFields();
   const byLabel = new Map(propertyFields.map((f) => [f.title, f]));
 
@@ -1113,9 +1114,9 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO work_orders (title, asset_id, location_id, priority, status, description, date_reported, scheduled_date)
-       VALUES ($1,$2,$3,$4,'Open',$5,$6,$7) RETURNING id`,
-      [title, assetId || null, locationId || null, priority || 'Medium', description || null, today(), scheduledDate || null]
+      `INSERT INTO work_orders (title, asset_id, location_id, priority, status, description, date_reported, scheduled_date, responsible_self)
+       VALUES ($1,$2,$3,$4,'Open',$5,$6,$7,$8) RETURNING id`,
+      [title, assetId || null, locationId || null, priority || 'Medium', description || null, today(), scheduledDate || null, !!responsibleSelf]
     );
     const woId = rows[0].id;
     const created = [];
@@ -1150,7 +1151,7 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
 export async function updateWorkOrder(woId, fields) {
   const allowed = ['title', 'description', 'priority', 'status', 'date_reported', 'date_completed',
     'scheduled_date', 'asset_id', 'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost',
-    'funding_source', 'funding_ref_id'];
+    'funding_source', 'funding_ref_id', 'responsible_self'];
   const setCols = [];
   const vals = [];
   let i = 1;
