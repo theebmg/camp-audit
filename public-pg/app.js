@@ -39,6 +39,20 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+function slugify(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''); }
+
+function downloadBlob(content, filename, mime) {
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 // In-page replacement for the browser's window.confirm — a floating modal
 // instead of native browser chrome. Resolves true/false the same way, so
 // every call site just becomes `await confirmDialog(...)`.
@@ -1598,7 +1612,36 @@ function reportPresets(entity) {
   return [];
 }
 
+// Reports has three tools sharing one nav entry (data explorer + the two
+// board-facing snapshot reports) — a shared tab bar switches between them via
+// a `mode` param, each tool otherwise fully independent.
+const REPORT_TABS = [
+  { key: 'explorer', label: 'Data Explorer' },
+  { key: 'board', label: 'Board Report' },
+  { key: 'forwardFocus', label: 'Forward Focus' },
+];
+function reportsTabsHtml(mode) {
+  return `<div class="card">
+    <div class="view-toggle">
+      ${REPORT_TABS.map((t) => `<button type="button" class="view-toggle-btn reports-tab-btn ${mode === t.key ? 'active' : ''}" data-mode="${t.key}">${escapeHtml(t.label)}</button>`).join('')}
+    </div>
+  </div>`;
+}
+function wireReportsTabs(container = app) {
+  container.querySelectorAll('.reports-tab-btn').forEach((btn) => btn.addEventListener('click', () => {
+    if (btn.classList.contains('active')) return;
+    go('reports', { mode: btn.dataset.mode }, { replace: true });
+  }));
+}
+
 async function renderReports(params = {}) {
+  const mode = REPORT_TABS.some((t) => t.key === params.mode) ? params.mode : 'explorer';
+  if (mode === 'board') return renderBoardReport();
+  if (mode === 'forwardFocus') return renderForwardFocusReport();
+  return renderReportsExplorer(params);
+}
+
+async function renderReportsExplorer(params = {}) {
   setChrome({ title: 'Reports', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
 
@@ -1714,6 +1757,7 @@ async function renderReports(params = {}) {
     const presets = reportPresets(entity);
     const hasActiveFilters = Object.keys(selectedFilters).length > 0;
     setApp(`
+      ${reportsTabsHtml('explorer')}
       <div class="card">
         <div class="view-toggle">
           ${REPORT_ENTITIES.map((e) => `<button type="button" class="view-toggle-btn entity-switch ${entity === e.key ? 'active' : ''}" data-entity="${e.key}">${escapeHtml(e.label)}</button>`).join('')}
@@ -1794,6 +1838,7 @@ async function renderReports(params = {}) {
   }
 
   function wire() {
+    wireReportsTabs();
     app.querySelectorAll('.entity-switch').forEach((btn) => {
       btn.addEventListener('click', async () => {
         if (btn.dataset.entity === entity) return;
@@ -1891,6 +1936,121 @@ async function renderReports(params = {}) {
 
   await loadSchema();
   await Promise.all([loadData(), loadFavorites()]);
+  draw();
+}
+
+// ---------- Board / Forward Focus reports: generate → preview iframe →
+// print/download/email, mirroring the legacy Activity/Capital report UI in
+// public/app.js but hitting the pg-api board/forward-focus endpoints. ----------
+
+function reportPreviewAreaHtml(report) {
+  if (!report) return '';
+  return `
+    <div class="card">
+      <h3>${escapeHtml(report.title)}</h3>
+      <iframe id="reportFrame" style="width:100%;height:480px;border:1px solid var(--border);border-radius:var(--radius);background:#fff"></iframe>
+      <div class="btn-row" style="margin-top:10px">
+        <button type="button" class="btn btn-secondary" id="reportPrintBtn">Print / Save as PDF</button>
+        <button type="button" class="btn btn-secondary" id="reportDlHtmlBtn">Download HTML</button>
+        <button type="button" class="btn btn-secondary" id="reportDlTextBtn">Download Text</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Email It</h3>
+      <div class="field-row"><label>Recipient</label><input type="email" id="reportRecipient" placeholder="someone@example.com" /></div>
+      <div class="field-row"><label>Subject</label><input type="text" id="reportSubject" value="Camp Sychar — ${escapeHtml(report.title)}" /></div>
+      <div class="btn-row"><button type="button" class="btn btn-primary" id="reportSendBtn">Send Email</button></div>
+    </div>`;
+}
+function wireReportPreviewArea(report, { sendPath, sendBody }) {
+  if (!report) return;
+  const frame = document.getElementById('reportFrame');
+  frame.srcdoc = report.html;
+  document.getElementById('reportPrintBtn').addEventListener('click', () => { frame.contentWindow.focus(); frame.contentWindow.print(); });
+  document.getElementById('reportDlHtmlBtn').addEventListener('click', () => downloadBlob(report.html, `${slugify(report.title)}.html`, 'text/html'));
+  document.getElementById('reportDlTextBtn').addEventListener('click', () => downloadBlob(report.text, `${slugify(report.title)}.txt`, 'text/plain'));
+  document.getElementById('reportSendBtn').addEventListener('click', async () => {
+    const recipient = document.getElementById('reportRecipient').value.trim();
+    const subject = document.getElementById('reportSubject').value.trim();
+    if (!recipient) { toast('Enter a recipient email'); return; }
+    const btn = document.getElementById('reportSendBtn');
+    btn.textContent = 'Sending…'; btn.disabled = true;
+    try {
+      await api(sendPath, { method: 'POST', body: JSON.stringify({ ...sendBody(), recipient, subject }) });
+      toast('Report emailed');
+    } catch (err) { toast(err.message); }
+    finally { btn.textContent = 'Send Email'; btn.disabled = false; }
+  });
+}
+
+async function renderBoardReport() {
+  setChrome({ title: 'Reports', showBack: false, showLogout: true });
+  const todayStr = isoDate(new Date());
+  const monthStartStr = isoDate(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
+  let periodStart = monthStartStr;
+  let periodEnd = todayStr;
+  let report = null;
+  let generating = false;
+
+  function draw() {
+    setApp(`
+      ${reportsTabsHtml('board')}
+      <div class="card">
+        <h3>Board Report</h3>
+        <p class="muted">Open Work Orders by status/priority, outstanding cost by funding source, completed items for the period below, and what's overdue/upcoming right now.</p>
+        <div class="field-row"><label>Period</label>
+          <div class="report-date-range">
+            <input type="date" id="boardFrom" value="${periodStart}" />
+            <span class="muted">to</span>
+            <input type="date" id="boardTo" value="${periodEnd}" />
+          </div>
+        </div>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="boardGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
+      </div>
+      ${reportPreviewAreaHtml(report)}`);
+    wireReportsTabs();
+    document.getElementById('boardGenBtn').addEventListener('click', generate);
+    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/board/send', sendBody: () => ({ periodStart, periodEnd }) });
+  }
+
+  async function generate() {
+    periodStart = document.getElementById('boardFrom').value || periodStart;
+    periodEnd = document.getElementById('boardTo').value || periodEnd;
+    generating = true; draw();
+    try { report = await api(`/api/pg/reports/board/preview?periodStart=${periodStart}&periodEnd=${periodEnd}`); }
+    catch (err) { toast(err.message); }
+    generating = false; draw();
+  }
+
+  draw();
+}
+
+async function renderForwardFocusReport() {
+  setChrome({ title: 'Reports', showBack: false, showLogout: true });
+  let report = null;
+  let generating = false;
+
+  function draw() {
+    setApp(`
+      ${reportsTabsHtml('forwardFocus')}
+      <div class="card">
+        <h3>Forward Focus</h3>
+        <p class="muted">Work Orders and Condition Findings flagged for board focus, sorted by cost — a recurring PM item shows the historical average actual cost of past instances instead of its estimate.</p>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="ffGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
+      </div>
+      ${reportPreviewAreaHtml(report)}`);
+    wireReportsTabs();
+    document.getElementById('ffGenBtn').addEventListener('click', generate);
+    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/forward-focus/send', sendBody: () => ({}) });
+  }
+
+  async function generate() {
+    generating = true; draw();
+    try { report = await api('/api/pg/reports/forward-focus/preview'); }
+    catch (err) { toast(err.message); }
+    generating = false; draw();
+  }
+
   draw();
 }
 
@@ -2799,7 +2959,7 @@ function wireRecurrenceToggle(root) {
 // dropdown scoped to that WO's tasks; picking a task narrows Title further to
 // the task's own text. This only fires on user-driven changes — initial render
 // for an existing event never overwrites its saved fields.
-function calendarLinkFieldsHtml({ workOrders, initialTasks = [], ev = {} }) {
+function calendarLinkFieldsHtml({ workOrders, workOrderTemplates = [], initialTasks = [], ev = {} }) {
   const hasWo = !!ev.WorkOrderId;
   return `
     <div class="field-row"><label>Link to Work Order (optional)</label>
@@ -2814,12 +2974,20 @@ function calendarLinkFieldsHtml({ workOrders, initialTasks = [], ev = {} }) {
         <option value="">— whole work order —</option>
         ${initialTasks.map((t) => `<option value="${t.Id}" ${ev.WorkOrderTaskId === t.Id ? 'selected' : ''}>${escapeHtml(t.Description)}${t.Done ? ' (done)' : ''}</option>`).join('')}
       </select>
+    </div>
+    <div class="field-row"><label>Auto-generate from PM Template (optional)</label>
+      <select name="workOrderTemplateId" id="linkWoTemplateId">
+        <option value="">— none —</option>
+        ${workOrderTemplates.map((t) => `<option value="${t.Id}" ${ev.WorkOrderTemplateId === t.Id ? 'selected' : ''}>${escapeHtml(t.Name)}</option>`).join('')}
+      </select>
+      <p class="muted" style="font-size:0.82rem;margin:4px 0 0">Each due occurrence auto-generates a real Work Order from this template — use this instead of "Link to Work Order" for recurring PM (set Repeats above too).</p>
     </div>`;
 }
 function wireCalendarLinkFields(root) {
   const woSelect = root.querySelector('#linkWorkOrderId');
   const taskRow = root.querySelector('#linkTaskRow');
   const taskSelect = root.querySelector('#linkTaskId');
+  const tplSelect = root.querySelector('#linkWoTemplateId');
   const titleInput = root.querySelector('[name="title"]');
   const descInput = root.querySelector('[name="description"]');
   const dateInput = root.querySelector('[name="eventDate"]');
@@ -2831,6 +2999,7 @@ function wireCalendarLinkFields(root) {
     currentTasks = [];
     if (!woId) { taskRow.hidden = true; return; }
     taskRow.hidden = false;
+    tplSelect.value = '';
     const { workOrder, tasks } = await api(`/api/pg/work-orders/${woId}`);
     currentTasks = tasks;
     taskSelect.innerHTML += tasks.map((t) => `<option value="${t.Id}">${escapeHtml(t.Description)}${t.Done ? ' (done)' : ''}</option>`).join('');
@@ -2849,11 +3018,20 @@ function wireCalendarLinkFields(root) {
       descInput.value = `Task from Work Order: ${woLabel}`;
     }
   });
+
+  tplSelect.addEventListener('change', () => {
+    if (!tplSelect.value) return;
+    woSelect.value = '';
+    taskRow.hidden = true;
+    taskSelect.innerHTML = '<option value="">— whole work order —</option>';
+  });
 }
 
 async function renderNewCalendarEvent(params = {}) {
   setChrome({ title: 'New Calendar Event', showBack: true, showLogout: true });
-  const { workOrders } = await api('/api/pg/work-orders');
+  const [{ workOrders }, { templates: workOrderTemplates }] = await Promise.all([
+    api('/api/pg/work-orders'), api('/api/pg/work-order-templates'),
+  ]);
   setApp(`
     <div class="card">
       <h3>New Calendar Event</h3>
@@ -2862,7 +3040,7 @@ async function renderNewCalendarEvent(params = {}) {
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${params.date || ''}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
         ${recurrenceFieldsHtml()}
-        ${calendarLinkFieldsHtml({ workOrders })}
+        ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates })}
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Create Event</button>
           <button class="btn btn-secondary" type="button" id="cancelEventBtn">Cancel</button>
@@ -2882,6 +3060,7 @@ async function renderNewCalendarEvent(params = {}) {
         recurrenceEndDate: fd.get('recurrenceEndDate') || undefined,
         workOrderId: fd.get('workOrderId') || undefined,
         workOrderTaskId: fd.get('workOrderTaskId') || undefined,
+        workOrderTemplateId: fd.get('workOrderTemplateId') || undefined,
       }) });
       toast('Event created');
       go('calendarEventDetail', { id: event.Id }, { replace: true });
@@ -2892,12 +3071,13 @@ async function renderNewCalendarEvent(params = {}) {
 async function renderCalendarEventDetail({ id }) {
   setChrome({ title: 'Calendar Event', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const [detail, workOrdersRes, tplRes] = await Promise.all([
-    api(`/api/pg/calendar-events/${id}`), api('/api/pg/work-orders'), api('/api/pg/checklist-templates'),
+  const [detail, workOrdersRes, tplRes, woTplRes] = await Promise.all([
+    api(`/api/pg/calendar-events/${id}`), api('/api/pg/work-orders'), api('/api/pg/checklist-templates'), api('/api/pg/work-order-templates'),
   ]);
   const { event: ev, checklist } = detail;
   const { workOrders } = workOrdersRes;
   const checklistTemplates = tplRes.templates;
+  const workOrderTemplates = woTplRes.templates;
   const initialTasks = ev.WorkOrderId ? (await api(`/api/pg/work-orders/${ev.WorkOrderId}`)).tasks : [];
 
   const checklistHtml = checklist ? checklistHtmlFor(checklist)
@@ -2915,7 +3095,7 @@ async function renderCalendarEventDetail({ id }) {
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${(ev.EventDate || '').slice(0, 10)}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(ev.Description || '')}</textarea></div>
         ${recurrenceFieldsHtml(ev)}
-        ${calendarLinkFieldsHtml({ workOrders, initialTasks, ev })}
+        ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates, initialTasks, ev })}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       ${ev.WorkOrderId ? `<div class="btn-row"><button class="btn btn-secondary" id="viewWoBtn">View Linked Work Order</button></div>` : ''}
@@ -2937,7 +3117,7 @@ async function renderCalendarEventDetail({ id }) {
         title: fd.get('title'), eventDate: fd.get('eventDate'), description: fd.get('description'),
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || '', workOrderId: fd.get('workOrderId') || '',
-        workOrderTaskId: fd.get('workOrderTaskId') || '',
+        workOrderTaskId: fd.get('workOrderTaskId') || '', workOrderTemplateId: fd.get('workOrderTemplateId') || '',
       }) });
       toast('Event updated');
       renderCalendarEventDetail({ id });
