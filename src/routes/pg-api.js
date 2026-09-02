@@ -37,6 +37,7 @@ import {
   listWorkOrderTaskPhotosForWorkOrder, createWorkOrderTaskPhoto, deleteWorkOrderTaskPhoto,
   listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
+  generateDueWorkOrdersForRange,
   listChecklistTemplates, createChecklistTemplate, updateChecklistTemplate, deleteChecklistTemplate,
   getChecklistInstanceForWorkOrder, getChecklistInstanceForCalendarEvent,
   attachChecklistToWorkOrder, attachChecklistToCalendarEvent, detachChecklistInstance, toggleChecklistStep,
@@ -810,15 +811,15 @@ router.get('/work-order-templates', async (req, res, next) => {
 });
 router.post('/work-order-templates', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults } = req.body || {};
+    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults }) });
+    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds }) });
   } catch (e) { next(e); }
 });
 router.patch('/work-order-templates/:id', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults } = req.body || {};
-    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults });
+    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds } = req.body || {};
+    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds });
     if (!template) return res.status(404).json({ ok: false, error: 'Template not found' });
     res.json({ ok: true, template });
   } catch (e) { next(e); }
@@ -833,6 +834,7 @@ router.get('/calendar-events', async (req, res, next) => {
   try {
     const { from, to } = req.query;
     if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to (YYYY-MM-DD) are required' });
+    await generateDueWorkOrdersForRange(from, to);
     res.json({ occurrences: await listCalendarEventOccurrences(from, to) });
   } catch (e) { next(e); }
 });
@@ -846,9 +848,9 @@ router.get('/calendar-events/:id', async (req, res, next) => {
 });
 router.post('/calendar-events', async (req, res, next) => {
   try {
-    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId } = req.body || {};
+    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId, workOrderTemplateId } = req.body || {};
     if (!title || !eventDate) return res.status(400).json({ ok: false, error: 'title and eventDate are required' });
-    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId }) });
+    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId, workOrderTemplateId }) });
   } catch (e) { next(e); }
 });
 router.patch('/calendar-events/:id', async (req, res, next) => {
@@ -863,6 +865,7 @@ router.patch('/calendar-events/:id', async (req, res, next) => {
     if (body.recurrenceEndDate !== undefined) fields.recurrence_end_date = body.recurrenceEndDate;
     if (body.workOrderId !== undefined) fields.work_order_id = body.workOrderId === '' ? null : Number(body.workOrderId);
     if (body.workOrderTaskId !== undefined) fields.work_order_task_id = body.workOrderTaskId === '' ? null : Number(body.workOrderTaskId);
+    if (body.workOrderTemplateId !== undefined) fields.work_order_template_id = body.workOrderTemplateId === '' ? null : Number(body.workOrderTemplateId);
     const event = await updateCalendarEvent(req.params.id, fields);
     if (!event) return res.status(404).json({ ok: false, error: 'Event not found' });
     res.json({ ok: true, event });

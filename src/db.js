@@ -1251,30 +1251,35 @@ function templateRowShape(r) {
   return {
     Id: r.id, Name: r.name, DefaultTitle: r.default_title, DefaultPriority: r.default_priority,
     DefaultDescription: r.default_description, TaskDefaults: r.task_defaults, JobLineDefaults: r.job_line_defaults,
+    ResponsibleSelf: r.responsible_self, PresetVolunteerIds: r.preset_volunteer_ids, PresetVendorIds: r.preset_vendor_ids,
   };
 }
 export async function listWorkOrderTemplates() {
   const { rows } = await pool.query('SELECT * FROM work_order_templates ORDER BY name');
   return rows.map(templateRowShape);
 }
-export async function createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, taskDefaults = [], jobLineDefaults = [] }) {
+export async function createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, taskDefaults = [], jobLineDefaults = [], responsibleSelf, presetVolunteerIds = [], presetVendorIds = [] }) {
   const { rows } = await pool.query(
-    `INSERT INTO work_order_templates (name, default_title, default_priority, default_description, task_defaults, job_line_defaults)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [name, defaultTitle || null, defaultPriority || null, defaultDescription || null, JSON.stringify(taskDefaults), JSON.stringify(jobLineDefaults)]
+    `INSERT INTO work_order_templates (name, default_title, default_priority, default_description, task_defaults, job_line_defaults, responsible_self, preset_volunteer_ids, preset_vendor_ids)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [name, defaultTitle || null, defaultPriority || null, defaultDescription || null, JSON.stringify(taskDefaults), JSON.stringify(jobLineDefaults),
+      !!responsibleSelf, presetVolunteerIds, presetVendorIds]
   );
   await logActivity({ action: 'created', entityType: 'work_order_template', entityId: rows[0].id, entityLabel: rows[0].name });
   return templateRowShape(rows[0]);
 }
-export async function updateWorkOrderTemplate(id, { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults }) {
+export async function updateWorkOrderTemplate(id, { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds }) {
   const { rows } = await pool.query(
     `UPDATE work_order_templates SET
        name = COALESCE($2,name), default_title = COALESCE($3,default_title),
        default_priority = COALESCE($4,default_priority), default_description = COALESCE($5,default_description),
-       task_defaults = COALESCE($6,task_defaults), job_line_defaults = COALESCE($7,job_line_defaults)
+       task_defaults = COALESCE($6,task_defaults), job_line_defaults = COALESCE($7,job_line_defaults),
+       responsible_self = COALESCE($8,responsible_self), preset_volunteer_ids = COALESCE($9,preset_volunteer_ids),
+       preset_vendor_ids = COALESCE($10,preset_vendor_ids)
      WHERE id = $1 RETURNING *`,
     [id, name ?? null, defaultTitle ?? null, defaultPriority ?? null, defaultDescription ?? null,
-      taskDefaults ? JSON.stringify(taskDefaults) : null, jobLineDefaults ? JSON.stringify(jobLineDefaults) : null]
+      taskDefaults ? JSON.stringify(taskDefaults) : null, jobLineDefaults ? JSON.stringify(jobLineDefaults) : null,
+      responsibleSelf ?? null, presetVolunteerIds ?? null, presetVendorIds ?? null]
   );
   if (rows[0]) await logActivity({ action: 'updated', entityType: 'work_order_template', entityId: rows[0].id, entityLabel: rows[0].name });
   return rows[0] ? templateRowShape(rows[0]) : null;
@@ -1282,6 +1287,46 @@ export async function updateWorkOrderTemplate(id, { name, defaultTitle, defaultP
 export async function deleteWorkOrderTemplate(id) {
   const { rows } = await pool.query('DELETE FROM work_order_templates WHERE id = $1 RETURNING name', [id]);
   if (rows[0]) await logActivity({ action: 'deleted', entityType: 'work_order_template', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+// Instantiates a template into a real Work Order — used by PM auto-generation
+// (see generateDueWorkOrdersForRange) where there's no browser session to do
+// the client-side prefill renderNewWorkOrder does. task_defaults/job_line_defaults
+// are already in createWorkOrder's tasks/assetUpdates shape (same arrays the
+// New Work Order form builds from a template pick), so no reshaping needed.
+export async function createWorkOrderFromTemplate(templateId, { assetId, locationId, scheduledDate } = {}) {
+  const { rows } = await pool.query('SELECT * FROM work_order_templates WHERE id = $1', [templateId]);
+  const tpl = rows[0];
+  if (!tpl) throw new Error(`Work Order Template #${templateId} not found`);
+  const { workOrderId } = await createWorkOrder({
+    title: tpl.default_title || tpl.name,
+    assetId, locationId,
+    priority: tpl.default_priority,
+    description: tpl.default_description,
+    scheduledDate,
+    responsibleSelf: tpl.responsible_self,
+    assetUpdates: tpl.job_line_defaults || [],
+    tasks: tpl.task_defaults || [],
+  });
+  if (tpl.preset_volunteer_ids?.length || tpl.preset_vendor_ids?.length) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const volunteerId of tpl.preset_volunteer_ids || []) {
+        await client.query(`INSERT INTO work_order_volunteers (work_order_id, volunteer_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [workOrderId, volunteerId]);
+      }
+      for (const vendorId of tpl.preset_vendor_ids || []) {
+        await client.query(`INSERT INTO work_order_vendors (work_order_id, vendor_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [workOrderId, vendorId]);
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+  return workOrderId;
 }
 
 // targetField is a property-field LABEL (matches an asset_property_fields.label),
@@ -1819,12 +1864,21 @@ function calendarEventRowShape(r) {
     RecurrenceType: r.recurrence_type, RecurrenceInterval: r.recurrence_interval, RecurrenceEndDate: r.recurrence_end_date,
     WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title,
     WorkOrderTaskId: r.work_order_task_id, TaskDescription: r.task_description,
+    WorkOrderTemplateId: r.work_order_template_id,
   };
 }
 
 // Expands recurring events into their occurrence dates within [fromDate, toDate]
 // (YYYY-MM-DD strings). Each returned entry is one occurrence, tagged with its
 // concrete Date so the calendar can place it on the right day.
+//
+// A PM-template-linked event has no static work_order_id of its own — each
+// occurrence gets its own generated Work Order once due (see
+// generateDueWorkOrdersForRange), so occurrences are joined against
+// calendar_event_generated_wo and WorkOrderId/WorkOrderTitle are overridden
+// per-occurrence when one has been generated. This means the existing
+// WorkOrderId-based "View Linked Work Order" UI keeps working unchanged
+// instead of a occurrence showing as a phantom entry with no real WO.
 export async function listCalendarEventOccurrences(fromDate, toDate) {
   const { rows } = await pool.query(
     `SELECT e.*, w.title AS wo_title, t.description AS task_description FROM calendar_events e
@@ -1833,16 +1887,75 @@ export async function listCalendarEventOccurrences(fromDate, toDate) {
      WHERE e.event_date <= $2 AND (e.recurrence_end_date IS NULL OR e.recurrence_end_date >= $1)`,
     [fromDate, toDate]
   );
+  const { rows: genRows } = await pool.query(
+    `SELECT g.calendar_event_id, g.occurrence_date, g.work_order_id, w.title AS wo_title
+     FROM calendar_event_generated_wo g JOIN work_orders w ON w.id = g.work_order_id
+     WHERE g.occurrence_date BETWEEN $1 AND $2`,
+    [fromDate, toDate]
+  );
+  const genByKey = new Map(genRows.map((r) => [`${r.calendar_event_id}:${r.occurrence_date.toISOString().slice(0, 10)}`, r]));
   const rangeStart = new Date(fromDate);
   const rangeEnd = new Date(toDate);
   const out = [];
   for (const row of rows) {
     const shaped = calendarEventRowShape(row);
     for (const occDate of expandRecurrence(row, rangeStart, rangeEnd)) {
-      out.push({ ...shaped, OccurrenceDate: occDate.toISOString().slice(0, 10) });
+      const occStr = occDate.toISOString().slice(0, 10);
+      const gen = genByKey.get(`${row.id}:${occStr}`);
+      out.push({
+        ...shaped,
+        OccurrenceDate: occStr,
+        WorkOrderId: gen ? gen.work_order_id : shaped.WorkOrderId,
+        WorkOrderTitle: gen ? gen.wo_title : shaped.WorkOrderTitle,
+      });
     }
   }
   return out;
+}
+
+// PM auto-generation: for every occurrence in [fromDate, min(toDate, today)]
+// of a Calendar Event linked to a Work Order Template, generate its Work
+// Order if it hasn't been already. Capping at today means opening the
+// calendar for a future month never generates anything early. Called from
+// the GET /calendar-events route, so both the dedicated calendar page and
+// the dashboard's calendar widget (same endpoint) trigger it.
+export async function generateDueWorkOrdersForRange(fromDate, toDate) {
+  const todayStr = today();
+  const cappedTo = toDate < todayStr ? toDate : todayStr;
+  if (cappedTo < fromDate) return [];
+  const occurrences = (await listCalendarEventOccurrences(fromDate, cappedTo))
+    .filter((o) => o.WorkOrderTemplateId);
+  const createdWorkOrderIds = [];
+  for (const occ of occurrences) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Advisory lock serializes concurrent requests racing to generate the
+      // same occurrence; UNIQUE(calendar_event_id, occurrence_date) on
+      // calendar_event_generated_wo is the actual guard this backs up.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`cegw:${occ.Id}:${occ.OccurrenceDate}`]);
+      const { rows: existing } = await client.query(
+        'SELECT 1 FROM calendar_event_generated_wo WHERE calendar_event_id = $1 AND occurrence_date = $2',
+        [occ.Id, occ.OccurrenceDate]
+      );
+      if (!existing.length) {
+        const workOrderId = await createWorkOrderFromTemplate(occ.WorkOrderTemplateId, { scheduledDate: occ.OccurrenceDate });
+        await client.query(
+          `INSERT INTO calendar_event_generated_wo (calendar_event_id, occurrence_date, work_order_id) VALUES ($1,$2,$3)
+           ON CONFLICT (calendar_event_id, occurrence_date) DO NOTHING`,
+          [occ.Id, occ.OccurrenceDate, workOrderId]
+        );
+        createdWorkOrderIds.push(workOrderId);
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+  return createdWorkOrderIds;
 }
 
 export async function getCalendarEvent(id) {
@@ -1856,18 +1969,18 @@ export async function getCalendarEvent(id) {
   return rows[0] ? calendarEventRowShape(rows[0]) : null;
 }
 
-export async function createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId }) {
+export async function createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId, workOrderTemplateId }) {
   const { rows } = await pool.query(
-    `INSERT INTO calendar_events (title, description, event_date, recurrence_type, recurrence_interval, recurrence_end_date, work_order_id, work_order_task_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-    [title, description || null, eventDate, recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null, workOrderTaskId || null]
+    `INSERT INTO calendar_events (title, description, event_date, recurrence_type, recurrence_interval, recurrence_end_date, work_order_id, work_order_task_id, work_order_template_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    [title, description || null, eventDate, recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null, workOrderTaskId || null, workOrderTemplateId || null]
   );
   await logActivity({ action: 'created', entityType: 'calendar_event', entityId: rows[0].id, entityLabel: rows[0].title });
   return calendarEventRowShape(rows[0]);
 }
 
 export async function updateCalendarEvent(id, fields) {
-  const allowed = ['title', 'description', 'event_date', 'recurrence_type', 'recurrence_interval', 'recurrence_end_date', 'work_order_id', 'work_order_task_id'];
+  const allowed = ['title', 'description', 'event_date', 'recurrence_type', 'recurrence_interval', 'recurrence_end_date', 'work_order_id', 'work_order_task_id', 'work_order_template_id'];
   const setCols = []; const vals = []; let i = 1;
   for (const [key, value] of Object.entries(fields)) {
     if (!allowed.includes(key)) continue;
