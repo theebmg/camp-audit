@@ -42,18 +42,25 @@ export function buildAssetReportRows({ assets, propertyFields, eavByAsset, compo
 }
 
 export function buildWorkOrderReportRows({ workOrders, volByWo, venByWo }) {
-  return workOrders.map((w) => ({
-    Title: w.title, Status: w.status, Priority: w.priority,
-    'Funding Source': FUNDING_SOURCE_LABELS[w.funding_source] || w.funding_source || null,
-    Asset: w.asset_name, Location: w.location_name,
-    'Scheduled Date': w.scheduled_date, 'Date Reported': w.date_reported, 'Date Completed': w.date_completed,
-    'Estimated Cost': w.estimated_cost, 'Actual Cost': w.actual_cost,
-    'Estimated Hours': w.estimated_hours, 'Actual Hours': w.actual_hours,
-    Volunteers: (volByWo.get(w.id) || []).join(', ') || null,
-    Vendors: (venByWo.get(w.id) || []).join(', ') || null,
-    _id: w.id,
-    _entity: 'workOrder',
-  }));
+  return workOrders.map((w) => {
+    const parties = [];
+    if (w.responsible_self) parties.push('Self');
+    if (volByWo.get(w.id)?.length) parties.push('Volunteer');
+    if (venByWo.get(w.id)?.length) parties.push('Vendor');
+    return {
+      Title: w.title, Status: w.status, Priority: w.priority,
+      'Funding Source': FUNDING_SOURCE_LABELS[w.funding_source] || w.funding_source || null,
+      Asset: w.asset_name, Location: w.location_name,
+      'Scheduled Date': w.scheduled_date, 'Date Reported': w.date_reported, 'Date Completed': w.date_completed,
+      'Estimated Cost': w.estimated_cost, 'Actual Cost': w.actual_cost,
+      'Estimated Hours': w.estimated_hours, 'Actual Hours': w.actual_hours,
+      'Responsible Party': parties.join(', ') || null,
+      Volunteers: (volByWo.get(w.id) || []).join(', ') || null,
+      Vendors: (venByWo.get(w.id) || []).join(', ') || null,
+      _id: w.id,
+      _entity: 'workOrder',
+    };
+  });
 }
 
 // "Progress made" — one row per Work Order Log entry (status change / note /
@@ -129,6 +136,7 @@ export const WORK_ORDER_COLUMN_SPECS = [
   { key: 'Actual Cost', label: 'Actual Cost', group: 'Dates & Cost' },
   { key: 'Estimated Hours', label: 'Estimated Hours', group: 'Dates & Cost' },
   { key: 'Actual Hours', label: 'Actual Hours', group: 'Dates & Cost' },
+  { key: 'Responsible Party', label: 'Responsible Party', options: ['Self', 'Volunteer', 'Vendor'], group: 'Crew', default: true },
   { key: 'Volunteers', label: 'Volunteers', group: 'Crew' },
   { key: 'Vendors', label: 'Vendors', group: 'Crew' },
 ];
@@ -167,7 +175,15 @@ export function applyReportFilters(rows, filters) {
   const entries = Object.entries(filters).filter(([, v]) => v && (Array.isArray(v) ? v.length : (v.from || v.to)));
   if (!entries.length) return rows;
   return rows.filter((row) => entries.every(([key, v]) => {
-    if (Array.isArray(v)) return v.includes(row[key] == null ? '' : String(row[key]));
+    if (Array.isArray(v)) {
+      // "Responsible Party" cells are joined multi-value strings ("Self, Vendor"),
+      // not a single value — match if any selected option appears in the cell.
+      if (key === 'Responsible Party') {
+        const cellValues = row[key] ? String(row[key]).split(', ') : [];
+        return v.some((opt) => cellValues.includes(opt));
+      }
+      return v.includes(row[key] == null ? '' : String(row[key]));
+    }
     const raw = row[key];
     if (!raw) return false; // a range filter is active but this row has no date — excluded
     const t = new Date(raw).getTime();

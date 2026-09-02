@@ -536,7 +536,7 @@ export async function getWorkOrdersReportRawData() {
     pool.query(
       `SELECT w.id, w.title, w.status, w.priority, w.date_reported, w.date_completed, w.scheduled_date,
               w.estimated_hours, w.estimated_cost, w.actual_hours, w.actual_cost, w.funding_source,
-              a.name AS asset_name, l.name AS location_name
+              w.responsible_self, a.name AS asset_name, l.name AS location_name
        FROM work_orders w
        LEFT JOIN assets a ON a.id = w.asset_id
        LEFT JOIN locations l ON l.id = w.location_id
