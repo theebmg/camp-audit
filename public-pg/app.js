@@ -1016,7 +1016,14 @@ async function renderAssetDetail({ id }, container = app) {
     </div>
 
     <div class="card"><h3>Findings (${conditionFindings.length})</h3>
-      ${conditionFindings.map((f) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(f.Title || '')}</span><span class="pill">${escapeHtml(f.Severity || '')}</span></div>`).join('') || '<p class="muted">None yet.</p>'}
+      ${conditionFindings.map((f) => `
+        <div class="list-item" style="cursor:default">
+          <span>${escapeHtml(f.Title || '')}</span>
+          <span style="display:flex;align-items:center;gap:8px">
+            <span class="pill">${escapeHtml(f.Severity || '')}</span>
+            <button type="button" class="btn btn-secondary toggle-board-focus" data-id="${f.Id}" data-next="${!f.BoardFocus}" style="padding:2px 8px;font-size:0.75rem;${f.BoardFocus ? 'background:#f0f2fb' : ''}">${f.BoardFocus ? '★ Board Focus' : '☆ Flag for Board'}</button>
+          </span>
+        </div>`).join('') || '<p class="muted">None yet.</p>'}
     </div>
 
     <div class="card">
@@ -1059,6 +1066,10 @@ async function renderAssetDetail({ id }, container = app) {
   container.querySelectorAll('.resolve-note').forEach((el) => el.addEventListener('click', async (e) => {
     e.preventDefault();
     await api(`/api/pg/notes/${el.dataset.id}/resolve`, { method: 'PATCH', body: JSON.stringify({ resolved: el.dataset.next === 'true' }) });
+    renderAssetDetail({ id }, container);
+  }));
+  container.querySelectorAll('.toggle-board-focus').forEach((el) => el.addEventListener('click', async () => {
+    await api(`/api/pg/condition-findings/${el.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ boardFocus: el.dataset.next === 'true' }) });
     renderAssetDetail({ id }, container);
   }));
 }
@@ -3726,6 +3737,9 @@ async function renderWorkOrderDetail({ id }, container = app) {
           </div>
         </div>
         <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" value="${(wo['Scheduled Date'] || '').slice(0, 10)}" /></div>
+        <div class="field-row"><label>Board Focus</label>
+          <label class="skill-chip ${wo.BoardFocus ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="boardFocus" style="margin-right:6px" ${wo.BoardFocus ? 'checked' : ''} />Flag for board report</label>
+        </div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(wo.Description || '')}</textarea></div>
         <div class="field-row"><label>Estimated Hours</label><input name="estimatedHours" type="number" value="${wo['Estimated Hours'] ?? ''}" /></div>
         <div class="field-row"><label>Actual Hours</label><input name="actualHours" type="number" value="${wo['Actual Hours'] ?? ''}" /></div>
@@ -3846,6 +3860,10 @@ async function renderWorkOrderDetail({ id }, container = app) {
   selfCheckbox?.addEventListener('change', () => {
     selfCheckbox.closest('.skill-chip').classList.toggle('selected', selfCheckbox.checked);
   });
+  const boardFocusCheckbox = container.querySelector('input[name="boardFocus"]');
+  boardFocusCheckbox?.addEventListener('change', () => {
+    boardFocusCheckbox.closest('.skill-chip').classList.toggle('selected', boardFocusCheckbox.checked);
+  });
 
   container.querySelector('#woFieldsForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -3867,6 +3885,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
         estimatedCost: fd.get('estimatedCost'), actualCost: fd.get('actualCost'),
         fundingSource, fundingRefId,
         responsibleSelf: fd.has('responsibleSelf'),
+        boardFocus: fd.has('boardFocus'),
       }) });
       toast('Work order updated');
       renderWorkOrderDetail({ id }, container);

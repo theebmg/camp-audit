@@ -274,7 +274,7 @@ export async function getAssetDetail(assetId) {
     getComponentRowsForAsset(assetId),
     getComponentTypeCatalog(buildingTypeId),
     pool.query(`SELECT id, title, status, priority FROM work_orders WHERE asset_id = $1 ORDER BY id DESC LIMIT 200`, [assetId]),
-    pool.query(`SELECT id, title, severity, status FROM condition_findings WHERE asset_id = $1 ORDER BY id DESC LIMIT 200`, [assetId]),
+    pool.query(`SELECT id, title, severity, status, board_focus FROM condition_findings WHERE asset_id = $1 ORDER BY id DESC LIMIT 200`, [assetId]),
     getAssetPropertyValuesEav(assetId),
   ]);
   const asset = assetRowToNocoShape(assetRow);
@@ -290,7 +290,7 @@ export async function getAssetDetail(assetId) {
     componentRows, // callers pass this straight into components.js's currentComponentState/sortHistory
     componentSchema,
     workOrders: workOrders.rows.map((r) => ({ Id: r.id, Title: r.title, Status: r.status, Priority: r.priority })),
-    conditionFindings: findings.rows.map((r) => ({ Id: r.id, Title: r.title, Severity: r.severity, Status: r.status })),
+    conditionFindings: findings.rows.map((r) => ({ Id: r.id, Title: r.title, Severity: r.severity, Status: r.status, BoardFocus: r.board_focus })),
   };
 }
 
@@ -1084,7 +1084,7 @@ export async function getWorkOrderDetail(woId) {
       'Estimated Hours': w.estimated_hours, 'Actual Hours': w.actual_hours,
       'Estimated Cost': w.estimated_cost, 'Actual Cost': w.actual_cost,
       Description: w.description,
-      ResponsibleSelf: w.responsible_self,
+      ResponsibleSelf: w.responsible_self, BoardFocus: w.board_focus,
       Asset: w.asset_id ? { Id: w.asset_id, Name: w.asset_name, LodgeHolder: w.asset_lodge_holder } : null,
       Location: w.location_id ? { Id: w.location_id, Name: w.location_name } : null,
       FundingSource: w.funding_source, FundingRefId: w.funding_ref_id, FundingRefLabel: fundingRefLabel,
@@ -1151,7 +1151,7 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
 export async function updateWorkOrder(woId, fields) {
   const allowed = ['title', 'description', 'priority', 'status', 'date_reported', 'date_completed',
     'scheduled_date', 'asset_id', 'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost',
-    'funding_source', 'funding_ref_id', 'responsible_self'];
+    'funding_source', 'funding_ref_id', 'responsible_self', 'board_focus'];
   const setCols = [];
   const vals = [];
   let i = 1;
@@ -1356,6 +1356,59 @@ export async function deleteAssetUpdate(auId) {
   await pool.query('DELETE FROM asset_updates WHERE id = $1', [auId]);
   await logActivity({ action: 'deleted', entityType: 'asset_update', entityId: Number(auId), entityLabel: `${rows[0].target_field} → ${rows[0].new_value}`, details: `On Work Order #${rows[0].work_order_id}` });
   return { ok: true };
+}
+
+// Condition Findings have no dedicated detail view/route yet (they're
+// listed read-only on the Asset detail page) — this is the one mutable
+// field they need for now: the Forward Focus board flag.
+export async function updateConditionFinding(id, { boardFocus }) {
+  const { rows } = await pool.query(
+    'UPDATE condition_findings SET board_focus = $2 WHERE id = $1 RETURNING id, title, board_focus',
+    [id, !!boardFocus]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'updated', entityType: 'condition_finding', entityId: rows[0].id, entityLabel: rows[0].title, details: boardFocus ? 'Flagged for board focus' : 'Unflagged from board focus' });
+  return { Id: rows[0].id, Title: rows[0].title, BoardFocus: rows[0].board_focus };
+}
+
+// Everything currently flagged board_focus, across both Work Orders and
+// Condition Findings — the Forward Focus report's raw material.
+export async function getBoardFocusItems() {
+  const [woRes, cfRes] = await Promise.all([
+    pool.query(`
+      SELECT w.id, w.title, w.estimated_cost, w.priority, w.status, a.name AS asset_name,
+             e.work_order_template_id
+      FROM work_orders w
+      LEFT JOIN assets a ON a.id = w.asset_id
+      LEFT JOIN calendar_event_generated_wo g ON g.work_order_id = w.id
+      LEFT JOIN calendar_events e ON e.id = g.calendar_event_id
+      WHERE w.board_focus = true
+      ORDER BY w.id DESC
+    `),
+    pool.query(`
+      SELECT cf.id, cf.title, cf.estimated_cost, cf.severity, cf.status, a.name AS asset_name
+      FROM condition_findings cf LEFT JOIN assets a ON a.id = cf.asset_id
+      WHERE cf.board_focus = true
+      ORDER BY cf.id DESC
+    `),
+  ]);
+  return { workOrders: woRes.rows, conditionFindings: cfRes.rows };
+}
+
+// Average actual_cost of past completed Work Orders generated from this
+// template via a recurring Calendar Event — used so a PM-recurring item's
+// forward cost projection is grounded in what the job has actually cost
+// before, not just its (often stale) estimate.
+export async function historicalAvgActualCost(templateId) {
+  const { rows } = await pool.query(
+    `SELECT AVG(w.actual_cost) AS avg_cost
+     FROM calendar_event_generated_wo g
+     JOIN calendar_events e ON e.id = g.calendar_event_id
+     JOIN work_orders w ON w.id = g.work_order_id
+     WHERE e.work_order_template_id = $1 AND w.status = 'Done' AND w.actual_cost IS NOT NULL`,
+    [templateId]
+  );
+  return rows[0]?.avg_cost != null ? Number(rows[0].avg_cost) : null;
 }
 
 // Completing a WO: apply every pending Asset Update to its target field (real

@@ -11,8 +11,8 @@
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
-import { buildCapitalPlanPg, buildBoardReportPg } from '../reportDataPg.js';
-import { renderBoardReportHtml, renderBoardReportText } from '../reportRender.js';
+import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg } from '../reportDataPg.js';
+import { renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText } from '../reportRender.js';
 import { uploadPhoto } from '../storage.js';
 import { renderChecklistPdf, renderWorkOrderScopePdf } from '../pdf.js';
 import { currentUsername, currentRole } from '../requestContext.js';
@@ -55,6 +55,7 @@ import {
   adminListRequestFields, adminCreateRequestField, adminUpdateRequestField,
   listMaintenanceRequests, getMaintenanceRequestDetail, updateMaintenanceRequestStatus,
   convertRequestToWorkOrder, linkRequestToAsset, listRequestMessages, createRequestMessage,
+  updateConditionFinding,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import {
@@ -215,6 +216,15 @@ router.patch('/assets/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+router.patch('/condition-findings/:id', async (req, res, next) => {
+  try {
+    const { boardFocus } = req.body || {};
+    const finding = await updateConditionFinding(req.params.id, { boardFocus });
+    if (!finding) return res.status(404).json({ ok: false, error: 'Condition Finding not found' });
+    res.json({ ok: true, finding });
+  } catch (e) { next(e); }
+});
+
 router.get('/assets/:id/history', async (req, res, next) => {
   try {
     const { asset, componentRows, propertyHistory } = await getAssetHistory(req.params.id);
@@ -349,6 +359,28 @@ router.post('/reports/board/send', async (req, res, next) => {
       subject: subject || `Camp Sychar — Board Report (${data.periodStart} to ${data.periodEnd})`,
       html: renderBoardReportHtml(data),
       text: renderBoardReportText(data),
+    });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+router.get('/reports/forward-focus/preview', async (req, res, next) => {
+  try {
+    const data = await buildForwardFocusReportPg();
+    res.json({ title: 'Forward Focus', html: renderForwardFocusHtml(data), text: renderForwardFocusText(data) });
+  } catch (e) { next(e); }
+});
+
+router.post('/reports/forward-focus/send', async (req, res, next) => {
+  try {
+    const { recipient, subject } = req.body || {};
+    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
+    const data = await buildForwardFocusReportPg();
+    await sendMail({
+      to: recipient,
+      subject: subject || 'Camp Sychar — Forward Focus',
+      html: renderForwardFocusHtml(data),
+      text: renderForwardFocusText(data),
     });
     res.json({ ok: true });
   } catch (e) { next(e); }
@@ -712,6 +744,7 @@ router.patch('/work-orders/:id', async (req, res, next) => {
     if (body.fundingSource != null) fields.funding_source = body.fundingSource;
     if (body.fundingRefId !== undefined) fields.funding_ref_id = body.fundingRefId === '' ? null : Number(body.fundingRefId);
     if (body.responsibleSelf !== undefined) fields.responsible_self = !!body.responsibleSelf;
+    if (body.boardFocus !== undefined) fields.board_focus = !!body.boardFocus;
     const detail = await updateWorkOrder(req.params.id, fields);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
     res.json({ ok: true, ...detail });

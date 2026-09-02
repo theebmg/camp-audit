@@ -4,7 +4,7 @@
 // break the current one" rule. Reuses currentComponentState() from
 // components.js UNCHANGED, so "what counts as current" stays defined once,
 // regardless of which database it reads from.
-import { getAllComponentRowsWithAssetInfo, pool } from './db.js';
+import { getAllComponentRowsWithAssetInfo, pool, getBoardFocusItems, historicalAvgActualCost } from './db.js';
 import { currentComponentState } from './components.js';
 import { FUNDING_SOURCE_LABELS } from './reports.js';
 
@@ -134,4 +134,33 @@ export async function buildBoardReportPg({ periodStart, periodEnd } = {}) {
     upcoming: upcomingRes.rows.map(rowShape),
     overdue: overdueRes.rows.map(rowShape),
   };
+}
+
+// Board-flagged Work Orders + Condition Findings, cost-sorted. A one-off
+// item shows its estimated_cost as-is; a PM-recurring Work Order (one
+// generated from a template-linked Calendar Event) shows the historical
+// average actual cost of past instances instead, when there is one —
+// grounded in reality rather than a possibly-stale estimate.
+export async function buildForwardFocusReportPg() {
+  const { workOrders, conditionFindings } = await getBoardFocusItems();
+
+  const items = [];
+  for (const w of workOrders) {
+    let cost = w.estimated_cost != null ? Number(w.estimated_cost) : null;
+    let costBasis = 'estimated';
+    if (w.work_order_template_id) {
+      const avg = await historicalAvgActualCost(w.work_order_template_id);
+      if (avg != null) { cost = avg; costBasis = 'historical average'; }
+    }
+    items.push({ kind: 'workOrder', id: w.id, title: w.title, assetName: w.asset_name, priority: w.priority, status: w.status, cost, costBasis });
+  }
+  for (const cf of conditionFindings) {
+    items.push({
+      kind: 'conditionFinding', id: cf.id, title: cf.title, assetName: cf.asset_name, priority: cf.severity, status: cf.status,
+      cost: cf.estimated_cost != null ? Number(cf.estimated_cost) : null, costBasis: 'estimated',
+    });
+  }
+  items.sort((a, b) => (b.cost ?? -Infinity) - (a.cost ?? -Infinity));
+  const total = items.reduce((sum, i) => sum + (i.cost || 0), 0);
+  return { items, total };
 }

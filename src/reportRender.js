@@ -187,3 +187,28 @@ export function renderBoardReportText({ periodStart, periodEnd, statusCounts, pr
   if (!upcoming.length) lines.push('  None.');
   return lines.join('\n');
 }
+
+export function renderForwardFocusHtml({ items, total }) {
+  const rowsHtml = items.map((i) => `
+    <tr>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.kind === 'workOrder' ? 'Work Order' : 'Condition Finding')}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.title)}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.assetName || '—')}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${fmtMoney(i.cost)}${i.costBasis === 'historical average' ? ' <span style="color:#6b7086;font-size:0.75rem;">(hist. avg)</span>' : ''}</td>
+    </tr>`).join('');
+  return htmlShell('Forward Focus', `Board-flagged items · ${items.length} item(s) · ${fmtMoney(total)} total`, `
+    <table style="width:100%;border-collapse:collapse;">
+      <tr style="text-align:left;font-size:0.78rem;color:#6b7086;text-transform:uppercase;">
+        <th style="padding:7px 10px;">Type</th><th>Item</th><th>Asset</th><th>Est. Cost</th>
+      </tr>
+      ${rowsHtml || '<tr><td style="padding:14px;color:#6b7086;">Nothing flagged for the board right now.</td></tr>'}
+    </table>
+  `);
+}
+
+export function renderForwardFocusText({ items, total }) {
+  const lines = ['CAMP SYCHAR — FORWARD FOCUS', `Board-flagged items — ${items.length} item(s), ${fmtMoney(total)} total`, ''];
+  items.forEach((i) => lines.push(`${i.kind === 'workOrder' ? 'WO' : 'CF'}  ${i.title}${i.assetName ? ` (${i.assetName})` : ''} — ${fmtMoney(i.cost)}${i.costBasis === 'historical average' ? ' (hist. avg)' : ''}`));
+  if (!items.length) lines.push('Nothing flagged for the board right now.');
+  return lines.join('\n');
+}
