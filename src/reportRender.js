@@ -12,7 +12,7 @@ const fmtDate = (iso) => (iso || '').slice(0, 10);
 const fmtDateTime = (iso) => (iso || '').slice(0, 16);
 const fmtMoney = (n) => (n == null ? '—' : `$${Number(n).toLocaleString()}`);
 
-function htmlShell(title, subtitle, bodyHtml) {
+export function htmlShell(title, subtitle, bodyHtml) {
   return `<!doctype html>
 <html><head><meta charset="utf-8"><title>${escapeHtml(title)}</title></head>
 <body style="margin:0;padding:24px;background:#f6f7fb;font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1a1d29;">
@@ -116,5 +116,74 @@ export function renderCapitalText({ rows, summary }) {
   lines.push('', 'Asset | Component | Condition | Est. Year | Est. Cost');
   rows.forEach((r) => lines.push(`${r.assetName} | ${r.componentType} | ${r.condition || '—'} | ${r.estReplacementYear || '—'} | ${fmtMoney(r.estReplacementCost)}`));
   if (!rows.length) lines.push('No component data yet.');
+  return lines.join('\n');
+}
+
+function countPillsHtml(items, key) {
+  return items.map((s) => `
+    <div style="display:inline-block;background:#f0f2fb;border-radius:12px;padding:10px 16px;margin:0 8px 8px 0;">
+      <div style="font-size:1.1rem;font-weight:800;">${s.count}</div>
+      <div style="font-size:0.78rem;color:#6b7086;">${escapeHtml(s[key])}</div>
+    </div>`).join('');
+}
+
+function boardListRowsHtml(items) {
+  return items.map((i) => `
+    <tr>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;white-space:nowrap;">${escapeHtml(fmtDate(i.scheduledDate || i.dateCompleted))}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.title)}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.assetName || '—')}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${i.priority ? escapeHtml(i.priority) : fmtMoney(i.cost)}</td>
+    </tr>`).join('');
+}
+
+// Board / monthly report: current open-WO snapshot (status/priority/funding),
+// plus what happened and what's next relative to today — regardless of the
+// period bounds, which only scope the "Completed" section (a board wants to
+// know what's overdue/upcoming right now, not just within the report month).
+export function renderBoardReportHtml({ periodStart, periodEnd, statusCounts, priorityCounts, fundingSourceTotals, completed, upcoming, overdue }) {
+  const fundingRowsHtml = fundingSourceTotals.map((f) => `
+    <tr><td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(f.label)}</td>
+        <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;text-align:right;">${fmtMoney(f.total)}</td></tr>`).join('');
+  const listTable = (items, emptyLabel) => `
+    <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
+      ${boardListRowsHtml(items) || `<tr><td style="padding:14px;color:#6b7086;">${escapeHtml(emptyLabel)}</td></tr>`}
+    </table>`;
+  return htmlShell('Board Report', `${periodStart} to ${periodEnd}`, `
+    <h3 style="margin:0 0 8px;font-size:1rem;">Open Work Orders by Status</h3>
+    <div>${countPillsHtml(statusCounts, 'status') || '<span style="color:#6b7086;">None open.</span>'}</div>
+    <h3 style="margin:20px 0 8px;font-size:1rem;">By Priority</h3>
+    <div>${countPillsHtml(priorityCounts, 'priority') || '<span style="color:#6b7086;">None open.</span>'}</div>
+    <h3 style="margin:20px 0 8px;font-size:1rem;">Outstanding Cost by Funding Source</h3>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">${fundingRowsHtml || '<tr><td style="padding:14px;color:#6b7086;">No outstanding cost.</td></tr>'}</table>
+    <h3 style="margin:0 0 8px;font-size:1rem;">Completed This Period (${completed.length})</h3>
+    ${listTable(completed, 'Nothing completed this period.')}
+    <h3 style="margin:0 0 8px;font-size:1rem;">Overdue (${overdue.length})</h3>
+    ${listTable(overdue, 'Nothing overdue.')}
+    <h3 style="margin:0 0 8px;font-size:1rem;">Upcoming (${upcoming.length})</h3>
+    ${listTable(upcoming, 'Nothing scheduled.')}
+  `);
+}
+
+export function renderBoardReportText({ periodStart, periodEnd, statusCounts, priorityCounts, fundingSourceTotals, completed, upcoming, overdue }) {
+  const lines = ['CAMP SYCHAR — BOARD REPORT', `${periodStart} to ${periodEnd}`, ''];
+  lines.push('Open Work Orders by Status:');
+  statusCounts.forEach((s) => lines.push(`  ${s.status}: ${s.count}`));
+  if (!statusCounts.length) lines.push('  None open.');
+  lines.push('', 'By Priority:');
+  priorityCounts.forEach((p) => lines.push(`  ${p.priority}: ${p.count}`));
+  if (!priorityCounts.length) lines.push('  None open.');
+  lines.push('', 'Outstanding Cost by Funding Source:');
+  fundingSourceTotals.forEach((f) => lines.push(`  ${f.label}: ${fmtMoney(f.total)}`));
+  if (!fundingSourceTotals.length) lines.push('  None.');
+  lines.push('', `Completed This Period (${completed.length}):`);
+  completed.forEach((c) => lines.push(`  ${fmtDate(c.dateCompleted)}  ${c.title}${c.assetName ? ` (${c.assetName})` : ''} — ${fmtMoney(c.cost)}`));
+  if (!completed.length) lines.push('  None.');
+  lines.push('', `Overdue (${overdue.length}):`);
+  overdue.forEach((o) => lines.push(`  ${fmtDate(o.scheduledDate)}  ${o.title}${o.assetName ? ` (${o.assetName})` : ''} [${o.priority}]`));
+  if (!overdue.length) lines.push('  None.');
+  lines.push('', `Upcoming (${upcoming.length}):`);
+  upcoming.forEach((u) => lines.push(`  ${fmtDate(u.scheduledDate)}  ${u.title}${u.assetName ? ` (${u.assetName})` : ''} [${u.priority}]`));
+  if (!upcoming.length) lines.push('  None.');
   return lines.join('\n');
 }

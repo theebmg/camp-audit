@@ -11,7 +11,8 @@
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
-import { buildCapitalPlanPg } from '../reportDataPg.js';
+import { buildCapitalPlanPg, buildBoardReportPg } from '../reportDataPg.js';
+import { renderBoardReportHtml, renderBoardReportText } from '../reportRender.js';
 import { uploadPhoto } from '../storage.js';
 import { renderChecklistPdf, renderWorkOrderScopePdf } from '../pdf.js';
 import { currentUsername, currentRole } from '../requestContext.js';
@@ -325,6 +326,32 @@ router.post('/reports/favorites', async (req, res, next) => {
 
 router.delete('/reports/favorites/:id', async (req, res, next) => {
   try { await deleteReportFavorite(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Board / monthly report — HTML + browser print, same email pattern as
+//      the legacy Activity/Capital reports in routes/reports.js. ----
+
+router.get('/reports/board/preview', async (req, res, next) => {
+  try {
+    const { periodStart, periodEnd } = req.query;
+    const data = await buildBoardReportPg({ periodStart, periodEnd });
+    res.json({ title: 'Board Report', html: renderBoardReportHtml(data), text: renderBoardReportText(data) });
+  } catch (e) { next(e); }
+});
+
+router.post('/reports/board/send', async (req, res, next) => {
+  try {
+    const { periodStart, periodEnd, recipient, subject } = req.body || {};
+    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
+    const data = await buildBoardReportPg({ periodStart, periodEnd });
+    await sendMail({
+      to: recipient,
+      subject: subject || `Camp Sychar — Board Report (${data.periodStart} to ${data.periodEnd})`,
+      html: renderBoardReportHtml(data),
+      text: renderBoardReportText(data),
+    });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
 });
 
 router.get('/capital-plan', async (req, res, next) => {
