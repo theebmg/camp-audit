@@ -8,8 +8,12 @@ function escapeHtml(s) {
 }
 
 const KIND_LABEL = { component: 'Component Event', finding: 'Condition Finding', workorder: 'Work Order' };
-const fmtDate = (iso) => (iso || '').slice(0, 10);
-const fmtDateTime = (iso) => (iso || '').slice(0, 16);
+// The legacy NocoDB report data passes ISO date strings, but the pg-backed
+// reports (Board/Forward Focus) pass raw `pg` driver Date objects straight
+// from `date`/`timestamp` columns — normalize both to a string before slicing.
+const isoStr = (v) => (v instanceof Date ? v.toISOString() : String(v || ''));
+const fmtDate = (iso) => isoStr(iso).slice(0, 10);
+const fmtDateTime = (iso) => isoStr(iso).slice(0, 16);
 const fmtMoney = (n) => (n == null ? '—' : `$${Number(n).toLocaleString()}`);
 
 export function htmlShell(title, subtitle, bodyHtml) {
