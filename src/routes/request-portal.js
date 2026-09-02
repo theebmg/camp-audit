@@ -9,6 +9,7 @@ import multer from 'multer';
 import { getRequestFormFields, createMaintenanceRequest, listLocations, createRequestMessage } from '../db.js';
 import { uploadPhoto } from '../storage.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
+import { renderPlainEmailHtml } from '../reportRender.js';
 
 const router = express.Router();
 const upload = multer({
@@ -71,7 +72,7 @@ router.post('/submit', async (req, res, next) => {
         + (request.Description ? `What you told us:\n${request.Description}\n\n` : '')
         + `— Camp Sychar Maintenance`;
       try {
-        await sendMail({ to: request.RequesterEmail, subject, text });
+        await sendMail({ to: request.RequesterEmail, subject, text, html: renderPlainEmailHtml(subject, text) });
         await createRequestMessage(request.Id, { subject, body: text, toEmail: request.RequesterEmail, sentBy: 'system' });
       } catch (e) {
         await createRequestMessage(request.Id, { subject, body: text, toEmail: request.RequesterEmail, sentBy: 'system', status: 'failed', error: e.message });

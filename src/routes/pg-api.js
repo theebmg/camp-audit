@@ -12,7 +12,7 @@ import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
 import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg } from '../reportDataPg.js';
-import { renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText } from '../reportRender.js';
+import { renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText, renderPlainEmailHtml } from '../reportRender.js';
 import { uploadPhoto } from '../storage.js';
 import { renderChecklistPdf, renderWorkOrderScopePdf } from '../pdf.js';
 import { currentUsername, currentRole } from '../requestContext.js';
@@ -1121,29 +1121,35 @@ function requestStatusEmail(request, status, reviewNote) {
   const greeting = `Hi${request.RequesterName ? ' ' + request.RequesterName : ''},`;
   const note = reviewNote ? `\n\nNote from our team:\n${reviewNote}` : '';
   const sign = '\n\n— Camp Sychar Maintenance';
+  let content;
   switch (status) {
     case 'approved':
-      return { subject: `Your maintenance request has been approved (Ref #${request.Id})`, text: `${greeting}\n\nGood news — your maintenance request has been approved and is in our queue.${note}${sign}` };
+      content = { subject: `Your maintenance request has been approved (Ref #${request.Id})`, text: `${greeting}\n\nGood news — your maintenance request has been approved and is in our queue.${note}${sign}` };
+      break;
     case 'denied':
-      return { subject: `Update on your maintenance request (Ref #${request.Id})`, text: `${greeting}\n\nWe've reviewed your maintenance request and won't be moving forward with it at this time.${note}${sign}` };
+      content = { subject: `Update on your maintenance request (Ref #${request.Id})`, text: `${greeting}\n\nWe've reviewed your maintenance request and won't be moving forward with it at this time.${note}${sign}` };
+      break;
     case 'converted':
-      return { subject: `Your maintenance request is being worked on (Ref #${request.Id})`, text: `${greeting}\n\nYour maintenance request has been approved and a work order has been created for it.${note}${sign}` };
+      content = { subject: `Your maintenance request is being worked on (Ref #${request.Id})`, text: `${greeting}\n\nYour maintenance request has been approved and a work order has been created for it.${note}${sign}` };
+      break;
     case 'closed':
-      return { subject: `Your maintenance request has been closed (Ref #${request.Id})`, text: `${greeting}\n\nYour maintenance request (Ref #${request.Id}) has been closed.${note}${sign}` };
+      content = { subject: `Your maintenance request has been closed (Ref #${request.Id})`, text: `${greeting}\n\nYour maintenance request (Ref #${request.Id}) has been closed.${note}${sign}` };
+      break;
     default:
       return null;
   }
+  return { ...content, html: renderPlainEmailHtml(content.subject, content.text) };
 }
 
 async function notifyRequester(request, status, reviewNote) {
   const content = requestStatusEmail(request, status, reviewNote);
   if (!content || !request.RequesterEmail) return;
   if (!mailIsConfigured()) {
-    await createRequestMessage(request.Id, { ...content, body: content.text, toEmail: request.RequesterEmail, sentBy: 'system', status: 'failed', error: 'Email not configured' });
+    await createRequestMessage(request.Id, { subject: content.subject, body: content.text, toEmail: request.RequesterEmail, sentBy: 'system', status: 'failed', error: 'Email not configured' });
     return;
   }
   try {
-    await sendMail({ to: request.RequesterEmail, subject: content.subject, text: content.text });
+    await sendMail({ to: request.RequesterEmail, subject: content.subject, text: content.text, html: content.html });
     await createRequestMessage(request.Id, { subject: content.subject, body: content.text, toEmail: request.RequesterEmail, sentBy: 'system' });
   } catch (e) {
     await createRequestMessage(request.Id, { subject: content.subject, body: content.text, toEmail: request.RequesterEmail, sentBy: 'system', status: 'failed', error: e.message });
@@ -1205,7 +1211,7 @@ router.post('/requests/:id/messages', async (req, res, next) => {
     const request = await getMaintenanceRequestDetail(req.params.id);
     if (!request) return res.status(404).json({ ok: false, error: 'Request not found' });
     try {
-      await sendMail({ to: request.RequesterEmail, subject, text: body });
+      await sendMail({ to: request.RequesterEmail, subject, text: body, html: renderPlainEmailHtml(subject, body) });
       const message = await createRequestMessage(request.Id, { subject, body, toEmail: request.RequesterEmail, sentBy: currentUsername() || 'unknown' });
       res.json({ ok: true, message });
     } catch (e) {

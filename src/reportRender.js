@@ -212,3 +212,11 @@ export function renderForwardFocusText({ items, total }) {
   if (!items.length) lines.push('Nothing flagged for the board right now.');
   return lines.join('\n');
 }
+
+// Turns a plain-text message (a Requester notification, a free-form message
+// from the Requests inbox) into a simple branded HTML body — same htmlShell
+// as every other report email, just a preformatted paragraph instead of a
+// table. Not for structured reports; those build their own bodyHtml.
+export function renderPlainEmailHtml(subject, text) {
+  return htmlShell(subject, '', `<div style="white-space:pre-wrap;line-height:1.5;">${escapeHtml(text)}</div>`);
+}
