@@ -1771,15 +1771,7 @@ function initMapEditor({ pins, features, layers }) {
         <button type="button" class="btn btn-secondary" id="mapGoAsset" style="width:100%;margin-top:6px">View asset →</button>
         <button type="button" class="btn btn-danger" id="mapRemovePin" style="width:100%;margin-top:8px">Remove from map</button>`;
       document.getElementById('mapGoAsset').addEventListener('click', () => go('assetDetail', { id: p.id }));
-      document.getElementById('mapRemovePin').addEventListener('click', async () => {
-        if (!await confirmDialog(`Remove ${p.name} from the map? Its findings and history are unaffected — you can re-place it any time.`)) return;
-        try {
-          await api(`/api/pg/map/pins/${p.id}`, { method: 'PATCH', body: JSON.stringify({ mapX: null, mapY: null }) });
-          mapPins = mapPins.filter((x) => x.id !== p.id);
-          select(null);
-          toast('Removed from map');
-        } catch (err) { toast(err.message); }
-      });
+      document.getElementById('mapRemovePin').addEventListener('click', () => removeSelectedPin());
       return;
     }
     const f = selected.ref;
@@ -1858,15 +1850,32 @@ function initMapEditor({ pins, features, layers }) {
         }, 250);
       });
     }
-    document.getElementById('mapDelFeature').addEventListener('click', async () => {
-      if (!await confirmDialog(`Delete ${f.label || 'this shape'}? This can't be undone.`)) return;
-      try {
-        await api(`/api/pg/map-features/${f.id}`, { method: 'DELETE' });
-        mapFeatures = mapFeatures.filter((x) => x.id !== f.id);
-        select(null);
-        toast('Shape deleted');
-      } catch (err) { toast(err.message); }
-    });
+    document.getElementById('mapDelFeature').addEventListener('click', () => deleteSelectedFeature());
+  }
+
+  // Shared by the panel buttons and the Delete/Backspace key — both paths
+  // confirm first since either can fire on a misclick.
+  async function removeSelectedPin() {
+    if (!selected || selected.type !== 'pin') return;
+    const p = selected.ref;
+    if (!await confirmDialog(`Remove ${p.name} from the map? Its findings and history are unaffected — you can re-place it any time.`)) return;
+    try {
+      await api(`/api/pg/map/pins/${p.id}`, { method: 'PATCH', body: JSON.stringify({ mapX: null, mapY: null }) });
+      mapPins = mapPins.filter((x) => x.id !== p.id);
+      select(null);
+      toast('Removed from map');
+    } catch (err) { toast(err.message); }
+  }
+  async function deleteSelectedFeature() {
+    if (!selected || selected.type !== 'feature') return;
+    const f = selected.ref;
+    if (!await confirmDialog(`Delete ${f.label || 'this shape'}? This can't be undone.`)) return;
+    try {
+      await api(`/api/pg/map-features/${f.id}`, { method: 'DELETE' });
+      mapFeatures = mapFeatures.filter((x) => x.id !== f.id);
+      select(null);
+      toast('Shape deleted');
+    } catch (err) { toast(err.message); }
   }
 
   // ---- tools / mode ----
@@ -2106,6 +2115,10 @@ function initMapEditor({ pins, features, layers }) {
     if (document.activeElement && ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) return;
     if (e.key === 'Escape') { pending = null; document.getElementById('mapFinish').style.display = 'none'; setMode('edit'); }
     if (e.key === 'Enter' && pending && pending.pts.length > 1) finishPending();
+    if ((e.key === 'Delete' || e.key === 'Backspace') && selected) {
+      e.preventDefault();
+      if (selected.type === 'pin') removeSelectedPin(); else deleteSelectedFeature();
+    }
   }
   document.addEventListener('keydown', mapKeydown);
 
