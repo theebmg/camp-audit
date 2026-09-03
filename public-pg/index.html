@@ -216,6 +216,43 @@
     main#app:has(.pane-row) { max-width: none; }
     @media (max-width: 640px) { .cal-strip { grid-template-columns: repeat(7, minmax(0,1fr)); } .cal-strip-event { display: none; } }
 
+    /* ---------- Interactive Map ---------- */
+    main#app:has(.map-view) { max-width: none; padding: 0; }
+    .map-view { display: flex; overflow: hidden; }
+    .map-side { width: 284px; flex: 0 0 284px; height: 100%; background: var(--surface); border-right: 1px solid var(--border); overflow-y: auto; }
+    .map-grp { padding: 12px 15px; border-bottom: 1px solid var(--border); }
+    .map-grp h2 { margin: 0 0 8px; font-size: 0.68rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+    .map-tools { display: flex; flex-wrap: wrap; gap: 6px; }
+    .map-tool { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 8px; padding: 6px 10px; font-size: 0.8rem; cursor: pointer; }
+    .map-tool.on { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+    .map-hint { font-size: 0.74rem; background: var(--accent-soft); color: var(--accent-dark); border-radius: 8px; padding: 8px 10px; margin-top: 8px; line-height: 1.4; }
+    .map-lyr { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 0.85rem; cursor: pointer; }
+    .map-lyr input[type=checkbox] { accent-color: var(--accent); }
+    .map-row2 { display: flex; gap: 8px; align-items: center; margin: 4px 0 8px; }
+    .map-row2 input[type=range] { flex: 1; accent-color: var(--accent); }
+    .map-stage { flex: 1; min-width: 0; height: 100%; position: relative; background: #324a3a; overflow: hidden; }
+    .map-stage svg { width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+    .map-stage svg.panning { cursor: grabbing; }
+    .map-stage svg.placing { cursor: crosshair; }
+    .map-finish { position: absolute; left: 50%; top: 12px; transform: translateX(-50%); display: none; }
+    .map-zoom { position: absolute; right: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 4px; }
+    .map-zoom button { width: 32px; height: 32px; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 8px; font-size: 16px; cursor: pointer; }
+    .map-search { width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; font-size: 0.85rem; background: var(--surface); color: var(--text); }
+    .map-asset-result { padding: 7px 9px; border: 1px solid var(--border); border-radius: 8px; margin-top: 6px; cursor: pointer; font-size: 0.82rem; }
+    .map-asset-result:hover { background: var(--surface-alt); }
+    .map-asset-result .muted { font-size: 0.72rem; }
+    .map-legend-item { display: flex; align-items: center; gap: 7px; font-size: 0.78rem; margin: 4px 0; }
+    .map-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 auto; }
+    .map-info-name { width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 7px 9px; font-size: 0.85rem; margin: 2px 0 8px; background: var(--surface); color: var(--text); }
+    .map-info-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+    .map-swatch { width: 20px; height: 20px; border-radius: 50%; cursor: pointer; border: 2px solid transparent; padding: 0; }
+    .map-swatch.on { border-color: var(--text); }
+    @media (max-width: 860px) {
+      .map-view { flex-direction: column; }
+      .map-side { width: 100%; flex: 0 0 auto; max-height: 44vh; }
+      .map-stage { flex: 1 1 auto; }
+    }
+
     /* Motion: cards/list-items/nav get a soft hover + a fade-in when a view
        swaps in — the thing that actually makes an app feel "fluid" vs. flat. */
     .card, .list-item, .nav-item { transition: background-color 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease; }

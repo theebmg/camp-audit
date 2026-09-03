@@ -176,10 +176,13 @@ router.get('/map/pins', async (req, res, next) => {
 router.patch('/map/pins/:id', async (req, res, next) => {
   try {
     const { mapX, mapY } = req.body || {};
-    if (typeof mapX !== 'number' || typeof mapY !== 'number') {
+    // null/null explicitly unplaces the asset from the map; anything else
+    // must be a real coordinate pair.
+    const unplacing = mapX === null && mapY === null;
+    if (!unplacing && (typeof mapX !== 'number' || typeof mapY !== 'number')) {
       return res.status(400).json({ ok: false, error: 'mapX and mapY (numbers) are required' });
     }
-    const updated = await setAssetMapLocation(req.params.id, { mapX, mapY });
+    const updated = await setAssetMapLocation(req.params.id, { mapX: unplacing ? null : mapX, mapY: unplacing ? null : mapY });
     if (!updated) return res.status(404).json({ ok: false, error: 'Asset not found' });
     res.json({ ok: true, pin: updated });
   } catch (e) { next(e); }

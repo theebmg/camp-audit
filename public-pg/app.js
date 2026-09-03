@@ -336,6 +336,7 @@ const NAV_ITEMS = [
   { icon: '🏠', label: 'Dashboard', view: 'dashboard' },
   { icon: '📝', label: 'Start Audit', view: 'auditPicker' },
   { icon: '📍', label: 'Locations', view: 'locations' },
+  { icon: '🗺️', label: 'Map', view: 'map' },
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
@@ -456,6 +457,7 @@ async function render(view, params = {}) {
       dashboard: () => renderDashboard(),
       auditPicker: () => renderAuditPicker(),
       locations: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderLocationsDrilldown() : renderLocations()),
+      map: () => renderMap(),
       assetsInLocation: () => renderAssetsInLocation(params),
       assetDetail: () => renderAssetDetail(params),
       audit: () => renderAudit(params),
@@ -1283,6 +1285,502 @@ async function renderAssetHistory({ id }) {
         <div class="muted">${escapeHtml(h['Old Value'] ?? '—')} → <strong>${escapeHtml(h['New Value'] ?? '—')}</strong></div>
         <div class="muted">${new Date(h.ChangedAt).toLocaleString()}${h.ChangedBy ? ` · ${escapeHtml(h.ChangedBy)}` : ''}</div>
       </div>`).join('') : '<p class="muted">No history yet.</p>');
+}
+
+// ---------- Interactive Map ----------
+// Pins are assets with map_x/map_y set (image-pixel coords on campmap.webp,
+// 2500x3700, top-left origin — never lat/lng). Pin color is derived live
+// from open condition_findings.severity, never stored, so there's no
+// "status" field to edit here — only position. Water/sewer lines and zones
+// are map_features rows (polylines/polygons in the same pixel space). Every
+// edit (drag, reshape, add, delete) writes straight through to the API on
+// its own — there's no separate "Save" step to remember.
+const MAP_KIND_DEFAULTS = {
+  water_line: { color: '#2b6cb0', weight: 4, label: 'Water line' },
+  sewer_line: { color: '#8a6d3b', weight: 4, label: 'Sewer line' },
+  zone: { color: '#5c8a4e', weight: 2, label: 'Zone' },
+};
+const MAP_SWATCHES = ['#2b6cb0', '#8a6d3b', '#5c8a4e', '#c0433a', '#d0902a', '#6b4fa0'];
+const MAP_SEVERITY_COLORS = { none: '#0ca30c', warn: '#fab219', serious: '#ec835a', critical: '#d03b3b' };
+
+async function renderMap() {
+  setChrome({ title: 'Interactive Map', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const [{ pins }, { features }] = await Promise.all([
+    api('/api/pg/map/pins'),
+    api('/api/pg/map-features'),
+  ]);
+
+  app.innerHTML = `
+    <div class="map-view">
+      <aside class="map-side">
+        <div class="map-grp">
+          <h2>Tools</h2>
+          <div class="map-tools" id="mapTools">
+            <button type="button" class="map-tool on" data-tool="edit">Edit</button>
+            <button type="button" class="map-tool" data-tool="add-asset">+ Asset</button>
+            <button type="button" class="map-tool" data-tool="add-water_line">+ Water line</button>
+            <button type="button" class="map-tool" data-tool="add-sewer_line">+ Sewer line</button>
+            <button type="button" class="map-tool" data-tool="add-zone">+ Zone</button>
+          </div>
+          <div class="map-hint" id="mapHint"><b>Edit:</b> drag a marker or shape to move it. Drag a shape's dots to reshape; click a faint midpoint to add a point; double-click a point to remove it. Scroll to zoom, drag empty space to pan.</div>
+        </div>
+        <div class="map-grp" id="mapAssetPicker" hidden>
+          <h2>Place an asset</h2>
+          <input type="text" class="map-search" id="mapAssetSearch" placeholder="Search assets by name…" autocomplete="off">
+          <div id="mapAssetResults"></div>
+        </div>
+        <div class="map-grp">
+          <h2>Layers</h2>
+          <label class="map-lyr"><input type="checkbox" data-layer="__base" checked> Base map</label>
+          <div class="map-row2"><span class="muted" style="font-size:11px">Dim</span><input type="range" id="mapDim" min="0" max="100" value="0"></div>
+          <label class="map-lyr"><input type="checkbox" data-layer="zone" checked> Zones</label>
+          <label class="map-lyr"><input type="checkbox" data-layer="water_line" checked> Water lines</label>
+          <label class="map-lyr"><input type="checkbox" data-layer="sewer_line" checked> Sewer lines</label>
+          <label class="map-lyr"><input type="checkbox" data-layer="asset" checked> Assets</label>
+          <label class="map-lyr"><input type="checkbox" data-layer="labels" checked> Labels</label>
+        </div>
+        <div class="map-grp">
+          <h2>Legend</h2>
+          <div class="map-legend-item"><span class="map-legend-dot" style="background:${MAP_SEVERITY_COLORS.none}"></span>No open findings</div>
+          <div class="map-legend-item"><span class="map-legend-dot" style="background:${MAP_SEVERITY_COLORS.warn}"></span>Minor / monitor</div>
+          <div class="map-legend-item"><span class="map-legend-dot" style="background:${MAP_SEVERITY_COLORS.serious}"></span>Moderate / major</div>
+          <div class="map-legend-item"><span class="map-legend-dot" style="background:${MAP_SEVERITY_COLORS.critical}"></span>Safety-critical</div>
+          <div class="map-legend-item"><span class="map-legend-dot" style="background:#fff;border:2px solid #d4af37"></span>Flagged for board</div>
+        </div>
+        <div class="map-grp" id="mapInfo"><h2>Selected</h2><div class="muted">Click a marker or shape to select it.</div></div>
+      </aside>
+      <div class="map-stage">
+        <svg id="mapSvg" viewBox="0 0 2500 3700" preserveAspectRatio="xMidYMid meet"></svg>
+        <button type="button" id="mapFinish" class="btn btn-primary map-finish">Finish shape (Enter)</button>
+        <div class="map-zoom">
+          <button type="button" id="mapZin" title="Zoom in">+</button>
+          <button type="button" id="mapZout" title="Zoom out">–</button>
+          <button type="button" id="mapFit" title="Fit map">⤢</button>
+        </div>
+      </div>
+    </div>`;
+
+  initMapEditor({ pins, features });
+}
+
+function initMapEditor({ pins, features }) {
+  const svg = document.getElementById('mapSvg');
+  const NS = 'http://www.w3.org/2000/svg';
+  const E = (t, a, p) => { const n = document.createElementNS(NS, t); for (const k in a) n.setAttribute(k, a[k]); if (p) p.appendChild(n); return n; };
+
+  const gBase = E('g', { 'data-layer': '__base' }, svg);
+  const baseImg = E('image', { href: 'campmap.webp', x: 0, y: 0, width: 2500, height: 3700 }, gBase);
+  const groups = {
+    zone: E('g', { 'data-layer': 'zone' }, svg),
+    water_line: E('g', { 'data-layer': 'water_line' }, svg),
+    sewer_line: E('g', { 'data-layer': 'sewer_line' }, svg),
+    asset: E('g', { 'data-layer': 'asset' }, svg),
+  };
+  const gLabels = E('g', { 'data-layer': 'labels' }, svg);
+  const gHandles = E('g', {}, svg);
+
+  // Local mirror of server state — every mutation below writes through to
+  // the API immediately (drag-end, finish-shape, delete, ...); this array
+  // just lets the SVG re-render instantly without waiting on the round trip.
+  let mapPins = pins.map((p) => ({ ...p }));
+  let mapFeatures = features.map((f) => ({ id: f.Id, kind: f.Kind, label: f.Label, points: f.Points, assetId: f.AssetId, style: f.Style || {} }));
+
+  let selected = null; // { type: 'pin'|'feature', ref }
+  let mode = 'edit';
+  let pending = null; // { kind, pts: [[x,y],...] } while drawing a new line/zone
+  let placingAsset = null; // asset chosen from the picker, waiting for a map click
+
+  function bucketOf(pin) {
+    if (pin.maxSeverity == null) return 'none';
+    if (pin.maxSeverity <= 2) return 'warn';
+    if (pin.maxSeverity <= 4) return 'serious';
+    return 'critical';
+  }
+  function pinColor(pin) { return MAP_SEVERITY_COLORS[bucketOf(pin)]; }
+  function featureColor(f) { return (f.style && f.style.color) || MAP_KIND_DEFAULTS[f.kind]?.color || '#5c8a4e'; }
+  function featureWeight(f) { return (f.style && f.style.weight) || MAP_KIND_DEFAULTS[f.kind]?.weight || 3; }
+  function dOf(pts, closed) { return 'M' + pts.map((p) => p.join(',')).join(' L ') + (closed ? ' Z' : ''); }
+  // The stage is landscape but campmap.webp is portrait (2500x3700), so
+  // preserveAspectRatio="xMidYMid meet" always letterboxes it — the SVG
+  // element's own bounding box is wider (or taller) than the image actually
+  // rendered inside it. Screen<->map conversions have to go through the
+  // fitted rect (the box the image is actually drawn into), not the raw
+  // element bounding box, or every click/drag lands off by the letterbox
+  // margin.
+  function fittedRect() {
+    const r = svg.getBoundingClientRect(), vb = svg.viewBox.baseVal;
+    const fscale = Math.min((r.width || 1) / vb.width, (r.height || 1) / vb.height) || 1;
+    const w = vb.width * fscale, h = vb.height * fscale;
+    return { left: r.left + (r.width - w) / 2, top: r.top + (r.height - h) / 2, scale: fscale };
+  }
+  function scale() { return 1 / fittedRect().scale; } // map units per rendered screen px
+
+  function render() {
+    const s = scale();
+    groups.zone.innerHTML = ''; groups.water_line.innerHTML = ''; groups.sewer_line.innerHTML = '';
+    groups.asset.innerHTML = ''; gLabels.innerHTML = ''; gHandles.innerHTML = '';
+
+    mapFeatures.forEach((f) => {
+      const grp = groups[f.kind] || groups.zone;
+      const g = E('g', { class: 'feat', 'data-kind': 'feature', 'data-id': f.id }, grp);
+      const isSel = selected && selected.type === 'feature' && selected.ref.id === f.id;
+      if (f.kind === 'zone') {
+        E('path', { d: dOf(f.points, true), fill: featureColor(f) + '3d', stroke: featureColor(f), 'stroke-width': (isSel ? featureWeight(f) + 1.5 : featureWeight(f)) * s }, g);
+      } else {
+        E('path', { d: dOf(f.points, false), fill: 'none', stroke: featureColor(f), 'stroke-width': (isSel ? featureWeight(f) + 1.5 : featureWeight(f)) * s, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, g);
+      }
+      if (f.label) {
+        const mid = f.points[Math.floor(f.points.length / 2)];
+        const lab = E('text', { x: mid[0], y: mid[1] - 8 * s, fill: '#20321f', 'font-size': 13 * s, 'text-anchor': 'middle', 'paint-order': 'stroke', stroke: '#fff', 'stroke-width': 3 * s }, gLabels);
+        lab.textContent = f.label;
+      }
+    });
+
+    mapPins.forEach((pin) => {
+      const g = E('g', { class: 'feat', 'data-kind': 'pin', 'data-id': pin.id }, groups.asset);
+      const isSel = selected && selected.type === 'pin' && selected.ref.id === pin.id;
+      const r = 15 * s;
+      if (pin.boardFocus) E('circle', { cx: pin.mapX, cy: pin.mapY, r: r + 5 * s, fill: 'none', stroke: '#d4af37', 'stroke-width': 2.5 * s, 'stroke-dasharray': `${4 * s},${3 * s}` }, g);
+      E('circle', { cx: pin.mapX, cy: pin.mapY, r, fill: pinColor(pin), stroke: isSel ? '#ffe08a' : '#fff', 'stroke-width': (isSel ? 4 : 2.5) * s }, g);
+      if (pin.openFindingCount) {
+        const t = E('text', { x: pin.mapX, y: pin.mapY, fill: '#fff', 'font-weight': '700', 'font-size': 13 * s, 'text-anchor': 'middle', 'dominant-baseline': 'central' }, g);
+        t.textContent = String(pin.openFindingCount);
+      }
+      const lab = E('text', { x: pin.mapX + r + 4 * s, y: pin.mapY + 5 * s, fill: '#20321f', 'font-size': 14 * s, 'paint-order': 'stroke', stroke: '#fff', 'stroke-width': 3 * s }, gLabels);
+      lab.textContent = pin.name;
+    });
+
+    if (pending) {
+      const closed = pending.kind === 'zone';
+      const dflt = MAP_KIND_DEFAULTS[pending.kind];
+      E('path', { d: 'M' + pending.pts.map((p) => p.join(',')).join(' L ') + (closed ? ' Z' : ''), fill: closed ? dflt.color + '33' : 'none', stroke: dflt.color, 'stroke-width': 4 * s, 'stroke-dasharray': `${8 * s} ${6 * s}` }, groups[pending.kind]);
+      pending.pts.forEach((p) => E('circle', { cx: p[0], cy: p[1], r: 5 * s, fill: dflt.color }, gHandles));
+    }
+
+    drawHandles(s);
+    applyLayerVisibility();
+  }
+
+  function drawHandles(s) {
+    if (!selected || selected.type !== 'feature') return;
+    const pts = selected.ref.points, n = pts.length;
+    const closed = selected.ref.kind === 'zone';
+    const segCount = closed ? n : n - 1;
+    for (let i = 0; i < segCount; i++) {
+      const a = pts[i], b = pts[(i + 1) % n];
+      E('circle', { cx: (a[0] + b[0]) / 2, cy: (a[1] + b[1]) / 2, r: 6 * s, class: 'handle', fill: featureColor(selected.ref), opacity: 0.55, 'data-mid': i }, gHandles);
+    }
+    pts.forEach((p, i) => E('circle', { cx: p[0], cy: p[1], r: 8 * s, class: 'handle', fill: '#fff', stroke: featureColor(selected.ref), 'stroke-width': 2.5 * s, 'data-vtx': i }, gHandles));
+  }
+
+  function applyLayerVisibility() {
+    document.querySelectorAll('[data-layer]').forEach((c) => {
+      if (c.tagName !== 'INPUT') return;
+      const key = c.dataset.layer;
+      const el = key === '__base' ? gBase : key === 'labels' ? gLabels : groups[key];
+      if (el) el.style.display = c.checked ? '' : 'none';
+    });
+  }
+
+  function toMap(e) {
+    const f = fittedRect(), vb = svg.viewBox.baseVal;
+    return { x: vb.x + (e.clientX - f.left) / f.scale, y: vb.y + (e.clientY - f.top) / f.scale };
+  }
+
+  // ---- pointer interaction ----
+  let pan = null, drag = null;
+  svg.addEventListener('pointerdown', (e) => {
+    const m = toMap(e);
+    if (mode === 'add-asset') { if (placingAsset) placeAssetAt(m); return; }
+    if (mode.startsWith('add-')) { addPointToPending(m); return; }
+    const h = e.target.closest('.handle');
+    if (h && selected && selected.type === 'feature') {
+      svg.setPointerCapture(e.pointerId);
+      const pts = selected.ref.points;
+      if (h.dataset.mid != null) {
+        const i = +h.dataset.mid;
+        pts.splice(i + 1, 0, [Math.round(m.x), Math.round(m.y)]);
+        drag = { k: 'vtx', i: i + 1, kind: 'feature' };
+        render();
+      } else {
+        drag = { k: 'vtx', i: +h.dataset.vtx, kind: 'feature' };
+      }
+      return;
+    }
+    const fe = e.target.closest('.feat');
+    if (fe) {
+      const kind = fe.dataset.kind, id = fe.dataset.id;
+      if (kind === 'pin') {
+        const pin = mapPins.find((p) => String(p.id) === id);
+        select({ type: 'pin', ref: pin });
+        svg.setPointerCapture(e.pointerId);
+        drag = { k: 'body', kind: 'pin', start: m, snap: { x: pin.mapX, y: pin.mapY } };
+      } else {
+        const f = mapFeatures.find((x) => String(x.id) === id);
+        select({ type: 'feature', ref: f });
+        svg.setPointerCapture(e.pointerId);
+        drag = { k: 'body', kind: 'feature', start: m, snap: f.points.map((p) => p.slice()) };
+      }
+      return;
+    }
+    select(null);
+    // SVGRect's x/y/width/height are prototype accessors, not own enumerable
+    // properties, so a plain object spread ({...baseVal}) silently drops
+    // them — snapshot explicitly or the pan below writes NaN into the
+    // viewBox the moment a move event fires.
+    const vb0 = svg.viewBox.baseVal;
+    pan = { x: e.clientX, y: e.clientY, vb: { x: vb0.x, y: vb0.y, width: vb0.width, height: vb0.height } };
+    svg.classList.add('panning');
+  });
+
+  svg.addEventListener('pointermove', (e) => {
+    if (drag) {
+      const m = toMap(e);
+      if (drag.kind === 'pin') {
+        const pin = selected.ref;
+        if (drag.k === 'vtx') { pin.mapX = Math.round(m.x); pin.mapY = Math.round(m.y); }
+        else { const dx = m.x - drag.start.x, dy = m.y - drag.start.y; pin.mapX = Math.round(drag.snap.x + dx); pin.mapY = Math.round(drag.snap.y + dy); }
+      } else {
+        const f = selected.ref;
+        if (drag.k === 'vtx') { f.points[drag.i] = [Math.round(m.x), Math.round(m.y)]; }
+        else { const dx = m.x - drag.start.x, dy = m.y - drag.start.y; f.points = drag.snap.map((p) => [Math.round(p[0] + dx), Math.round(p[1] + dy)]); }
+      }
+      render();
+      return;
+    }
+    if (pan) {
+      // Mutating the viewBox alone repaints the pan natively — no need to
+      // rebuild every element on each move (panning never changes vb.width/
+      // height, so scale()/render() output wouldn't change anyway).
+      const f = fittedRect(), vb = svg.viewBox.baseVal;
+      vb.x = pan.vb.x - (e.clientX - pan.x) / f.scale;
+      vb.y = pan.vb.y - (e.clientY - pan.y) / f.scale;
+    }
+  });
+
+  async function endDrag() {
+    if (!drag) return;
+    const wasKind = drag.kind, ref = selected?.ref;
+    drag = null;
+    if (ref && wasKind === 'pin') {
+      try { await api(`/api/pg/map/pins/${ref.id}`, { method: 'PATCH', body: JSON.stringify({ mapX: ref.mapX, mapY: ref.mapY }) }); toast('Pin moved'); }
+      catch (err) { toast(err.message); }
+    } else if (ref && wasKind === 'feature') {
+      try { await api(`/api/pg/map-features/${ref.id}`, { method: 'PATCH', body: JSON.stringify({ points: ref.points }) }); toast('Shape updated'); }
+      catch (err) { toast(err.message); }
+    }
+    if (selected) openInfo();
+  }
+  svg.addEventListener('pointerup', () => { const had = !!drag; pan = null; svg.classList.remove('panning'); if (had) endDrag(); });
+  svg.addEventListener('pointercancel', () => { drag = null; pan = null; svg.classList.remove('panning'); });
+
+  svg.addEventListener('dblclick', async (e) => {
+    const h = e.target.closest('.handle');
+    if (h && h.dataset.vtx != null && selected && selected.type === 'feature' && selected.ref.points.length > 2) {
+      selected.ref.points.splice(+h.dataset.vtx, 1);
+      render();
+      try { await api(`/api/pg/map-features/${selected.ref.id}`, { method: 'PATCH', body: JSON.stringify({ points: selected.ref.points }) }); }
+      catch (err) { toast(err.message); }
+      return;
+    }
+    if (pending && pending.pts.length > 1) finishPending();
+  });
+
+  svg.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const vb = svg.viewBox.baseVal;
+    const { x: mx, y: my } = toMap(e);
+    const f = e.deltaY > 0 ? 1.12 : 0.89;
+    vb.x = mx - (mx - vb.x) * f; vb.y = my - (my - vb.y) * f;
+    vb.width *= f; vb.height *= f;
+    render();
+  }, { passive: false });
+
+  function addPointToPending(m) {
+    const x = Math.round(m.x), y = Math.round(m.y);
+    if (!pending) pending = { kind: mode.slice(4), pts: [] };
+    pending.pts.push([x, y]);
+    document.getElementById('mapFinish').style.display = 'block';
+    render();
+  }
+  async function finishPending() {
+    if (!pending) return;
+    const kind = pending.kind, pts = pending.pts;
+    try {
+      const { feature } = await api('/api/pg/map-features', { method: 'POST', body: JSON.stringify({ kind, label: MAP_KIND_DEFAULTS[kind].label, points: pts }) });
+      pending = null;
+      document.getElementById('mapFinish').style.display = 'none';
+      setMode('edit');
+      mapFeatures.push({ id: feature.Id, kind: feature.Kind, label: feature.Label, points: feature.Points, assetId: feature.AssetId, style: feature.Style || {} });
+      select({ type: 'feature', ref: mapFeatures[mapFeatures.length - 1] });
+      toast('Shape saved — rename it at left if you like');
+    } catch (err) { toast(err.message); }
+  }
+  document.getElementById('mapFinish').addEventListener('click', finishPending);
+
+  async function placeAssetAt(m) {
+    const asset = placingAsset;
+    const x = Math.round(m.x), y = Math.round(m.y);
+    try {
+      await api(`/api/pg/map/pins/${asset.Id}`, { method: 'PATCH', body: JSON.stringify({ mapX: x, mapY: y }) });
+      let pin = mapPins.find((p) => p.id === asset.Id);
+      if (pin) { pin.mapX = x; pin.mapY = y; }
+      else {
+        mapPins.push({ ref: 'asset', id: asset.Id, name: asset.Name, category: asset.assetType, mapX: x, mapY: y, locationId: asset.locationId, locationName: asset.locationName, openFindingCount: 0, maxSeverity: null, boardFocus: false });
+        pin = mapPins[mapPins.length - 1];
+      }
+      placingAsset = null;
+      document.getElementById('mapAssetPicker').hidden = true;
+      document.getElementById('mapAssetSearch').value = '';
+      document.getElementById('mapAssetResults').innerHTML = '';
+      setMode('edit');
+      select({ type: 'pin', ref: pin });
+      toast(`${asset.Name} placed on the map`);
+    } catch (err) { toast(err.message); }
+  }
+
+  // ---- selection / info panel ----
+  function select(sel) { selected = sel; render(); openInfo(); }
+  function openInfo() {
+    const box = document.getElementById('mapInfo');
+    if (!selected) { box.innerHTML = '<h2>Selected</h2><div class="muted">Click a marker or shape to select it.</div>'; return; }
+    if (selected.type === 'pin') {
+      const p = selected.ref;
+      const bucket = bucketOf(p);
+      const sevLabel = { none: 'No open findings', warn: 'Minor / monitor', serious: 'Moderate / major', critical: 'Safety-critical' }[bucket];
+      box.innerHTML = `<h2>Selected</h2>
+        <div style="font-weight:700;font-size:0.95rem;margin-bottom:2px">${escapeHtml(p.name)}</div>
+        <div class="muted" style="margin-bottom:10px">${escapeHtml(p.category || 'Asset')}${p.locationName ? ' · ' + escapeHtml(p.locationName) : ''}</div>
+        <div class="map-info-row"><span class="map-legend-dot" style="background:${MAP_SEVERITY_COLORS[bucket]}"></span><span style="font-size:0.82rem">${escapeHtml(sevLabel)}${p.openFindingCount ? ` (${p.openFindingCount} open)` : ''}</span></div>
+        ${p.boardFocus ? '<div class="map-info-row" style="color:#a4801a;font-size:0.8rem">🏳 Flagged for board report</div>' : ''}
+        <button type="button" class="btn btn-secondary" id="mapGoAsset" style="width:100%;margin-top:6px">View asset →</button>
+        <button type="button" class="btn btn-danger" id="mapRemovePin" style="width:100%;margin-top:8px">Remove from map</button>`;
+      document.getElementById('mapGoAsset').addEventListener('click', () => go('assetDetail', { id: p.id }));
+      document.getElementById('mapRemovePin').addEventListener('click', async () => {
+        if (!await confirmDialog(`Remove ${p.name} from the map? Its findings and history are unaffected — you can re-place it any time.`)) return;
+        try {
+          await api(`/api/pg/map/pins/${p.id}`, { method: 'PATCH', body: JSON.stringify({ mapX: null, mapY: null }) });
+          mapPins = mapPins.filter((x) => x.id !== p.id);
+          select(null);
+          toast('Removed from map');
+        } catch (err) { toast(err.message); }
+      });
+      return;
+    }
+    const f = selected.ref;
+    box.innerHTML = `<h2>Selected</h2>
+      <input class="map-info-name" id="mapFeatLabel" value="${escapeHtml(f.label || '')}" placeholder="Label">
+      <div class="map-info-row">
+        <select class="map-search" id="mapFeatKind" style="flex:1">
+          ${['water_line', 'sewer_line', 'zone'].map((k) => `<option value="${k}" ${f.kind === k ? 'selected' : ''}>${MAP_KIND_DEFAULTS[k].label}</option>`).join('')}
+        </select>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin:2px 0 6px">Color</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+        ${MAP_SWATCHES.map((c) => `<button type="button" class="map-swatch ${featureColor(f) === c ? 'on' : ''}" data-color="${c}" style="background:${c}"></button>`).join('')}
+      </div>
+      <button type="button" class="btn btn-danger" id="mapDelFeature" style="width:100%">Delete shape</button>`;
+    let labelTimer;
+    document.getElementById('mapFeatLabel').addEventListener('input', (e) => {
+      f.label = e.target.value;
+      render();
+      clearTimeout(labelTimer);
+      labelTimer = setTimeout(async () => {
+        try { await api(`/api/pg/map-features/${f.id}`, { method: 'PATCH', body: JSON.stringify({ label: f.label }) }); }
+        catch (err) { toast(err.message); }
+      }, 500);
+    });
+    document.getElementById('mapFeatKind').addEventListener('change', async (e) => {
+      f.kind = e.target.value;
+      render(); openInfo();
+      try { await api(`/api/pg/map-features/${f.id}`, { method: 'PATCH', body: JSON.stringify({ kind: f.kind }) }); }
+      catch (err) { toast(err.message); }
+    });
+    box.querySelectorAll('.map-swatch').forEach((sw) => sw.addEventListener('click', async () => {
+      f.style = { ...(f.style || {}), color: sw.dataset.color };
+      render(); openInfo();
+      try { await api(`/api/pg/map-features/${f.id}`, { method: 'PATCH', body: JSON.stringify({ style: f.style }) }); }
+      catch (err) { toast(err.message); }
+    }));
+    document.getElementById('mapDelFeature').addEventListener('click', async () => {
+      if (!await confirmDialog(`Delete ${f.label || MAP_KIND_DEFAULTS[f.kind].label}? This can't be undone.`)) return;
+      try {
+        await api(`/api/pg/map-features/${f.id}`, { method: 'DELETE' });
+        mapFeatures = mapFeatures.filter((x) => x.id !== f.id);
+        select(null);
+        toast('Shape deleted');
+      } catch (err) { toast(err.message); }
+    });
+  }
+
+  // ---- tools / mode ----
+  function setMode(m) {
+    mode = m;
+    document.querySelectorAll('.map-tool').forEach((t) => t.classList.toggle('on', t.dataset.tool === m));
+    svg.classList.toggle('placing', m.startsWith('add-'));
+    if (m !== 'add-asset') { placingAsset = null; const picker = document.getElementById('mapAssetPicker'); if (picker) picker.hidden = true; }
+    if (!m.startsWith('add-') && pending) { pending = null; document.getElementById('mapFinish').style.display = 'none'; render(); }
+  }
+  document.getElementById('mapTools').addEventListener('click', (e) => {
+    const b = e.target.closest('.map-tool');
+    if (!b) return;
+    const tool = b.dataset.tool;
+    setMode(tool);
+    if (tool === 'add-asset') { document.getElementById('mapAssetPicker').hidden = false; document.getElementById('mapAssetSearch').focus(); }
+  });
+
+  // ---- asset search/picker ----
+  let assetSearchTimer;
+  document.getElementById('mapAssetSearch').addEventListener('input', (e) => {
+    clearTimeout(assetSearchTimer);
+    const q = e.target.value.trim();
+    const resultsBox = document.getElementById('mapAssetResults');
+    if (!q) { resultsBox.innerHTML = ''; return; }
+    assetSearchTimer = setTimeout(async () => {
+      const { assets } = await api(`/api/pg/assets-search?q=${encodeURIComponent(q)}`);
+      resultsBox.innerHTML = assets.map((a) => `
+        <div class="map-asset-result" data-id="${a.Id}">
+          <div>${escapeHtml(a.Name)}${a.onMap ? ' <span class="muted">(on map — click to move)</span>' : ''}</div>
+          <div class="muted">${escapeHtml(a.assetType || '')}${a.locationName ? ' · ' + escapeHtml(a.locationName) : ''}</div>
+        </div>`).join('') || '<div class="muted" style="padding:6px 0">No matches</div>';
+      resultsBox.querySelectorAll('.map-asset-result').forEach((el) => el.addEventListener('click', () => {
+        placingAsset = assets.find((a) => String(a.Id) === el.dataset.id);
+        toast(`Click on the map to place ${placingAsset.Name}`);
+      }));
+    }, 250);
+  });
+
+  // ---- layers, zoom, keys ----
+  document.querySelectorAll('[data-layer]').forEach((c) => c.addEventListener('change', render));
+  document.getElementById('mapDim').addEventListener('input', (e) => { baseImg.setAttribute('opacity', 1 - e.target.value / 100); });
+  document.getElementById('mapZin').addEventListener('click', () => zoom(0.8));
+  document.getElementById('mapZout').addEventListener('click', () => zoom(1.25));
+  document.getElementById('mapFit').addEventListener('click', () => { svg.setAttribute('viewBox', '0 0 2500 3700'); render(); });
+  function zoom(f) {
+    const vb = svg.viewBox.baseVal, cx = vb.x + vb.width / 2, cy = vb.y + vb.height / 2;
+    vb.width *= f; vb.height *= f; vb.x = cx - vb.width / 2; vb.y = cy - vb.height / 2;
+    render();
+  }
+
+  function mapKeydown(e) {
+    if (!document.getElementById('mapSvg')) { document.removeEventListener('keydown', mapKeydown); return; }
+    if (document.activeElement && ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) return;
+    if (e.key === 'Escape') { pending = null; document.getElementById('mapFinish').style.display = 'none'; setMode('edit'); }
+    if (e.key === 'Enter' && pending && pending.pts.length > 1) finishPending();
+  }
+  document.addEventListener('keydown', mapKeydown);
+
+  // ---- sizing: fill the space below the topbar/banner exactly, whatever
+  // their heights happen to be, instead of guessing at a vh calc() ----
+  function sizeStage() {
+    const view = document.querySelector('.map-view');
+    if (!view) { window.removeEventListener('resize', sizeStage); return; }
+    view.style.height = Math.max(360, window.innerHeight - view.getBoundingClientRect().top - 12) + 'px';
+    render();
+  }
+  window.addEventListener('resize', sizeStage);
+  sizeStage();
 }
 
 function moneyFmt(n) { return '$' + Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 0 }); }

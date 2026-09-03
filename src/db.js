@@ -1744,12 +1744,12 @@ export async function createSkill(name) {
 
 export async function searchAssetsLive(q) {
   const { rows } = await pool.query(
-    `SELECT a.id, a.name, a.asset_type, a.location_id, l.name AS location_name
+    `SELECT a.id, a.name, a.asset_type, a.location_id, l.name AS location_name, (a.map_x IS NOT NULL) AS on_map
      FROM assets a LEFT JOIN locations l ON l.id = a.location_id
      WHERE a.name ILIKE $1 ORDER BY a.name LIMIT 20`,
     [`%${q}%`]
   );
-  return rows.map((r) => ({ Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: r.location_name }));
+  return rows.map((r) => ({ Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: r.location_name, onMap: r.on_map }));
 }
 
 export async function createAssetQuick({ name, locationId, assetType }) {
@@ -1810,7 +1810,7 @@ export async function setAssetMapLocation(assetId, { mapX, mapY }) {
     [assetId, mapX, mapY]
   );
   if (!rows[0]) return null;
-  await logActivity({ action: 'moved map pin for', entityType: 'asset', entityId: rows[0].id, entityLabel: rows[0].name });
+  await logActivity({ action: mapX === null ? 'removed map pin for' : 'moved map pin for', entityType: 'asset', entityId: rows[0].id, entityLabel: rows[0].name });
   return { Id: rows[0].id, Name: rows[0].name, mapX: rows[0].map_x, mapY: rows[0].map_y };
 }
 
