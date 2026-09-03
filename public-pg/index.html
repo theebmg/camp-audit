@@ -247,6 +247,19 @@
     .map-info-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
     .map-swatch { width: 20px; height: 20px; border-radius: 50%; cursor: pointer; border: 2px solid transparent; padding: 0; }
     .map-swatch.on { border-color: var(--text); }
+    .map-layer-row { display: flex; align-items: center; gap: 6px; padding: 6px 0 2px; }
+    .map-layer-row2 { display: flex; align-items: center; gap: 5px; padding: 0 0 8px; border-bottom: 1px solid var(--border); margin-bottom: 2px; position: relative; }
+    .map-layer-swatch { width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--border); cursor: pointer; padding: 0; flex: 0 0 auto; }
+    .map-layer-swatch-picker { position: absolute; top: 100%; left: 0; z-index: 5; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 6px; display: flex; gap: 5px; flex-wrap: wrap; width: 140px; box-shadow: var(--shadow-sm); }
+    .map-layer-swatch-picker .map-swatch { width: 18px; height: 18px; }
+    .map-layer-name { flex: 1; min-width: 0; border: 1px solid transparent; background: transparent; color: var(--text); font-size: 0.83rem; padding: 3px 4px; border-radius: 6px; }
+    .map-layer-name:hover, .map-layer-name:focus { border-color: var(--border); background: var(--surface); }
+    .map-layer-vis input { accent-color: var(--accent); }
+    .map-layer-icon { width: 34px; border: 1px solid var(--border); border-radius: 6px; padding: 3px 4px; font-size: 0.85rem; text-align: center; background: var(--surface); color: var(--text); }
+    .map-layer-cond-lbl { display: flex; align-items: center; gap: 3px; font-size: 0.68rem; color: var(--muted); cursor: pointer; white-space: nowrap; }
+    .map-layer-btn { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 6px; width: 22px; height: 22px; font-size: 11px; cursor: pointer; padding: 0; }
+    .map-layer-btn:disabled { opacity: 0.35; cursor: default; }
+    .map-add-layer { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 8px; background: var(--surface-alt); }
     @media (max-width: 860px) {
       .map-view { flex-direction: column; }
       .map-side { width: 100%; flex: 0 0 auto; max-height: 44vh; }

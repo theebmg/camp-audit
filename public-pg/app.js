@@ -1289,26 +1289,27 @@ async function renderAssetHistory({ id }) {
 
 // ---------- Interactive Map ----------
 // Pins are assets with map_x/map_y set (image-pixel coords on campmap.webp,
-// 2500x3700, top-left origin — never lat/lng). Pin color is derived live
-// from open condition_findings.severity, never stored, so there's no
-// "status" field to edit here — only position. Water/sewer lines and zones
-// are map_features rows (polylines/polygons in the same pixel space). Every
-// edit (drag, reshape, add, delete) writes straight through to the API on
-// its own — there's no separate "Save" step to remember.
-const MAP_KIND_DEFAULTS = {
-  water_line: { color: '#2b6cb0', weight: 4, label: 'Water line' },
-  sewer_line: { color: '#8a6d3b', weight: 4, label: 'Sewer line' },
-  zone: { color: '#5c8a4e', weight: 2, label: 'Zone' },
-};
-const MAP_SWATCHES = ['#2b6cb0', '#8a6d3b', '#5c8a4e', '#c0433a', '#d0902a', '#6b4fa0'];
+// 2500x3700, top-left origin — never lat/lng). Every point/line/zone
+// dropped on the map — Electrical, Trash, Water valves, Sewer, or anything
+// invented later — belongs to a map_layer (name/color/icon/z-order/
+// visibility/condition-coloring): layers are DATA managed entirely from
+// this UI, never hardcoded here. A marker's color is a flat layer color
+// unless its layer has "color by condition" on AND it's linked to a real
+// asset, in which case it's derived live from that asset's worst open
+// condition_findings.severity — never stored. Every edit (drag, reshape,
+// add, delete, layer CRUD) writes straight through to the API on its own —
+// there's no separate "Save" step to remember.
+const MAP_SWATCHES = ['#2b6cb0', '#8a6d3b', '#5c8a4e', '#c0433a', '#d0902a', '#6b4fa0', '#4b6b5c', '#8a8272'];
 const MAP_SEVERITY_COLORS = { none: '#0ca30c', warn: '#fab219', serious: '#ec835a', critical: '#d03b3b' };
+const MAP_GEOM_LABEL = { point: 'points', line: 'lines', zone: 'zones', mixed: 'mixed' };
 
 async function renderMap() {
   setChrome({ title: 'Interactive Map', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const [{ pins }, { features }] = await Promise.all([
+  const [{ pins }, { features }, { layers }] = await Promise.all([
     api('/api/pg/map/pins'),
     api('/api/pg/map-features'),
+    api('/api/pg/map/layers'),
   ]);
 
   app.innerHTML = `
@@ -1316,13 +1317,7 @@ async function renderMap() {
       <aside class="map-side">
         <div class="map-grp">
           <h2>Tools</h2>
-          <div class="map-tools" id="mapTools">
-            <button type="button" class="map-tool on" data-tool="edit">Edit</button>
-            <button type="button" class="map-tool" data-tool="add-asset">+ Asset</button>
-            <button type="button" class="map-tool" data-tool="add-water_line">+ Water line</button>
-            <button type="button" class="map-tool" data-tool="add-sewer_line">+ Sewer line</button>
-            <button type="button" class="map-tool" data-tool="add-zone">+ Zone</button>
-          </div>
+          <div class="map-tools" id="mapTools"></div>
           <div class="map-hint" id="mapHint"><b>Edit:</b> drag a marker or shape to move it. Drag a shape's dots to reshape; click a faint midpoint to add a point; double-click a point to remove it. Scroll to zoom, drag empty space to pan.</div>
         </div>
         <div class="map-grp" id="mapAssetPicker" hidden>
@@ -1331,14 +1326,39 @@ async function renderMap() {
           <div id="mapAssetResults"></div>
         </div>
         <div class="map-grp">
-          <h2>Layers</h2>
-          <label class="map-lyr"><input type="checkbox" data-layer="__base" checked> Base map</label>
+          <h2>Base</h2>
+          <label class="map-lyr"><input type="checkbox" id="mapBaseToggle" checked> Base map</label>
           <div class="map-row2"><span class="muted" style="font-size:11px">Dim</span><input type="range" id="mapDim" min="0" max="100" value="0"></div>
-          <label class="map-lyr"><input type="checkbox" data-layer="zone" checked> Zones</label>
-          <label class="map-lyr"><input type="checkbox" data-layer="water_line" checked> Water lines</label>
-          <label class="map-lyr"><input type="checkbox" data-layer="sewer_line" checked> Sewer lines</label>
-          <label class="map-lyr"><input type="checkbox" data-layer="asset" checked> Assets</label>
-          <label class="map-lyr"><input type="checkbox" data-layer="labels" checked> Labels</label>
+          <label class="map-lyr"><input type="checkbox" id="mapLabelsToggle" checked> Labels</label>
+        </div>
+        <div class="map-grp">
+          <h2>Pin labels</h2>
+          <div class="map-tools" id="mapLabelMode">
+            <button type="button" class="map-tool" data-label-mode="asset">Asset name</button>
+            <button type="button" class="map-tool" data-label-mode="holder">Cabin holder</button>
+          </div>
+        </div>
+        <div class="map-grp" id="mapLayersGrp">
+          <h2>Layers</h2>
+          <div id="mapLayerRows"></div>
+          <div class="map-add-layer" id="mapAddLayerForm" hidden>
+            <input type="text" class="map-search" id="newLayerName" placeholder="Layer name" style="margin-bottom:6px">
+            <div class="map-info-row">
+              <select class="map-search" id="newLayerGeom" style="flex:1">
+                <option value="point">Points</option>
+                <option value="line">Lines</option>
+                <option value="zone">Zones</option>
+                <option value="mixed">Mixed</option>
+              </select>
+              <input type="text" class="map-search" id="newLayerIcon" placeholder="🔧" maxlength="2" style="width:52px">
+            </div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px" id="newLayerSwatches">
+              ${MAP_SWATCHES.map((c) => `<button type="button" class="map-swatch" data-color="${c}" style="background:${c}"></button>`).join('')}
+            </div>
+            <label class="map-lyr" style="margin-bottom:8px"><input type="checkbox" id="newLayerCond"> Color by condition (asset-linked)</label>
+            <button type="button" class="btn btn-primary" id="newLayerCreate" style="width:100%">Create layer</button>
+          </div>
+          <button type="button" class="btn btn-secondary" id="mapAddLayerBtn" style="width:100%;margin-top:8px">+ Add layer</button>
         </div>
         <div class="map-grp">
           <h2>Legend</h2>
@@ -1347,6 +1367,7 @@ async function renderMap() {
           <div class="map-legend-item"><span class="map-legend-dot" style="background:${MAP_SEVERITY_COLORS.serious}"></span>Moderate / major</div>
           <div class="map-legend-item"><span class="map-legend-dot" style="background:${MAP_SEVERITY_COLORS.critical}"></span>Safety-critical</div>
           <div class="map-legend-item"><span class="map-legend-dot" style="background:#fff;border:2px solid #d4af37"></span>Flagged for board</div>
+          <div class="muted" style="font-size:11px;margin-top:4px">Condition colors apply on layers with "color by condition" on, for markers linked to an asset.</div>
         </div>
         <div class="map-grp" id="mapInfo"><h2>Selected</h2><div class="muted">Click a marker or shape to select it.</div></div>
       </aside>
@@ -1361,45 +1382,75 @@ async function renderMap() {
       </div>
     </div>`;
 
-  initMapEditor({ pins, features });
+  initMapEditor({ pins, features, layers });
 }
 
-function initMapEditor({ pins, features }) {
+function initMapEditor({ pins, features, layers }) {
   const svg = document.getElementById('mapSvg');
   const NS = 'http://www.w3.org/2000/svg';
   const E = (t, a, p) => { const n = document.createElementNS(NS, t); for (const k in a) n.setAttribute(k, a[k]); if (p) p.appendChild(n); return n; };
 
-  const gBase = E('g', { 'data-layer': '__base' }, svg);
+  const gBase = E('g', {}, svg);
   const baseImg = E('image', { href: 'campmap.webp', x: 0, y: 0, width: 2500, height: 3700 }, gBase);
-  const groups = {
-    zone: E('g', { 'data-layer': 'zone' }, svg),
-    water_line: E('g', { 'data-layer': 'water_line' }, svg),
-    sewer_line: E('g', { 'data-layer': 'sewer_line' }, svg),
-    asset: E('g', { 'data-layer': 'asset' }, svg),
-  };
-  const gLabels = E('g', { 'data-layer': 'labels' }, svg);
+  const gLabels = E('g', {}, svg);
   const gHandles = E('g', {}, svg);
 
   // Local mirror of server state — every mutation below writes through to
-  // the API immediately (drag-end, finish-shape, delete, ...); this array
-  // just lets the SVG re-render instantly without waiting on the round trip.
+  // the API immediately (drag-end, finish-shape, delete, layer edits, ...);
+  // these arrays just let the SVG re-render instantly without waiting on
+  // the round trip.
+  function normalizeFeature(f) {
+    return {
+      id: f.Id, kind: f.Kind, label: f.Label, points: f.Points, assetId: f.AssetId, layerId: f.LayerId,
+      style: f.Style || {}, assetName: f.AssetName, holderName: f.HolderName,
+      openFindingCount: Number(f.OpenFindingCount) || 0, maxSeverity: f.MaxSeverity, boardFocus: f.BoardFocus,
+    };
+  }
   let mapPins = pins.map((p) => ({ ...p }));
-  let mapFeatures = features.map((f) => ({ id: f.Id, kind: f.Kind, label: f.Label, points: f.Points, assetId: f.AssetId, style: f.Style || {} }));
+  let mapFeatures = features.map(normalizeFeature);
+  let mapLayers = layers.map((l) => ({ ...l }));
+
+  let layerGroups = {}; // layerId -> <g>, kept in z-order between gBase and gLabels
+  let orphanGroup = null; // features whose layer was deleted
+  let buildingsFallbackGroup = null; // building pins if the "Buildings" layer was deleted
 
   let selected = null; // { type: 'pin'|'feature', ref }
   let mode = 'edit';
-  let pending = null; // { kind, pts: [[x,y],...] } while drawing a new line/zone
+  let pending = null; // { kind, layerId, pts: [[x,y],...] } while drawing a new line/zone
   let placingAsset = null; // asset chosen from the picker, waiting for a map click
+  let labelMode = (() => { try { return localStorage.getItem('campMapLabelMode') === 'holder' ? 'holder' : 'asset'; } catch { return 'asset'; } })();
 
-  function bucketOf(pin) {
-    if (pin.maxSeverity == null) return 'none';
-    if (pin.maxSeverity <= 2) return 'warn';
-    if (pin.maxSeverity <= 4) return 'serious';
+  function layerById(id) { return mapLayers.find((l) => l.Id === id); }
+
+  function bucketOf(sev) {
+    if (sev == null) return 'none';
+    if (sev <= 2) return 'warn';
+    if (sev <= 4) return 'serious';
     return 'critical';
   }
-  function pinColor(pin) { return MAP_SEVERITY_COLORS[bucketOf(pin)]; }
-  function featureColor(f) { return (f.style && f.style.color) || MAP_KIND_DEFAULTS[f.kind]?.color || '#5c8a4e'; }
-  function featureWeight(f) { return (f.style && f.style.weight) || MAP_KIND_DEFAULTS[f.kind]?.weight || 3; }
+  function pinColor(pin) {
+    const layer = layerById(pin.layerId);
+    if (layer && !layer.ColorByCondition) return layer.Color;
+    return MAP_SEVERITY_COLORS[bucketOf(pin.maxSeverity)];
+  }
+  function featureColor(f) {
+    const layer = layerById(f.layerId);
+    if (!layer) return '#5c8a4e';
+    if (layer.ColorByCondition && f.assetId) return MAP_SEVERITY_COLORS[bucketOf(f.maxSeverity)];
+    return layer.Color;
+  }
+  function featureWeight(f) { return f.kind === 'zone' ? 2 : 4; }
+  function labelOf(pin) { return labelMode === 'holder' ? (pin.holderName || pin.name) : pin.name; }
+  // Labels live in one shared gLabels group (so they always paint above
+  // every shape/marker, regardless of layer z-order) — which means hiding a
+  // layer only hides its own group, not the labels drawn alongside it. Skip
+  // adding a label at all for anything on a hidden layer, or it's left
+  // floating on the map with no marker under it.
+  function layerVisible(layerId) {
+    if (!layerId) return true;
+    const l = layerById(layerId);
+    return !l || l.DefaultVisible !== false;
+  }
   function dOf(pts, closed) { return 'M' + pts.map((p) => p.join(',')).join(' L ') + (closed ? ' Z' : ''); }
   // The stage is landscape but campmap.webp is portrait (2500x3700), so
   // preserveAspectRatio="xMidYMid meet" always letterboxes it — the SVG
@@ -1416,29 +1467,70 @@ function initMapEditor({ pins, features }) {
   }
   function scale() { return 1 / fittedRect().scale; } // map units per rendered screen px
 
+  // Layer groups are rebuilt (removed + recreated in z-order) only when the
+  // layer set itself changes (add/delete/reorder) — render() just clears
+  // and repopulates their children, so drags/pans stay cheap.
+  function rebuildLayerGroups() {
+    Object.values(layerGroups).forEach((g) => g.remove());
+    if (orphanGroup) orphanGroup.remove();
+    if (buildingsFallbackGroup) buildingsFallbackGroup.remove();
+    layerGroups = {};
+    orphanGroup = E('g', {}, svg);
+    svg.insertBefore(orphanGroup, gLabels);
+    [...mapLayers].sort((a, b) => a.ZIndex - b.ZIndex).forEach((l) => {
+      const g = E('g', { 'data-layer-id': l.Id }, svg);
+      svg.insertBefore(g, gLabels);
+      layerGroups[l.Id] = g;
+    });
+    buildingsFallbackGroup = E('g', {}, svg);
+    svg.insertBefore(buildingsFallbackGroup, gLabels);
+  }
+
   function render() {
     const s = scale();
-    groups.zone.innerHTML = ''; groups.water_line.innerHTML = ''; groups.sewer_line.innerHTML = '';
-    groups.asset.innerHTML = ''; gLabels.innerHTML = ''; gHandles.innerHTML = '';
+    Object.values(layerGroups).forEach((g) => { g.innerHTML = ''; });
+    orphanGroup.innerHTML = ''; buildingsFallbackGroup.innerHTML = '';
+    gLabels.innerHTML = ''; gHandles.innerHTML = '';
 
     mapFeatures.forEach((f) => {
-      const grp = groups[f.kind] || groups.zone;
+      const grp = (f.layerId && layerGroups[f.layerId]) || orphanGroup;
       const g = E('g', { class: 'feat', 'data-kind': 'feature', 'data-id': f.id }, grp);
       const isSel = selected && selected.type === 'feature' && selected.ref.id === f.id;
+      const color = featureColor(f);
+      const showLabel = layerVisible(f.layerId);
       if (f.kind === 'zone') {
-        E('path', { d: dOf(f.points, true), fill: featureColor(f) + '3d', stroke: featureColor(f), 'stroke-width': (isSel ? featureWeight(f) + 1.5 : featureWeight(f)) * s }, g);
+        E('path', { d: dOf(f.points, true), fill: color + '3d', stroke: color, 'stroke-width': (isSel ? featureWeight(f) + 1.5 : featureWeight(f)) * s }, g);
+        if (f.label && showLabel) {
+          const mid = f.points[Math.floor(f.points.length / 2)];
+          const lab = E('text', { x: mid[0], y: mid[1] - 8 * s, fill: '#20321f', 'font-size': 13 * s, 'text-anchor': 'middle', 'paint-order': 'stroke', stroke: '#fff', 'stroke-width': 3 * s }, gLabels);
+          lab.textContent = f.label;
+        }
+      } else if (f.kind === 'line') {
+        E('path', { d: dOf(f.points, false), fill: 'none', stroke: color, 'stroke-width': (isSel ? featureWeight(f) + 1.5 : featureWeight(f)) * s, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, g);
+        if (f.label && showLabel) {
+          const mid = f.points[Math.floor(f.points.length / 2)];
+          const lab = E('text', { x: mid[0], y: mid[1] - 8 * s, fill: '#20321f', 'font-size': 13 * s, 'text-anchor': 'middle', 'paint-order': 'stroke', stroke: '#fff', 'stroke-width': 3 * s }, gLabels);
+          lab.textContent = f.label;
+        }
       } else {
-        E('path', { d: dOf(f.points, false), fill: 'none', stroke: featureColor(f), 'stroke-width': (isSel ? featureWeight(f) + 1.5 : featureWeight(f)) * s, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, g);
-      }
-      if (f.label) {
-        const mid = f.points[Math.floor(f.points.length / 2)];
-        const lab = E('text', { x: mid[0], y: mid[1] - 8 * s, fill: '#20321f', 'font-size': 13 * s, 'text-anchor': 'middle', 'paint-order': 'stroke', stroke: '#fff', 'stroke-width': 3 * s }, gLabels);
-        lab.textContent = f.label;
+        const p = f.points[0] || [0, 0];
+        const r = 13 * s;
+        const layer = layerById(f.layerId);
+        E('circle', { cx: p[0], cy: p[1], r, fill: color, stroke: isSel ? '#ffe08a' : '#fff', 'stroke-width': (isSel ? 4 : 2.5) * s }, g);
+        if (layer?.Icon) {
+          const t = E('text', { x: p[0], y: p[1], 'font-size': 14 * s, 'text-anchor': 'middle', 'dominant-baseline': 'central' }, g);
+          t.textContent = layer.Icon;
+        }
+        if (showLabel) {
+          const lab = E('text', { x: p[0] + r + 4 * s, y: p[1] + 5 * s, fill: '#20321f', 'font-size': 13 * s, 'paint-order': 'stroke', stroke: '#fff', 'stroke-width': 3 * s }, gLabels);
+          lab.textContent = (labelMode === 'holder' ? f.holderName : null) || f.label || '';
+        }
       }
     });
 
     mapPins.forEach((pin) => {
-      const g = E('g', { class: 'feat', 'data-kind': 'pin', 'data-id': pin.id }, groups.asset);
+      const grp = (pin.layerId && layerGroups[pin.layerId]) || buildingsFallbackGroup;
+      const g = E('g', { class: 'feat', 'data-kind': 'pin', 'data-id': pin.id }, grp);
       const isSel = selected && selected.type === 'pin' && selected.ref.id === pin.id;
       const r = 15 * s;
       if (pin.boardFocus) E('circle', { cx: pin.mapX, cy: pin.mapY, r: r + 5 * s, fill: 'none', stroke: '#d4af37', 'stroke-width': 2.5 * s, 'stroke-dasharray': `${4 * s},${3 * s}` }, g);
@@ -1447,40 +1539,42 @@ function initMapEditor({ pins, features }) {
         const t = E('text', { x: pin.mapX, y: pin.mapY, fill: '#fff', 'font-weight': '700', 'font-size': 13 * s, 'text-anchor': 'middle', 'dominant-baseline': 'central' }, g);
         t.textContent = String(pin.openFindingCount);
       }
-      const lab = E('text', { x: pin.mapX + r + 4 * s, y: pin.mapY + 5 * s, fill: '#20321f', 'font-size': 14 * s, 'paint-order': 'stroke', stroke: '#fff', 'stroke-width': 3 * s }, gLabels);
-      lab.textContent = pin.name;
+      if (layerVisible(pin.layerId)) {
+        const lab = E('text', { x: pin.mapX + r + 4 * s, y: pin.mapY + 5 * s, fill: '#20321f', 'font-size': 14 * s, 'paint-order': 'stroke', stroke: '#fff', 'stroke-width': 3 * s }, gLabels);
+        lab.textContent = labelOf(pin);
+      }
     });
 
     if (pending) {
+      const layer = layerById(pending.layerId);
+      const color = layer?.Color || '#5c8a4e';
       const closed = pending.kind === 'zone';
-      const dflt = MAP_KIND_DEFAULTS[pending.kind];
-      E('path', { d: 'M' + pending.pts.map((p) => p.join(',')).join(' L ') + (closed ? ' Z' : ''), fill: closed ? dflt.color + '33' : 'none', stroke: dflt.color, 'stroke-width': 4 * s, 'stroke-dasharray': `${8 * s} ${6 * s}` }, groups[pending.kind]);
-      pending.pts.forEach((p) => E('circle', { cx: p[0], cy: p[1], r: 5 * s, fill: dflt.color }, gHandles));
+      const grp = (pending.layerId && layerGroups[pending.layerId]) || orphanGroup;
+      E('path', { d: 'M' + pending.pts.map((p) => p.join(',')).join(' L ') + (closed ? ' Z' : ''), fill: closed ? color + '33' : 'none', stroke: color, 'stroke-width': 4 * s, 'stroke-dasharray': `${8 * s} ${6 * s}` }, grp);
+      pending.pts.forEach((p) => E('circle', { cx: p[0], cy: p[1], r: 5 * s, fill: color }, gHandles));
     }
 
     drawHandles(s);
-    applyLayerVisibility();
+    applyVisibility();
   }
 
   function drawHandles(s) {
-    if (!selected || selected.type !== 'feature') return;
+    if (!selected || selected.type !== 'feature' || selected.ref.kind === 'point') return;
     const pts = selected.ref.points, n = pts.length;
     const closed = selected.ref.kind === 'zone';
     const segCount = closed ? n : n - 1;
+    const color = featureColor(selected.ref);
     for (let i = 0; i < segCount; i++) {
       const a = pts[i], b = pts[(i + 1) % n];
-      E('circle', { cx: (a[0] + b[0]) / 2, cy: (a[1] + b[1]) / 2, r: 6 * s, class: 'handle', fill: featureColor(selected.ref), opacity: 0.55, 'data-mid': i }, gHandles);
+      E('circle', { cx: (a[0] + b[0]) / 2, cy: (a[1] + b[1]) / 2, r: 6 * s, class: 'handle', fill: color, opacity: 0.55, 'data-mid': i }, gHandles);
     }
-    pts.forEach((p, i) => E('circle', { cx: p[0], cy: p[1], r: 8 * s, class: 'handle', fill: '#fff', stroke: featureColor(selected.ref), 'stroke-width': 2.5 * s, 'data-vtx': i }, gHandles));
+    pts.forEach((p, i) => E('circle', { cx: p[0], cy: p[1], r: 8 * s, class: 'handle', fill: '#fff', stroke: color, 'stroke-width': 2.5 * s, 'data-vtx': i }, gHandles));
   }
 
-  function applyLayerVisibility() {
-    document.querySelectorAll('[data-layer]').forEach((c) => {
-      if (c.tagName !== 'INPUT') return;
-      const key = c.dataset.layer;
-      const el = key === '__base' ? gBase : key === 'labels' ? gLabels : groups[key];
-      if (el) el.style.display = c.checked ? '' : 'none';
-    });
+  function applyVisibility() {
+    mapLayers.forEach((l) => { const g = layerGroups[l.Id]; if (g) g.style.display = l.DefaultVisible ? '' : 'none'; });
+    gBase.style.display = document.getElementById('mapBaseToggle')?.checked === false ? 'none' : '';
+    gLabels.style.display = document.getElementById('mapLabelsToggle')?.checked === false ? 'none' : '';
   }
 
   function toMap(e) {
@@ -1493,7 +1587,14 @@ function initMapEditor({ pins, features }) {
   svg.addEventListener('pointerdown', (e) => {
     const m = toMap(e);
     if (mode === 'add-asset') { if (placingAsset) placeAssetAt(m); return; }
-    if (mode.startsWith('add-')) { addPointToPending(m); return; }
+    if (mode.startsWith('add-layer:')) {
+      const [, layerIdStr, geom] = mode.split(':');
+      const layer = layerById(Number(layerIdStr));
+      if (!layer) { setMode('edit'); return; }
+      if (geom === 'point') { placeLayerPointAt(m, layer); return; }
+      addPointToPending(m, layer, geom);
+      return;
+    }
     const h = e.target.closest('.handle');
     if (h && selected && selected.type === 'feature') {
       svg.setPointerCapture(e.pointerId);
@@ -1597,37 +1698,49 @@ function initMapEditor({ pins, features }) {
     render();
   }, { passive: false });
 
-  function addPointToPending(m) {
+  function addPointToPending(m, layer, geom) {
     const x = Math.round(m.x), y = Math.round(m.y);
-    if (!pending) pending = { kind: mode.slice(4), pts: [] };
+    if (!pending) pending = { kind: geom, layerId: layer.Id, pts: [] };
     pending.pts.push([x, y]);
     document.getElementById('mapFinish').style.display = 'block';
     render();
   }
   async function finishPending() {
     if (!pending) return;
-    const kind = pending.kind, pts = pending.pts;
+    const { kind, layerId, pts } = pending;
+    const layer = layerById(layerId);
     try {
-      const { feature } = await api('/api/pg/map-features', { method: 'POST', body: JSON.stringify({ kind, label: MAP_KIND_DEFAULTS[kind].label, points: pts }) });
+      const { feature } = await api('/api/pg/map-features', { method: 'POST', body: JSON.stringify({ kind, label: layer?.Name || kind, points: pts, layerId }) });
       pending = null;
       document.getElementById('mapFinish').style.display = 'none';
       setMode('edit');
-      mapFeatures.push({ id: feature.Id, kind: feature.Kind, label: feature.Label, points: feature.Points, assetId: feature.AssetId, style: feature.Style || {} });
+      mapFeatures.push(normalizeFeature(feature));
       select({ type: 'feature', ref: mapFeatures[mapFeatures.length - 1] });
       toast('Shape saved — rename it at left if you like');
     } catch (err) { toast(err.message); }
   }
   document.getElementById('mapFinish').addEventListener('click', finishPending);
 
+  async function placeLayerPointAt(m, layer) {
+    const x = Math.round(m.x), y = Math.round(m.y);
+    try {
+      const { feature } = await api('/api/pg/map-features', { method: 'POST', body: JSON.stringify({ kind: 'point', label: layer.Name, points: [[x, y]], layerId: layer.Id }) });
+      mapFeatures.push(normalizeFeature(feature));
+      setMode('edit');
+      select({ type: 'feature', ref: mapFeatures[mapFeatures.length - 1] });
+      toast(`${layer.Name} marker added — rename it at left if you like`);
+    } catch (err) { toast(err.message); }
+  }
+
   async function placeAssetAt(m) {
     const asset = placingAsset;
     const x = Math.round(m.x), y = Math.round(m.y);
     try {
-      await api(`/api/pg/map/pins/${asset.Id}`, { method: 'PATCH', body: JSON.stringify({ mapX: x, mapY: y }) });
+      const { pin: updated } = await api(`/api/pg/map/pins/${asset.Id}`, { method: 'PATCH', body: JSON.stringify({ mapX: x, mapY: y }) });
       let pin = mapPins.find((p) => p.id === asset.Id);
-      if (pin) { pin.mapX = x; pin.mapY = y; }
+      if (pin) { pin.mapX = x; pin.mapY = y; pin.layerId = updated.LayerId; }
       else {
-        mapPins.push({ ref: 'asset', id: asset.Id, name: asset.Name, category: asset.assetType, mapX: x, mapY: y, locationId: asset.locationId, locationName: asset.locationName, openFindingCount: 0, maxSeverity: null, boardFocus: false });
+        mapPins.push({ ref: 'asset', id: asset.Id, name: asset.Name, category: asset.assetType, mapX: x, mapY: y, layerId: updated.LayerId, locationId: asset.locationId, locationName: asset.locationName, holderName: asset.holderName || null, openFindingCount: 0, maxSeverity: null, boardFocus: false });
         pin = mapPins[mapPins.length - 1];
       }
       placingAsset = null;
@@ -1647,13 +1760,14 @@ function initMapEditor({ pins, features }) {
     if (!selected) { box.innerHTML = '<h2>Selected</h2><div class="muted">Click a marker or shape to select it.</div>'; return; }
     if (selected.type === 'pin') {
       const p = selected.ref;
-      const bucket = bucketOf(p);
+      const bucket = bucketOf(p.maxSeverity);
       const sevLabel = { none: 'No open findings', warn: 'Minor / monitor', serious: 'Moderate / major', critical: 'Safety-critical' }[bucket];
       box.innerHTML = `<h2>Selected</h2>
         <div style="font-weight:700;font-size:0.95rem;margin-bottom:2px">${escapeHtml(p.name)}</div>
         <div class="muted" style="margin-bottom:10px">${escapeHtml(p.category || 'Asset')}${p.locationName ? ' · ' + escapeHtml(p.locationName) : ''}</div>
         <div class="map-info-row"><span class="map-legend-dot" style="background:${MAP_SEVERITY_COLORS[bucket]}"></span><span style="font-size:0.82rem">${escapeHtml(sevLabel)}${p.openFindingCount ? ` (${p.openFindingCount} open)` : ''}</span></div>
         ${p.boardFocus ? '<div class="map-info-row" style="color:#a4801a;font-size:0.8rem">🏳 Flagged for board report</div>' : ''}
+        ${p.holderName ? `<div class="map-info-row" style="font-size:0.8rem">🏠 Held by ${escapeHtml(p.holderName)}</div>` : ''}
         <button type="button" class="btn btn-secondary" id="mapGoAsset" style="width:100%;margin-top:6px">View asset →</button>
         <button type="button" class="btn btn-danger" id="mapRemovePin" style="width:100%;margin-top:8px">Remove from map</button>`;
       document.getElementById('mapGoAsset').addEventListener('click', () => go('assetDetail', { id: p.id }));
@@ -1669,17 +1783,28 @@ function initMapEditor({ pins, features }) {
       return;
     }
     const f = selected.ref;
+    const layer = layerById(f.layerId);
+    const eligibleLayers = mapLayers.filter((l) => l.Geometry === f.kind || l.Geometry === 'mixed');
     box.innerHTML = `<h2>Selected</h2>
       <input class="map-info-name" id="mapFeatLabel" value="${escapeHtml(f.label || '')}" placeholder="Label">
-      <div class="map-info-row">
-        <select class="map-search" id="mapFeatKind" style="flex:1">
-          ${['water_line', 'sewer_line', 'zone'].map((k) => `<option value="${k}" ${f.kind === k ? 'selected' : ''}>${MAP_KIND_DEFAULTS[k].label}</option>`).join('')}
-        </select>
-      </div>
-      <div style="font-size:11px;color:var(--muted);margin:2px 0 6px">Color</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
-        ${MAP_SWATCHES.map((c) => `<button type="button" class="map-swatch ${featureColor(f) === c ? 'on' : ''}" data-color="${c}" style="background:${c}"></button>`).join('')}
-      </div>
+      <div style="font-size:11px;color:var(--muted);margin:2px 0 6px">Layer</div>
+      <select class="map-search" id="mapFeatLayer" style="width:100%;margin-bottom:10px">
+        <option value="">— none —</option>
+        ${eligibleLayers.map((l) => `<option value="${l.Id}" ${f.layerId === l.Id ? 'selected' : ''}>${l.Icon ? l.Icon + ' ' : ''}${escapeHtml(l.Name)}</option>`).join('')}
+      </select>
+      ${layer?.ColorByCondition ? `
+        <div style="font-size:11px;color:var(--muted);margin:2px 0 6px">Linked asset (drives its color)</div>
+        ${f.assetId ? `
+          <div class="map-asset-result" style="margin-bottom:6px">
+            <div>${escapeHtml(f.assetName || 'Asset #' + f.assetId)}</div>
+            <div class="muted">${f.openFindingCount ? `${f.openFindingCount} open finding(s)` : 'No open findings'}</div>
+          </div>
+          <button type="button" class="btn btn-secondary" id="mapUnlinkAsset" style="width:100%;margin-bottom:10px">Unlink asset</button>
+        ` : `
+          <input type="text" class="map-search" id="mapFeatAssetSearch" placeholder="Search assets to link…" autocomplete="off" style="margin-bottom:6px">
+          <div id="mapFeatAssetResults" style="margin-bottom:10px"></div>
+        `}
+      ` : ''}
       <button type="button" class="btn btn-danger" id="mapDelFeature" style="width:100%">Delete shape</button>`;
     let labelTimer;
     document.getElementById('mapFeatLabel').addEventListener('input', (e) => {
@@ -1691,20 +1816,50 @@ function initMapEditor({ pins, features }) {
         catch (err) { toast(err.message); }
       }, 500);
     });
-    document.getElementById('mapFeatKind').addEventListener('change', async (e) => {
-      f.kind = e.target.value;
+    document.getElementById('mapFeatLayer').addEventListener('change', async (e) => {
+      f.layerId = e.target.value ? Number(e.target.value) : null;
       render(); openInfo();
-      try { await api(`/api/pg/map-features/${f.id}`, { method: 'PATCH', body: JSON.stringify({ kind: f.kind }) }); }
+      try { await api(`/api/pg/map-features/${f.id}`, { method: 'PATCH', body: JSON.stringify({ layerId: f.layerId }) }); }
       catch (err) { toast(err.message); }
     });
-    box.querySelectorAll('.map-swatch').forEach((sw) => sw.addEventListener('click', async () => {
-      f.style = { ...(f.style || {}), color: sw.dataset.color };
+    const unlinkBtn = document.getElementById('mapUnlinkAsset');
+    if (unlinkBtn) unlinkBtn.addEventListener('click', async () => {
+      f.assetId = null; f.assetName = null; f.holderName = null; f.maxSeverity = null; f.openFindingCount = 0; f.boardFocus = false;
       render(); openInfo();
-      try { await api(`/api/pg/map-features/${f.id}`, { method: 'PATCH', body: JSON.stringify({ style: f.style }) }); }
+      try { await api(`/api/pg/map-features/${f.id}`, { method: 'PATCH', body: JSON.stringify({ assetId: null }) }); }
       catch (err) { toast(err.message); }
-    }));
+    });
+    const featAssetSearch = document.getElementById('mapFeatAssetSearch');
+    if (featAssetSearch) {
+      let searchTimer, lastResults = [];
+      featAssetSearch.addEventListener('input', (e) => {
+        clearTimeout(searchTimer);
+        const q = e.target.value.trim();
+        const box2 = document.getElementById('mapFeatAssetResults');
+        if (!q) { box2.innerHTML = ''; return; }
+        searchTimer = setTimeout(async () => {
+          const { assets } = await api(`/api/pg/assets-search?q=${encodeURIComponent(q)}`);
+          lastResults = assets;
+          box2.innerHTML = assets.map((a) => `
+            <div class="map-asset-result" data-id="${a.Id}">
+              <div>${escapeHtml(a.Name)}</div>
+              <div class="muted">${escapeHtml(a.assetType || '')}${a.locationName ? ' · ' + escapeHtml(a.locationName) : ''}</div>
+            </div>`).join('') || '<div class="muted" style="padding:6px 0">No matches</div>';
+          box2.querySelectorAll('.map-asset-result').forEach((el) => el.addEventListener('click', async () => {
+            const asset = lastResults.find((a) => String(a.Id) === el.dataset.id);
+            if (!asset) return;
+            try {
+              const { feature: full } = await api(`/api/pg/map-features/${f.id}`, { method: 'PATCH', body: JSON.stringify({ assetId: asset.Id }) });
+              Object.assign(f, normalizeFeature(full));
+              render(); openInfo();
+              toast(`Linked to ${asset.Name}`);
+            } catch (err) { toast(err.message); }
+          }));
+        }, 250);
+      });
+    }
     document.getElementById('mapDelFeature').addEventListener('click', async () => {
-      if (!await confirmDialog(`Delete ${f.label || MAP_KIND_DEFAULTS[f.kind].label}? This can't be undone.`)) return;
+      if (!await confirmDialog(`Delete ${f.label || 'this shape'}? This can't be undone.`)) return;
       try {
         await api(`/api/pg/map-features/${f.id}`, { method: 'DELETE' });
         mapFeatures = mapFeatures.filter((x) => x.id !== f.id);
@@ -1715,9 +1870,29 @@ function initMapEditor({ pins, features }) {
   }
 
   // ---- tools / mode ----
+  function renderToolbar() {
+    const box = document.getElementById('mapTools');
+    let html = `<button type="button" class="map-tool ${mode === 'edit' ? 'on' : ''}" data-tool="edit">Edit</button>
+      <button type="button" class="map-tool ${mode === 'add-asset' ? 'on' : ''}" data-tool="add-asset">+ Asset</button>`;
+    [...mapLayers].sort((a, b) => a.ZIndex - b.ZIndex).forEach((l) => {
+      if (l.Name === 'Buildings') return;
+      const icon = l.Icon ? l.Icon + ' ' : '';
+      if (l.Geometry === 'mixed') {
+        html += '<span class="map-tool-group">' + ['point', 'line', 'zone'].map((g) => {
+          const suffix = { point: '●', line: '—', zone: '▭' }[g];
+          const tool = `add-layer:${l.Id}:${g}`;
+          return `<button type="button" class="map-tool ${mode === tool ? 'on' : ''}" data-tool="${tool}" title="${escapeHtml(l.Name)} (${g})">${icon}${suffix}</button>`;
+        }).join('') + '</span>';
+      } else {
+        const tool = `add-layer:${l.Id}:${l.Geometry}`;
+        html += `<button type="button" class="map-tool ${mode === tool ? 'on' : ''}" data-tool="${tool}">+ ${icon}${escapeHtml(l.Name)}</button>`;
+      }
+    });
+    box.innerHTML = html;
+  }
   function setMode(m) {
     mode = m;
-    document.querySelectorAll('.map-tool').forEach((t) => t.classList.toggle('on', t.dataset.tool === m));
+    renderToolbar();
     svg.classList.toggle('placing', m.startsWith('add-'));
     if (m !== 'add-asset') { placingAsset = null; const picker = document.getElementById('mapAssetPicker'); if (picker) picker.hidden = true; }
     if (!m.startsWith('add-') && pending) { pending = null; document.getElementById('mapFinish').style.display = 'none'; render(); }
@@ -1730,7 +1905,7 @@ function initMapEditor({ pins, features }) {
     if (tool === 'add-asset') { document.getElementById('mapAssetPicker').hidden = false; document.getElementById('mapAssetSearch').focus(); }
   });
 
-  // ---- asset search/picker ----
+  // ---- asset search/picker (+ Asset tool) ----
   let assetSearchTimer;
   document.getElementById('mapAssetSearch').addEventListener('input', (e) => {
     clearTimeout(assetSearchTimer);
@@ -1751,8 +1926,171 @@ function initMapEditor({ pins, features }) {
     }, 250);
   });
 
-  // ---- layers, zoom, keys ----
-  document.querySelectorAll('[data-layer]').forEach((c) => c.addEventListener('change', render));
+  // ---- layer panel (list, add, recolor, rename, reorder, delete) ----
+  function renderLayerRows() {
+    const box = document.getElementById('mapLayerRows');
+    const sorted = [...mapLayers].sort((a, b) => b.ZIndex - a.ZIndex);
+    box.innerHTML = sorted.map((l, i) => `
+      <div class="map-layer-row" data-id="${l.Id}">
+        <button type="button" class="map-layer-swatch" data-id="${l.Id}" style="background:${l.Color}" title="Change color"></button>
+        <input type="text" class="map-layer-name" data-id="${l.Id}" value="${escapeHtml(l.Name)}">
+        <label class="map-layer-vis" title="Visible on map"><input type="checkbox" class="map-layer-vis-cb" data-id="${l.Id}" ${l.DefaultVisible ? 'checked' : ''}></label>
+        <div class="map-layer-swatch-picker" hidden data-id="${l.Id}">
+          ${MAP_SWATCHES.map((c) => `<button type="button" class="map-swatch" data-id="${l.Id}" data-color="${c}" style="background:${c}"></button>`).join('')}
+        </div>
+      </div>
+      <div class="map-layer-row2">
+        <input type="text" class="map-layer-icon" data-id="${l.Id}" value="${l.Icon || ''}" maxlength="2" placeholder="—" title="Icon">
+        <span class="muted" style="font-size:10.5px;flex:1">${MAP_GEOM_LABEL[l.Geometry] || l.Geometry}</span>
+        <label class="map-layer-cond-lbl" title="Color by condition for asset-linked markers"><input type="checkbox" class="map-layer-cond-cb" data-id="${l.Id}" ${l.ColorByCondition ? 'checked' : ''}> cond.</label>
+        <button type="button" class="map-layer-btn" data-id="${l.Id}" data-act="up" ${i === 0 ? 'disabled' : ''} title="Move up">↑</button>
+        <button type="button" class="map-layer-btn" data-id="${l.Id}" data-act="down" ${i === sorted.length - 1 ? 'disabled' : ''} title="Move down">↓</button>
+        <button type="button" class="map-layer-btn" data-id="${l.Id}" data-act="del" title="Delete layer">🗑</button>
+      </div>
+    `).join('') || '<div class="muted">No layers yet.</div>';
+
+    box.querySelectorAll('.map-layer-swatch').forEach((btn) => btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const picker = box.querySelector(`.map-layer-swatch-picker[data-id="${btn.dataset.id}"]`);
+      box.querySelectorAll('.map-layer-swatch-picker').forEach((p) => { if (p !== picker) p.hidden = true; });
+      if (picker) picker.hidden = !picker.hidden;
+    }));
+    box.querySelectorAll('.map-layer-swatch-picker .map-swatch').forEach((sw) => sw.addEventListener('click', async () => {
+      const l = layerById(Number(sw.dataset.id));
+      if (!l) return;
+      l.Color = sw.dataset.color;
+      renderLayerRows(); render();
+      try { await api(`/api/pg/map/layers/${l.Id}`, { method: 'PATCH', body: JSON.stringify({ color: l.Color }) }); }
+      catch (err) { toast(err.message); }
+    }));
+    box.querySelectorAll('.map-layer-name').forEach((inp) => {
+      let t;
+      inp.addEventListener('input', () => {
+        const l = layerById(Number(inp.dataset.id));
+        if (!l) return;
+        l.Name = inp.value;
+        clearTimeout(t);
+        t = setTimeout(async () => {
+          try { await api(`/api/pg/map/layers/${l.Id}`, { method: 'PATCH', body: JSON.stringify({ name: l.Name }) }); renderToolbar(); }
+          catch (err) { toast(err.message); }
+        }, 500);
+      });
+    });
+    box.querySelectorAll('.map-layer-icon').forEach((inp) => {
+      let t;
+      inp.addEventListener('input', () => {
+        const l = layerById(Number(inp.dataset.id));
+        if (!l) return;
+        l.Icon = inp.value;
+        clearTimeout(t);
+        t = setTimeout(async () => {
+          render(); renderToolbar();
+          try { await api(`/api/pg/map/layers/${l.Id}`, { method: 'PATCH', body: JSON.stringify({ icon: l.Icon }) }); }
+          catch (err) { toast(err.message); }
+        }, 500);
+      });
+    });
+    box.querySelectorAll('.map-layer-vis-cb').forEach((cb) => cb.addEventListener('change', async () => {
+      const l = layerById(Number(cb.dataset.id));
+      if (!l) return;
+      l.DefaultVisible = cb.checked;
+      render(); // not just applyVisibility() — labels are only added to gLabels at render time, so hiding a layer without a re-render leaves its labels orphaned on screen
+      try { await api(`/api/pg/map/layers/${l.Id}`, { method: 'PATCH', body: JSON.stringify({ defaultVisible: l.DefaultVisible }) }); }
+      catch (err) { toast(err.message); }
+    }));
+    box.querySelectorAll('.map-layer-cond-cb').forEach((cb) => cb.addEventListener('change', async () => {
+      const l = layerById(Number(cb.dataset.id));
+      if (!l) return;
+      l.ColorByCondition = cb.checked;
+      render();
+      if (selected && selected.type === 'feature' && selected.ref.layerId === l.Id) openInfo();
+      try { await api(`/api/pg/map/layers/${l.Id}`, { method: 'PATCH', body: JSON.stringify({ colorByCondition: l.ColorByCondition }) }); }
+      catch (err) { toast(err.message); }
+    }));
+    box.querySelectorAll('.map-layer-btn').forEach((btn) => btn.addEventListener('click', async () => {
+      const l = layerById(Number(btn.dataset.id));
+      if (!l) return;
+      if (btn.dataset.act === 'del') { await deleteLayer(l); return; }
+      await moveLayer(l, btn.dataset.act === 'up' ? -1 : 1);
+    }));
+  }
+
+  async function moveLayer(layer, dir) {
+    const sorted = [...mapLayers].sort((a, b) => b.ZIndex - a.ZIndex);
+    const idx = sorted.findIndex((l) => l.Id === layer.Id);
+    const swapIdx = idx + dir;
+    if (swapIdx < 0 || swapIdx >= sorted.length) return;
+    const a = sorted[idx], b = sorted[swapIdx];
+    const az = a.ZIndex, bz = b.ZIndex;
+    a.ZIndex = bz; b.ZIndex = az;
+    rebuildLayerGroups(); renderLayerRows(); renderToolbar(); render();
+    try {
+      await Promise.all([
+        api(`/api/pg/map/layers/${a.Id}`, { method: 'PATCH', body: JSON.stringify({ zIndex: a.ZIndex }) }),
+        api(`/api/pg/map/layers/${b.Id}`, { method: 'PATCH', body: JSON.stringify({ zIndex: b.ZIndex }) }),
+      ]);
+    } catch (err) { toast(err.message); }
+  }
+
+  async function deleteLayer(layer) {
+    if (!await confirmDialog(`Delete the "${layer.Name}" layer? Its markers/shapes stay on the map but lose this layer's color/icon/visibility until reassigned.`)) return;
+    try {
+      await api(`/api/pg/map/layers/${layer.Id}`, { method: 'DELETE' });
+      mapLayers = mapLayers.filter((l) => l.Id !== layer.Id);
+      mapFeatures.forEach((f) => { if (f.layerId === layer.Id) f.layerId = null; });
+      mapPins.forEach((p) => { if (p.layerId === layer.Id) p.layerId = null; });
+      if (selected && ((selected.type === 'feature' && selected.ref.layerId === null) || (selected.type === 'pin' && selected.ref.layerId === null))) openInfo();
+      rebuildLayerGroups(); renderLayerRows(); renderToolbar(); render();
+      toast('Layer deleted');
+    } catch (err) { toast(err.message); }
+  }
+
+  document.getElementById('mapAddLayerBtn').addEventListener('click', () => {
+    const form = document.getElementById('mapAddLayerForm');
+    form.hidden = !form.hidden;
+    if (!form.hidden) document.getElementById('newLayerName').focus();
+  });
+  let newLayerColor = MAP_SWATCHES[0];
+  document.getElementById('newLayerSwatches').addEventListener('click', (e) => {
+    const btn = e.target.closest('.map-swatch');
+    if (!btn) return;
+    newLayerColor = btn.dataset.color;
+    document.querySelectorAll('#newLayerSwatches .map-swatch').forEach((b) => b.classList.toggle('on', b === btn));
+  });
+  document.getElementById('newLayerCreate').addEventListener('click', async () => {
+    const name = document.getElementById('newLayerName').value.trim();
+    if (!name) { toast('Give the layer a name'); return; }
+    const geometry = document.getElementById('newLayerGeom').value;
+    const icon = document.getElementById('newLayerIcon').value.trim();
+    const colorByCondition = document.getElementById('newLayerCond').checked;
+    try {
+      const { layer } = await api('/api/pg/map/layers', { method: 'POST', body: JSON.stringify({ name, geometry, color: newLayerColor, icon: icon || null, colorByCondition }) });
+      mapLayers.push(layer);
+      document.getElementById('newLayerName').value = '';
+      document.getElementById('newLayerIcon').value = '';
+      document.getElementById('newLayerCond').checked = false;
+      document.getElementById('mapAddLayerForm').hidden = true;
+      rebuildLayerGroups(); renderLayerRows(); renderToolbar(); render();
+      toast(`"${layer.Name}" layer created`);
+    } catch (err) { toast(err.message); }
+  });
+
+  // ---- pin label mode (asset name <-> cabin holder), remembered per browser ----
+  function renderLabelModeButtons() {
+    document.querySelectorAll('#mapLabelMode .map-tool').forEach((b) => b.classList.toggle('on', b.dataset.labelMode === labelMode));
+  }
+  document.getElementById('mapLabelMode').addEventListener('click', (e) => {
+    const b = e.target.closest('.map-tool');
+    if (!b) return;
+    labelMode = b.dataset.labelMode;
+    try { localStorage.setItem('campMapLabelMode', labelMode); } catch { /* private browsing, etc. */ }
+    renderLabelModeButtons();
+    render();
+  });
+
+  // ---- base map, zoom, keys ----
+  document.getElementById('mapBaseToggle').addEventListener('change', applyVisibility);
+  document.getElementById('mapLabelsToggle').addEventListener('change', applyVisibility);
   document.getElementById('mapDim').addEventListener('input', (e) => { baseImg.setAttribute('opacity', 1 - e.target.value / 100); });
   document.getElementById('mapZin').addEventListener('click', () => zoom(0.8));
   document.getElementById('mapZout').addEventListener('click', () => zoom(1.25));
@@ -1780,6 +2118,11 @@ function initMapEditor({ pins, features }) {
     render();
   }
   window.addEventListener('resize', sizeStage);
+
+  rebuildLayerGroups();
+  renderToolbar();
+  renderLayerRows();
+  renderLabelModeButtons();
   sizeStage();
 }
 

@@ -1744,12 +1744,12 @@ export async function createSkill(name) {
 
 export async function searchAssetsLive(q) {
   const { rows } = await pool.query(
-    `SELECT a.id, a.name, a.asset_type, a.location_id, l.name AS location_name, (a.map_x IS NOT NULL) AS on_map
+    `SELECT a.id, a.name, a.asset_type, a.location_id, l.name AS location_name, a.lodge_holder, (a.map_x IS NOT NULL) AS on_map
      FROM assets a LEFT JOIN locations l ON l.id = a.location_id
      WHERE a.name ILIKE $1 ORDER BY a.name LIMIT 20`,
     [`%${q}%`]
   );
-  return rows.map((r) => ({ Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: r.location_name, onMap: r.on_map }));
+  return rows.map((r) => ({ Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: r.location_name, holderName: r.lodge_holder, onMap: r.on_map }));
 }
 
 export async function createAssetQuick({ name, locationId, assetType }) {
@@ -1763,13 +1763,19 @@ export async function createAssetQuick({ name, locationId, assetType }) {
 }
 
 // ── Interactive Map — pins are assets with map_x/map_y set (image-pixel
-//    coords on campmap.webp, not lat/lng). Color is derived, never stored:
-//    the worst OPEN condition_findings.severity for that asset. Severity
-//    strings are "N - Label" (see FINDING_SEVERITY_OPTIONS in pg-api.js);
-//    we sort/threshold on the leading integer. ───────────────────────────
+//    coords on campmap.webp, not lat/lng). A pin's color is derived, never
+//    stored — the worst OPEN condition_findings.severity for that asset —
+//    but only when its layer has color_by_condition=true; otherwise it's a
+//    flat layer color. Severity strings are "N - Label" (see
+//    FINDING_SEVERITY_OPTIONS in pg-api.js); we sort/threshold on the
+//    leading integer. Layers are user-managed rows in map_layers, never
+//    hardcoded (see listMapLayers below) — a building pin references one
+//    via assets.map_layer_id (defaulting to "Buildings"), and every
+//    map_features point/line/zone via its own layer_id. ─────────────────
 export async function listMapPins() {
   const { rows } = await pool.query(`
     SELECT a.id, a.name, a.asset_type, a.map_x, a.map_y, a.location_id, l.name AS location_name,
+           a.map_layer_id, a.lodge_holder,
            cf.max_severity, cf.open_count,
            COALESCE(cf.any_focus, false) OR COALESCE(wo.any_focus, false) AS board_focus
     FROM assets a
@@ -1796,60 +1802,181 @@ export async function listMapPins() {
     category: r.asset_type,
     mapX: r.map_x,
     mapY: r.map_y,
+    layerId: r.map_layer_id,
     locationId: r.location_id,
     locationName: r.location_name,
+    holderName: r.lodge_holder,
     openFindingCount: Number(r.open_count) || 0,
     maxSeverity: r.max_severity, // 1-5 or null; frontend buckets into red/amber/green
     boardFocus: r.board_focus,
   }));
 }
 
-export async function setAssetMapLocation(assetId, { mapX, mapY }) {
+export async function setAssetMapLocation(assetId, { mapX, mapY, layerId }) {
   const { rows } = await pool.query(
-    `UPDATE assets SET map_x = $2, map_y = $3, updated_at = now() WHERE id = $1 RETURNING id, name, map_x, map_y`,
-    [assetId, mapX, mapY]
+    `UPDATE assets SET
+       map_x = $2, map_y = $3,
+       map_layer_id = COALESCE($4, map_layer_id, (SELECT id FROM map_layers WHERE name = 'Buildings' LIMIT 1)),
+       updated_at = now()
+     WHERE id = $1 RETURNING id, name, map_x, map_y, map_layer_id`,
+    [assetId, mapX, mapY, layerId || null]
   );
   if (!rows[0]) return null;
   await logActivity({ action: mapX === null ? 'removed map pin for' : 'moved map pin for', entityType: 'asset', entityId: rows[0].id, entityLabel: rows[0].name });
-  return { Id: rows[0].id, Name: rows[0].name, mapX: rows[0].map_x, mapY: rows[0].map_y };
+  return { Id: rows[0].id, Name: rows[0].name, mapX: rows[0].map_x, mapY: rows[0].map_y, LayerId: rows[0].map_layer_id };
+}
+
+const MAP_FEATURE_KINDS = new Set(['point', 'line', 'zone']);
+const MAP_FEATURE_SELECT = `
+  SELECT f.id, f.kind, f.label, f.points, f.asset_id, f.style, f.layer_id,
+         a.name AS asset_name, a.lodge_holder,
+         cf.max_severity, cf.open_count,
+         COALESCE(cf.any_focus, false) OR COALESCE(wo.any_focus, false) AS board_focus
+  FROM map_features f
+  LEFT JOIN assets a ON a.id = f.asset_id
+  LEFT JOIN LATERAL (
+    SELECT max(substring(severity from '^\\d+')::int) AS max_severity,
+           count(*) AS open_count,
+           bool_or(board_focus) AS any_focus
+    FROM condition_findings
+    WHERE asset_id = f.asset_id AND status = 'Open'
+  ) cf ON true
+  LEFT JOIN LATERAL (
+    SELECT bool_or(board_focus) AS any_focus
+    FROM work_orders
+    WHERE asset_id = f.asset_id AND status NOT IN ('Completed', 'Cancelled')
+  ) wo ON true
+`;
+function formatMapFeatureRow(r) {
+  return {
+    Id: r.id, Kind: r.kind, Label: r.label, Points: r.points, AssetId: r.asset_id, Style: r.style, LayerId: r.layer_id,
+    AssetName: r.asset_name, HolderName: r.lodge_holder,
+    OpenFindingCount: Number(r.open_count) || 0, MaxSeverity: r.max_severity, BoardFocus: r.board_focus,
+  };
+}
+async function getMapFeatureFull(id) {
+  const { rows } = await pool.query(`${MAP_FEATURE_SELECT} WHERE f.id = $1`, [id]);
+  return rows[0] ? formatMapFeatureRow(rows[0]) : null;
 }
 
 export async function listMapFeatures() {
-  const { rows } = await pool.query(
-    `SELECT id, kind, label, points, asset_id, style, created_at, updated_at FROM map_features ORDER BY id`
-  );
-  return rows.map((r) => ({
-    Id: r.id, Kind: r.kind, Label: r.label, Points: r.points, AssetId: r.asset_id, Style: r.style,
-  }));
+  const { rows } = await pool.query(`${MAP_FEATURE_SELECT} ORDER BY f.id`);
+  return rows.map(formatMapFeatureRow);
 }
 
-export async function createMapFeature({ kind, label, points, assetId, style }) {
-  if (!kind || !points) { const err = new Error('kind and points are required'); err.status = 400; throw err; }
+export async function createMapFeature({ kind, label, points, assetId, style, layerId }) {
+  if (!kind || !MAP_FEATURE_KINDS.has(kind) || !points) { const err = new Error('kind (point, line, or zone) and points are required'); err.status = 400; throw err; }
   const { rows } = await pool.query(
-    `INSERT INTO map_features (kind, label, points, asset_id, style) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [kind, label || null, JSON.stringify(points), assetId || null, style ? JSON.stringify(style) : null]
+    `INSERT INTO map_features (kind, label, points, asset_id, style, layer_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [kind, label || null, JSON.stringify(points), assetId || null, style ? JSON.stringify(style) : null, layerId || null]
   );
-  await logActivity({ action: 'created', entityType: 'map_feature', entityId: rows[0].id, entityLabel: label || kind });
-  return { Id: rows[0].id, Kind: rows[0].kind, Label: rows[0].label, Points: rows[0].points, AssetId: rows[0].asset_id, Style: rows[0].style };
+  const full = await getMapFeatureFull(rows[0].id);
+  await logActivity({ action: 'created', entityType: 'map_feature', entityId: full.Id, entityLabel: full.Label || full.Kind });
+  return full;
 }
 
-export async function updateMapFeature(id, { kind, label, points, assetId, style }) {
-  const { rows } = await pool.query(
-    `UPDATE map_features SET
-       kind = COALESCE($2, kind), label = COALESCE($3, label),
-       points = COALESCE($4, points), asset_id = $5, style = COALESCE($6, style),
-       updated_at = now()
-     WHERE id = $1 RETURNING *`,
-    [id, kind || null, label ?? null, points ? JSON.stringify(points) : null, assetId ?? null, style ? JSON.stringify(style) : null]
-  );
-  if (!rows[0]) return null;
-  await logActivity({ action: 'updated', entityType: 'map_feature', entityId: rows[0].id, entityLabel: rows[0].label || rows[0].kind });
-  return { Id: rows[0].id, Kind: rows[0].kind, Label: rows[0].label, Points: rows[0].points, AssetId: rows[0].asset_id, Style: rows[0].style };
+// Partial update — only columns whose key is present in `patch` are
+// touched. A drag-end PATCH that sends only {points} can never silently
+// wipe assetId/layerId (the previous asset_id=$n / always-overwrite version
+// did exactly that on every points-only save), and an explicit null (unlink
+// asset, clear layer) is distinguishable from "field not sent" this way.
+export async function updateMapFeature(id, patch) {
+  const sets = [];
+  const vals = [id];
+  const add = (col, val) => { vals.push(val); sets.push(`${col} = $${vals.length}`); };
+  if ('kind' in patch) {
+    if (!MAP_FEATURE_KINDS.has(patch.kind)) { const err = new Error('kind must be point, line, or zone'); err.status = 400; throw err; }
+    add('kind', patch.kind);
+  }
+  if ('label' in patch) add('label', patch.label ?? null);
+  if ('points' in patch) add('points', patch.points ? JSON.stringify(patch.points) : null);
+  if ('assetId' in patch) add('asset_id', patch.assetId ?? null);
+  if ('style' in patch) add('style', patch.style ? JSON.stringify(patch.style) : null);
+  if ('layerId' in patch) add('layer_id', patch.layerId ?? null);
+  if (sets.length) {
+    sets.push('updated_at = now()');
+    const { rows } = await pool.query(`UPDATE map_features SET ${sets.join(', ')} WHERE id = $1 RETURNING id`, vals);
+    if (!rows[0]) return null;
+  } else {
+    const { rows } = await pool.query('SELECT id FROM map_features WHERE id = $1', [id]);
+    if (!rows[0]) return null;
+  }
+  const full = await getMapFeatureFull(id);
+  await logActivity({ action: 'updated', entityType: 'map_feature', entityId: full.Id, entityLabel: full.Label || full.Kind });
+  return full;
 }
 
 export async function deleteMapFeature(id) {
   const { rows } = await pool.query('DELETE FROM map_features WHERE id = $1 RETURNING kind, label', [id]);
   if (rows[0]) await logActivity({ action: 'deleted', entityType: 'map_feature', entityId: Number(id), entityLabel: rows[0].label || rows[0].kind });
+}
+
+// ── Map layers — user-defined, not hardcoded. "Add a layer" is a row
+//    insert; recoloring/reordering/hiding/deleting is an update on that
+//    row. Deleting a layer just orphans its features/pins (layer_id/
+//    map_layer_id -> null via FK ON DELETE SET NULL) rather than blocking
+//    or cascading — they keep showing, just unlabeled, until reassigned. ──
+const MAP_LAYER_GEOMETRIES = new Set(['point', 'line', 'zone', 'mixed']);
+function formatMapLayerRow(r) {
+  return {
+    Id: r.id, Name: r.name, Geometry: r.geometry, Color: r.color, Icon: r.icon,
+    ZIndex: r.z_index, DefaultVisible: r.default_visible, ColorByCondition: r.color_by_condition,
+  };
+}
+
+export async function listMapLayers() {
+  const { rows } = await pool.query('SELECT * FROM map_layers ORDER BY z_index, id');
+  return rows.map(formatMapLayerRow);
+}
+
+export async function createMapLayer({ name, geometry, color, icon, zIndex, defaultVisible, colorByCondition }) {
+  if (!name || !name.trim()) { const err = new Error('name is required'); err.status = 400; throw err; }
+  const { rows: maxRows } = await pool.query('SELECT COALESCE(MAX(z_index), 0) + 10 AS next FROM map_layers');
+  const { rows } = await pool.query(
+    `INSERT INTO map_layers (name, geometry, color, icon, z_index, default_visible, color_by_condition)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [
+      name.trim(),
+      MAP_LAYER_GEOMETRIES.has(geometry) ? geometry : 'point',
+      color || '#2b6cb0',
+      icon || null,
+      zIndex ?? maxRows[0].next,
+      defaultVisible !== false,
+      !!colorByCondition,
+    ]
+  );
+  await logActivity({ action: 'created', entityType: 'map_layer', entityId: rows[0].id, entityLabel: rows[0].name });
+  return formatMapLayerRow(rows[0]);
+}
+
+export async function updateMapLayer(id, patch) {
+  const sets = [];
+  const vals = [id];
+  const add = (col, val) => { vals.push(val); sets.push(`${col} = $${vals.length}`); };
+  if ('name' in patch) {
+    if (!patch.name || !patch.name.trim()) { const err = new Error('name is required'); err.status = 400; throw err; }
+    add('name', patch.name.trim());
+  }
+  if ('geometry' in patch) add('geometry', MAP_LAYER_GEOMETRIES.has(patch.geometry) ? patch.geometry : 'point');
+  if ('color' in patch) add('color', patch.color);
+  if ('icon' in patch) add('icon', patch.icon ?? null);
+  if ('zIndex' in patch) add('z_index', patch.zIndex);
+  if ('defaultVisible' in patch) add('default_visible', !!patch.defaultVisible);
+  if ('colorByCondition' in patch) add('color_by_condition', !!patch.colorByCondition);
+  if (!sets.length) {
+    const { rows } = await pool.query('SELECT * FROM map_layers WHERE id = $1', [id]);
+    return rows[0] ? formatMapLayerRow(rows[0]) : null;
+  }
+  sets.push('updated_at = now()');
+  const { rows } = await pool.query(`UPDATE map_layers SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, vals);
+  if (!rows[0]) return null;
+  await logActivity({ action: 'updated', entityType: 'map_layer', entityId: rows[0].id, entityLabel: rows[0].name });
+  return formatMapLayerRow(rows[0]);
+}
+
+export async function deleteMapLayer(id) {
+  const { rows } = await pool.query('DELETE FROM map_layers WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'map_layer', entityId: Number(id), entityLabel: rows[0].name });
 }
 
 // ── Work Order Tasks — free-text scope-of-work job lines (the default way to

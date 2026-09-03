@@ -57,6 +57,7 @@ import {
   convertRequestToWorkOrder, linkRequestToAsset, listRequestMessages, createRequestMessage,
   updateConditionFinding,
   listMapPins, setAssetMapLocation, listMapFeatures, createMapFeature, updateMapFeature, deleteMapFeature,
+  listMapLayers, createMapLayer, updateMapLayer, deleteMapLayer,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import {
@@ -175,16 +176,46 @@ router.get('/map/pins', async (req, res, next) => {
 
 router.patch('/map/pins/:id', async (req, res, next) => {
   try {
-    const { mapX, mapY } = req.body || {};
+    const { mapX, mapY, layerId } = req.body || {};
     // null/null explicitly unplaces the asset from the map; anything else
     // must be a real coordinate pair.
     const unplacing = mapX === null && mapY === null;
     if (!unplacing && (typeof mapX !== 'number' || typeof mapY !== 'number')) {
       return res.status(400).json({ ok: false, error: 'mapX and mapY (numbers) are required' });
     }
-    const updated = await setAssetMapLocation(req.params.id, { mapX: unplacing ? null : mapX, mapY: unplacing ? null : mapY });
+    const updated = await setAssetMapLocation(req.params.id, { mapX: unplacing ? null : mapX, mapY: unplacing ? null : mapY, layerId });
     if (!updated) return res.status(404).json({ ok: false, error: 'Asset not found' });
     res.json({ ok: true, pin: updated });
+  } catch (e) { next(e); }
+});
+
+// ---- Map layers — user-defined (name/color/icon/z-order/visibility/
+// condition-coloring is all just data in map_layers), never hardcoded on
+// the server or client. See listMapLayers in db.js. ----
+
+router.get('/map/layers', async (req, res, next) => {
+  try { res.json({ layers: await listMapLayers() }); } catch (e) { next(e); }
+});
+
+router.post('/map/layers', async (req, res, next) => {
+  try {
+    const { name, geometry, color, icon, zIndex, defaultVisible, colorByCondition } = req.body || {};
+    res.json({ ok: true, layer: await createMapLayer({ name, geometry, color, icon, zIndex, defaultVisible, colorByCondition }) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/map/layers/:id', async (req, res, next) => {
+  try {
+    const updated = await updateMapLayer(req.params.id, req.body || {});
+    if (!updated) return res.status(404).json({ ok: false, error: 'Layer not found' });
+    res.json({ ok: true, layer: updated });
+  } catch (e) { next(e); }
+});
+
+router.delete('/map/layers/:id', async (req, res, next) => {
+  try {
+    await deleteMapLayer(req.params.id);
+    res.json({ ok: true });
   } catch (e) { next(e); }
 });
 
@@ -196,16 +227,15 @@ router.get('/map-features', async (req, res, next) => {
 
 router.post('/map-features', async (req, res, next) => {
   try {
-    const { kind, label, points, assetId, style } = req.body || {};
-    const created = await createMapFeature({ kind, label, points, assetId, style });
+    const { kind, label, points, assetId, style, layerId } = req.body || {};
+    const created = await createMapFeature({ kind, label, points, assetId, style, layerId });
     res.json({ ok: true, feature: created });
   } catch (e) { next(e); }
 });
 
 router.patch('/map-features/:id', async (req, res, next) => {
   try {
-    const { kind, label, points, assetId, style } = req.body || {};
-    const updated = await updateMapFeature(req.params.id, { kind, label, points, assetId, style });
+    const updated = await updateMapFeature(req.params.id, req.body || {});
     if (!updated) return res.status(404).json({ ok: false, error: 'Map feature not found' });
     res.json({ ok: true, feature: updated });
   } catch (e) { next(e); }
