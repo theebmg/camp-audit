@@ -56,6 +56,7 @@ import {
   listMaintenanceRequests, getMaintenanceRequestDetail, updateMaintenanceRequestStatus,
   convertRequestToWorkOrder, linkRequestToAsset, listRequestMessages, createRequestMessage,
   updateConditionFinding,
+  listMapPins, setAssetMapLocation, listMapFeatures, createMapFeature, updateMapFeature, deleteMapFeature,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import {
@@ -157,6 +158,60 @@ router.patch('/assets/:id/building-type', async (req, res, next) => {
     const updated = await setAssetBuildingType(req.params.id, buildingTypeId ?? null);
     if (!updated) return res.status(404).json({ ok: false, error: 'Asset not found' });
     res.json({ ok: true, ...updated });
+  } catch (e) { next(e); }
+});
+
+// ---- Interactive map — pins are assets with map_x/map_y set (image-pixel
+// coords on campmap.webp, 2500x3700, origin top-left — never lat/lng).
+// Buildings are already `assets` rows (asset_type = 'Camp Building', etc.),
+// which is also where condition_findings/work_orders key off of, so pins
+// only live on assets; `locations` has no map presence of its own. ----
+
+router.get('/map/pins', async (req, res, next) => {
+  try {
+    res.json({ pins: await listMapPins() });
+  } catch (e) { next(e); }
+});
+
+router.patch('/map/pins/:id', async (req, res, next) => {
+  try {
+    const { mapX, mapY } = req.body || {};
+    if (typeof mapX !== 'number' || typeof mapY !== 'number') {
+      return res.status(400).json({ ok: false, error: 'mapX and mapY (numbers) are required' });
+    }
+    const updated = await setAssetMapLocation(req.params.id, { mapX, mapY });
+    if (!updated) return res.status(404).json({ ok: false, error: 'Asset not found' });
+    res.json({ ok: true, pin: updated });
+  } catch (e) { next(e); }
+});
+
+router.get('/map-features', async (req, res, next) => {
+  try {
+    res.json({ features: await listMapFeatures() });
+  } catch (e) { next(e); }
+});
+
+router.post('/map-features', async (req, res, next) => {
+  try {
+    const { kind, label, points, assetId, style } = req.body || {};
+    const created = await createMapFeature({ kind, label, points, assetId, style });
+    res.json({ ok: true, feature: created });
+  } catch (e) { next(e); }
+});
+
+router.patch('/map-features/:id', async (req, res, next) => {
+  try {
+    const { kind, label, points, assetId, style } = req.body || {};
+    const updated = await updateMapFeature(req.params.id, { kind, label, points, assetId, style });
+    if (!updated) return res.status(404).json({ ok: false, error: 'Map feature not found' });
+    res.json({ ok: true, feature: updated });
+  } catch (e) { next(e); }
+});
+
+router.delete('/map-features/:id', async (req, res, next) => {
+  try {
+    await deleteMapFeature(req.params.id);
+    res.json({ ok: true });
   } catch (e) { next(e); }
 });
 

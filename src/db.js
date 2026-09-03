@@ -1762,6 +1762,96 @@ export async function createAssetQuick({ name, locationId, assetType }) {
   return { Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: null };
 }
 
+// ── Interactive Map — pins are assets with map_x/map_y set (image-pixel
+//    coords on campmap.webp, not lat/lng). Color is derived, never stored:
+//    the worst OPEN condition_findings.severity for that asset. Severity
+//    strings are "N - Label" (see FINDING_SEVERITY_OPTIONS in pg-api.js);
+//    we sort/threshold on the leading integer. ───────────────────────────
+export async function listMapPins() {
+  const { rows } = await pool.query(`
+    SELECT a.id, a.name, a.asset_type, a.map_x, a.map_y, a.location_id, l.name AS location_name,
+           cf.max_severity, cf.open_count,
+           COALESCE(cf.any_focus, false) OR COALESCE(wo.any_focus, false) AS board_focus
+    FROM assets a
+    LEFT JOIN locations l ON l.id = a.location_id
+    LEFT JOIN LATERAL (
+      SELECT max(substring(severity from '^\d+')::int) AS max_severity,
+             count(*) AS open_count,
+             bool_or(board_focus) AS any_focus
+      FROM condition_findings
+      WHERE asset_id = a.id AND status = 'Open'
+    ) cf ON true
+    LEFT JOIN LATERAL (
+      SELECT bool_or(board_focus) AS any_focus
+      FROM work_orders
+      WHERE asset_id = a.id AND status NOT IN ('Completed', 'Cancelled')
+    ) wo ON true
+    WHERE a.map_x IS NOT NULL AND a.map_y IS NOT NULL
+    ORDER BY a.name
+  `);
+  return rows.map((r) => ({
+    ref: 'asset',
+    id: r.id,
+    name: r.name,
+    category: r.asset_type,
+    mapX: r.map_x,
+    mapY: r.map_y,
+    locationId: r.location_id,
+    locationName: r.location_name,
+    openFindingCount: Number(r.open_count) || 0,
+    maxSeverity: r.max_severity, // 1-5 or null; frontend buckets into red/amber/green
+    boardFocus: r.board_focus,
+  }));
+}
+
+export async function setAssetMapLocation(assetId, { mapX, mapY }) {
+  const { rows } = await pool.query(
+    `UPDATE assets SET map_x = $2, map_y = $3, updated_at = now() WHERE id = $1 RETURNING id, name, map_x, map_y`,
+    [assetId, mapX, mapY]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'moved map pin for', entityType: 'asset', entityId: rows[0].id, entityLabel: rows[0].name });
+  return { Id: rows[0].id, Name: rows[0].name, mapX: rows[0].map_x, mapY: rows[0].map_y };
+}
+
+export async function listMapFeatures() {
+  const { rows } = await pool.query(
+    `SELECT id, kind, label, points, asset_id, style, created_at, updated_at FROM map_features ORDER BY id`
+  );
+  return rows.map((r) => ({
+    Id: r.id, Kind: r.kind, Label: r.label, Points: r.points, AssetId: r.asset_id, Style: r.style,
+  }));
+}
+
+export async function createMapFeature({ kind, label, points, assetId, style }) {
+  if (!kind || !points) { const err = new Error('kind and points are required'); err.status = 400; throw err; }
+  const { rows } = await pool.query(
+    `INSERT INTO map_features (kind, label, points, asset_id, style) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [kind, label || null, JSON.stringify(points), assetId || null, style ? JSON.stringify(style) : null]
+  );
+  await logActivity({ action: 'created', entityType: 'map_feature', entityId: rows[0].id, entityLabel: label || kind });
+  return { Id: rows[0].id, Kind: rows[0].kind, Label: rows[0].label, Points: rows[0].points, AssetId: rows[0].asset_id, Style: rows[0].style };
+}
+
+export async function updateMapFeature(id, { kind, label, points, assetId, style }) {
+  const { rows } = await pool.query(
+    `UPDATE map_features SET
+       kind = COALESCE($2, kind), label = COALESCE($3, label),
+       points = COALESCE($4, points), asset_id = $5, style = COALESCE($6, style),
+       updated_at = now()
+     WHERE id = $1 RETURNING *`,
+    [id, kind || null, label ?? null, points ? JSON.stringify(points) : null, assetId ?? null, style ? JSON.stringify(style) : null]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'updated', entityType: 'map_feature', entityId: rows[0].id, entityLabel: rows[0].label || rows[0].kind });
+  return { Id: rows[0].id, Kind: rows[0].kind, Label: rows[0].label, Points: rows[0].points, AssetId: rows[0].asset_id, Style: rows[0].style };
+}
+
+export async function deleteMapFeature(id) {
+  const { rows } = await pool.query('DELETE FROM map_features WHERE id = $1 RETURNING kind, label', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'map_feature', entityId: Number(id), entityLabel: rows[0].label || rows[0].kind });
+}
+
 // ── Work Order Tasks — free-text scope-of-work job lines (the default way to
 //    add work to a WO). Distinct from asset_updates, which is the separate,
 //    optional "this WO also changes an asset property field" mechanism —
