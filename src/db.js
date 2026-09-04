@@ -628,6 +628,42 @@ export async function resolveAssetNote(noteId, resolved = true) {
   return rows[0] || null;
 }
 
+// ── Notes scratchpad — standalone, user-categorized notes (not tied to an
+//    asset). Categories are whatever text the user types, same free-tagging
+//    approach as map layers, so new categories never need a code change. ──
+
+export async function listNotes() {
+  const { rows } = await pool.query('SELECT * FROM notes ORDER BY done ASC, updated_at DESC');
+  return rows;
+}
+
+export async function createNote({ title, body = null, category = 'General' }) {
+  const { rows } = await pool.query(
+    `INSERT INTO notes (title, body, category, created_by) VALUES ($1,$2,$3,$4) RETURNING *`,
+    [title, body, category || 'General', currentUsername()]
+  );
+  await logActivity({ action: 'created', entityType: 'note', entityId: rows[0].id, entityLabel: title, details: category });
+  return rows[0];
+}
+
+export async function updateNote(id, { title, body, category, done }) {
+  const sets = ['updated_at = now()'];
+  const vals = [];
+  let i = 1;
+  if (title !== undefined) { sets.push(`title = $${i++}`); vals.push(title); }
+  if (body !== undefined) { sets.push(`body = $${i++}`); vals.push(body); }
+  if (category !== undefined) { sets.push(`category = $${i++}`); vals.push(category || 'General'); }
+  if (done !== undefined) { sets.push(`done = $${i++}`); vals.push(!!done); }
+  vals.push(id);
+  const { rows } = await pool.query(`UPDATE notes SET ${sets.join(', ')} WHERE id = $${i} RETURNING *`, vals);
+  return rows[0] || null;
+}
+
+export async function deleteNote(id) {
+  const { rows } = await pool.query('DELETE FROM notes WHERE id = $1 RETURNING title', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'note', entityId: id, entityLabel: rows[0].title });
+}
+
 // ── Full asset edit (core fields + property fields, one call) — the
 //    "Edit Asset" admin screen. Distinct from submitAudit: no component
 //    events or findings here, just direct field edits. ─────────────────────

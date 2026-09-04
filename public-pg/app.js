@@ -337,6 +337,7 @@ const NAV_ITEMS = [
   { icon: '📝', label: 'Start Audit', view: 'auditPicker' },
   { icon: '📍', label: 'Locations', view: 'locations' },
   { icon: '🗺️', label: 'Map', view: 'map' },
+  { icon: '🗒️', label: 'Notes', view: 'notes' },
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
@@ -458,6 +459,7 @@ async function render(view, params = {}) {
       auditPicker: () => renderAuditPicker(),
       locations: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderLocationsDrilldown() : renderLocations()),
       map: () => renderMap(),
+      notes: () => renderNotes(),
       assetsInLocation: () => renderAssetsInLocation(params),
       assetDetail: () => renderAssetDetail(params),
       audit: () => renderAudit(params),
@@ -2451,6 +2453,139 @@ async function renderCapitalPlan() {
     document.getElementById('clearBucketFilter')?.addEventListener('click', () => { activeBucket = null; draw(); });
     app.querySelectorAll('tr.clickable-row').forEach((tr) => tr.addEventListener('click', () => go('assetDetail', { id: tr.dataset.assetId })));
     wireTableViewToggle(draw);
+  }
+
+  draw();
+}
+
+// ---------- Notes scratchpad ----------
+// Freeform notes ("a program I want to implement soon") with a user-typed
+// category — no fixed category list, just whatever's already been used
+// offered back as suggestions, same free-tagging approach as map layers.
+
+async function renderNotes() {
+  setChrome({ title: 'Notes', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  let notes = (await api('/api/pg/notes')).notes;
+  let categoryFilter = null;
+  let adding = false;
+  let editingId = null;
+  let showDone = false;
+
+  function categories() {
+    return [...new Set(notes.map((n) => n.category || 'General'))].sort();
+  }
+
+  function noteFormHtml(note) {
+    return `<div class="card">
+      <h3>${note ? 'Edit Note' : 'New Note'}</h3>
+      <div class="field-row"><label>Title</label><input class="nf-title" value="${escapeHtml(note?.title || '')}" required /></div>
+      <div class="field-row"><label>Category</label>
+        <input class="nf-category" list="noteCategoryOptions" value="${escapeHtml(note?.category || categoryFilter || 'General')}" />
+        <datalist id="noteCategoryOptions">${categories().map((c) => `<option value="${escapeHtml(c)}">`).join('')}</datalist>
+      </div>
+      <div class="field-row"><label>Details</label><textarea class="nf-body" placeholder="Optional details…">${escapeHtml(note?.body || '')}</textarea></div>
+      <div class="btn-row">
+        <button class="btn btn-primary nf-save" data-id="${note?.id ?? ''}">Save</button>
+        <button class="btn btn-secondary nf-cancel">Cancel</button>
+      </div>
+    </div>`;
+  }
+
+  function noteCardHtml(n) {
+    return `<div class="list-item" style="align-items:flex-start;flex-wrap:wrap;gap:10px;${n.done ? 'opacity:0.6' : ''}">
+      <input type="checkbox" class="note-done" data-id="${n.id}" ${n.done ? 'checked' : ''} style="margin-top:4px" />
+      <div style="flex:1;min-width:180px">
+        <div><strong style="${n.done ? 'text-decoration:line-through' : ''}">${escapeHtml(n.title)}</strong> <span class="pill">${escapeHtml(n.category || 'General')}</span></div>
+        ${n.body ? `<div class="muted" style="white-space:pre-wrap">${escapeHtml(n.body)}</div>` : ''}
+        <div class="muted" style="font-size:12px">${n.created_by ? escapeHtml(n.created_by) + ' · ' : ''}${formatDateNice(n.updated_at)}</div>
+      </div>
+      <div class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary note-edit" data-id="${n.id}">Edit</button>
+        <button class="btn btn-secondary note-delete" data-id="${n.id}" data-title="${escapeHtml(n.title)}">Delete</button>
+      </div>
+    </div>`;
+  }
+
+  function draw() {
+    const cats = categories();
+    const visible = notes
+      .filter((n) => showDone || !n.done)
+      .filter((n) => !categoryFilter || (n.category || 'General') === categoryFilter);
+    setApp(`
+      ${cats.length ? `<div class="card">
+        <div class="view-toggle">
+          <button type="button" class="view-toggle-btn note-cat-btn ${!categoryFilter ? 'active' : ''}" data-cat="">All</button>
+          ${cats.map((c) => `<button type="button" class="view-toggle-btn note-cat-btn ${categoryFilter === c ? 'active' : ''}" data-cat="${escapeHtml(c)}">${escapeHtml(c)}</button>`).join('')}
+        </div>
+      </div>` : ''}
+      <div class="btn-row" style="margin:-6px 0 16px">
+        <button class="btn btn-secondary" id="addNoteBtn">+ Add Note</button>
+        <label style="display:flex;align-items:center;gap:6px;margin-left:auto">
+          <input type="checkbox" id="showDoneToggle" ${showDone ? 'checked' : ''} /> Show done
+        </label>
+      </div>
+      ${adding ? noteFormHtml(null) : ''}
+      ${editingId ? noteFormHtml(notes.find((n) => n.id === editingId)) : ''}
+      <div class="card">
+        ${visible.map(noteCardHtml).join('') || '<p class="muted">🗒️ No notes yet.</p>'}
+      </div>
+    `);
+    wire();
+  }
+
+  function wire() {
+    app.querySelectorAll('.note-cat-btn').forEach((btn) => btn.addEventListener('click', () => {
+      categoryFilter = btn.dataset.cat || null;
+      draw();
+    }));
+    document.getElementById('showDoneToggle')?.addEventListener('change', (e) => { showDone = e.target.checked; draw(); });
+    document.getElementById('addNoteBtn')?.addEventListener('click', () => { adding = true; editingId = null; draw(); });
+    app.querySelectorAll('.note-edit').forEach((btn) => btn.addEventListener('click', () => {
+      editingId = Number(btn.dataset.id); adding = false; draw();
+    }));
+    app.querySelectorAll('.nf-cancel').forEach((btn) => btn.addEventListener('click', () => { adding = false; editingId = null; draw(); }));
+
+    app.querySelectorAll('.nf-save').forEach((btn) => btn.addEventListener('click', async () => {
+      const card = btn.closest('.card');
+      const title = card.querySelector('.nf-title').value.trim();
+      const category = card.querySelector('.nf-category').value.trim() || 'General';
+      const body = card.querySelector('.nf-body').value.trim();
+      if (!title) { toast('Title is required'); return; }
+      const id = btn.dataset.id;
+      try {
+        if (id) {
+          const { note } = await api(`/api/pg/notes/${id}`, { method: 'PATCH', body: JSON.stringify({ title, category, body }) });
+          notes = notes.map((n) => (n.id === note.id ? note : n));
+        } else {
+          const { note } = await api('/api/pg/notes', { method: 'POST', body: JSON.stringify({ title, category, body }) });
+          notes = [note, ...notes];
+        }
+        toast('Saved');
+        adding = false; editingId = null;
+        draw();
+      } catch (err) { toast(err.message); }
+    }));
+
+    app.querySelectorAll('.note-done').forEach((cb) => cb.addEventListener('change', async () => {
+      const id = Number(cb.dataset.id);
+      try {
+        const { note } = await api(`/api/pg/notes/${id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) });
+        notes = notes.map((n) => (n.id === note.id ? note : n));
+        draw();
+      } catch (err) { toast(err.message); }
+    }));
+
+    app.querySelectorAll('.note-delete').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!await confirmDialog(`Delete note "${btn.dataset.title}"?`)) return;
+      const id = Number(btn.dataset.id);
+      try {
+        await api(`/api/pg/notes/${id}`, { method: 'DELETE' });
+        notes = notes.filter((n) => n.id !== id);
+        toast('Deleted');
+        draw();
+      } catch (err) { toast(err.message); }
+    }));
   }
 
   draw();

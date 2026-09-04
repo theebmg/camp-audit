@@ -21,6 +21,7 @@ import {
   getAssetPropertyFields, getComponentTypeCatalog, getAssetDetail, getAssetHistory,
   submitAudit, getMaintenanceLog, listBuildingTypes, setAssetBuildingType,
   listAssetNotes, createAssetNote, resolveAssetNote, updateAssetFull,
+  listNotes, createNote, updateNote, deleteNote,
   adminListPropertyFields, adminCreatePropertyField, adminUpdatePropertyField,
   adminListComponentTypes, adminCreateComponentType, adminUpdateComponentType,
   adminCreateBuildingType, adminDeleteBuildingType,
@@ -215,6 +216,33 @@ router.patch('/map/layers/:id', async (req, res, next) => {
 router.delete('/map/layers/:id', async (req, res, next) => {
   try {
     await deleteMapLayer(req.params.id);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+router.get('/notes', async (req, res, next) => {
+  try { res.json({ notes: await listNotes() }); } catch (e) { next(e); }
+});
+
+router.post('/notes', async (req, res, next) => {
+  try {
+    const { title, body, category } = req.body || {};
+    if (!title || !title.trim()) return res.status(400).json({ ok: false, error: 'Title is required' });
+    res.json({ ok: true, note: await createNote({ title: title.trim(), body, category }) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/notes/:id', async (req, res, next) => {
+  try {
+    const updated = await updateNote(req.params.id, req.body || {});
+    if (!updated) return res.status(404).json({ ok: false, error: 'Note not found' });
+    res.json({ ok: true, note: updated });
+  } catch (e) { next(e); }
+});
+
+router.delete('/notes/:id', async (req, res, next) => {
+  try {
+    await deleteNote(req.params.id);
     res.json({ ok: true });
   } catch (e) { next(e); }
 });
