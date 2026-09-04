@@ -260,10 +260,21 @@
     .map-layer-btn { border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 6px; width: 22px; height: 22px; font-size: 11px; cursor: pointer; padding: 0; }
     .map-layer-btn:disabled { opacity: 0.35; cursor: default; }
     .map-add-layer { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 8px; background: var(--surface-alt); }
+    .map-layers-toggle { display: flex; align-items: center; gap: 6px; width: 100%; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 8px; padding: 8px 10px; font-size: 0.85rem; cursor: pointer; text-align: left; }
+    .map-layers-toggle:hover { background: var(--surface-alt); }
+    .map-layers-toggle .map-layers-count { margin-left: auto; font-size: 0.78rem; }
+    .map-layers-toggle .map-layers-chevron { color: var(--muted); font-size: 0.7rem; transition: transform .15s; }
+    .map-layers-toggle.on .map-layers-chevron { transform: rotate(180deg); }
+    .map-layers-popover { position: fixed; width: 300px; max-height: 70vh; overflow-y: auto; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow-sm); z-index: 30; padding: 12px 15px; }
+    .map-layers-popover-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    .map-layers-popover-head h2 { margin: 0; font-size: 0.68rem; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+    .map-layers-close { border: none; background: transparent; color: var(--muted); font-size: 14px; line-height: 1; cursor: pointer; padding: 2px 4px; }
+    .map-layers-close:hover { color: var(--text); }
     @media (max-width: 860px) {
       .map-view { flex-direction: column; }
       .map-side { width: 100%; flex: 0 0 auto; max-height: 44vh; }
       .map-stage { flex: 1 1 auto; }
+      .map-layers-popover { width: calc(100vw - 24px); }
     }
 
     /* Motion: cards/list-items/nav get a soft hover + a fade-in when a view

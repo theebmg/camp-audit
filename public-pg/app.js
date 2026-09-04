@@ -1339,26 +1339,11 @@ async function renderMap() {
           </div>
         </div>
         <div class="map-grp" id="mapLayersGrp">
-          <h2>Layers</h2>
-          <div id="mapLayerRows"></div>
-          <div class="map-add-layer" id="mapAddLayerForm" hidden>
-            <input type="text" class="map-search" id="newLayerName" placeholder="Layer name" style="margin-bottom:6px">
-            <div class="map-info-row">
-              <select class="map-search" id="newLayerGeom" style="flex:1">
-                <option value="point">Points</option>
-                <option value="line">Lines</option>
-                <option value="zone">Zones</option>
-                <option value="mixed">Mixed</option>
-              </select>
-              <input type="text" class="map-search" id="newLayerIcon" placeholder="🔧" maxlength="2" style="width:52px">
-            </div>
-            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px" id="newLayerSwatches">
-              ${MAP_SWATCHES.map((c) => `<button type="button" class="map-swatch" data-color="${c}" style="background:${c}"></button>`).join('')}
-            </div>
-            <label class="map-lyr" style="margin-bottom:8px"><input type="checkbox" id="newLayerCond"> Color by condition (asset-linked)</label>
-            <button type="button" class="btn btn-primary" id="newLayerCreate" style="width:100%">Create layer</button>
-          </div>
-          <button type="button" class="btn btn-secondary" id="mapAddLayerBtn" style="width:100%;margin-top:8px">+ Add layer</button>
+          <button type="button" class="map-layers-toggle" id="mapLayersBtn">
+            <span>Layers</span>
+            <span class="map-layers-count muted" id="mapLayersCount"></span>
+            <span class="map-layers-chevron">▾</span>
+          </button>
         </div>
         <div class="map-grp">
           <h2>Legend</h2>
@@ -1371,6 +1356,31 @@ async function renderMap() {
         </div>
         <div class="map-grp" id="mapInfo"><h2>Selected</h2><div class="muted">Click a marker or shape to select it.</div></div>
       </aside>
+      <div class="map-layers-popover" id="mapLayersPopover" hidden>
+        <div class="map-layers-popover-head">
+          <h2>Layers</h2>
+          <button type="button" class="map-layers-close" id="mapLayersClose" aria-label="Close">✕</button>
+        </div>
+        <div id="mapLayerRows"></div>
+        <div class="map-add-layer" id="mapAddLayerForm" hidden>
+          <input type="text" class="map-search" id="newLayerName" placeholder="Layer name" style="margin-bottom:6px">
+          <div class="map-info-row">
+            <select class="map-search" id="newLayerGeom" style="flex:1">
+              <option value="point">Points</option>
+              <option value="line">Lines</option>
+              <option value="zone">Zones</option>
+              <option value="mixed">Mixed</option>
+            </select>
+            <input type="text" class="map-search" id="newLayerIcon" placeholder="🔧" maxlength="2" style="width:52px">
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px" id="newLayerSwatches">
+            ${MAP_SWATCHES.map((c) => `<button type="button" class="map-swatch" data-color="${c}" style="background:${c}"></button>`).join('')}
+          </div>
+          <label class="map-lyr" style="margin-bottom:8px"><input type="checkbox" id="newLayerCond"> Color by condition (asset-linked)</label>
+          <button type="button" class="btn btn-primary" id="newLayerCreate" style="width:100%">Create layer</button>
+        </div>
+        <button type="button" class="btn btn-secondary" id="mapAddLayerBtn" style="width:100%;margin-top:8px">+ Add layer</button>
+      </div>
       <div class="map-stage">
         <svg id="mapSvg" viewBox="0 0 2500 3700" preserveAspectRatio="xMidYMid meet"></svg>
         <button type="button" id="mapFinish" class="btn btn-primary map-finish">Finish shape (Enter)</button>
@@ -1585,6 +1595,12 @@ function initMapEditor({ pins, features, layers }) {
   // ---- pointer interaction ----
   let pan = null, drag = null;
   svg.addEventListener('pointerdown', (e) => {
+    // A click that lands on a marker/label sets pointer capture below, which
+    // retargets the follow-up 'click' event away from its real target — the
+    // document-level outside-click listener for the layers popover can't
+    // reliably see those, so close it straight from here instead.
+    const layersPopover = document.getElementById('mapLayersPopover');
+    if (layersPopover && !layersPopover.hidden) toggleLayersPopover(false);
     const m = toMap(e);
     if (mode === 'add-asset') { if (placingAsset) placeAssetAt(m); return; }
     if (mode.startsWith('add-layer:')) {
@@ -1938,6 +1954,8 @@ function initMapEditor({ pins, features, layers }) {
   // ---- layer panel (list, add, recolor, rename, reorder, delete) ----
   function renderLayerRows() {
     const box = document.getElementById('mapLayerRows');
+    const countEl = document.getElementById('mapLayersCount');
+    if (countEl) countEl.textContent = mapLayers.length ? `${mapLayers.filter((l) => l.DefaultVisible).length}/${mapLayers.length}` : '';
     const sorted = [...mapLayers].sort((a, b) => b.ZIndex - a.ZIndex);
     box.innerHTML = sorted.map((l, i) => `
       <div class="map-layer-row" data-id="${l.Id}">
@@ -2054,6 +2072,51 @@ function initMapEditor({ pins, features, layers }) {
     } catch (err) { toast(err.message); }
   }
 
+  // Layers popover: keeps per-layer editing (rename/recolor/reorder/etc) out
+  // of the sidebar's default scroll — it's fixed-positioned off the toggle
+  // button so it isn't clipped by the sidebar's own overflow-y:auto.
+  function toggleLayersPopover(forceOpen) {
+    const pop = document.getElementById('mapLayersPopover');
+    const btn = document.getElementById('mapLayersBtn');
+    const open = forceOpen !== undefined ? forceOpen : pop.hidden;
+    if (!open) {
+      pop.hidden = true;
+      btn.classList.remove('on');
+      document.getElementById('mapAddLayerForm').hidden = true;
+      return;
+    }
+    pop.hidden = false;
+    btn.classList.add('on');
+    const r = btn.getBoundingClientRect();
+    const margin = 12;
+    let left = r.left;
+    left = Math.min(left, window.innerWidth - pop.offsetWidth - margin);
+    left = Math.max(margin, left);
+    pop.style.left = `${left}px`;
+    // Size-aware placement: cap the popover's height to whichever side (below
+    // or above the button) has more room, so a tall layer list can never grow
+    // over the toggle button itself and swallow its own close click.
+    const spaceBelow = window.innerHeight - r.bottom - margin;
+    const spaceAbove = r.top - margin;
+    if (spaceBelow >= 200 || spaceBelow >= spaceAbove) {
+      pop.style.maxHeight = `${Math.max(160, spaceBelow - 6)}px`;
+      pop.style.top = `${r.bottom + 6}px`;
+    } else {
+      const maxHeight = Math.max(160, spaceAbove - 6);
+      pop.style.maxHeight = `${maxHeight}px`;
+      pop.style.top = `${Math.max(margin, r.top - 6 - Math.min(pop.scrollHeight, maxHeight))}px`;
+    }
+  }
+  document.getElementById('mapLayersBtn').addEventListener('click', (e) => { e.stopPropagation(); toggleLayersPopover(); });
+  document.getElementById('mapLayersClose').addEventListener('click', () => toggleLayersPopover(false));
+  function outsideClickCloseLayersPopover(e) {
+    const pop = document.getElementById('mapLayersPopover');
+    if (!pop) { document.removeEventListener('click', outsideClickCloseLayersPopover); return; }
+    if (pop.hidden || pop.contains(e.target) || e.target.closest('#mapLayersBtn')) return;
+    toggleLayersPopover(false);
+  }
+  document.addEventListener('click', outsideClickCloseLayersPopover);
+
   document.getElementById('mapAddLayerBtn').addEventListener('click', () => {
     const form = document.getElementById('mapAddLayerForm');
     form.hidden = !form.hidden;
@@ -2112,6 +2175,7 @@ function initMapEditor({ pins, features, layers }) {
 
   function mapKeydown(e) {
     if (!document.getElementById('mapSvg')) { document.removeEventListener('keydown', mapKeydown); return; }
+    if (e.key === 'Escape' && !document.getElementById('mapLayersPopover').hidden) { toggleLayersPopover(false); return; }
     if (document.activeElement && ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) return;
     if (e.key === 'Escape') { pending = null; document.getElementById('mapFinish').style.display = 'none'; setMode('edit'); }
     if (e.key === 'Enter' && pending && pending.pts.length > 1) finishPending();
