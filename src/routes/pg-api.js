@@ -67,6 +67,9 @@ import {
   updateConditionFinding, deferFinding, dismissFinding, getFindingsSummary,
   listMapPins, setAssetMapLocation, listMapFeatures, createMapFeature, updateMapFeature, deleteMapFeature,
   listMapLayers, createMapLayer, updateMapLayer, deleteMapLayer,
+  listInboxBatches, getInboxCount, suggestAssetsForText, triageAttachToEntity, triageCreateWorkOrder, triageCreateFinding, voidAttachments,
+  splitWorkOrder, getWorkOrderFamily,
+  listMapCalibrationPoints, createMapCalibrationPoint, deleteMapCalibrationPoint, nearestAssetsToGps,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import {
@@ -161,6 +164,87 @@ router.patch('/admin/attachment-roles/:id', async (req, res, next) => {
 });
 router.delete('/admin/attachment-roles/:id', async (req, res, next) => {
   try { await deleteAttachmentRole(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Triage inbox (Build Brief v2 Phase 5) ----
+
+router.get('/inbox', async (req, res, next) => {
+  try { res.json({ batches: await listInboxBatches() }); } catch (e) { next(e); }
+});
+router.get('/inbox/count', async (req, res, next) => {
+  try { res.json({ count: await getInboxCount() }); } catch (e) { next(e); }
+});
+router.get('/inbox/suggest-assets', async (req, res, next) => {
+  try {
+    const { text, lat, lng } = req.query;
+    if (lat && lng) return res.json({ suggestions: await nearestAssetsToGps(Number(lat), Number(lng)) });
+    res.json({ suggestions: await suggestAssetsForText(text || '') });
+  } catch (e) { next(e); }
+});
+router.post('/inbox/attach', async (req, res, next) => {
+  try {
+    const { attachmentIds, entityType, entityId, roleId } = req.body || {};
+    if (!Array.isArray(attachmentIds) || !attachmentIds.length) return res.status(400).json({ ok: false, error: 'attachmentIds is required' });
+    await triageAttachToEntity(attachmentIds, entityType, Number(entityId), { roleId: roleId ? Number(roleId) : null });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+router.post('/inbox/create-work-order', async (req, res, next) => {
+  try {
+    const { attachmentIds, assetId, title } = req.body || {};
+    if (!Array.isArray(attachmentIds) || !attachmentIds.length) return res.status(400).json({ ok: false, error: 'attachmentIds is required' });
+    if (!title) return res.status(400).json({ ok: false, error: 'title is required' });
+    res.json({ ok: true, ...(await triageCreateWorkOrder(attachmentIds, { assetId: assetId ? Number(assetId) : null, title })) });
+  } catch (e) { next(e); }
+});
+router.post('/inbox/create-finding', async (req, res, next) => {
+  try {
+    const { attachmentIds, assetId, severity, description } = req.body || {};
+    if (!Array.isArray(attachmentIds) || !attachmentIds.length) return res.status(400).json({ ok: false, error: 'attachmentIds is required' });
+    if (!assetId || !severity || !description) return res.status(400).json({ ok: false, error: 'assetId, severity, and description are required' });
+    res.json({ ok: true, ...(await triageCreateFinding(attachmentIds, { assetId: Number(assetId), severity, description })) });
+  } catch (e) { next(e); }
+});
+router.post('/inbox/void', async (req, res, next) => {
+  try {
+    const { attachmentIds } = req.body || {};
+    if (!Array.isArray(attachmentIds) || !attachmentIds.length) return res.status(400).json({ ok: false, error: 'attachmentIds is required' });
+    await voidAttachments(attachmentIds);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ---- Work order splitting + family (Build Brief v2 Phase 5, §5.4) ----
+
+router.post('/work-orders/:id/split', async (req, res, next) => {
+  try {
+    const { jobLineIds } = req.body || {};
+    if (!Array.isArray(jobLineIds) || !jobLineIds.length) return res.status(400).json({ ok: false, error: 'jobLineIds is required' });
+    res.json({ ok: true, ...(await splitWorkOrder(Number(req.params.id), jobLineIds.map(Number))) });
+  } catch (e) { next(e); }
+});
+router.get('/work-orders/:id/family', async (req, res, next) => {
+  try {
+    const family = await getWorkOrderFamily(req.params.id);
+    if (!family) return res.status(404).json({ ok: false, error: 'Work order not found' });
+    res.json(family);
+  } catch (e) { next(e); }
+});
+
+// ---- Map GPS calibration (Build Brief v2 Phase 5, §5.3) ----
+
+router.get('/admin/map-calibration', async (req, res, next) => {
+  try { res.json({ points: await listMapCalibrationPoints() }); } catch (e) { next(e); }
+});
+router.post('/admin/map-calibration', async (req, res, next) => {
+  try {
+    const { label, lat, lng, mapX, mapY } = req.body || {};
+    if (!label || lat == null || lng == null || mapX == null || mapY == null) return res.status(400).json({ ok: false, error: 'label, lat, lng, mapX, and mapY are all required' });
+    res.json({ ok: true, point: await createMapCalibrationPoint({ label, lat: Number(lat), lng: Number(lng), mapX: Number(mapX), mapY: Number(mapY) }) });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/map-calibration/:id', async (req, res, next) => {
+  try { await deleteMapCalibrationPoint(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 // Condition Findings severity options — mirrors the live NocoDB Severity select.

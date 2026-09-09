@@ -12,6 +12,7 @@ import manageRouter from './routes/manage.js';
 import reportsRouter from './routes/reports.js';
 import pgApiRouter from './routes/pg-api.js';
 import requestPortalRouter from './routes/request-portal.js';
+import { pollInbox, imapIsConfigured } from './mailIngest.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -116,4 +117,13 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`camp-audit listening on :${PORT}`);
+  // Email-fed triage inbox (Build Brief v2 Phase 5, §5.2) — 5 min poll is
+  // fine per the brief. No-op silently when IMAP_* env vars aren't set, same
+  // as mailer.js's mailIsConfigured() convention for outbound.
+  if (imapIsConfigured()) {
+    pollInbox();
+    setInterval(pollInbox, 5 * 60 * 1000);
+  } else {
+    console.log('mailIngest: IMAP_* env vars not set — inbox email ingest disabled (manual upload still works).');
+  }
 });

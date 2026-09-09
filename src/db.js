@@ -1154,7 +1154,7 @@ const JOB_LINE_STATUS_BREAKDOWN_SQL = `
 
 export async function listWorkOrders() {
   const { rows } = await pool.query(
-    `SELECT w.id, w.title, ws.id AS status_id, ws.name AS status, ws.color AS status_color, ws.is_terminal AS status_is_terminal,
+    `SELECT w.id, w.title, w.wo_number, w.parent_wo_id, w.split_root_id, ws.id AS status_id, ws.name AS status, ws.color AS status_color, ws.is_terminal AS status_is_terminal,
             w.priority, w.date_reported, w.date_completed, w.deferred_reason, w.revisit_date,
             jl.earliest_scheduled_date AS scheduled_date,
             jl.line_count, jl.estimated_hours, jl.estimated_cost, jl.actual_hours, jl.actual_cost,
@@ -1175,7 +1175,8 @@ export async function listWorkOrders() {
     const terminalCost = Number(r.terminal_cost || 0);
     const terminalLines = Number(r.terminal_lines || 0);
     return {
-      Id: r.id, Title: r.title, Status: r.status, StatusId: r.status_id, StatusColor: r.status_color, StatusIsTerminal: r.status_is_terminal,
+      Id: r.id, Title: r.title, WoNumber: r.wo_number, ParentWoId: r.parent_wo_id, SplitRootId: r.split_root_id,
+      Status: r.status, StatusId: r.status_id, StatusColor: r.status_color, StatusIsTerminal: r.status_is_terminal,
       Priority: r.priority, IsBlocked: r.is_blocked,
       'Date Reported': r.date_reported, 'Date Completed': r.date_completed, 'Scheduled Date': r.scheduled_date,
       DeferredReason: r.deferred_reason, RevisitDate: r.revisit_date,
@@ -1265,6 +1266,7 @@ export async function getWorkOrderDetail(woId) {
       DeferredReason: w.deferred_reason, RevisitDate: w.revisit_date,
       Description: w.description,
       BoardFocus: w.board_focus,
+      WoNumber: w.wo_number, ParentWoId: w.parent_wo_id, SplitRootId: w.split_root_id,
       Asset: w.asset_id ? { Id: w.asset_id, Name: w.asset_name, LodgeHolder: w.asset_lodge_holder } : null,
       Location: w.location_id ? { Id: w.location_id, Name: w.location_name } : null,
     },
@@ -1453,12 +1455,17 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // A freshly created WO is its own unsplit root (§5.4: split_root_id
+    // points at itself until/unless it's ever split off). wo_number is a
+    // display string, defaulted to the real id — fetching the id up front
+    // via nextval lets both go in the same INSERT instead of an INSERT+UPDATE.
+    const { rows: idRows } = await client.query(`SELECT nextval(pg_get_serial_sequence('work_orders','id')) AS id`);
+    const woId = Number(idRows[0].id);
     const { rows } = await client.query(
-      `INSERT INTO work_orders (title, asset_id, location_id, priority, status_id, description, date_reported)
-       VALUES ($1,$2,$3,$4,(SELECT id FROM work_order_statuses WHERE name = 'Reported'),$5,$6) RETURNING id`,
-      [title, assetId || null, locationId || null, priority || 'Medium', description || null, today()]
+      `INSERT INTO work_orders (id, title, asset_id, location_id, priority, status_id, description, date_reported, wo_number, split_root_id)
+       VALUES ($1,$2,$3,$4,$5,(SELECT id FROM work_order_statuses WHERE name = 'Reported'),$6,$7,$8,$1) RETURNING id`,
+      [woId, title, assetId || null, locationId || null, priority || 'Medium', description || null, today(), String(woId)]
     );
-    const woId = rows[0].id;
     const created = [];
     for (const u of assetUpdates) {
       if (!u?.targetField || !byLabel.has(u.targetField)) continue; // must be a live property field label
@@ -1601,12 +1608,16 @@ export async function duplicateWorkOrder(woId) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const { rows } = await client.query(
-      `INSERT INTO work_orders (title, asset_id, location_id, priority, status_id, description, date_reported)
-       VALUES ($1,$2,$3,$4,(SELECT id FROM work_order_statuses WHERE name = 'Reported'),$5,$6) RETURNING id`,
-      [`${w.title} (Copy)`, w.asset_id, w.location_id, w.priority, w.description, today()]
+    // Same self-pointing-root / wo_number-from-id pattern as createWorkOrder
+    // — a duplicate is a brand new, never-split WO, not a sibling of the
+    // original.
+    const { rows: idRows } = await client.query(`SELECT nextval(pg_get_serial_sequence('work_orders','id')) AS id`);
+    const newId = Number(idRows[0].id);
+    await client.query(
+      `INSERT INTO work_orders (id, title, asset_id, location_id, priority, status_id, description, date_reported, wo_number, split_root_id)
+       VALUES ($1,$2,$3,$4,$5,(SELECT id FROM work_order_statuses WHERE name = 'Reported'),$6,$7,$8,$1)`,
+      [newId, `${w.title} (Copy)`, w.asset_id, w.location_id, w.priority, w.description, today(), String(newId)]
     );
-    const newId = rows[0].id;
     for (const u of srcUpdates.rows) {
       await client.query(
         `INSERT INTO asset_updates (work_order_id, target_field, new_value, applied) VALUES ($1,$2,$3,false)`,
@@ -2946,6 +2957,242 @@ export async function deleteAttachmentRole(id) {
   if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} attachment(s) still use this role — deactivate it instead of deleting`); e.status = 400; throw e; }
   const { rows } = await pool.query('DELETE FROM attachment_roles WHERE id = $1 RETURNING name', [id]);
   if (rows[0]) await logActivity({ action: 'deleted', entityType: 'attachment_role', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+// ── Triage inbox (Build Brief v2 Phase 5, §5.3) — batches with at least one
+//    attachment still in triage_status='inbox'. A batch is a suggestion, not
+//    a commitment: acting on a subset of its photos leaves the rest in the
+//    inbox (triage_status only changes for the attachments actually acted
+//    on), so a 20-photo walkthrough email can become three separate WOs
+//    without losing track of what's left. ──────────────────────────────────
+
+export async function listInboxBatches() {
+  const { rows } = await pool.query(`
+    SELECT b.id, b.subject, b.body_text, b.sender_email, b.received_at,
+           json_agg(json_build_object(
+             'Id', a.id, 'Url', a.url, 'ThumbUrl', a.thumb_url, 'Kind', a.kind,
+             'Width', a.width, 'Height', a.height, 'TakenAt', a.taken_at,
+             'GpsLat', a.gps_lat, 'GpsLng', a.gps_lng, 'OriginalFilename', a.original_filename
+           ) ORDER BY a.taken_at NULLS LAST, a.id) AS attachments
+    FROM attachment_batches b
+    JOIN attachments a ON a.batch_id = b.id AND a.triage_status = 'inbox' AND a.deleted_at IS NULL
+    GROUP BY b.id
+    ORDER BY b.received_at DESC`
+  );
+  return rows.map((r) => ({ Id: r.id, Subject: r.subject, BodyText: r.body_text, SenderEmail: r.sender_email, ReceivedAt: r.received_at, Attachments: r.attachments }));
+}
+
+// Dashboard badge (§5.3) — "the failure mode is a junk drawer of 400
+// untriaged photos; the badge is the only thing preventing it."
+export async function getInboxCount() {
+  const { rows } = await pool.query(`SELECT count(*) FROM attachments WHERE triage_status = 'inbox' AND deleted_at IS NULL`);
+  return Number(rows[0].count);
+}
+
+// Fuzzy asset-name match for a batch's subject/body (§5.2) — plain word
+// overlap, not a real search index. Never auto-assigns; the inbox surfaces
+// the top matches as tappable suggestions only. A silent wrong match
+// against 337 assets is worse than no match.
+export async function suggestAssetsForText(text, limit = 3) {
+  if (!text) return [];
+  const words = new Set(text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((w) => w.length > 2));
+  if (!words.size) return [];
+  const { rows } = await pool.query('SELECT id, name FROM assets');
+  const scored = rows.map((r) => {
+    const nameWords = r.name.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean);
+    const score = nameWords.filter((w) => words.has(w)).length;
+    return { Id: r.id, Name: r.name, score };
+  }).filter((s) => s.score > 0).sort((a, b) => b.score - a.score);
+  return scored.slice(0, limit).map(({ Id, Name }) => ({ Id, Name }));
+}
+
+async function markTriaged(attachmentIds, client = pool) {
+  if (!attachmentIds.length) return;
+  await client.query(`UPDATE attachments SET triage_status = 'triaged' WHERE id = ANY($1::int[])`, [attachmentIds]);
+}
+
+// The common triage action: link a batch of selected inbox photos onto an
+// EXISTING entity (an existing WO, a job line, an asset for reference-only
+// filing, etc) and mark them triaged. "Create WO" / "New finding" below
+// create the parent row first, then call this the same way.
+export async function triageAttachToEntity(attachmentIds, entityType, entityId, { roleId = null } = {}) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const id of attachmentIds) await linkAttachment(id, { entityType, entityId, roleId }, client);
+    await markTriaged(attachmentIds, client);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function triageCreateWorkOrder(attachmentIds, { assetId, title }) {
+  const { workOrderId } = await createWorkOrder({ assetId, title });
+  await triageAttachToEntity(attachmentIds, 'work_order', workOrderId);
+  return { workOrderId };
+}
+
+export async function triageCreateFinding(attachmentIds, { assetId, severity, description }) {
+  const { rows } = await pool.query(
+    `INSERT INTO condition_findings (asset_id, title, severity, description, status, date_identified, created_by)
+     VALUES ($1,$2,$3,$4,'Open',$5,$6) RETURNING id`,
+    [assetId, (description || '').slice(0, 80) || 'Finding from inbox', severity, description, today(), currentUsername()]
+  );
+  await triageAttachToEntity(attachmentIds, 'condition_finding', rows[0].id);
+  return { findingId: rows[0].id };
+}
+
+// Void is one tap, no confirm, per the attachment-level voidAttachment
+// comment — this is the multi-select version for the inbox's own Void action.
+export async function voidAttachments(attachmentIds) {
+  for (const id of attachmentIds) await voidAttachment(id);
+}
+
+// ── Work order splitting (Build Brief v2 Phase 5, §5.4) — `id serial` stays
+//    the real primary key everywhere; wo_number is a DISPLAY string only,
+//    always the next flat suffix off the root ("1000-2", "1000-3", ...),
+//    never nested. Only available on a non-terminal WO — discovering more
+//    work on a closed job creates a new WO, never a retroactive child. ─────
+
+export async function splitWorkOrder(woId, jobLineIds) {
+  if (!jobLineIds?.length) { const e = new Error('Select at least one job line to split off'); e.status = 400; throw e; }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const woRes = await client.query(
+      `SELECT w.*, ws.is_terminal FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`, [woId]
+    );
+    const wo = woRes.rows[0];
+    if (!wo) { const e = new Error('Work order not found'); e.status = 404; throw e; }
+    if (wo.is_terminal) { const e = new Error('Cannot split a closed work order — a new WO for follow-on work keeps completion dates meaningful'); e.status = 400; throw e; }
+
+    const lineCheck = await client.query(`SELECT id, scheduled_date FROM job_lines WHERE id = ANY($1::int[]) AND work_order_id = $2`, [jobLineIds, woId]);
+    if (lineCheck.rows.length !== jobLineIds.length) { const e = new Error('One or more selected lines do not belong to this work order'); e.status = 400; throw e; }
+
+    const rootId = wo.split_root_id;
+    const rootRes = await client.query('SELECT wo_number FROM work_orders WHERE id = $1', [rootId]);
+    const siblingsRes = await client.query('SELECT wo_number FROM work_orders WHERE split_root_id = $1', [rootId]);
+    const nextSuffix = 1 + Math.max(0, ...siblingsRes.rows.map((r) => Number(r.wo_number.match(/-(\d+)$/)?.[1]) || 0));
+    const newWoNumber = `${rootRes.rows[0].wo_number}-${nextSuffix}`;
+
+    // Child starts at Assessed or Scheduled (§5.4) — Scheduled if any moved
+    // line already has a date, Assessed otherwise (lines exist with
+    // hours+cost, matching 2.2's own definition of that status).
+    const targetStatusName = lineCheck.rows.some((r) => r.scheduled_date) ? 'Scheduled' : 'Assessed';
+    const statusRes = await client.query('SELECT id FROM work_order_statuses WHERE name = $1', [targetStatusName]);
+
+    const childRes = await client.query(
+      `INSERT INTO work_orders (asset_id, location_id, project_id, priority, status_id, wo_number, parent_wo_id, split_root_id, title, description, board_focus, date_reported)
+       SELECT asset_id, location_id, project_id, priority, $2, $3, $1, $4, title, description, board_focus, $5
+       FROM work_orders WHERE id = $1 RETURNING id`,
+      [woId, statusRes.rows[0].id, newWoNumber, rootId, today()]
+    );
+    const childId = childRes.rows[0].id;
+
+    // Lines carry their own hours/cost/funding/crew/status/attachments/
+    // finding links with them — nothing else to re-sort (attachment_links
+    // point at job_line ids, which don't change, so photos travel for free).
+    await client.query(`UPDATE job_lines SET work_order_id = $1 WHERE id = ANY($2::int[])`, [childId, jobLineIds]);
+
+    await client.query('COMMIT');
+    await logActivity({ action: 'split off', entityType: 'work_order', entityId: childId, entityLabel: newWoNumber, details: `From WO ${wo.wo_number}` });
+    return { workOrderId: childId, woNumber: newWoNumber };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Family rollup (§5.4) — every sibling off the same root, with a combined
+// total. Without this a split silently fragments project totals; a single
+// query on the indexed split_root_id, not a recursive walk.
+export async function getWorkOrderFamily(woId) {
+  const rootRes = await pool.query('SELECT split_root_id FROM work_orders WHERE id = $1', [woId]);
+  if (!rootRes.rows[0]) return null;
+  const rootId = rootRes.rows[0].split_root_id;
+  const { rows: members } = await pool.query(
+    `SELECT w.id, w.wo_number, w.title, ws.name AS status_name, ws.color AS status_color
+     FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id
+     WHERE w.split_root_id = $1 ORDER BY w.id`,
+    [rootId]
+  );
+  let totalCost = 0, totalHours = 0;
+  const memberDetails = [];
+  for (const m of members) {
+    const rollup = await workOrderRollup(m.id);
+    memberDetails.push({ Id: m.id, WoNumber: m.wo_number, Title: m.title, Status: m.status_name, StatusColor: m.status_color, Rollup: rollup });
+    totalCost += rollup.ActualCost || rollup.EstimatedCost || 0;
+    totalHours += rollup.ActualHours || rollup.EstimatedHours || 0;
+  }
+  return { RootId: rootId, Members: memberDetails, TotalCost: totalCost, TotalHours: totalHours };
+}
+
+// ── Map GPS calibration (Build Brief v2 Phase 5, §5.3) — a one-time affine
+//    fit from real-world GPS to campmap.webp image-pixel space, from exactly
+//    3 non-collinear reference points (assets already carry map_x/map_y —
+//    migration 0027). Recomputed live from whatever points are stored rather
+//    than cached, so editing a point via the admin/map UI takes effect
+//    immediately. ───────────────────────────────────────────────────────────
+
+export async function listMapCalibrationPoints() {
+  const { rows } = await pool.query('SELECT id, label, lat, lng, map_x, map_y FROM map_calibration_points ORDER BY id');
+  return rows.map((r) => ({ Id: r.id, Label: r.label, Lat: r.lat, Lng: r.lng, MapX: r.map_x, MapY: r.map_y }));
+}
+export async function createMapCalibrationPoint({ label, lat, lng, mapX, mapY }) {
+  const countRes = await pool.query('SELECT count(*) FROM map_calibration_points');
+  if (Number(countRes.rows[0].count) >= 3) { const e = new Error('Only 3 calibration points are used — delete one before adding another'); e.status = 400; throw e; }
+  const { rows } = await pool.query('INSERT INTO map_calibration_points (label, lat, lng, map_x, map_y) VALUES ($1,$2,$3,$4,$5) RETURNING *', [label, lat, lng, mapX, mapY]);
+  return { Id: rows[0].id, Label: rows[0].label, Lat: rows[0].lat, Lng: rows[0].lng, MapX: rows[0].map_x, MapY: rows[0].map_y };
+}
+export async function deleteMapCalibrationPoint(id) {
+  await pool.query('DELETE FROM map_calibration_points WHERE id = $1', [id]);
+}
+
+// Solves x' = a·lat + b·lng + c and y' = d·lat + e·lng + f from exactly 3
+// point correspondences via Cramer's rule — a fixed 3x3 linear solve, no
+// matrix library needed. Returns null for (near-)collinear points, which
+// have no unique solution.
+function solveAffine(points) {
+  const det3 = (m) =>
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+    - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+    + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  const A = points.map((p) => [p.Lat, p.Lng, 1]);
+  const D = det3(A);
+  if (Math.abs(D) < 1e-9) return null;
+  const solveFor = (target) => {
+    const b = points.map(target);
+    const withCol = (col) => A.map((row, i) => row.map((v, j) => (j === col ? b[i] : v)));
+    return [det3(withCol(0)) / D, det3(withCol(1)) / D, det3(withCol(2)) / D];
+  };
+  return { xCoef: solveFor((p) => p.MapX), yCoef: solveFor((p) => p.MapY) };
+}
+
+export async function gpsToMapPixel(lat, lng) {
+  const points = await listMapCalibrationPoints();
+  if (points.length < 3) return null;
+  const transform = solveAffine(points);
+  if (!transform) return null;
+  const { xCoef, yCoef } = transform;
+  return { x: xCoef[0] * lat + xCoef[1] * lng + xCoef[2], y: yCoef[0] * lat + yCoef[1] * lng + yCoef[2] };
+}
+
+// "Confirm or correct" (§5.3) — nearest N assets to a photo's EXIF GPS, in
+// map-pixel space so distance is meaningful regardless of calibration scale.
+export async function nearestAssetsToGps(lat, lng, limit = 5) {
+  const pixel = await gpsToMapPixel(lat, lng);
+  if (!pixel) return [];
+  const { rows } = await pool.query('SELECT id, name, map_x, map_y FROM assets WHERE map_x IS NOT NULL AND map_y IS NOT NULL');
+  return rows
+    .map((r) => ({ Id: r.id, Name: r.name, DistancePx: Math.hypot(r.map_x - pixel.x, r.map_y - pixel.y) }))
+    .sort((a, b) => a.DistancePx - b.DistancePx)
+    .slice(0, limit);
 }
 
 // ── Calendar Events — independent of Work Orders (optional link either way).

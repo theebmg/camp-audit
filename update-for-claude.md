@@ -1,3 +1,89 @@
+# Runbook: Inbox, Email Ingest, Splitting (Build Brief v2, Phase 5)
+
+Phase 5 landed 2026-09-09. Migrations 0048–0049.
+
+## What changed
+- **Critical fix caught by smoke-testing, not by inspection**: migration
+  0048 makes `work_orders.wo_number`/`split_root_id` `NOT NULL`, but the
+  three places that raw-INSERT into `work_orders`
+  (`createWorkOrder`/`duplicateWorkOrder` in db.js; `splitWorkOrder` itself
+  was written correctly from the start) didn't set them — every new WO
+  creation would have thrown a constraint violation in production. Fixed by
+  fetching `nextval(pg_get_serial_sequence('work_orders','id'))` before the
+  INSERT so `id`, `wo_number` (defaults to the id as text), and
+  `split_root_id` (self-pointing — a fresh WO is its own unsplit root) can
+  all go in one statement. `createWorkOrderFromTemplate` (PM
+  auto-generation) and `convertRequestToWorkOrder` both already route
+  through `createWorkOrder`, so they're covered without their own fix.
+  **If you add a fourth place that creates a work order, it must go through
+  `createWorkOrder` — never a bare `INSERT INTO work_orders` again.**
+- **Splitting** (§5.4): `splitWorkOrder(woId, jobLineIds)` in db.js — only
+  on a non-terminal WO, moves the given lines to a new child
+  (`work_order_id` UPDATE only; their hours/cost/crew/status/attachments/
+  finding links travel for free since nothing else points at the WO, it
+  points at them). `wo_number` is always the next flat suffix off
+  `split_root_id` ("1000-2", "1000-3", ...), computed from the max existing
+  suffix among siblings, never nested. `getWorkOrderFamily(woId)` returns
+  every sibling off the same root plus a combined cost/hours total — one
+  query on the indexed `split_root_id`, not a recursive walk. WO detail page
+  gained a "Split Selected Lines" button (checkbox per job line, reuses
+  `.jl-split-select`) and a "Family" toggle panel. The WO grid
+  (`renderWorkOrders`) defaults to roots-only with a "+N splits" chip that
+  expands children inline; "Show all splits flat" checkbox bypasses grouping.
+- **Triage inbox** (§5.3): `listInboxBatches()`/`getInboxCount()` in db.js;
+  `renderInbox()` in app.js, grouped by batch, per-batch multi-select
+  checkboxes, action row (Create WO / Add to Existing WO / Add to Job Line /
+  New Finding / File to Asset reference-only / Void). Void has no confirm
+  dialog by design (matches the single-attachment `voidAttachment` from
+  Phase 4). EXIF-cluster "select this cluster" chips group a batch's photos
+  by `taken_at` proximity (≤5min gaps) — **time-only, not GPS-distance
+  refined**; the brief's "80 feet apart" framing implies a GPS check too,
+  documented as a follow-up below, not implemented. Nearest-asset-from-GPS
+  and fuzzy subject-match asset suggestions
+  (`suggestAssetsForText`/`nearestAssetsToGps`) surface as tappable chips in
+  every action panel that needs an asset — never auto-assigned.
+- **Email ingest** (§5.2): new `src/mailIngest.js` (isolated from
+  `mailer.js` the same way `storage.js` is isolated for S3 — only module
+  that knows IMAP), polled every 5 minutes from `server.js` via
+  `setInterval`, no-ops silently when `IMAP_HOST`/`IMAP_USER`/
+  `IMAP_PASSWORD` aren't set (mirrors `mailIsConfigured()`'s convention).
+  **Not yet exercised against a live mailbox** — there were no IMAP
+  credentials available this session to test with; the code is written
+  carefully against imapflow's documented API and is defensive at every
+  step (a bad poll logs and returns, never crashes the server), but the
+  first real poll once `cmms@fracturedrv.com` credentials are in `.env`
+  should be watched. Subject `/\bWO\s*(\d+(-\d+)?)\b/i` skips the inbox
+  entirely and attaches straight to that WO (looked up by `wo_number`, so
+  it works for both split children like "1000-2" and plain ids). Junk
+  filter drops inline/related MIME parts and images under 200px on both
+  edges before they ever reach the inbox.
+- **Map GPS calibration** (§5.3): `map_calibration_points` table (0049),
+  exactly 3 points enforced at the `createMapCalibrationPoint` layer (a 4th
+  insert is rejected — delete one first). `solveAffine`/`gpsToMapPixel` in
+  db.js solve the 6-parameter affine transform via Cramer's rule on a fixed
+  3×3 system, recomputed live from whatever points are stored (no caching)
+  so editing a point takes effect immediately. Admin page at Admin → System
+  → Map GPS Calibration. **Caught and fixed during smoke-testing**: the
+  first version compared `p.lat`/`p.mapX` (lowercase) against
+  `listMapCalibrationPoints()`'s actual `Lat`/`MapX` (PascalCase) output,
+  silently producing `NaN` for every calibrated point — verified fixed with
+  a live 3-point round-trip before considering this phase done.
+
+## Known gaps / follow-ups
+- EXIF clustering is time-only (≤5min gaps), not the brief's full
+  "shot within 4 minutes, 80 feet apart" — a GPS-haversine-distance check
+  should join the time check once there's real GPS-tagged test data to
+  verify against (there wasn't any this session).
+- Email ingest is unverified against a live mailbox — see above. Test the
+  first real poll once IMAP credentials exist; watch the container logs
+  (`mailIngest: poll failed: ...` / `mailIngest: failed to ingest a
+  message`) for anything imapflow's actual server behavior didn't match the
+  documented API this was written against.
+- No sender whitelist on email ingest (§5.2, settled/deliberate for now) —
+  `ingestOneMessage` is the single place to add one later.
+- Hard-delete reaper for `deleted_at`-older-than-30-days attachments is
+  still not built (same low-priority gap noted in Phase 4).
+
 # Runbook: Attachments (Build Brief v2, Phase 4)
 
 Phase 4 landed 2026-09-09. Migrations 0044–0047. Read this before touching

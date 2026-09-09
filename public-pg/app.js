@@ -464,6 +464,7 @@ const NAV_ITEMS = [
   { icon: '🗺️', label: 'Map', view: 'map' },
   { icon: '🗒️', label: 'Notes', view: 'notes' },
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
+  { icon: '📥', label: 'Inbox', view: 'inbox' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
   { icon: '👷', label: 'Crew', view: 'crew' },
@@ -585,6 +586,7 @@ async function render(view, params = {}) {
       locations: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderLocationsDrilldown() : renderLocations()),
       map: () => renderMap(),
       notes: () => renderNotes(),
+      inbox: () => renderInbox(),
       assetsInLocation: () => renderAssetsInLocation(params),
       assetDetail: () => renderAssetDetail(params),
       audit: () => renderAudit(params),
@@ -606,6 +608,7 @@ async function render(view, params = {}) {
       adminWorkOrderStatuses: () => renderAdminWorkOrderStatuses(),
       adminJobLineStatuses: () => renderAdminJobLineStatuses(),
       adminAttachmentRoles: () => renderAdminAttachmentRoles(),
+      adminMapCalibration: () => renderAdminMapCalibration(),
       calendar: () => renderCalendar(params),
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
@@ -685,12 +688,13 @@ async function renderDashboard() {
   let selectedWeekDate = isoDate(today);
   const weekOccByDay = new Map();
 
-  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary] = await Promise.all([
+  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary, inboxRes] = await Promise.all([
     prefs.woOverview ? api('/api/pg/dashboard/wo-summary') : Promise.resolve(null),
     prefs.calendar ? api(`/api/pg/calendar-events?from=${isoDate(weekStart)}&to=${isoDate(weekEnd)}`) : Promise.resolve(null),
     prefs.calendar ? api('/api/pg/work-orders') : Promise.resolve(null),
     prefs.activity ? api(`/api/pg/activity-log?limit=12${isAdmin ? '' : `&username=${encodeURIComponent(currentUser.username || '')}`}`) : Promise.resolve(null),
     prefs.findings ? api('/api/pg/findings-summary') : Promise.resolve(null),
+    api('/api/pg/inbox/count'),
   ]);
 
   // Open should trend to zero (3) — every finding is meant to end up with a
@@ -817,6 +821,7 @@ async function renderDashboard() {
           <div class="list-item" data-view="locations" style="flex:1;min-width:140px">📍 Browse Locations</div>
           <div class="list-item" data-view="maintenanceLog" style="flex:1;min-width:140px">📋 Maintenance Log</div>
           <div class="list-item" data-view="capitalPlan" style="flex:1;min-width:140px">💰 Capital Plan</div>
+          <div class="list-item" data-view="inbox" style="flex:1;min-width:140px${inboxRes.count > 0 ? ';font-weight:600' : ''}">📥 Inbox${inboxRes.count > 0 ? ` <span class="pill">${inboxRes.count}</span>` : ''}</div>
         </div>
         <details style="margin-top:10px">
           <summary class="muted" style="cursor:pointer">Customize dashboard</summary>
@@ -919,6 +924,7 @@ const ADMIN_LEAF_RENDERERS = {
   adminWorkOrderStatuses: (params, container) => renderAdminWorkOrderStatuses(container),
   adminJobLineStatuses: (params, container) => renderAdminJobLineStatuses(container),
   adminAttachmentRoles: (params, container) => renderAdminAttachmentRoles(container),
+  adminMapCalibration: (params, container) => renderAdminMapCalibration(container),
   adminChecklistTemplates: (params, container) => renderAdminChecklistTemplates(container),
   adminUsers: (params, container) => renderAdminUsers(container),
   activityLog: (params, container) => renderActivityLog(container),
@@ -2795,6 +2801,238 @@ async function renderNotes() {
   draw();
 }
 
+// ---------- Triage Inbox (Build Brief v2 Phase 5) ----------
+// Grid of thumbnails, newest batch first, grouped by batch. A batch is a
+// suggestion, not a commitment — acting on some of its photos leaves the
+// rest in the inbox, so one email can become several work orders. Selection
+// and the action bar are scoped per batch, matching "repeat until empty."
+
+// Groups a batch's photos by EXIF taken_at proximity (within 5 min) — "these
+// were shot in one pass" — so one tap selects the cluster instead of
+// hand-picking each thumbnail. GPS-distance refinement is a documented
+// follow-up (see update-for-claude.md); time alone is what's implemented.
+function clusterInboxAttachments(attachments) {
+  const withTime = attachments.filter((a) => a.TakenAt).sort((a, b) => new Date(a.TakenAt) - new Date(b.TakenAt));
+  if (withTime.length < 2) return [];
+  const clusters = [];
+  let current = [withTime[0]];
+  for (let i = 1; i < withTime.length; i++) {
+    const gapMs = new Date(withTime[i].TakenAt) - new Date(withTime[i - 1].TakenAt);
+    if (gapMs <= 5 * 60 * 1000) current.push(withTime[i]);
+    else { clusters.push(current); current = [withTime[i]]; }
+  }
+  clusters.push(current);
+  return clusters.filter((c) => c.length > 1);
+}
+
+async function renderInbox() {
+  setChrome({ title: 'Inbox', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const { batches } = await api('/api/pg/inbox');
+
+  if (!batches.length) {
+    app.innerHTML = `<div class="card"><h3>Inbox</h3><p class="muted">Nothing to triage. Photos land here from email (once configured) or the "Attach file" button — direct uploads on an asset/WO/job line skip the inbox entirely.</p></div>`;
+    return;
+  }
+
+  app.innerHTML = batches.map((b) => {
+    const clusters = clusterInboxAttachments(b.Attachments);
+    return `
+    <div class="card inbox-batch" data-batch-id="${b.Id}">
+      <h3>${escapeHtml(b.Subject || '(no subject)')}</h3>
+      <p class="muted">${b.SenderEmail ? escapeHtml(b.SenderEmail) + ' · ' : ''}${new Date(b.ReceivedAt).toLocaleString()} · ${b.Attachments.length} photo${b.Attachments.length === 1 ? '' : 's'}</p>
+      ${clusters.length ? `<div class="btn-row" style="margin-bottom:8px">${clusters.map((c, i) => `<button type="button" class="btn btn-secondary cluster-select" data-ids="${c.map((a) => a.Id).join(',')}">Select cluster ${i + 1} (${c.length}, ~${Math.round((new Date(c[c.length - 1].TakenAt) - new Date(c[0].TakenAt)) / 60000)}min)</button>`).join('')}</div>` : ''}
+      <div class="attach-grid" style="display:flex;flex-wrap:wrap;gap:8px">
+        ${b.Attachments.map((a) => `
+          <label class="inbox-thumb" style="position:relative;cursor:pointer;display:block">
+            <input type="checkbox" class="inbox-select" value="${a.Id}" style="position:absolute;top:2px;left:2px;z-index:1;width:20px;height:20px" />
+            ${a.Kind === 'image'
+              ? `<img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:84px;height:84px;object-fit:cover;border-radius:8px;display:block" />`
+              : `<div style="width:84px;height:84px;border-radius:8px;background:#f0f2fb;display:flex;align-items:center;justify-content:center;font-size:28px">📄</div>`}
+          </label>`).join('')}
+      </div>
+      <div class="btn-row" style="margin-top:10px">
+        <button type="button" class="btn btn-secondary batch-select-all">Select All</button>
+        <button type="button" class="btn btn-primary batch-action" data-action="createWo">Create WO</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="addToWo">Add to Existing WO</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="addToLine">Add to Job Line</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="newFinding">New Finding</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="fileAsset">File to Asset (reference)</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="void">Void</button>
+      </div>
+      <div class="batch-action-panel" hidden></div>
+    </div>`;
+  }).join('');
+
+  batches.forEach((b) => wireInboxBatch(b));
+}
+
+function wireInboxBatch(batch) {
+  const card = app.querySelector(`.inbox-batch[data-batch-id="${batch.Id}"]`);
+  if (!card) return;
+  const panel = card.querySelector('.batch-action-panel');
+
+  const selectedIds = () => [...card.querySelectorAll('.inbox-select:checked')].map((el) => Number(el.value));
+
+  card.querySelector('.batch-select-all').addEventListener('click', () => {
+    card.querySelectorAll('.inbox-select').forEach((el) => { el.checked = true; });
+  });
+  card.querySelectorAll('.cluster-select').forEach((btn) => btn.addEventListener('click', () => {
+    const ids = new Set(btn.dataset.ids.split(',').map(Number));
+    card.querySelectorAll('.inbox-select').forEach((el) => { el.checked = ids.has(Number(el.value)); });
+  }));
+
+  async function afterAction() {
+    toast('Done');
+    renderInbox();
+  }
+
+  // Nearest-asset-from-GPS + fuzzy subject-match suggestions (§5.3/§5.2) —
+  // "confirm or correct" instead of a blind search. Never auto-assigns.
+  async function suggestionsHtml() {
+    const ids = selectedIds();
+    const withGps = batch.Attachments.find((a) => ids.includes(a.Id) && a.GpsLat != null);
+    const [textSugg, gpsSugg] = await Promise.all([
+      api(`/api/pg/inbox/suggest-assets?text=${encodeURIComponent(batch.Subject || '')}`),
+      withGps ? api(`/api/pg/inbox/suggest-assets?lat=${withGps.GpsLat}&lng=${withGps.GpsLng}`) : Promise.resolve({ suggestions: [] }),
+    ]);
+    const all = [...gpsSugg.suggestions, ...textSugg.suggestions].filter((s, i, arr) => arr.findIndex((x) => x.Id === s.Id) === i).slice(0, 3);
+    if (!all.length) return '';
+    return `<div class="btn-row" style="margin-bottom:8px">${all.map((s) => `<button type="button" class="btn btn-secondary suggest-asset-btn" data-id="${s.Id}" data-name="${escapeHtml(s.Name)}">📍 ${escapeHtml(s.Name)}</button>`).join('')}</div>`;
+  }
+
+  card.querySelectorAll('.batch-action').forEach((btn) => btn.addEventListener('click', async () => {
+    const ids = selectedIds();
+    if (!ids.length) { toast('Select at least one photo first'); return; }
+    const action = btn.dataset.action;
+
+    if (action === 'void') {
+      try { await api('/api/pg/inbox/void', { method: 'POST', body: JSON.stringify({ attachmentIds: ids }) }); await afterAction(); }
+      catch (err) { toast(err.message); }
+      return;
+    }
+
+    panel.hidden = false;
+    const suggHtml = await suggestionsHtml();
+
+    if (action === 'createWo') {
+      panel.innerHTML = `<div class="card" style="margin-top:8px">
+        ${suggHtml}
+        <div class="field-row"><label>Asset</label><div class="asset-picker"></div></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="use-subject-title" checked /> Use subject as work order title</label>
+        <div class="field-row title-row" hidden><label>Title</label><input class="wo-title" value="${escapeHtml(batch.Subject || '')}" /></div>
+        <div class="btn-row"><button type="button" class="btn btn-primary panel-confirm">Create Work Order</button><button type="button" class="btn btn-secondary panel-cancel">Cancel</button></div>
+      </div>`;
+      let asset = null;
+      mountAssetCombobox(panel.querySelector('.asset-picker'), { onSelect: (a) => { asset = a; } });
+      panel.querySelectorAll('.suggest-asset-btn').forEach((sb) => sb.addEventListener('click', () => {
+        asset = { Id: Number(sb.dataset.id), Name: sb.dataset.name };
+        panel.querySelector('.ac-input').value = sb.dataset.name;
+      }));
+      panel.querySelector('.use-subject-title').addEventListener('change', (e) => { panel.querySelector('.title-row').hidden = e.target.checked; });
+      panel.querySelector('.panel-cancel').addEventListener('click', () => { panel.hidden = true; });
+      panel.querySelector('.panel-confirm').addEventListener('click', async () => {
+        const title = panel.querySelector('.use-subject-title').checked ? (batch.Subject || 'Work Order') : panel.querySelector('.wo-title').value.trim();
+        if (!title) { toast('Title is required'); return; }
+        try {
+          const { workOrderId } = await api('/api/pg/inbox/create-work-order', { method: 'POST', body: JSON.stringify({ attachmentIds: ids, assetId: asset?.Id || null, title }) });
+          toast('Work order created');
+          go('workOrderDetail', { id: workOrderId });
+        } catch (err) { toast(err.message); }
+      });
+    } else if (action === 'fileAsset') {
+      panel.innerHTML = `<div class="card" style="margin-top:8px">
+        ${suggHtml}
+        <div class="field-row"><label>Asset</label><div class="asset-picker"></div></div>
+        <div class="btn-row"><button type="button" class="btn btn-primary panel-confirm">File Photos</button><button type="button" class="btn btn-secondary panel-cancel">Cancel</button></div>
+      </div>`;
+      let asset = null;
+      mountAssetCombobox(panel.querySelector('.asset-picker'), { onSelect: (a) => { asset = a; } });
+      panel.querySelectorAll('.suggest-asset-btn').forEach((sb) => sb.addEventListener('click', () => {
+        asset = { Id: Number(sb.dataset.id), Name: sb.dataset.name };
+        panel.querySelector('.ac-input').value = sb.dataset.name;
+      }));
+      panel.querySelector('.panel-cancel').addEventListener('click', () => { panel.hidden = true; });
+      panel.querySelector('.panel-confirm').addEventListener('click', async () => {
+        if (!asset) { toast('Pick an asset first'); return; }
+        try {
+          await api('/api/pg/inbox/attach', { method: 'POST', body: JSON.stringify({ attachmentIds: ids, entityType: 'asset', entityId: asset.Id }) });
+          await afterAction();
+        } catch (err) { toast(err.message); }
+      });
+    } else if (action === 'newFinding') {
+      panel.innerHTML = `<div class="card" style="margin-top:8px">
+        ${suggHtml}
+        <div class="field-row"><label>Asset</label><div class="asset-picker"></div></div>
+        <div class="field-row"><label>Severity</label><select class="finding-severity">${(state.options.findingSeverity || []).map((s) => `<option>${escapeHtml(s)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Description</label><textarea class="finding-description"></textarea></div>
+        <div class="btn-row"><button type="button" class="btn btn-primary panel-confirm">Create Finding</button><button type="button" class="btn btn-secondary panel-cancel">Cancel</button></div>
+      </div>`;
+      let asset = null;
+      mountAssetCombobox(panel.querySelector('.asset-picker'), { onSelect: (a) => { asset = a; } });
+      panel.querySelectorAll('.suggest-asset-btn').forEach((sb) => sb.addEventListener('click', () => {
+        asset = { Id: Number(sb.dataset.id), Name: sb.dataset.name };
+        panel.querySelector('.ac-input').value = sb.dataset.name;
+      }));
+      panel.querySelector('.panel-cancel').addEventListener('click', () => { panel.hidden = true; });
+      panel.querySelector('.panel-confirm').addEventListener('click', async () => {
+        const description = panel.querySelector('.finding-description').value.trim();
+        if (!asset || !description) { toast('Asset and description are required'); return; }
+        try {
+          await api('/api/pg/inbox/create-finding', { method: 'POST', body: JSON.stringify({
+            attachmentIds: ids, assetId: asset.Id, severity: panel.querySelector('.finding-severity').value, description,
+          }) });
+          await afterAction();
+        } catch (err) { toast(err.message); }
+      });
+    } else if (action === 'addToWo' || action === 'addToLine') {
+      panel.innerHTML = `<div class="card" style="margin-top:8px">
+        ${suggHtml}
+        <div class="field-row"><label>Asset</label><div class="asset-picker"></div></div>
+        <div class="field-row wo-row" hidden><label>Work Order</label><select class="wo-picker"></select></div>
+        ${action === 'addToLine' ? '<div class="field-row line-row" hidden><label>Job Line</label><select class="line-picker"></select></div>' : ''}
+        <div class="btn-row"><button type="button" class="btn btn-primary panel-confirm">Attach</button><button type="button" class="btn btn-secondary panel-cancel">Cancel</button></div>
+      </div>`;
+      let asset = null;
+      const woRow = panel.querySelector('.wo-row');
+      const woPicker = panel.querySelector('.wo-picker');
+      const lineRow = panel.querySelector('.line-row');
+      const linePicker = panel.querySelector('.line-picker');
+      async function loadWos(a) {
+        const detail = await api(`/api/pg/assets/${a.Id}`);
+        woRow.hidden = false;
+        woPicker.innerHTML = detail.workOrders.map((w) => `<option value="${w.Id}">${escapeHtml(w.Title)} (${escapeHtml(w.Status)})</option>`).join('') || '<option value="">— none —</option>';
+        if (action === 'addToLine' && detail.workOrders.length) await loadLines(detail.workOrders[0].Id);
+      }
+      async function loadLines(woId) {
+        if (!linePicker) return;
+        const wo = await api(`/api/pg/work-orders/${woId}`);
+        lineRow.hidden = false;
+        linePicker.innerHTML = (wo.jobLines || []).map((jl) => `<option value="${jl.Id}">${escapeHtml(jl.Title)}</option>`).join('') || '<option value="">— none —</option>';
+      }
+      mountAssetCombobox(panel.querySelector('.asset-picker'), { onSelect: (a) => { asset = a; if (a) loadWos(a); } });
+      panel.querySelectorAll('.suggest-asset-btn').forEach((sb) => sb.addEventListener('click', () => {
+        asset = { Id: Number(sb.dataset.id), Name: sb.dataset.name };
+        panel.querySelector('.ac-input').value = sb.dataset.name;
+        loadWos(asset);
+      }));
+      woPicker.addEventListener('change', () => { if (action === 'addToLine') loadLines(woPicker.value); });
+      panel.querySelector('.panel-cancel').addEventListener('click', () => { panel.hidden = true; });
+      panel.querySelector('.panel-confirm').addEventListener('click', async () => {
+        const woId = woPicker.value;
+        if (!woId) { toast('Pick a work order first'); return; }
+        const entityType = action === 'addToLine' ? 'job_line' : 'work_order';
+        const entityId = action === 'addToLine' ? linePicker.value : woId;
+        if (action === 'addToLine' && !entityId) { toast('Pick a job line first'); return; }
+        try {
+          await api('/api/pg/inbox/attach', { method: 'POST', body: JSON.stringify({ attachmentIds: ids, entityType, entityId: Number(entityId) }) });
+          await afterAction();
+        } catch (err) { toast(err.message); }
+      });
+    }
+  }));
+}
+
 async function renderMaintenanceLog() {
   setChrome({ title: 'Maintenance Log', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
@@ -3417,6 +3655,7 @@ const ADMIN_CATEGORIES = {
     icon: '🕘', title: 'System', description: 'What has been done across the app',
     items: [
       { view: 'activityLog', icon: '🕘', label: 'Activity Log' },
+      { view: 'adminMapCalibration', icon: '🧭', label: 'Map GPS Calibration' },
     ],
   },
 };
@@ -4274,6 +4513,59 @@ async function renderAdminAttachmentRoles(container = app) {
   });
 }
 
+// Build Brief v2 Phase 5 (§5.3): the one-time affine calibration that makes
+// "nearest-asset suggestion from GPS" possible in the inbox. Needs exactly 3
+// non-collinear reference points — pick 3 assets whose real-world GPS
+// coordinates you know AND whose map_x/map_y are already set on the
+// interactive Map (open the Map, click the asset's pin, its coordinates are
+// shown there), then enter both here for each.
+async function renderAdminMapCalibration(container = app) {
+  if (container === app) setChrome({ title: 'Map GPS Calibration', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { points } = await api('/api/pg/admin/map-calibration');
+
+  const rows = points.map((p) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap">
+      <span><strong>${escapeHtml(p.Label)}</strong><div class="muted" style="font-weight:400">GPS ${p.Lat}, ${p.Lng} → map ${p.MapX}, ${p.MapY}</div></span>
+      <button class="btn btn-secondary calib-delete" data-id="${p.Id}" data-name="${escapeHtml(p.Label)}">Delete</button>
+    </div>`).join('') || '<p class="muted">No calibration points yet — GPS-based inbox suggestions are disabled until 3 are added.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Map GPS Calibration</h3>
+      <p class="muted">Exactly 3 non-collinear points, real-world GPS → campmap.webp pixel coordinates. Powers "nearest asset" suggestions in the Inbox when a photo carries EXIF GPS. Pick 3 assets you're sure of — open the Map, tap the asset's pin to read its map_x/map_y, and pair that with its actual GPS coordinates (from your phone, standing at the asset).</p>
+      <p class="muted">${points.length}/3 points set${points.length >= 3 ? ' — calibrated.' : '.'}</p>
+    </div>
+    <div class="card">${rows}</div>
+    ${points.length < 3 ? `
+    <div class="card">
+      <h3>Add Point</h3>
+      <form id="addCalibForm">
+        <div class="field-row"><label>Label</label><input name="label" placeholder="e.g. Main Lodge" required /></div>
+        <div class="field-row"><label>GPS Latitude</label><input name="lat" type="number" step="any" required /></div>
+        <div class="field-row"><label>GPS Longitude</label><input name="lng" type="number" step="any" required /></div>
+        <div class="field-row"><label>Map X (pixels)</label><input name="mapX" type="number" step="any" required /></div>
+        <div class="field-row"><label>Map Y (pixels)</label><input name="mapY" type="number" step="any" required /></div>
+        <button class="btn btn-primary" type="submit">Add Point</button>
+      </form>
+    </div>` : ''}`;
+
+  container.querySelectorAll('.calib-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete calibration point "${btn.dataset.name}"?`)) return;
+    await api(`/api/pg/admin/map-calibration/${btn.dataset.id}`, { method: 'DELETE' });
+    renderAdminMapCalibration(container);
+  }));
+  container.querySelector('#addCalibForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/map-calibration', { method: 'POST', body: JSON.stringify({
+        label: fd.get('label'), lat: fd.get('lat'), lng: fd.get('lng'), mapX: fd.get('mapX'), mapY: fd.get('mapY'),
+      }) });
+      renderAdminMapCalibration(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
 async function renderAdminSubAreas(container = app) {
   if (container === app) setChrome({ title: 'Component Sub-Areas', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
@@ -4874,12 +5166,37 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
   let statusFilter = params.status || null;
   let scheduleFilter = params.schedule || null;
   let selectedWoId = null;
+  // Grid defaults to split roots only, one row per family, with a "+N
+  // splits" chip; clicking it expands the children nested inline (§5.4
+  // Display). A filter toggle shows every split flat when wanted.
+  let showAllSplits = false;
+  const expandedRoots = new Set();
+
+  function buildDisplayList(list) {
+    if (showAllSplits) return list.map((w) => ({ w, indent: w.SplitRootId !== w.Id, splitCount: 0 }));
+    const byRoot = new Map();
+    for (const w of list) {
+      if (!byRoot.has(w.SplitRootId)) byRoot.set(w.SplitRootId, []);
+      byRoot.get(w.SplitRootId).push(w);
+    }
+    const out = [];
+    for (const members of byRoot.values()) {
+      const root = members.find((m) => m.Id === m.SplitRootId) || [...members].sort((a, b) => a.Id - b.Id)[0];
+      const children = members.filter((m) => m.Id !== root.Id).sort((a, b) => a.Id - b.Id);
+      out.push({ w: root, indent: false, splitCount: children.length });
+      if (expandedRoots.has(root.Id)) children.forEach((c) => out.push({ w: c, indent: true, splitCount: 0 }));
+    }
+    return out;
+  }
 
   function draw() {
     const mode = onOpenWorkOrder ? 'cards' : getTableViewMode();
     const visibleWOs = workOrders.filter((w) =>
       (!statusFilter || w.Status === statusFilter) && (!scheduleFilter || matchesScheduleFilter(w, scheduleFilter)));
-    const cardRows = visibleWOs.map((w) => {
+    const displayList = buildDisplayList(visibleWOs);
+    const splitChipHtml = (item) => item.splitCount > 0
+      ? ` <button type="button" class="split-expand-chip pill" data-id="${item.w.Id}" style="cursor:pointer;border:none">${expandedRoots.has(item.w.Id) ? '▾' : '▸'} +${item.splitCount} split${item.splitCount === 1 ? '' : 's'}</button>` : '';
+    const cardRows = displayList.map(({ w, indent, splitCount }, idx) => {
       const days = daysSince(w['Date Reported']);
       const bits = [];
       if (cols.asset && w.Asset) bits.push(escapeHtml(w.Asset.Name));
@@ -4889,16 +5206,16 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
       if (cols.dateCreated && w['Date Reported']) bits.push(`Created ${formatDateNice(w['Date Reported'])}`);
       if (cols.estHours && w['Estimated Hours'] != null) bits.push(`${w['Estimated Hours']}h est.`);
       if (cols.estCost && w['Estimated Cost'] != null) bits.push(`$${Number(w['Estimated Cost']).toLocaleString()} est.`);
-      return `<div class="list-item ${onOpenWorkOrder && selectedWoId === w.Id ? 'cal-strip-selected' : ''}" style="flex-wrap:wrap" data-id="${w.Id}">
-        <span>${escapeHtml(w.Title)}${w.IsBlocked ? ' 🚧' : ''}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}${woProgressBarHtml(w)}</span>
+      return `<div class="list-item ${onOpenWorkOrder && selectedWoId === w.Id ? 'cal-strip-selected' : ''}" style="flex-wrap:wrap${indent ? ';margin-left:20px;border-left:2px solid var(--border,#ccc)' : ''}" data-id="${w.Id}">
+        <span>WO ${escapeHtml(w.WoNumber || w.Id)} — ${escapeHtml(w.Title)}${w.IsBlocked ? ' 🚧' : ''}${splitChipHtml({ w, splitCount })}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}${woProgressBarHtml(w)}</span>
         ${cols.status ? statusPillHtml(w.Status, w.StatusColor) : ''}
       </div>`;
     }).join('') || `<p class="muted">${(statusFilter || scheduleFilter) ? 'Nothing matches this filter.' : 'No work orders yet.'}</p>`;
 
-    const tableRows = visibleWOs.map((w) => {
+    const tableRows = displayList.map(({ w, indent, splitCount }) => {
       const days = daysSince(w['Date Reported']);
       return `<tr class="clickable-row" data-id="${w.Id}">
-        <td data-label="Title">${escapeHtml(w.Title)}${w.IsBlocked ? ' 🚧' : ''}${woProgressBarHtml(w)}</td>
+        <td data-label="Title"${indent ? ' style="padding-left:24px"' : ''}>WO ${escapeHtml(w.WoNumber || w.Id)} — ${escapeHtml(w.Title)}${w.IsBlocked ? ' 🚧' : ''}${splitChipHtml({ w, splitCount })}${woProgressBarHtml(w)}</td>
         ${cols.asset ? `<td data-label="Asset">${escapeHtml(w.Asset?.Name || '—')}</td>` : ''}
         ${cols.status ? `<td data-label="Status">${statusPillHtml(w.Status, w.StatusColor)}</td>` : ''}
         ${cols.priority ? `<td data-label="Priority">${escapeHtml(w.Priority || '')}</td>` : ''}
@@ -4915,6 +5232,7 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
     setApp(`
       <div class="btn-row" style="margin-bottom:12px;justify-content:space-between">
         <button class="btn btn-primary" id="newWoBtnTop">+ New Work Order</button>
+        <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" id="showAllSplitsToggle" ${showAllSplits ? 'checked' : ''} style="width:auto" /> Show all splits flat</label>
         ${onOpenWorkOrder ? '' : tableViewToggleHtml(mode)}
       </div>
       ${filterLabel ? `<div class="btn-row" style="margin:-6px 0 12px"><button class="btn btn-secondary" id="clearWoFilter">✕ Filtered: ${escapeHtml(filterLabel)}</button></div>` : ''}
@@ -4937,6 +5255,13 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
 
     container.querySelector('#newWoBtnTop').addEventListener('click', () => go('newWorkOrder', {}));
     container.querySelector('#clearWoFilter')?.addEventListener('click', () => { statusFilter = null; scheduleFilter = null; draw(); });
+    container.querySelector('#showAllSplitsToggle')?.addEventListener('change', (e) => { showAllSplits = e.target.checked; draw(); });
+    container.querySelectorAll('.split-expand-chip').forEach((el) => el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = Number(el.dataset.id);
+      if (expandedRoots.has(id)) expandedRoots.delete(id); else expandedRoots.add(id);
+      draw();
+    }));
     container.querySelectorAll('.list-item[data-id], tr.clickable-row').forEach((el) => el.addEventListener('click', () => {
       if (onOpenWorkOrder) { selectedWoId = Number(el.dataset.id); draw(); onOpenWorkOrder(el.dataset.id); }
       else go('workOrderDetail', { id: el.dataset.id });
@@ -5309,6 +5634,7 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }
 
   return `<details class="card jl-card" data-id="${jl.Id}">
     <summary style="cursor:pointer;display:flex;align-items:center;gap:10px;list-style:none">
+      <input type="checkbox" class="jl-split-select" value="${jl.Id}" title="Select to split off into a new work order" onclick="event.stopPropagation()" style="width:18px;height:18px;flex-shrink:0" />
       ${statusPillHtml(jl.StatusName, jl.StatusColor)}
       <span style="flex:1;${jl.StatusIsTerminal ? 'text-decoration:line-through;color:var(--muted)' : ''}">
         <strong>${escapeHtml(jl.Title)}</strong>
@@ -5455,7 +5781,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       <p class="muted" style="margin:4px 0 8px">Review the costs above and use "Complete Work Order" below when ready — closing is never automatic.</p>
     </div>` : ''}
     <div class="card">
-      <h3>${escapeHtml(wo.Title)}</h3>
+      <h3>WO ${escapeHtml(wo.WoNumber || wo.Id)} — ${escapeHtml(wo.Title)}</h3>
       <form id="woFieldsForm">
         <div class="field-row"><label>Asset</label><div id="woAssetPicker"></div></div>
         <div class="field-row"><label>Status</label>
@@ -5479,7 +5805,9 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <button class="btn btn-primary" id="completeWoBtn" ${wo.StatusIsTerminal ? 'disabled' : ''}>${wo.StatusIsTerminal ? wo.Status : 'Complete Work Order'}</button>
         <a class="btn btn-secondary" href="/api/pg/work-orders/${id}/scope-pdf" target="_blank" rel="noopener" title="A printable job description to hand a vendor or volunteer — no cost figures included">🖨️ Scope of Work (PDF)</a>
         <button class="btn btn-secondary" id="duplicateWoBtn">Duplicate</button>
+        <button class="btn btn-secondary" id="familyBtn">Family</button>
       </div>
+      <div id="familyPanel" hidden></div>
     </div>
 
     ${rollupHtml}
@@ -5492,7 +5820,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
 
     <div class="card">
       <h3>Job Lines</h3>
-      <p class="muted">The unit of work — hours, cost, funding, responsibility, and scope all live on the line. A vendor on the roof, volunteers on the deck, one work order.</p>
+      <p class="muted">The unit of work — hours, cost, funding, responsibility, and scope all live on the line. A vendor on the roof, volunteers on the deck, one work order. Check lines above and use Split to move them into a new sibling work order (e.g. the roof needs a specialist, the deck doesn't).</p>
+      ${!wo.StatusIsTerminal ? `<div class="btn-row"><button type="button" class="btn btn-secondary" id="splitLinesBtn">Split Selected Lines Into New WO</button></div>` : ''}
       ${jobLineRows}
       <div class="card" style="margin-top:10px;background:transparent;border:1px dashed var(--border,#ccc)">
         <h4 style="margin-top:0">+ Add Job Line</h4>
@@ -5597,6 +5926,39 @@ async function renderWorkOrderDetail({ id }, container = app) {
     e.preventDefault();
     const d = new Date(rollup.EarliestScheduledDate);
     go('calendar', { month: d.getMonth(), year: d.getFullYear(), fromWorkOrderId: id, fromWorkOrderTitle: wo.Title });
+  });
+
+  container.querySelector('#splitLinesBtn')?.addEventListener('click', async () => {
+    const jobLineIds = [...container.querySelectorAll('.jl-split-select:checked')].map((el) => Number(el.value));
+    if (!jobLineIds.length) { toast('Check at least one job line first'); return; }
+    if (!await confirmDialog(`Split ${jobLineIds.length} line(s) into a new sibling work order? Their hours, cost, crew, status, and photos move with them.`, { confirmLabel: 'Split' })) return;
+    try {
+      const result = await api(`/api/pg/work-orders/${id}/split`, { method: 'POST', body: JSON.stringify({ jobLineIds }) });
+      toast(`Created WO ${result.woNumber}`);
+      go('workOrderDetail', { id: result.workOrderId });
+    } catch (err) { toast(err.message); }
+  });
+
+  container.querySelector('#familyBtn')?.addEventListener('click', async () => {
+    const panel = container.querySelector('#familyPanel');
+    if (!panel.hidden) { panel.hidden = true; return; }
+    panel.hidden = false;
+    panel.innerHTML = LOADING_HTML;
+    const family = await api(`/api/pg/work-orders/${id}/family`);
+    if (family.Members.length < 2) {
+      panel.innerHTML = '<p class="muted" style="margin-top:8px">This work order has never been split — it\'s its own family of one.</p>';
+      return;
+    }
+    panel.innerHTML = `
+      <div class="card" style="margin-top:8px;background:transparent">
+        <p class="muted">Combined across the whole family: <strong>$${family.TotalCost.toLocaleString()}</strong> · <strong>${family.TotalHours}h</strong></p>
+        ${family.Members.map((m) => `
+          <div class="list-item family-member-link" data-id="${m.Id}" style="cursor:pointer">
+            <span>WO ${escapeHtml(m.WoNumber)}${m.Id === Number(id) ? ' (this one)' : ''} — ${escapeHtml(m.Title)}</span>
+            ${statusPillHtml(m.Status, m.StatusColor)}
+          </div>`).join('')}
+      </div>`;
+    panel.querySelectorAll('.family-member-link').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.id })));
   });
 
   container.querySelector('#addJlForm').addEventListener('submit', async (e) => {
