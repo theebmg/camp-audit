@@ -135,7 +135,7 @@ function boardListRowsHtml(items) {
   return items.map((i) => `
     <tr>
       <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;white-space:nowrap;">${escapeHtml(fmtDate(i.scheduledDate || i.dateCompleted))}</td>
-      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.title)}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.title)}${i.jobLineTitle ? ` — ${escapeHtml(i.jobLineTitle)}` : ''}</td>
       <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.assetName || '—')}</td>
       <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${i.priority ? escapeHtml(i.priority) : fmtMoney(i.cost)}</td>
     </tr>`).join('');
@@ -184,10 +184,10 @@ export function renderBoardReportText({ periodStart, periodEnd, statusCounts, pr
   completed.forEach((c) => lines.push(`  ${fmtDate(c.dateCompleted)}  ${c.title}${c.assetName ? ` (${c.assetName})` : ''} — ${fmtMoney(c.cost)}`));
   if (!completed.length) lines.push('  None.');
   lines.push('', `Overdue (${overdue.length}):`);
-  overdue.forEach((o) => lines.push(`  ${fmtDate(o.scheduledDate)}  ${o.title}${o.assetName ? ` (${o.assetName})` : ''} [${o.priority}]`));
+  overdue.forEach((o) => lines.push(`  ${fmtDate(o.scheduledDate)}  ${o.title}${o.jobLineTitle ? ` — ${o.jobLineTitle}` : ''}${o.assetName ? ` (${o.assetName})` : ''} [${o.priority}]`));
   if (!overdue.length) lines.push('  None.');
   lines.push('', `Upcoming (${upcoming.length}):`);
-  upcoming.forEach((u) => lines.push(`  ${fmtDate(u.scheduledDate)}  ${u.title}${u.assetName ? ` (${u.assetName})` : ''} [${u.priority}]`));
+  upcoming.forEach((u) => lines.push(`  ${fmtDate(u.scheduledDate)}  ${u.title}${u.jobLineTitle ? ` — ${u.jobLineTitle}` : ''}${u.assetName ? ` (${u.assetName})` : ''} [${u.priority}]`));
   if (!upcoming.length) lines.push('  None.');
   return lines.join('\n');
 }
@@ -196,7 +196,7 @@ export function renderForwardFocusHtml({ items, total }) {
   const rowsHtml = items.map((i) => `
     <tr>
       <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.kind === 'workOrder' ? 'Work Order' : 'Condition Finding')}</td>
-      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.title)}</td>
+      <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.title)}${i.jobLineTitle ? ` — ${escapeHtml(i.jobLineTitle)}` : ''}</td>
       <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.assetName || '—')}</td>
       <td style="padding:7px 10px;border-bottom:1px solid #eef0f6;">${fmtMoney(i.cost)}${i.costBasis === 'historical average' ? ' <span style="color:#6b7086;font-size:0.75rem;">(hist. avg)</span>' : ''}</td>
     </tr>`).join('');

@@ -28,7 +28,11 @@ import {
   adminGetApplicabilityMatrix, adminSetApplicability,
   adminListSubAreas, adminCreateSubArea, adminDeleteSubArea,
   listWorkOrders, getWorkOrderDetail, createWorkOrder, updateWorkOrder, duplicateWorkOrder, getWorkOrderSummary,
-  workOrderRollup,
+  workOrderRollup, workOrderCloseGate,
+  listWorkOrderStatuses, listJobLineStatuses,
+  adminListWorkOrderStatuses, adminCreateWorkOrderStatus, adminUpdateWorkOrderStatus, adminDeleteWorkOrderStatus,
+  adminListJobLineStatuses, adminCreateJobLineStatus, adminUpdateJobLineStatus, adminDeleteJobLineStatus,
+  getDisplaySettings, updateDisplaySettings,
   listWorkOrderTemplates, createWorkOrderTemplate, updateWorkOrderTemplate, deleteWorkOrderTemplate,
   addAssetUpdateToWorkOrder, deleteAssetUpdate, completeWorkOrder,
   listJobLines, getJobLine, createJobLine, updateJobLine, deleteJobLine,
@@ -140,8 +144,9 @@ router.get('/search', async (req, res, next) => {
 
 router.get('/options', async (req, res, next) => {
   try {
-    const [propertyFields, componentSchema, buildingTypes] = await Promise.all([
+    const [propertyFields, componentSchema, buildingTypes, workOrderStatuses, jobLineStatuses, displaySettings] = await Promise.all([
       getAssetPropertyFields(), getComponentTypeCatalog(), listBuildingTypes(),
+      listWorkOrderStatuses(), listJobLineStatuses(), getDisplaySettings(),
     ]);
     res.json({
       propertyFields,
@@ -149,6 +154,7 @@ router.get('/options', async (req, res, next) => {
       eventTypeOptions: componentSchema.eventTypeOptions,
       conditionOptions: componentSchema.conditionOptions,
       buildingTypes,
+      workOrderStatuses, jobLineStatuses, displaySettings,
       findingSeverity: FINDING_SEVERITY_OPTIONS,
       currentUser: { username: currentUsername(), role: currentRole() },
     });
@@ -830,7 +836,8 @@ router.patch('/job-lines/:jobLineId', async (req, res, next) => {
     const body = req.body || {};
     const fields = {};
     if (body.title != null) fields.title = body.title;
-    if (body.done !== undefined) fields.done = !!body.done;
+    if (body.statusId != null) fields.status_id = Number(body.statusId);
+    if (body.statusNote !== undefined) fields.statusNote = body.statusNote;
     if (body.responsibilityClass != null) fields.responsibility_class = body.responsibilityClass;
     if (body.fundingSource != null) fields.funding_source = body.fundingSource;
     if (body.fundingRefId !== undefined) fields.funding_ref_id = body.fundingRefId === '' ? null : Number(body.fundingRefId);
@@ -891,6 +898,70 @@ router.delete('/admin/causes/:id', async (req, res, next) => {
   try { await deleteCause(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
+// ---- Work order / job line status catalogs (2.1/2.2) — admin-editable,
+// read by the frontend instead of a hardcoded list (WO_STATUS_OPTIONS is
+// gone from both reports.js and app.js as of this route existing). ----
+router.get('/work-order-statuses', async (req, res, next) => {
+  try { res.json({ statuses: await listWorkOrderStatuses() }); } catch (e) { next(e); }
+});
+router.get('/job-line-statuses', async (req, res, next) => {
+  try { res.json({ statuses: await listJobLineStatuses() }); } catch (e) { next(e); }
+});
+router.get('/admin/work-order-statuses', async (req, res, next) => {
+  try { res.json({ statuses: await adminListWorkOrderStatuses() }); } catch (e) { next(e); }
+});
+router.post('/admin/work-order-statuses', async (req, res, next) => {
+  try {
+    const { name, sortOrder, color, isTerminal } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, status: await adminCreateWorkOrderStatus({ name: name.trim(), sortOrder, color, isTerminal }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/work-order-statuses/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, color, isTerminal, active } = req.body || {};
+    const status = await adminUpdateWorkOrderStatus(req.params.id, { name, sortOrder, color, isTerminal, active });
+    if (!status) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, status });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/work-order-statuses/:id', async (req, res, next) => {
+  try { await adminDeleteWorkOrderStatus(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+router.get('/admin/job-line-statuses', async (req, res, next) => {
+  try { res.json({ statuses: await adminListJobLineStatuses() }); } catch (e) { next(e); }
+});
+router.post('/admin/job-line-statuses', async (req, res, next) => {
+  try {
+    const { name, sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, status: await adminCreateJobLineStatus({ name: name.trim(), sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/job-line-statuses/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel, active } = req.body || {};
+    const status = await adminUpdateJobLineStatus(req.params.id, { name, sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel, active });
+    if (!status) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, status });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/job-line-statuses/:id', async (req, res, next) => {
+  try { await adminDeleteJobLineStatus(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Display settings (2.6) ----
+router.get('/display-settings', async (req, res, next) => {
+  try { res.json(await getDisplaySettings()); } catch (e) { next(e); }
+});
+router.put('/display-settings', async (req, res, next) => {
+  try {
+    const { woProgressWeighting } = req.body || {};
+    if (!['cost', 'count'].includes(woProgressWeighting)) return res.status(400).json({ ok: false, error: 'woProgressWeighting must be "cost" or "count"' });
+    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting }) });
+  } catch (e) { next(e); }
+});
+
 router.post('/work-orders', async (req, res, next) => {
   try {
     const { title, assetId, locationId, priority, description, scheduledDate, assetUpdates, jobLines } = req.body || {};
@@ -915,7 +986,9 @@ router.patch('/work-orders/:id', async (req, res, next) => {
     if (body.title != null) fields.title = body.title;
     if (body.description !== undefined) fields.description = body.description;
     if (body.priority != null) fields.priority = body.priority;
-    if (body.status != null) fields.status = body.status;
+    if (body.statusId != null) fields.status_id = Number(body.statusId);
+    if (body.deferredReason !== undefined) fields.deferred_reason = body.deferredReason;
+    if (body.revisitDate !== undefined) fields.revisit_date = body.revisitDate;
     if (body.assetId !== undefined) fields.asset_id = body.assetId === '' ? null : Number(body.assetId);
     if (body.dateReported !== undefined) fields.date_reported = body.dateReported;
     if (body.dateCompleted !== undefined) fields.date_completed = body.dateCompleted;

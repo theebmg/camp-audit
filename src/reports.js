@@ -5,11 +5,14 @@
 // "what does a report row look like" question lives in exactly one place.
 import { currentComponentState } from './components.js';
 
-// Work Order Status/Priority and funding source aren't schema-driven catalogs
-// like asset properties/components (see app.js's WO_STATUS_OPTIONS /
-// FUNDING_SOURCE_LABELS, which these mirror) — fixed lists here so report
-// filters can offer them without a free-text box.
-export const WO_STATUS_OPTIONS = ['Open', 'In Progress', 'On Hold', 'Urgent', 'Done'];
+// Work order/job line status is a real admin-editable catalog now (Phase 2)
+// — WORK_ORDER_COLUMN_SPECS deliberately omits a fixed `options` list for
+// Status/Status Change below so columnDefsFromRows() derives the filter's
+// checkbox list from whatever status names actually appear in the report
+// rows, instead of a hardcoded array going stale the moment someone adds or
+// renames a status in Admin. Priority and funding source are still fixed —
+// neither is an admin-editable table (see the brief: funding_source stays a
+// CHECK enum, priority was never part of this rework).
 export const WO_PRIORITY_OPTIONS = ['Low', 'Medium', 'High', 'Urgent'];
 export const FUNDING_SOURCE_LABELS = {
   operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other',
@@ -126,7 +129,7 @@ export function assetColumnSpecs(propertyFields, componentTypeOptions) {
 
 export const WORK_ORDER_COLUMN_SPECS = [
   { key: 'Title', label: 'Title', group: 'Work Order Info', default: true },
-  { key: 'Status', label: 'Status', options: WO_STATUS_OPTIONS, group: 'Work Order Info', default: true },
+  { key: 'Status', label: 'Status', group: 'Work Order Info', default: true },
   { key: 'Priority', label: 'Priority', options: WO_PRIORITY_OPTIONS, group: 'Work Order Info', default: true },
   { key: 'Funding Source', label: 'Funding Source', options: Object.values(FUNDING_SOURCE_LABELS), group: 'Work Order Info' },
   { key: 'Asset', label: 'Asset', group: 'Work Order Info', default: true },
@@ -148,7 +151,7 @@ export const WORK_ORDER_LOG_COLUMN_SPECS = [
   { key: 'Work Order', label: 'Work Order', group: 'Progress Log', default: true },
   { key: 'Asset', label: 'Asset', group: 'Progress Log' },
   { key: 'Location', label: 'Location', group: 'Progress Log' },
-  { key: 'Status Change', label: 'Status Change', options: WO_STATUS_OPTIONS, group: 'Progress Log', default: true },
+  { key: 'Status Change', label: 'Status Change', group: 'Progress Log', default: true },
   { key: 'Hours', label: 'Hours', group: 'Progress Log' },
   { key: 'Note', label: 'Note', group: 'Progress Log', default: true },
   { key: 'Logged By', label: 'Logged By', group: 'Progress Log' },

@@ -1,3 +1,62 @@
+# Runbook: Lifecycle & Status (Build Brief v2, Phase 2)
+
+Phase 2 landed 2026-09-09, same session as Phase 1. Migrations 0040–0042.
+`work_orders.status` and the old `done` boolean on `job_lines` are both
+**gone** — both are now `status_id` FKs into admin-editable tables.
+
+## What changed
+- `work_order_statuses` (Reported/Assessed/Scheduled/In Progress/Done/
+  Deferred/Cancelled — Done/Deferred/Cancelled terminal). `work_orders.
+  status_id` replaces `status`. **Urgent is gone as a status** (it's a
+  priority); **On Hold is gone as a status** (blocked lives on the job line).
+- `job_line_statuses` (Not Started/In Progress/Waiting on Parts/Waiting on
+  Approval/Waiting on Weather/Done/Not Needed/Cancelled). `job_lines.
+  status_id` replaces the `done` boolean entirely — there is no `Done`
+  column anymore, only `StatusId`/`StatusName` (check `IsTerminal`, not a
+  boolean, to ask "is this line finished").
+- **Every status transition, on either table, writes a
+  `work_order_log_entries` row automatically** — `changeWorkOrderStatus` and
+  `changeJobLineStatus` in db.js are the *only* two places either
+  `status_id` column is ever written; nothing else may update them directly.
+  A job-line status with `requires_note = true` throws (400) unless a
+  `statusNote` is supplied — enforced server-side, not just in the UI.
+- `work_orders.deferred_reason`/`revisit_date` are required together the
+  moment status becomes 'Deferred' (enforced in `changeWorkOrderStatus`) and
+  cleared automatically on any other status change.
+- `workOrderCloseGate(woId)` (db.js) answers "can this WO close" — true once
+  every job line is terminal (not "all Done"; Not Needed counts). It never
+  auto-closes anything; the WO detail page shows a banner suggesting review
+  when true, but the manual "Complete Work Order" button is always available
+  regardless.
+- `display_settings.wo_progress_weighting` (single row, 'cost' or 'count')
+  drives the WO grid's segmented progress bar — `JOB_LINE_STATUS_BREAKDOWN_SQL`
+  in db.js computes the per-status cost/count breakdown embedded into
+  `listWorkOrders()`'s rows (`StatusBreakdown`, `PercentCompleteCost`,
+  `PercentCompleteCount`, `TerminalLineCount`). Admin toggle lives on the
+  Work Order Statuses admin page.
+- Status pills everywhere read a literal `color` off the row (`StatusColor`
+  on WOs, job lines, and calendar/job-line-scheduled entries) via
+  `statusPillHtml`/`statusColorStyle` in app.js — there is no hardcoded
+  name→CSS-class map left for work order or job line status. The Capital
+  Plan budget page's item pills are the one exception (neutral, no color
+  plumbed through `getBudgetOverview` yet — low-value to add, `Status` there
+  is just a display string).
+- `WO_STATUS_OPTIONS` is gone from both `reports.js` and `app.js`. Reports
+  v1's Status/Status Change columns derive their filter checkboxes from
+  whatever names actually appear in the exported rows (`columnDefsFromRows`'
+  "distinct" path) instead of a fixed list, since `reports.js` deliberately
+  has no DB access to fetch the live catalog itself.
+
+## Known gaps / follow-ups
+- Job-line status-change log entries can't set `job_line_id` on the log row
+  yet — same pending-migration-0037 blocker as Phase 1 (see that section
+  below). The line's title is folded into the note text instead.
+- `getBudgetOverview`'s itemized Capital Plan rows don't carry a status
+  color (`Status` is a bare name there) — cosmetic gap, not a correctness
+  one.
+
+---
+
 # Runbook: Job Lines (Build Brief v2, Phase 1)
 
 Phase 1 of `toClaudeCode/BUILD_BRIEF_v2_joblines_lifecycle_attachments.md` landed

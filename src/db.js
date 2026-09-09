@@ -273,7 +273,12 @@ export async function getAssetDetail(assetId) {
     getAssetPropertyFields(buildingTypeId),
     getComponentRowsForAsset(assetId),
     getComponentTypeCatalog(buildingTypeId),
-    pool.query(`SELECT id, title, status, priority FROM work_orders WHERE asset_id = $1 ORDER BY id DESC LIMIT 200`, [assetId]),
+    pool.query(
+      `SELECT w.id, w.title, ws.name AS status, ws.color AS status_color, w.priority
+       FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id
+       WHERE w.asset_id = $1 ORDER BY w.id DESC LIMIT 200`,
+      [assetId]
+    ),
     pool.query(`SELECT id, title, severity, status, board_focus FROM condition_findings WHERE asset_id = $1 ORDER BY id DESC LIMIT 200`, [assetId]),
     getAssetPropertyValuesEav(assetId),
   ]);
@@ -289,7 +294,7 @@ export async function getAssetDetail(assetId) {
     properties: { fields, topLevel: fields.filter((f) => !revealed.has(f.title)).map((f) => f.title), dependencies },
     componentRows, // callers pass this straight into components.js's currentComponentState/sortHistory
     componentSchema,
-    workOrders: workOrders.rows.map((r) => ({ Id: r.id, Title: r.title, Status: r.status, Priority: r.priority })),
+    workOrders: workOrders.rows.map((r) => ({ Id: r.id, Title: r.title, Status: r.status, StatusColor: r.status_color, Priority: r.priority })),
     conditionFindings: findings.rows.map((r) => ({ Id: r.id, Title: r.title, Severity: r.severity, Status: r.status, BoardFocus: r.board_focus })),
   };
 }
@@ -553,12 +558,13 @@ const JOB_LINE_ROLLUP_SQL = `
 export async function getWorkOrdersReportRawData() {
   const [woRows, volRows, venRows] = await Promise.all([
     pool.query(
-      `SELECT w.id, w.title, w.status, w.priority, w.date_reported, w.date_completed,
+      `SELECT w.id, w.title, ws.name AS status, w.priority, w.date_reported, w.date_completed,
               jl.earliest_scheduled_date AS scheduled_date,
               jl.estimated_hours, jl.estimated_cost, jl.actual_hours, jl.actual_cost,
               jl.funding_sources, jl.responsibility_classes,
               a.name AS asset_name, l.name AS location_name
        FROM work_orders w
+       JOIN work_order_statuses ws ON ws.id = w.status_id
        LEFT JOIN assets a ON a.id = w.asset_id
        LEFT JOIN locations l ON l.id = w.location_id
        LEFT JOIN (${JOB_LINE_ROLLUP_SQL}) jl ON jl.work_order_id = w.id
@@ -1012,19 +1018,21 @@ export async function getBudgetOverview() {
   // line, not work order, is the point of Phase 1: one WO can have lines
   // against three different funding sources.
   const opRes = await pool.query(`
-    SELECT jl.id, w.status, COALESCE(jl.actual_cost, jl.estimated_cost, 0) AS cost
+    SELECT jl.id, ws.name AS status, ws.is_terminal, COALESCE(jl.actual_cost, jl.estimated_cost, 0) AS cost
     FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
+    JOIN work_order_statuses ws ON ws.id = w.status_id
     WHERE jl.funding_source = 'operating_budget' AND COALESCE(jl.actual_cost, jl.estimated_cost, 0) > 0
   `);
-  const pendingOpCost = opRes.rows.filter((r) => r.status !== 'Done').reduce((s, r) => s + Number(r.cost), 0);
+  const pendingOpCost = opRes.rows.filter((r) => !r.is_terminal).reduce((s, r) => s + Number(r.cost), 0);
   const totalOpCost = opRes.rows.reduce((s, r) => s + Number(r.cost), 0);
 
   async function itemizedGroups(fundingSource, entities) {
     const lineRes = await pool.query(
       `SELECT jl.id AS job_line_id, jl.title AS job_line_title, jl.funding_ref_id,
-              w.id AS work_order_id, w.title AS wo_title, w.status,
+              w.id AS work_order_id, w.title AS wo_title, ws.name AS status,
               COALESCE(jl.actual_cost, jl.estimated_cost, 0) AS cost
        FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
+       JOIN work_order_statuses ws ON ws.id = w.status_id
        WHERE jl.funding_source = $1`,
       [fundingSource]
     );
@@ -1066,59 +1074,99 @@ export async function getBudgetOverview() {
 // (1.4/1.2 moved scheduled_date off work_orders) — a WO counts by the
 // EARLIEST date among its lines; zero lines, or lines with no date at all,
 // count as unscheduled.
+// Build Brief v2, Phase 2: "by status" is now whatever's in work_order_statuses
+// (admin-editable, no hardcoded list in the frontend — see reports.js/app.js).
+// "By schedule" is unchanged from Phase 1: derived from job lines, terminal
+// statuses excluded (a Deferred or Cancelled WO isn't "due" anything).
 export async function getWorkOrderSummary() {
   const { rows } = await pool.query(`
-    SELECT
-      w.status,
-      MIN(jl.scheduled_date) AS earliest_scheduled_date
+    SELECT ws.id AS status_id, ws.name AS status_name, ws.color, ws.is_terminal,
+           MIN(jl.scheduled_date) AS earliest_scheduled_date
     FROM work_orders w
+    JOIN work_order_statuses ws ON ws.id = w.status_id
     LEFT JOIN job_lines jl ON jl.work_order_id = w.id
-    GROUP BY w.id, w.status
+    GROUP BY w.id, ws.id, ws.name, ws.color, ws.is_terminal
   `);
-  const r = { open: 0, in_progress: 0, on_hold: 0, urgent: 0, done: 0, due_today: 0, past_due: 0, due_future: 0, unscheduled: 0 };
+  const byStatus = new Map();
   const todayStr = today();
+  let dueToday = 0, pastDue = 0, dueFuture = 0, unscheduled = 0;
   for (const row of rows) {
-    if (row.status === 'Open') r.open++;
-    else if (row.status === 'In Progress') r.in_progress++;
-    else if (row.status === 'On Hold') r.on_hold++;
-    else if (row.status === 'Urgent') r.urgent++;
-    else if (row.status === 'Done') r.done++;
-    if (row.status === 'Done') continue;
+    if (!byStatus.has(row.status_id)) byStatus.set(row.status_id, { Id: row.status_id, Name: row.status_name, Color: row.color, Count: 0 });
+    byStatus.get(row.status_id).Count++;
+    if (row.is_terminal) continue;
     const sd = row.earliest_scheduled_date ? row.earliest_scheduled_date.toISOString().slice(0, 10) : null;
-    if (!sd) r.unscheduled++;
-    else if (sd === todayStr) r.due_today++;
-    else if (sd < todayStr) r.past_due++;
-    else r.due_future++;
+    if (!sd) unscheduled++;
+    else if (sd === todayStr) dueToday++;
+    else if (sd < todayStr) pastDue++;
+    else dueFuture++;
   }
   return {
-    Open: r.open, InProgress: r.in_progress, OnHold: r.on_hold, Urgent: r.urgent, Done: r.done,
-    DueToday: r.due_today, PastDue: r.past_due, DueFuture: r.due_future, Unscheduled: r.unscheduled,
+    ByStatus: [...byStatus.values()],
+    DueToday: dueToday, PastDue: pastDue, DueFuture: dueFuture, Unscheduled: unscheduled,
   };
 }
 
+// Per-work-order breakdown of job-line cost/count by status — the segmented
+// progress bar (2.6). "% complete" counts a line as done once its status is
+// terminal (Not Needed counts toward progress even though it's excluded from
+// "work performed" reporting — see job_line_statuses' migration comment).
+// Cost-weighted is the board-facing default: finishing the deck while the
+// roof (most of the money) sits untouched should not read as "mostly done."
+const JOB_LINE_STATUS_BREAKDOWN_SQL = `
+  SELECT t.work_order_id,
+    json_agg(json_build_object('statusId', s.id, 'name', s.name, 'color', s.color, 'isTerminal', s.is_terminal, 'lineCount', t.line_count, 'cost', t.cost) ORDER BY s.sort_order) AS breakdown,
+    SUM(CASE WHEN s.is_terminal THEN t.cost ELSE 0 END) AS terminal_cost,
+    SUM(t.cost) AS total_cost,
+    SUM(CASE WHEN s.is_terminal THEN t.line_count ELSE 0 END) AS terminal_lines,
+    SUM(t.line_count) AS total_lines
+  FROM (
+    SELECT work_order_id, status_id, COUNT(*) AS line_count, SUM(COALESCE(actual_cost, estimated_cost, 0)) AS cost
+    FROM job_lines GROUP BY work_order_id, status_id
+  ) t
+  JOIN job_line_statuses s ON s.id = t.status_id
+  GROUP BY t.work_order_id
+`;
+
 export async function listWorkOrders() {
   const { rows } = await pool.query(
-    `SELECT w.id, w.title, w.status, w.priority, w.date_reported, w.date_completed,
+    `SELECT w.id, w.title, ws.id AS status_id, ws.name AS status, ws.color AS status_color, ws.is_terminal AS status_is_terminal,
+            w.priority, w.date_reported, w.date_completed, w.deferred_reason, w.revisit_date,
             jl.earliest_scheduled_date AS scheduled_date,
             jl.line_count, jl.estimated_hours, jl.estimated_cost, jl.actual_hours, jl.actual_cost,
-            w.asset_id, a.name AS asset_name, w.location_id, l.name AS location_name
+            slb.breakdown, slb.terminal_cost, slb.total_cost, slb.terminal_lines, slb.total_lines,
+            w.asset_id, a.name AS asset_name, w.location_id, l.name AS location_name,
+            EXISTS (SELECT 1 FROM job_lines bjl WHERE bjl.work_order_id = w.id AND bjl.blocked_reason IS NOT NULL) AS is_blocked
      FROM work_orders w
+     JOIN work_order_statuses ws ON ws.id = w.status_id
      LEFT JOIN assets a ON a.id = w.asset_id
      LEFT JOIN locations l ON l.id = w.location_id
      LEFT JOIN (${JOB_LINE_ROLLUP_SQL}) jl ON jl.work_order_id = w.id
+     LEFT JOIN (${JOB_LINE_STATUS_BREAKDOWN_SQL}) slb ON slb.work_order_id = w.id
      ORDER BY w.id DESC`
   );
-  return rows.map((r) => ({
-    Id: r.id, Title: r.title, Status: r.status, Priority: r.priority,
-    'Date Reported': r.date_reported, 'Date Completed': r.date_completed, 'Scheduled Date': r.scheduled_date,
-    LineCount: Number(r.line_count || 0),
-    'Estimated Hours': r.estimated_hours != null ? Number(r.estimated_hours) : null,
-    'Estimated Cost': r.estimated_cost != null ? Number(r.estimated_cost) : null,
-    'Actual Hours': r.actual_hours != null ? Number(r.actual_hours) : null,
-    'Actual Cost': r.actual_cost != null ? Number(r.actual_cost) : null,
-    Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
-    Location: r.location_id ? { Id: r.location_id, Name: r.location_name } : null,
-  }));
+  return rows.map((r) => {
+    const totalCost = Number(r.total_cost || 0);
+    const totalLines = Number(r.total_lines || 0);
+    const terminalCost = Number(r.terminal_cost || 0);
+    const terminalLines = Number(r.terminal_lines || 0);
+    return {
+      Id: r.id, Title: r.title, Status: r.status, StatusId: r.status_id, StatusColor: r.status_color, StatusIsTerminal: r.status_is_terminal,
+      Priority: r.priority, IsBlocked: r.is_blocked,
+      'Date Reported': r.date_reported, 'Date Completed': r.date_completed, 'Scheduled Date': r.scheduled_date,
+      DeferredReason: r.deferred_reason, RevisitDate: r.revisit_date,
+      LineCount: Number(r.line_count || 0),
+      'Estimated Hours': r.estimated_hours != null ? Number(r.estimated_hours) : null,
+      'Estimated Cost': r.estimated_cost != null ? Number(r.estimated_cost) : null,
+      'Actual Hours': r.actual_hours != null ? Number(r.actual_hours) : null,
+      'Actual Cost': r.actual_cost != null ? Number(r.actual_cost) : null,
+      StatusBreakdown: r.breakdown || [],
+      TerminalLineCount: terminalLines,
+      PercentCompleteCost: totalCost > 0 ? terminalCost / totalCost : (totalLines > 0 ? terminalLines / totalLines : 0),
+      PercentCompleteCount: totalLines > 0 ? terminalLines / totalLines : 0,
+      Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
+      Location: r.location_id ? { Id: r.location_id, Name: r.location_name } : null,
+    };
+  });
 }
 
 async function getAssetUpdatesForWorkOrder(woId) {
@@ -1170,20 +1218,26 @@ export async function workOrderRollup(woId) {
 
 export async function getWorkOrderDetail(woId) {
   const { rows } = await pool.query(
-    `SELECT w.*, a.name AS asset_name, a.lodge_holder AS asset_lodge_holder, l.name AS location_name FROM work_orders w
+    `SELECT w.*, ws.name AS status_name, ws.color AS status_color, ws.is_terminal AS status_is_terminal,
+            a.name AS asset_name, a.lodge_holder AS asset_lodge_holder, l.name AS location_name,
+            EXISTS (SELECT 1 FROM job_lines bjl WHERE bjl.work_order_id = w.id AND bjl.blocked_reason IS NOT NULL) AS is_blocked
+     FROM work_orders w
+     JOIN work_order_statuses ws ON ws.id = w.status_id
      LEFT JOIN assets a ON a.id = w.asset_id LEFT JOIN locations l ON l.id = w.location_id
      WHERE w.id = $1`,
     [woId]
   );
   const w = rows[0];
   if (!w) return null;
-  const [assetUpdates, rollup, crewRoster] = await Promise.all([
-    getAssetUpdatesForWorkOrder(woId), workOrderRollup(woId), getWorkOrderCrewRoster(woId),
+  const [assetUpdates, rollup, crewRoster, closeGate] = await Promise.all([
+    getAssetUpdatesForWorkOrder(woId), workOrderRollup(woId), getWorkOrderCrewRoster(woId), workOrderCloseGate(woId),
   ]);
   return {
     workOrder: {
-      Id: w.id, Title: w.title, Status: w.status, Priority: w.priority,
+      Id: w.id, Title: w.title, Status: w.status_name, StatusId: w.status_id, StatusColor: w.status_color, StatusIsTerminal: w.status_is_terminal,
+      Priority: w.priority, IsBlocked: w.is_blocked,
       'Date Reported': w.date_reported, 'Date Completed': w.date_completed,
+      DeferredReason: w.deferred_reason, RevisitDate: w.revisit_date,
       Description: w.description,
       BoardFocus: w.board_focus,
       Asset: w.asset_id ? { Id: w.asset_id, Name: w.asset_name, LodgeHolder: w.asset_lodge_holder } : null,
@@ -1191,8 +1245,25 @@ export async function getWorkOrderDetail(woId) {
     },
     rollup,
     crewRoster,
+    closeGate,
     assetUpdates,
   };
+}
+
+// 2.5's close gate: a WO CAN close once no line is non-terminal — not "all
+// Done" (a line correctly marked Not Needed still lets the WO close). This
+// never triggers an auto-close (the brief is explicit: closing is always a
+// deliberate action); it only tells the UI whether to show the "review and
+// close?" prompt.
+export async function workOrderCloseGate(woId) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) FILTER (WHERE NOT s.is_terminal) AS non_terminal, COUNT(*) AS total
+     FROM job_lines jl JOIN job_line_statuses s ON s.id = jl.status_id
+     WHERE jl.work_order_id = $1`,
+    [woId]
+  );
+  const r = rows[0];
+  return { ReadyToClose: Number(r.total) > 0 && Number(r.non_terminal) === 0, LineCount: Number(r.total) };
 }
 
 // funding_ref_id points at a different table depending on funding_source
@@ -1207,6 +1278,145 @@ async function getFundingRefLabel(fundingSource, fundingRefId) {
 
 const today = () => new Date().toISOString().slice(0, 10);
 
+// ── Work order / job line status catalogs (Phase 2, 2.1/2.2) — admin-
+//    editable, read by the frontend instead of a hardcoded list. ───────────
+export async function listWorkOrderStatuses() {
+  const { rows } = await pool.query('SELECT * FROM work_order_statuses WHERE active ORDER BY sort_order, name');
+  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Color: r.color, IsTerminal: r.is_terminal }));
+}
+export async function listJobLineStatuses() {
+  const { rows } = await pool.query('SELECT * FROM job_line_statuses WHERE active ORDER BY sort_order, name');
+  return rows.map((r) => ({
+    Id: r.id, Name: r.name, SortOrder: r.sort_order, Color: r.color, IsTerminal: r.is_terminal,
+    CountsAsWorkPerformed: r.counts_as_work_performed, RequiresNote: r.requires_note, NoteLabel: r.note_label,
+  }));
+}
+
+// ── Admin CRUD for the two status catalogs — same in-use-guard pattern as
+//    causes/sub-areas/building types: block deleting a status something
+//    still references, deactivate instead. ────────────────────────────────
+export async function adminListWorkOrderStatuses() {
+  const { rows } = await pool.query('SELECT * FROM work_order_statuses ORDER BY sort_order, name');
+  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Color: r.color, IsTerminal: r.is_terminal, Active: r.active }));
+}
+export async function adminCreateWorkOrderStatus({ name, sortOrder = 100, color = '#888888', isTerminal = false }) {
+  const { rows } = await pool.query(
+    'INSERT INTO work_order_statuses (name, sort_order, color, is_terminal) VALUES ($1,$2,$3,$4) RETURNING *',
+    [name, sortOrder, color, !!isTerminal]
+  );
+  await logActivity({ action: 'created', entityType: 'work_order_status', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0];
+}
+export async function adminUpdateWorkOrderStatus(id, { name, sortOrder, color, isTerminal, active }) {
+  const { rows } = await pool.query(
+    `UPDATE work_order_statuses SET name = COALESCE($2,name), sort_order = COALESCE($3,sort_order),
+       color = COALESCE($4,color), is_terminal = COALESCE($5,is_terminal), active = COALESCE($6,active)
+     WHERE id = $1 RETURNING *`,
+    [id, name ?? null, sortOrder ?? null, color ?? null, isTerminal ?? null, active ?? null]
+  );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'work_order_status', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] || null;
+}
+export async function adminDeleteWorkOrderStatus(id) {
+  const inUse = await pool.query('SELECT count(*) FROM work_orders WHERE status_id = $1', [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} work order(s) still use this status — deactivate it instead`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM work_order_statuses WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'work_order_status', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+export async function adminListJobLineStatuses() {
+  const { rows } = await pool.query('SELECT * FROM job_line_statuses ORDER BY sort_order, name');
+  return rows.map((r) => ({
+    Id: r.id, Name: r.name, SortOrder: r.sort_order, Color: r.color, IsTerminal: r.is_terminal,
+    CountsAsWorkPerformed: r.counts_as_work_performed, RequiresNote: r.requires_note, NoteLabel: r.note_label, Active: r.active,
+  }));
+}
+export async function adminCreateJobLineStatus({ name, sortOrder = 100, color = '#888888', isTerminal = false, countsAsWorkPerformed = false, requiresNote = false, noteLabel = null }) {
+  const { rows } = await pool.query(
+    `INSERT INTO job_line_statuses (name, sort_order, color, is_terminal, counts_as_work_performed, requires_note, note_label)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+    [name, sortOrder, color, !!isTerminal, !!countsAsWorkPerformed, !!requiresNote, noteLabel || null]
+  );
+  await logActivity({ action: 'created', entityType: 'job_line_status', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0];
+}
+export async function adminUpdateJobLineStatus(id, { name, sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel, active }) {
+  const { rows } = await pool.query(
+    `UPDATE job_line_statuses SET name = COALESCE($2,name), sort_order = COALESCE($3,sort_order),
+       color = COALESCE($4,color), is_terminal = COALESCE($5,is_terminal),
+       counts_as_work_performed = COALESCE($6,counts_as_work_performed),
+       requires_note = COALESCE($7,requires_note), note_label = COALESCE($8,note_label), active = COALESCE($9,active)
+     WHERE id = $1 RETURNING *`,
+    [id, name ?? null, sortOrder ?? null, color ?? null, isTerminal ?? null, countsAsWorkPerformed ?? null, requiresNote ?? null, noteLabel ?? null, active ?? null]
+  );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'job_line_status', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] || null;
+}
+export async function adminDeleteJobLineStatus(id) {
+  const inUse = await pool.query('SELECT count(*) FROM job_lines WHERE status_id = $1', [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} job line(s) still use this status — deactivate it instead`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM job_line_statuses WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'job_line_status', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+// ── Display settings (2.6) — single admin-wide toggle for now: whether the
+//    WO grid's progress bar defaults to cost-weighted or line-count-weighted. ─
+export async function getDisplaySettings() {
+  const { rows } = await pool.query('SELECT wo_progress_weighting FROM display_settings ORDER BY id LIMIT 1');
+  return { WoProgressWeighting: rows[0]?.wo_progress_weighting || 'cost' };
+}
+export async function updateDisplaySettings({ woProgressWeighting }) {
+  await pool.query(
+    `UPDATE display_settings SET wo_progress_weighting = $1 WHERE id = (SELECT id FROM display_settings ORDER BY id LIMIT 1)`,
+    [woProgressWeighting]
+  );
+  await logActivity({ action: 'updated', entityType: 'display_settings', entityLabel: 'WO progress weighting', details: woProgressWeighting });
+  return getDisplaySettings();
+}
+async function resolveWorkOrderStatusId(nameOrId) {
+  if (typeof nameOrId === 'number') return nameOrId;
+  if (/^\d+$/.test(String(nameOrId))) return Number(nameOrId);
+  const { rows } = await pool.query('SELECT id FROM work_order_statuses WHERE name = $1', [nameOrId]);
+  if (!rows[0]) { const e = new Error(`"${nameOrId}" is not a known work order status`); e.status = 400; throw e; }
+  return rows[0].id;
+}
+
+// Every status transition writes a work_order_log_entries row automatically
+// (2.4) — no exceptions, no silent updates. This is the one place a WO's
+// status_id is ever written, so every caller (the WO fields form, the quick
+// "Update Status To" log-entry shortcut) goes through the same enforcement:
+// Deferred requires a reason + revisit_date (2.3), checked at the API layer
+// because that's where the board credibility comes from.
+async function changeWorkOrderStatus(client, woId, newStatusId, { deferredReason, revisitDate } = {}) {
+  const { rows: curRows } = await client.query(
+    `SELECT w.status_id, ws.name AS old_name, w.title FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
+    [woId]
+  );
+  const cur = curRows[0];
+  if (!cur) { const e = new Error('Work Order not found'); e.status = 404; throw e; }
+  if (cur.status_id === newStatusId) return;
+  const { rows: newRows } = await client.query('SELECT name FROM work_order_statuses WHERE id = $1', [newStatusId]);
+  const newName = newRows[0]?.name;
+  if (!newName) { const e = new Error('Unknown work order status'); e.status = 400; throw e; }
+  if (newName === 'Deferred' && (!deferredReason || !revisitDate)) {
+    const e = new Error('Deferring a work order requires a reason and a revisit date'); e.status = 400; throw e;
+  }
+  const setCols = ['status_id = $2'];
+  const vals = [woId, newStatusId];
+  if (newName === 'Deferred') {
+    setCols.push(`deferred_reason = $3`, `revisit_date = $4`);
+    vals.push(deferredReason, revisitDate);
+  } else {
+    setCols.push('deferred_reason = NULL', 'revisit_date = NULL');
+  }
+  if (newName === 'Done') setCols.push(`date_completed = COALESCE(date_completed, CURRENT_DATE)`);
+  await client.query(`UPDATE work_orders SET ${setCols.join(', ')} WHERE id = $1`, vals);
+  await client.query(
+    'INSERT INTO work_order_log_entries (work_order_id, note, status_change, username) VALUES ($1,$2,$3,$4)',
+    [woId, `Status changed: ${cur.old_name} → ${newName}`, newName, currentUsername()]
+  );
+}
+
 // jobLines: [{ title, responsibilityClass, fundingSource, fundingRefId,
 // estimatedHours, estimatedCost, scheduledDate }] — the WO creation flow
 // (1.7) captures a full job line per "+ Add job line" row; scheduledDate
@@ -1219,8 +1429,8 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO work_orders (title, asset_id, location_id, priority, status, description, date_reported)
-       VALUES ($1,$2,$3,$4,'Open',$5,$6) RETURNING id`,
+      `INSERT INTO work_orders (title, asset_id, location_id, priority, status_id, description, date_reported)
+       VALUES ($1,$2,$3,$4,(SELECT id FROM work_order_statuses WHERE name = 'Reported'),$5,$6) RETURNING id`,
       [title, assetId || null, locationId || null, priority || 'Medium', description || null, today()]
     );
     const woId = rows[0].id;
@@ -1238,8 +1448,8 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
       const lineTitle = (typeof line === 'string' ? line : line?.title || '').trim();
       if (!lineTitle) continue;
       await client.query(
-        `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, scheduled_date)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, scheduled_date, status_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT id FROM job_line_statuses WHERE name = 'Not Started'))`,
         [woId, lineTitle, sortOrder++,
           line.responsibilityClass || 'self', line.fundingSource || 'operating_budget', line.fundingRefId || null,
           line.estimatedHours ?? null, line.estimatedCost ?? null, line.scheduledDate || scheduledDate || null]
@@ -1257,7 +1467,7 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
 }
 
 export async function updateWorkOrder(woId, fields) {
-  const allowed = ['title', 'description', 'priority', 'status', 'date_reported', 'date_completed', 'asset_id', 'board_focus'];
+  const allowed = ['title', 'description', 'priority', 'date_reported', 'date_completed', 'asset_id', 'board_focus'];
   const setCols = [];
   const vals = [];
   let i = 1;
@@ -1266,10 +1476,27 @@ export async function updateWorkOrder(woId, fields) {
     setCols.push(`${key} = $${i++}`);
     vals.push(value === '' ? null : value);
   }
-  if (!setCols.length) return getWorkOrderDetail(woId);
-  vals.push(woId);
-  const { rowCount } = await pool.query(`UPDATE work_orders SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
-  if (!rowCount) return null;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: existsRows } = await client.query('SELECT id FROM work_orders WHERE id = $1', [woId]);
+    if (!existsRows.length) { await client.query('ROLLBACK'); return null; }
+    if (setCols.length) {
+      vals.push(woId);
+      await client.query(`UPDATE work_orders SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
+    }
+    if (fields.status_id != null) {
+      await changeWorkOrderStatus(client, woId, await resolveWorkOrderStatusId(fields.status_id), {
+        deferredReason: fields.deferred_reason, revisitDate: fields.revisit_date,
+      });
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
   const detail = await getWorkOrderDetail(woId);
   await logActivity({ action: 'updated', entityType: 'work_order', entityId: Number(woId), entityLabel: detail?.workOrder?.Title });
   return detail;
@@ -1293,12 +1520,28 @@ export async function listWorkOrderLogEntries(woId) {
 // Logging an entry can optionally also change the WO's status in the same
 // action ("log what I did, and mark it In Progress") — one motion instead
 // of two separate saves.
+// The manual note (if any) and the automatic "Status changed: X → Y" entry
+// (2.4, via changeWorkOrderStatus) are deliberately two separate log rows —
+// one is what the operator wrote, the other is the unconditional audit trail.
 export async function createWorkOrderLogEntry(woId, { note, hours, statusChange }) {
   const { rows } = await pool.query(
-    'INSERT INTO work_order_log_entries (work_order_id, note, hours, status_change, username) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-    [woId, note, hours ?? null, statusChange || null, currentUsername()]
+    'INSERT INTO work_order_log_entries (work_order_id, note, hours, username) VALUES ($1,$2,$3,$4) RETURNING *',
+    [woId, note, hours ?? null, currentUsername()]
   );
-  if (statusChange) await pool.query('UPDATE work_orders SET status = $2 WHERE id = $1', [woId, statusChange]);
+  if (statusChange) {
+    const statusId = await resolveWorkOrderStatusId(statusChange);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await changeWorkOrderStatus(client, woId, statusId, {});
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
   const woRes = await pool.query('SELECT title FROM work_orders WHERE id = $1', [woId]);
   await logActivity({
     action: 'created', entityType: 'work_order_log_entry', entityId: rows[0].id, entityLabel: woRes.rows[0]?.title,
@@ -1334,8 +1577,8 @@ export async function duplicateWorkOrder(woId) {
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO work_orders (title, asset_id, location_id, priority, status, description, date_reported)
-       VALUES ($1,$2,$3,$4,'Open',$5,$6) RETURNING id`,
+      `INSERT INTO work_orders (title, asset_id, location_id, priority, status_id, description, date_reported)
+       VALUES ($1,$2,$3,$4,(SELECT id FROM work_order_statuses WHERE name = 'Reported'),$5,$6) RETURNING id`,
       [`${w.title} (Copy)`, w.asset_id, w.location_id, w.priority, w.description, today()]
     );
     const newId = rows[0].id;
@@ -1347,8 +1590,8 @@ export async function duplicateWorkOrder(woId) {
     }
     for (const l of srcLines.rows) {
       await client.query(
-        `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+        `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, status_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,(SELECT id FROM job_line_statuses WHERE name = 'Not Started'))`,
         [newId, l.title, l.sort_order, l.responsibility_class, l.funding_source, l.funding_ref_id, l.estimated_hours, l.estimated_cost]
       );
     }
@@ -1510,10 +1753,11 @@ export async function updateConditionFinding(id, { boardFocus }) {
 export async function getBoardFocusItems() {
   const [woRes, cfRes] = await Promise.all([
     pool.query(`
-      SELECT w.id, w.title, w.priority, w.status, a.name AS asset_name,
+      SELECT w.id, w.title, w.priority, ws.name AS status, a.name AS asset_name,
              e.work_order_template_id,
              COALESCE(jl.estimated_cost, 0) AS estimated_cost
       FROM work_orders w
+      JOIN work_order_statuses ws ON ws.id = w.status_id
       LEFT JOIN assets a ON a.id = w.asset_id
       LEFT JOIN calendar_event_generated_wo g ON g.work_order_id = w.id
       LEFT JOIN calendar_events e ON e.id = g.calendar_event_id
@@ -1545,7 +1789,8 @@ export async function historicalAvgActualCost(templateId) {
        SELECT work_order_id, SUM(actual_cost) AS total_actual_cost
        FROM job_lines WHERE actual_cost IS NOT NULL GROUP BY work_order_id
      ) wo_actual ON wo_actual.work_order_id = w.id
-     WHERE e.work_order_template_id = $1 AND w.status = 'Done'`,
+     JOIN work_order_statuses ws ON ws.id = w.status_id
+     WHERE e.work_order_template_id = $1 AND ws.name = 'Done'`,
     [templateId]
   );
   return rows[0]?.avg_cost != null ? Number(rows[0].avg_cost) : null;
@@ -1561,40 +1806,46 @@ export async function historicalAvgActualCost(templateId) {
 // two of that WO's three lines are already done.
 export async function getBoardReportRawData({ periodStart, periodEnd, todayStr }) {
   const [openStatusRes, openFundingRes, completedRes, upcomingRes, overdueRes] = await Promise.all([
-    // One row per open WO regardless of whether it has job lines yet (a
-    // freshly-Reported WO with no lines should still count as Open).
-    pool.query(`SELECT status, priority FROM work_orders WHERE status != 'Done'`),
+    // One row per non-terminal WO regardless of whether it has job lines yet
+    // (a freshly-Reported WO with no lines should still count as open).
+    // "Open" now means NOT is_terminal — Deferred/Cancelled are terminal too,
+    // not just Done, so they're correctly excluded here.
+    pool.query(`SELECT ws.name AS status, w.priority FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE NOT ws.is_terminal`),
     // Funding totals only make sense for WOs that have costed lines —
     // separate query, one row per line, so a WO split across two funding
     // sources contributes to both totals correctly.
     pool.query(`
       SELECT jl.funding_source, COALESCE(jl.actual_cost, jl.estimated_cost, 0) AS cost
       FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
-      WHERE w.status != 'Done'
+      JOIN work_order_statuses ws ON ws.id = w.status_id
+      WHERE NOT ws.is_terminal
     `),
     pool.query(`
       SELECT w.id, w.title, w.date_completed, a.name AS asset_name,
              jl.estimated_cost, jl.actual_cost, jl.funding_sources
       FROM work_orders w
+      JOIN work_order_statuses ws ON ws.id = w.status_id
       LEFT JOIN assets a ON a.id = w.asset_id
       LEFT JOIN (${JOB_LINE_ROLLUP_SQL}) jl ON jl.work_order_id = w.id
-      WHERE w.status = 'Done' AND w.date_completed BETWEEN $1 AND $2
+      WHERE ws.name = 'Done' AND w.date_completed BETWEEN $1 AND $2
       ORDER BY w.date_completed DESC
     `, [periodStart, periodEnd]),
     pool.query(`
       SELECT jl.id AS job_line_id, jl.title AS job_line_title, jl.scheduled_date,
              w.id AS work_order_id, w.title AS wo_title, w.priority, a.name AS asset_name
       FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
+      JOIN work_order_statuses ws ON ws.id = w.status_id
       LEFT JOIN assets a ON a.id = w.asset_id
-      WHERE w.status != 'Done' AND jl.scheduled_date >= $1
+      WHERE NOT ws.is_terminal AND jl.scheduled_date >= $1
       ORDER BY jl.scheduled_date ASC
     `, [todayStr]),
     pool.query(`
       SELECT jl.id AS job_line_id, jl.title AS job_line_title, jl.scheduled_date,
              w.id AS work_order_id, w.title AS wo_title, w.priority, a.name AS asset_name
       FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
+      JOIN work_order_statuses ws ON ws.id = w.status_id
       LEFT JOIN assets a ON a.id = w.asset_id
-      WHERE w.status != 'Done' AND jl.scheduled_date < $1
+      WHERE NOT ws.is_terminal AND jl.scheduled_date < $1
       ORDER BY jl.scheduled_date ASC
     `, [todayStr]),
   ]);
@@ -1639,7 +1890,7 @@ export async function completeWorkOrder(woId) {
       await client.query('UPDATE asset_updates SET applied = true WHERE id = $1', [u.id]);
       appliedIds.push(u.id);
     }
-    await client.query(`UPDATE work_orders SET status = 'Done', date_completed = $1 WHERE id = $2`, [today(), woId]);
+    await changeWorkOrderStatus(client, woId, await resolveWorkOrderStatusId('Done'), {});
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK');
@@ -2166,8 +2417,8 @@ export async function deleteMapLayer(id) {
 
 function jobLineRowShape(r) {
   return {
-    Id: r.id, WorkOrderId: r.work_order_id, Title: r.title, Done: r.done, SortOrder: r.sort_order,
-    ResponsibilityClass: r.responsibility_class,
+    Id: r.id, WorkOrderId: r.work_order_id, Title: r.title, SortOrder: r.sort_order,
+    StatusId: r.status_id, ResponsibilityClass: r.responsibility_class,
     FundingSource: r.funding_source, FundingRefId: r.funding_ref_id,
     EstimatedHours: r.estimated_hours != null ? Number(r.estimated_hours) : null,
     ActualHours: r.actual_hours != null ? Number(r.actual_hours) : null,
@@ -2181,15 +2432,23 @@ function jobLineRowShape(r) {
 }
 
 // One line's full detail — used by the job-line edit form, which needs the
-// funding label, cause names, and assigned crew alongside the bare columns.
+// funding label, status flags, cause names, and assigned crew alongside the
+// bare columns.
 async function hydrateJobLine(row) {
   const shaped = jobLineRowShape(row);
-  const [fundingRefLabel, causes, assignees] = await Promise.all([
+  const [fundingRefLabel, statusRows, causes, assignees] = await Promise.all([
     getFundingRefLabel(row.funding_source, row.funding_ref_id),
+    pool.query('SELECT name, color, is_terminal, counts_as_work_performed, requires_note, note_label FROM job_line_statuses WHERE id = $1', [row.status_id]),
     pool.query(`SELECT c.id, c.name FROM job_line_causes jlc JOIN causes c ON c.id = jlc.cause_id WHERE jlc.job_line_id = $1 ORDER BY c.sort_order, c.name`, [row.id]),
     getJobLineAssignees(row.id),
   ]);
-  return { ...shaped, FundingRefLabel: fundingRefLabel, Causes: causes.rows.map((c) => ({ Id: c.id, Name: c.name })), ...assignees };
+  const s = statusRows.rows[0] || {};
+  return {
+    ...shaped, FundingRefLabel: fundingRefLabel,
+    StatusName: s.name, StatusColor: s.color, StatusIsTerminal: s.is_terminal,
+    StatusCountsAsWorkPerformed: s.counts_as_work_performed,
+    Causes: causes.rows.map((c) => ({ Id: c.id, Name: c.name })), ...assignees,
+  };
 }
 
 export async function listJobLines(woId) {
@@ -2204,61 +2463,104 @@ export async function getJobLine(id) {
 
 // Creation only takes the fields the field-capture flow (1.7) actually asks
 // for at WO-creation time; complaint/cause/correction are filled in later,
-// during/after the work (1.6), through updateJobLine.
+// during/after the work (1.6), through updateJobLine. Every new line starts
+// 'Not Started' — status changes from there go through changeJobLineStatus.
 export async function createJobLine(woId, {
   title, responsibilityClass = 'self', fundingSource = 'operating_budget', fundingRefId = null,
   estimatedHours = null, estimatedCost = null, scheduledDate = null,
 }) {
   const { rows: maxRows } = await pool.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM job_lines WHERE work_order_id = $1', [woId]);
   const { rows } = await pool.query(
-    `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, scheduled_date)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+    `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, scheduled_date, status_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT id FROM job_line_statuses WHERE name = 'Not Started')) RETURNING *`,
     [woId, title, maxRows[0].next, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate]
   );
   await logActivity({ action: 'created', entityType: 'job_line', entityId: rows[0].id, entityLabel: rows[0].title, details: `On Work Order #${woId}` });
   return hydrateJobLine(rows[0]);
 }
 
+// Every job-line status transition writes a work_order_log_entries row
+// (2.4) — same unconditional-logging rule as work orders. requires_note
+// (2.1) blocks the save without an answer to note_label, since a contextual
+// question gets answered but a generic empty box doesn't. counts_as_work_
+// performed statuses stamp completed_date once (never overwritten here —
+// see updateJobLine for the explicit-edit path). work_order_log_entries has
+// no job_line_id column live yet (migration 0037 pending — see
+// update-for-claude.md), so the line's title is folded into the note text
+// instead of a structured link, for now.
+async function changeJobLineStatus(client, jobLineId, newStatusId, { statusNote } = {}) {
+  const { rows: curRows } = await client.query(
+    `SELECT jl.status_id, jl.title, jl.work_order_id, jl.completed_date, s.name AS old_name
+     FROM job_lines jl JOIN job_line_statuses s ON s.id = jl.status_id WHERE jl.id = $1`,
+    [jobLineId]
+  );
+  const cur = curRows[0];
+  if (!cur) { const e = new Error('Job line not found'); e.status = 404; throw e; }
+  if (cur.status_id === newStatusId) return;
+  const { rows: newRows } = await client.query(
+    'SELECT name, requires_note, note_label, counts_as_work_performed FROM job_line_statuses WHERE id = $1', [newStatusId]
+  );
+  const newStatus = newRows[0];
+  if (!newStatus) { const e = new Error('Unknown job line status'); e.status = 400; throw e; }
+  if (newStatus.requires_note && !statusNote?.trim()) {
+    const e = new Error(newStatus.note_label || `A note is required to mark this line "${newStatus.name}"`); e.status = 400; throw e;
+  }
+  const setCols = ['status_id = $2'];
+  const vals = [jobLineId, newStatusId];
+  if (newStatus.counts_as_work_performed && !cur.completed_date) {
+    setCols.push('completed_date = CURRENT_DATE');
+  }
+  await client.query(`UPDATE job_lines SET ${setCols.join(', ')} WHERE id = $1`, vals);
+  const noteText = statusNote?.trim()
+    ? `Job line "${cur.title}" → ${newStatus.name}: ${statusNote.trim()}`
+    : `Job line "${cur.title}" status: ${cur.old_name} → ${newStatus.name}`;
+  await client.query(
+    'INSERT INTO work_order_log_entries (work_order_id, note, status_change, username) VALUES ($1,$2,$3,$4)',
+    [cur.work_order_id, noteText, newStatus.name, currentUsername()]
+  );
+}
+
 const JOB_LINE_UPDATE_COLUMNS = [
-  'title', 'done', 'responsibility_class', 'funding_source', 'funding_ref_id',
+  'title', 'responsibility_class', 'funding_source', 'funding_ref_id',
   'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost', 'scheduled_date',
   'complaint', 'cause_note', 'correction', 'blocked_reason', 'blocked_since', 'completed_date',
 ];
 export async function updateJobLine(id, fields) {
   const setCols = []; const vals = []; let i = 1;
   for (const [key, value] of Object.entries(fields)) {
-    if (key === 'causeIds') continue; // handled separately below (own junction table)
+    if (key === 'causeIds' || key === 'status_id' || key === 'statusNote') continue; // handled separately below
     if (!JOB_LINE_UPDATE_COLUMNS.includes(key)) continue;
     setCols.push(`${key} = $${i++}`);
     vals.push(value === '' ? null : value);
   }
-  let row = null;
-  if (setCols.length) {
-    vals.push(id);
-    const { rows } = await pool.query(`UPDATE job_lines SET ${setCols.join(', ')} WHERE id = $${i} RETURNING *`, vals);
-    row = rows[0];
-  } else {
-    const { rows } = await pool.query('SELECT * FROM job_lines WHERE id = $1', [id]);
-    row = rows[0];
-  }
-  if (!row) return null;
-  if (fields.causeIds !== undefined) {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: existsRows } = await client.query('SELECT id FROM job_lines WHERE id = $1', [id]);
+    if (!existsRows.length) { await client.query('ROLLBACK'); return null; }
+    if (setCols.length) {
+      vals.push(id);
+      await client.query(`UPDATE job_lines SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
+    }
+    if (fields.status_id != null) {
+      await changeJobLineStatus(client, id, Number(fields.status_id), { statusNote: fields.statusNote });
+    }
+    if (fields.causeIds !== undefined) {
       await client.query('DELETE FROM job_line_causes WHERE job_line_id = $1', [id]);
       for (const causeId of fields.causeIds || []) {
         await client.query('INSERT INTO job_line_causes (job_line_id, cause_id) VALUES ($1,$2)', [id, causeId]);
       }
-      await client.query('COMMIT');
-    } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
   }
-  if (fields.done !== undefined && fields.done !== null) {
-    await logActivity({ action: 'toggled', entityType: 'job_line', entityId: row.id, entityLabel: row.title, details: fields.done ? 'checked' : 'unchecked' });
-  } else {
-    await logActivity({ action: 'updated', entityType: 'job_line', entityId: row.id, entityLabel: row.title });
-  }
-  return hydrateJobLine(row);
+  const { rows } = await pool.query('SELECT * FROM job_lines WHERE id = $1', [id]);
+  await logActivity({ action: 'updated', entityType: 'job_line', entityId: rows[0].id, entityLabel: rows[0].title });
+  return hydrateJobLine(rows[0]);
 }
 export async function deleteJobLine(id) {
   const { rows } = await pool.query('DELETE FROM job_lines WHERE id = $1 RETURNING title, work_order_id', [id]);
@@ -2523,10 +2825,11 @@ export async function listCalendarEventOccurrences(fromDate, toDate) {
 export async function listJobLinesScheduledInRange(fromDate, toDate) {
   const { rows } = await pool.query(
     `SELECT jl.id, jl.title, jl.scheduled_date, jl.work_order_id,
-            w.title AS wo_title, w.status AS wo_status, w.priority,
+            w.title AS wo_title, ws.name AS wo_status, ws.color AS wo_status_color, w.priority,
             a.id AS asset_id, a.name AS asset_name
      FROM job_lines jl
      JOIN work_orders w ON w.id = jl.work_order_id
+     JOIN work_order_statuses ws ON ws.id = w.status_id
      LEFT JOIN assets a ON a.id = w.asset_id
      WHERE jl.scheduled_date BETWEEN $1 AND $2
      ORDER BY jl.scheduled_date`,
@@ -2534,7 +2837,7 @@ export async function listJobLinesScheduledInRange(fromDate, toDate) {
   );
   return rows.map((r) => ({
     JobLineId: r.id, JobLineTitle: r.title, ScheduledDate: r.scheduled_date,
-    WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title, WorkOrderStatus: r.wo_status, Priority: r.priority,
+    WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title, WorkOrderStatus: r.wo_status, WorkOrderStatusColor: r.wo_status_color, Priority: r.priority,
     Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
   }));
 }

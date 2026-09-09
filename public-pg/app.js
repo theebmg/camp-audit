@@ -478,6 +478,8 @@ async function render(view, params = {}) {
       adminSubAreas: () => renderAdminSubAreas(),
       adminWoTemplates: () => renderAdminWoTemplates(),
       adminCauses: () => renderAdminCauses(),
+      adminWorkOrderStatuses: () => renderAdminWorkOrderStatuses(),
+      adminJobLineStatuses: () => renderAdminJobLineStatuses(),
       calendar: () => renderCalendar(params),
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
@@ -564,8 +566,12 @@ async function renderDashboard() {
     prefs.activity ? api(`/api/pg/activity-log?limit=12${isAdmin ? '' : `&username=${encodeURIComponent(currentUser.username || '')}`}`) : Promise.resolve(null),
   ]);
 
-  function statTile(n, label, colorClass, filterParams) {
-    return `<div class="bucket-tile tile-${colorClass}${filterParams ? ' clickable-tile wo-filter-tile' : ''}" ${filterParams ? `data-filter='${JSON.stringify(filterParams)}'` : ''}>
+  // colorClass is a fixed severity word (neutral/pop/warn/bad/good) for the
+  // schedule buckets, which aren't admin-editable data; statusColor is a
+  // literal hex from work_order_statuses for the by-status tiles, which are.
+  function statTile(n, label, colorClass, filterParams, statusColor) {
+    const style = statusColor ? ` style="background:${statusColor}1a;border-color:${statusColor}66"` : '';
+    return `<div class="bucket-tile ${statusColor ? '' : `tile-${colorClass}`}${filterParams ? ' clickable-tile wo-filter-tile' : ''}"${style} ${filterParams ? `data-filter='${JSON.stringify(filterParams)}'` : ''}>
       <div class="n">${n}</div><div class="muted">${escapeHtml(label)}</div>
     </div>`;
   }
@@ -577,11 +583,7 @@ async function renderDashboard() {
       <h3>Work Orders</h3>
       <p class="muted" style="margin-top:-6px">By status</p>
       <div class="summary-buckets">
-        ${statTile(s.Open, 'Open', 'neutral', { status: 'Open' })}
-        ${statTile(s.InProgress, 'In Progress', 'pop', { status: 'In Progress' })}
-        ${statTile(s.OnHold, 'On Hold', 'warn', { status: 'On Hold' })}
-        ${statTile(s.Urgent, 'Urgent', 'bad', { status: 'Urgent' })}
-        ${statTile(s.Done, 'Done', 'good', { status: 'Done' })}
+        ${s.ByStatus.map((st) => statTile(st.Count, st.Name, null, { status: st.Name }, st.Color)).join('')}
       </div>
       <p class="muted">By schedule (open WOs only)</p>
       <div class="summary-buckets">
@@ -640,7 +642,7 @@ async function renderDashboard() {
     return `<p class="muted" style="margin-bottom:6px">${escapeHtml(label)}</p>` + dayEvents.map((e) => e.type === 'wo'
       ? `<div class="list-item cal-strip-wo-link" style="cursor:pointer" data-wo-id="${e.Id}">
           <span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.Title)}</span>
-          <span class="pill ${woStatusPillClass(e.Status)}">${escapeHtml(e.Status || '')}</span>
+          ${statusPillHtml(e.Status, e.StatusColor)}
         </div>`
       : `<div class="list-item cal-strip-event-link" style="cursor:pointer" data-event-id="${e.Id}">
           <span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span>
@@ -771,6 +773,8 @@ const ADMIN_LEAF_RENDERERS = {
   adminSubAreas: (params, container) => renderAdminSubAreas(container),
   adminWoTemplates: (params, container) => renderAdminWoTemplates(container),
   adminCauses: (params, container) => renderAdminCauses(container),
+  adminWorkOrderStatuses: (params, container) => renderAdminWorkOrderStatuses(container),
+  adminJobLineStatuses: (params, container) => renderAdminJobLineStatuses(container),
   adminChecklistTemplates: (params, container) => renderAdminChecklistTemplates(container),
   adminUsers: (params, container) => renderAdminUsers(container),
   activityLog: (params, container) => renderActivityLog(container),
@@ -941,12 +945,15 @@ function conditionPillClass(c) {
   return '';
 }
 
-function woStatusPillClass(status) {
-  if (status === 'Done') return 'good';
-  if (status === 'Urgent') return 'bad';
-  if (status === 'In Progress') return 'pop';
-  if (status === 'On Hold') return 'warn';
-  return ''; // Open = neutral
+// Work order / job line statuses are admin-editable tables now (Phase 2) —
+// no hardcoded name->class mapping. Pills render with the status's own
+// `color` field; callers without a color on hand (a bare status name with
+// no row context) get a neutral pill instead of guessing.
+function statusColorStyle(color) {
+  return color ? ` style="background:${color}1a;color:${color};border:1px solid ${color}66"` : '';
+}
+function statusPillHtml(name, color) {
+  return name ? `<span class="pill"${statusColorStyle(color)}>${escapeHtml(name)}</span>` : '';
 }
 
 // A step with no dependency is always visible. Otherwise it's visible only
@@ -1032,7 +1039,7 @@ async function renderAssetDetail({ id }, container = app) {
     <div class="card"><h3>Components</h3>${componentRows}</div>
 
     <div class="card"><h3>Work Orders (${workOrders.length})</h3>
-      ${workOrders.map((w) => `<div class="list-item" data-wo-id="${w.Id}"><span>${escapeHtml(w.Title)}</span><span class="pill ${w.Status === 'Done' ? 'good' : ''}">${escapeHtml(w.Status || '')}</span></div>`).join('') || '<p class="muted">None yet.</p>'}
+      ${workOrders.map((w) => `<div class="list-item" data-wo-id="${w.Id}"><span>${escapeHtml(w.Title)}</span>${statusPillHtml(w.Status, w.StatusColor)}</div>`).join('') || '<p class="muted">None yet.</p>'}
     </div>
 
     <div class="card"><h3>Findings (${conditionFindings.length})</h3>
@@ -2333,7 +2340,7 @@ async function renderCapitalPlan() {
         ${g.LinkedAssets?.length ? `<p class="muted">Linked asset${g.LinkedAssets.length > 1 ? 's' : ''}: ${g.LinkedAssets.map((a) => `<a href="#" class="budget-asset-link" data-asset-id="${a.Id}">${escapeHtml(a.Name)}</a>`).join(', ')}</p>` : ''}
         ${g.Items.length ? g.Items.map((it) => `<div class="list-item budget-wo-link" data-wo-id="${it.WorkOrderId}">
           <span>${escapeHtml(it.Title)}</span>
-          <span class="pill ${woStatusPillClass(it.Status)}">${escapeHtml(it.Status)} · ${moneyFmt(it.Cost)}</span>
+          <span class="pill">${escapeHtml(it.Status)} · ${moneyFmt(it.Cost)}</span>
         </div>`).join('') : '<p class="muted">No work orders tagged to this yet.</p>'}
         <div class="btn-row"><button class="btn btn-secondary delete-fund-entity" data-kind="${kind}" data-id="${g.Id}" data-name="${escapeHtml(g.Name)}">Delete</button></div>
       </div>
@@ -3194,6 +3201,8 @@ const ADMIN_CATEGORIES = {
       { view: 'adminWoTemplates', icon: '🧾', label: 'Work Order Templates' },
       { view: 'adminChecklistTemplates', icon: '✅', label: 'Checklist Templates' },
       { view: 'adminCauses', icon: '🔍', label: 'Causes' },
+      { view: 'adminWorkOrderStatuses', icon: '🚦', label: 'Work Order Statuses' },
+      { view: 'adminJobLineStatuses', icon: '🚦', label: 'Job Line Statuses' },
     ],
   },
   requests: {
@@ -3818,6 +3827,143 @@ async function renderAdminApplicability(container = app) {
 // multi-select reads from. Deactivating (not deleting) is the default path
 // once a cause is in use, same in-use-guard pattern as sub-areas/building
 // types; deleting a never-used cause is still allowed.
+// Work order statuses (2.2) — admin-editable, seeded with Reported/Assessed/
+// Scheduled/In Progress/Done/Deferred/Cancelled. No "Urgent" or "On Hold"
+// here on purpose: Urgent is a priority (see the priority column), and
+// Blocked lives on the job line — see the Job Line Statuses page.
+async function renderAdminWorkOrderStatuses(container = app) {
+  if (container === app) setChrome({ title: 'Work Order Statuses', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const [{ statuses }, displaySettings] = await Promise.all([
+    api('/api/pg/admin/work-order-statuses'), api('/api/pg/display-settings'),
+  ]);
+
+  const rows = statuses.map((s) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap">
+      <span><span class="pill" style="background:${s.Color}1a;color:${s.Color};border:1px solid ${s.Color}66">${escapeHtml(s.Name)}</span>
+        ${s.IsTerminal ? '<span class="muted">terminal</span>' : ''}${!s.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary wos-toggle-active" data-id="${s.Id}" data-active="${s.Active}">${s.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary wos-delete" data-id="${s.Id}" data-name="${escapeHtml(s.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No statuses defined.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Work Order Statuses</h3>
+      <p class="muted">The pipeline a work order moves through. Terminal statuses (Done/Deferred/Cancelled) no longer block on the close gate.</p>
+    </div>
+    <div class="card">
+      <h3>Grid progress bar weighting</h3>
+      <p class="muted">Whether the work order grid's progress bar defaults to cost-weighted (recommended — the board sees money, not just line count) or line-count-weighted.</p>
+      <select id="progressWeightingSelect">
+        <option value="cost" ${displaySettings.WoProgressWeighting === 'cost' ? 'selected' : ''}>Cost-weighted</option>
+        <option value="count" ${displaySettings.WoProgressWeighting === 'count' ? 'selected' : ''}>Line-count-weighted</option>
+      </select>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Status</h3>
+      <form id="addWosForm">
+        <div class="field-row"><label>Name</label><input name="name" required /></div>
+        <div class="field-row"><label>Color</label><input name="color" type="color" value="#888888" /></div>
+        <div class="field-row"><label>Terminal</label>
+          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="isTerminal" style="margin-right:6px" />No longer blocks anything downstream</label>
+        </div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelector('#progressWeightingSelect').addEventListener('change', async (e) => {
+    try {
+      await api('/api/pg/display-settings', { method: 'PUT', body: JSON.stringify({ woProgressWeighting: e.target.value }) });
+      toast('Saved');
+      if (state.options) state.options.displaySettings = await api('/api/pg/display-settings');
+    } catch (err) { toast(err.message); }
+  });
+  container.querySelectorAll('.wos-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try { await api(`/api/pg/admin/work-order-statuses/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) }); renderAdminWorkOrderStatuses(container); }
+    catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.wos-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete status "${btn.dataset.name}"? Only possible if no work order uses it — deactivate instead if it's in use.`)) return;
+    try { await api(`/api/pg/admin/work-order-statuses/${btn.dataset.id}`, { method: 'DELETE' }); toast('Deleted'); renderAdminWorkOrderStatuses(container); }
+    catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addWosForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/work-order-statuses', { method: 'POST', body: JSON.stringify({ name: fd.get('name'), color: fd.get('color'), isTerminal: fd.has('isTerminal') }) });
+      renderAdminWorkOrderStatuses(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+// Job line statuses (2.1) — is_terminal and counts_as_work_performed are
+// separate flags on purpose: "Not Needed" is terminal but isn't work
+// performed, which is what makes "12 completed, 3 not needed" an honest
+// board sentence instead of "15 closed."
+async function renderAdminJobLineStatuses(container = app) {
+  if (container === app) setChrome({ title: 'Job Line Statuses', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { statuses } = await api('/api/pg/admin/job-line-statuses');
+
+  const rows = statuses.map((s) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap">
+      <span><span class="pill" style="background:${s.Color}1a;color:${s.Color};border:1px solid ${s.Color}66">${escapeHtml(s.Name)}</span>
+        ${s.IsTerminal ? '<span class="muted">terminal</span>' : ''}${s.CountsAsWorkPerformed ? '<span class="muted">counts as work performed</span>' : ''}${s.RequiresNote ? `<span class="muted">requires note: "${escapeHtml(s.NoteLabel || '')}"</span>` : ''}${!s.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary jls-toggle-active" data-id="${s.Id}" data-active="${s.Active}">${s.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary jls-delete" data-id="${s.Id}" data-name="${escapeHtml(s.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No statuses defined.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Job Line Statuses</h3>
+      <p class="muted">What a job line's own progress dropdown offers. Blocked is not a status — see blocked_reason on the job line itself.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Status</h3>
+      <form id="addJlsForm">
+        <div class="field-row"><label>Name</label><input name="name" required /></div>
+        <div class="field-row"><label>Color</label><input name="color" type="color" value="#888888" /></div>
+        <div class="field-row"><label>Terminal</label>
+          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="isTerminal" style="margin-right:6px" />No longer blocks the WO from closing</label>
+        </div>
+        <div class="field-row"><label>Counts as Work Performed</label>
+          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="countsAsWorkPerformed" style="margin-right:6px" />Real work happened (not just "decided not needed")</label>
+        </div>
+        <div class="field-row"><label>Requires Note</label>
+          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="requiresNote" style="margin-right:6px" />Won't save without an answer</label>
+        </div>
+        <div class="field-row"><label>Note Prompt</label><input name="noteLabel" placeholder="e.g. Why was this not needed?" /></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.jls-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try { await api(`/api/pg/admin/job-line-statuses/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) }); renderAdminJobLineStatuses(container); }
+    catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.jls-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete status "${btn.dataset.name}"? Only possible if no job line uses it — deactivate instead if it's in use.`)) return;
+    try { await api(`/api/pg/admin/job-line-statuses/${btn.dataset.id}`, { method: 'DELETE' }); toast('Deleted'); renderAdminJobLineStatuses(container); }
+    catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addJlsForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/job-line-statuses', { method: 'POST', body: JSON.stringify({
+        name: fd.get('name'), color: fd.get('color'), isTerminal: fd.has('isTerminal'),
+        countsAsWorkPerformed: fd.has('countsAsWorkPerformed'), requiresNote: fd.has('requiresNote'), noteLabel: fd.get('noteLabel') || null,
+      }) });
+      renderAdminJobLineStatuses(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
 async function renderAdminCauses(container = app) {
   if (container === app) setChrome({ title: 'Causes', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
@@ -3926,7 +4072,7 @@ function openDayPanel(dateKey, entries) {
         <button class="btn btn-secondary" id="closeDayPanelBtn">✕</button>
       </div>
       ${entries.length ? entries.map((e) => e.type === 'jobLine'
-        ? `<div class="list-item day-panel-entry" data-wo-id="${e.WorkOrderId}"><span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span><span class="pill ${woStatusPillClass(e.WorkOrderStatus)}">${escapeHtml(e.WorkOrderStatus || '')}</span></div>`
+        ? `<div class="list-item day-panel-entry" data-wo-id="${e.WorkOrderId}"><span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span>${statusPillHtml(e.WorkOrderStatus, e.WorkOrderStatusColor)}</div>`
         : `<div class="list-item day-panel-entry" data-event-id="${e.Id}"><span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`
       ).join('') : '<p class="muted">Nothing scheduled this day.</p>'}
       <div class="btn-row"><button class="btn btn-primary" id="dayPanelAddEventBtn">+ Add Event This Day</button></div>
@@ -3982,7 +4128,7 @@ async function renderCalendar(params = {}) {
     const allUnscheduled = workOrders.filter((w) => !w['Scheduled Date']);
 
     const entryHtml = (e) => e.type === 'jobLine'
-      ? `<div class="cal-entry" data-wo-id="${e.WorkOrderId}"><span class="pill ${woStatusPillClass(e.WorkOrderStatus)}">🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span></div>`
+      ? `<div class="cal-entry" data-wo-id="${e.WorkOrderId}"><span class="pill"${statusColorStyle(e.WorkOrderStatusColor)}>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span></div>`
       : `<div class="cal-entry" data-event-id="${e.Id}"><span class="pill pop">📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`;
 
     const cells = [];
@@ -4022,7 +4168,7 @@ async function renderCalendar(params = {}) {
             <p class="muted">Set a Scheduled Date on a work order to place it on the calendar.</p>
             ${allUnscheduled.length ? allUnscheduled.map((w) => `<div class="list-item" data-wo-id="${w.Id}">
               <span>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</span>
-              <span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status)}</span>
+              ${statusPillHtml(w.Status, w.StatusColor)}
             </div>`).join('') : '<p class="muted">None — everything is scheduled. 🎉</p>'}
           </div>
         </div>
@@ -4428,7 +4574,7 @@ function daysSince(dateStr) {
 
 const WO_SCHEDULE_FILTER_LABELS = { pastDue: 'Past Due', dueToday: 'Due Today', dueFuture: 'Due Later', unscheduled: 'Unscheduled' };
 function matchesScheduleFilter(w, key) {
-  if (w.Status === 'Done') return false;
+  if (w.StatusIsTerminal) return false;
   const sd = w['Scheduled Date'] ? w['Scheduled Date'].slice(0, 10) : null;
   const todayStr = isoDate(new Date());
   if (key === 'unscheduled') return !sd;
@@ -4437,6 +4583,28 @@ function matchesScheduleFilter(w, key) {
   if (key === 'dueToday') return sd === todayStr;
   if (key === 'dueFuture') return sd > todayStr;
   return true;
+}
+
+// Segmented progress bar (2.6) — one segment per job-line status present,
+// sized by the admin's chosen weighting (cost-weighted by default: finishing
+// two of three lines while the roof — most of the money — sits untouched
+// should not read as "mostly done"). Falls back to line-count share when
+// nothing has a cost yet, so a freshly-scoped WO doesn't render an empty bar.
+function woProgressBarHtml(w) {
+  if (!w.LineCount || !w.StatusBreakdown?.length) return '';
+  const weighting = state.options?.displaySettings?.WoProgressWeighting || 'cost';
+  const totalCost = w.StatusBreakdown.reduce((s, x) => s + Number(x.cost || 0), 0);
+  const segments = w.StatusBreakdown.map((s) => {
+    const share = (weighting === 'cost' && totalCost > 0)
+      ? Number(s.cost || 0) / totalCost
+      : Number(s.lineCount || 0) / w.LineCount;
+    return `<div style="flex:${Math.max(share, 0.03)};background:${s.color}" title="${escapeHtml(s.name)}"></div>`;
+  }).join('');
+  const costPart = w['Estimated Cost'] ? `${moneyFmt(w['Actual Cost'] || 0)} of ${moneyFmt(w['Estimated Cost'])}` : null;
+  const hoursPart = w['Estimated Hours'] ? `${w['Actual Hours'] || 0} of ${w['Estimated Hours']} hrs` : null;
+  return `
+    <div style="display:flex;height:6px;border-radius:3px;overflow:hidden;background:rgba(128,128,128,0.2);margin:4px 0">${segments}</div>
+    <div class="muted" style="font-size:0.78rem">${w.TerminalLineCount}/${w.LineCount} lines${costPart ? ` · ${costPart}` : ''}${hoursPart ? ` · ${hoursPart}` : ''}</div>`;
 }
 
 async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder } = {}) {
@@ -4463,17 +4631,17 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
       if (cols.estHours && w['Estimated Hours'] != null) bits.push(`${w['Estimated Hours']}h est.`);
       if (cols.estCost && w['Estimated Cost'] != null) bits.push(`$${Number(w['Estimated Cost']).toLocaleString()} est.`);
       return `<div class="list-item ${onOpenWorkOrder && selectedWoId === w.Id ? 'cal-strip-selected' : ''}" style="flex-wrap:wrap" data-id="${w.Id}">
-        <span>${escapeHtml(w.Title)}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}</span>
-        ${cols.status ? `<span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status || '')}</span>` : ''}
+        <span>${escapeHtml(w.Title)}${w.IsBlocked ? ' 🚧' : ''}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}${woProgressBarHtml(w)}</span>
+        ${cols.status ? statusPillHtml(w.Status, w.StatusColor) : ''}
       </div>`;
     }).join('') || `<p class="muted">${(statusFilter || scheduleFilter) ? 'Nothing matches this filter.' : 'No work orders yet.'}</p>`;
 
     const tableRows = visibleWOs.map((w) => {
       const days = daysSince(w['Date Reported']);
       return `<tr class="clickable-row" data-id="${w.Id}">
-        <td data-label="Title">${escapeHtml(w.Title)}</td>
+        <td data-label="Title">${escapeHtml(w.Title)}${w.IsBlocked ? ' 🚧' : ''}${woProgressBarHtml(w)}</td>
         ${cols.asset ? `<td data-label="Asset">${escapeHtml(w.Asset?.Name || '—')}</td>` : ''}
-        ${cols.status ? `<td data-label="Status"><span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status || '')}</span></td>` : ''}
+        ${cols.status ? `<td data-label="Status">${statusPillHtml(w.Status, w.StatusColor)}</td>` : ''}
         ${cols.priority ? `<td data-label="Priority">${escapeHtml(w.Priority || '')}</td>` : ''}
         ${cols.daysSinceCreated ? `<td data-label="Days Since Created">${days != null ? days : '—'}</td>` : ''}
         ${cols.scheduledDate ? `<td data-label="Scheduled Date">${formatDateNice(w['Scheduled Date']) || '—'}</td>` : ''}
@@ -4871,7 +5039,7 @@ const FUNDING_SOURCE_LABELS = {
 // close-gate logic are Phase 2), then its own crew and photos. Collapsed by
 // default (<details>) so N lines on one WO doesn't turn the page into an
 // unreadable wall on a phone.
-function jobLineCardHtml(jl, { fundingEntities, causesCatalog }) {
+function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }) {
   const fundingSource = jl.FundingSource || 'operating_budget';
   const fundingRefOptions = (fundingEntities[fundingSource] || []).map((e) => `<option value="${e.Id}" ${e.Id === jl.FundingRefId ? 'selected' : ''}>${escapeHtml(e.Name)}</option>`).join('');
   const selectedCauseIds = new Set((jl.Causes || []).map((c) => c.Id));
@@ -4885,13 +5053,20 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog }) {
 
   return `<details class="card jl-card" data-id="${jl.Id}">
     <summary style="cursor:pointer;display:flex;align-items:center;gap:10px;list-style:none">
-      <input type="checkbox" class="jl-done-toggle" data-id="${jl.Id}" ${jl.Done ? 'checked' : ''} onclick="event.stopPropagation()" />
-      <span style="flex:1;${jl.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">
+      ${statusPillHtml(jl.StatusName, jl.StatusColor)}
+      <span style="flex:1;${jl.StatusIsTerminal ? 'text-decoration:line-through;color:var(--muted)' : ''}">
         <strong>${escapeHtml(jl.Title)}</strong>
         <div class="muted" style="font-weight:400;font-size:0.85rem">${summaryBits}</div>
       </span>
     </summary>
     <form class="jl-edit-form" style="margin-top:12px">
+      <div class="field-row"><label>Status</label>
+        <select class="jl-e-status">${jobLineStatuses.map((s) => `<option value="${s.Id}" data-requires-note="${s.RequiresNote}" data-note-label="${escapeHtml(s.NoteLabel || '')}" ${jl.StatusId === s.Id ? 'selected' : ''}>${escapeHtml(s.Name)}</option>`).join('')}</select>
+      </div>
+      <div class="field-row jl-e-status-note-row" hidden>
+        <label class="jl-e-status-note-label">Note</label>
+        <input class="jl-e-status-note" placeholder="Required for this status" />
+      </div>
       <div class="field-row"><label>Title</label><input class="jl-e-title" value="${escapeHtml(jl.Title)}" required /></div>
       <div class="field-row"><label>Responsibility</label>
         <select class="jl-e-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${jl.ResponsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
@@ -4960,7 +5135,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
   const checklistTemplates = tplRes.templates;
   const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
   const causesCatalog = causesRes.causes;
-  const { workOrder: wo, rollup, crewRoster, assetUpdates, jobLines, checklist, logEntries, crewSessions, photos } = detail;
+  const { workOrder: wo, rollup, crewRoster, closeGate, assetUpdates, jobLines, checklist, logEntries, crewSessions, photos } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
   // Job-line pickers (assign-crew, crew-session attendee union) read the full
   // roster off `state` rather than threading it through every helper — same
@@ -4968,7 +5143,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
   state._allVolunteers = allVolunteers.volunteers;
   state._allVendors = allVendors.vendors;
 
-  const jobLineRows = jobLines.map((jl) => jobLineCardHtml(jl, { fundingEntities, causesCatalog })).join('')
+  const jobLineRows = jobLines.map((jl) => jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses })).join('')
     || '<p class="muted">No job lines yet — add the scope of work below.</p>';
 
   const woPhotoRows = (photos || []).map((p) => `
@@ -4977,7 +5152,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
       <button type="button" class="photo-remove delete-wo-photo" data-id="${p.Id}">&times;</button>
     </div>`).join('');
 
-  const WO_STATUS_OPTIONS = ['Open', 'In Progress', 'On Hold', 'Urgent', 'Done'];
+  const workOrderStatuses = state.options.workOrderStatuses; // admin-editable (2.2) — never hardcode this list
+  const jobLineStatuses = state.options.jobLineStatuses; // admin-editable (2.1)
   const logRows = logEntries.map((e) => `
     <div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start">
       <div style="flex:1;min-width:200px">
@@ -5032,13 +5208,23 @@ async function renderWorkOrderDetail({ id }, container = app) {
     </div>`;
 
   container.innerHTML = `
+    ${(closeGate.ReadyToClose && !wo.StatusIsTerminal) ? `
+    <div class="card" style="border:1px solid #22c55e66;background:#22c55e0d">
+      <strong>All job lines are finished.</strong>
+      <p class="muted" style="margin:4px 0 8px">Review the costs above and use "Complete Work Order" below when ready — closing is never automatic.</p>
+    </div>` : ''}
     <div class="card">
       <h3>${escapeHtml(wo.Title)}</h3>
       <form id="woFieldsForm">
         <div class="field-row"><label>Asset</label><div id="woAssetPicker"></div></div>
         <div class="field-row"><label>Status</label>
-          <select name="status">${['Open', 'In Progress', 'On Hold', 'Urgent', 'Done'].map((s) => `<option ${wo.Status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+          <select name="statusId" id="woStatusSelect">${workOrderStatuses.map((s) => `<option value="${s.Id}" ${wo.StatusId === s.Id ? 'selected' : ''}>${escapeHtml(s.Name)}</option>`).join('')}</select>
         </div>
+        <div class="field-row" id="deferredFieldsRow" ${workOrderStatuses.find((s) => s.Id === wo.StatusId)?.Name === 'Deferred' ? '' : 'hidden'}>
+          <label>Deferred Reason</label><input name="deferredReason" value="${escapeHtml(wo.DeferredReason || '')}" placeholder="Why is this being deferred?" />
+          <label style="margin-top:8px">Revisit Date</label><input name="revisitDate" type="date" value="${(wo.RevisitDate || '').slice(0, 10)}" />
+        </div>
+        ${wo.IsBlocked ? `<p class="muted">🚧 Blocked — see the blocked job line below for the reason.</p>` : ''}
         <div class="field-row"><label>Priority</label>
           <select name="priority">${['Low', 'Medium', 'High', 'Urgent'].map((s) => `<option ${wo.Priority === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         </div>
@@ -5049,7 +5235,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       <div class="btn-row">
-        <button class="btn btn-primary" id="completeWoBtn" ${wo.Status === 'Done' ? 'disabled' : ''}>${wo.Status === 'Done' ? 'Completed' : 'Complete Work Order'}</button>
+        <button class="btn btn-primary" id="completeWoBtn" ${wo.StatusIsTerminal ? 'disabled' : ''}>${wo.StatusIsTerminal ? wo.Status : 'Complete Work Order'}</button>
         <a class="btn btn-secondary" href="/api/pg/work-orders/${id}/scope-pdf" target="_blank" rel="noopener" title="A printable job description to hand a vendor or volunteer — no cost figures included">🖨️ Scope of Work (PDF)</a>
         <button class="btn btn-secondary" id="duplicateWoBtn">Duplicate</button>
       </div>
@@ -5089,7 +5275,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <div class="field-row"><label>Note</label><textarea name="note" required placeholder="What did you do?"></textarea></div>
         <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
         <div class="field-row"><label>Update Status To (optional)</label>
-          <select name="statusChange"><option value="" selected>— no change —</option>${WO_STATUS_OPTIONS.map((s) => `<option>${s}</option>`).join('')}</select>
+          <select name="statusChange"><option value="" selected>— no change —</option>${workOrderStatuses.filter((s) => s.Name !== 'Deferred').map((s) => `<option>${escapeHtml(s.Name)}</option>`).join('')}</select>
+          <p class="muted" style="font-size:0.8rem;margin-top:4px">Deferring requires a reason and revisit date — use the Status field above for that.</p>
         </div>
         <button class="btn btn-primary" type="submit">Add Log Entry</button>
       </form>
@@ -5137,6 +5324,11 @@ async function renderWorkOrderDetail({ id }, container = app) {
     boardFocusCheckbox.closest('.skill-chip').classList.toggle('selected', boardFocusCheckbox.checked);
   });
 
+  container.querySelector('#woStatusSelect').addEventListener('change', (e) => {
+    const statusName = workOrderStatuses.find((s) => s.Id === Number(e.target.value))?.Name;
+    container.querySelector('#deferredFieldsRow').hidden = statusName !== 'Deferred';
+  });
+
   container.querySelector('#woFieldsForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!await confirmDialog('Save changes to this work order?')) return;
@@ -5145,7 +5337,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
     try {
       await api(`/api/pg/work-orders/${id}`, { method: 'PATCH', body: JSON.stringify({
         assetId: newAsset ? newAsset.Id : (wo.Asset ? wo.Asset.Id : ''),
-        status: fd.get('status'), priority: fd.get('priority'), description: fd.get('description'),
+        statusId: Number(fd.get('statusId')), priority: fd.get('priority'), description: fd.get('description'),
+        deferredReason: fd.get('deferredReason') || undefined, revisitDate: fd.get('revisitDate') || undefined,
         boardFocus: fd.has('boardFocus'),
       }) });
       toast('Work order updated');
@@ -5182,10 +5375,17 @@ async function renderWorkOrderDetail({ id }, container = app) {
     const jlId = card.dataset.id;
     const jl = jobLines.find((l) => String(l.Id) === jlId);
 
-    card.querySelector('.jl-done-toggle').addEventListener('change', async (e) => {
-      try { await api(`/api/pg/job-lines/${jlId}`, { method: 'PATCH', body: JSON.stringify({ done: e.target.checked }) }); renderWorkOrderDetail({ id }, container); }
-      catch (err) { toast(err.message); }
-    });
+    const statusSelect = card.querySelector('.jl-e-status');
+    const statusNoteRow = card.querySelector('.jl-e-status-note-row');
+    function syncStatusNoteVisibility() {
+      const opt = statusSelect.selectedOptions[0];
+      const requiresNote = opt?.dataset.requiresNote === 'true';
+      statusNoteRow.hidden = !requiresNote;
+      statusNoteRow.querySelector('.jl-e-status-note-label').textContent = opt?.dataset.noteLabel || 'Note';
+      statusNoteRow.querySelector('.jl-e-status-note').placeholder = opt?.dataset.noteLabel || 'Required for this status';
+    }
+    statusSelect.addEventListener('change', syncStatusNoteVisibility);
+    syncStatusNoteVisibility();
 
     const fundingSourceSelect = card.querySelector('.jl-e-funding-source');
     const fundingRefRow = card.querySelector('.jl-e-funding-ref-row');
@@ -5207,6 +5407,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       try {
         await api(`/api/pg/job-lines/${jlId}`, { method: 'PATCH', body: JSON.stringify({
           title: card.querySelector('.jl-e-title').value.trim(),
+          statusId: Number(statusSelect.value), statusNote: card.querySelector('.jl-e-status-note').value,
           responsibilityClass: card.querySelector('.jl-e-resp').value,
           fundingSource: fundingSourceSelect.value,
           fundingRefId: fundingRefRow.hidden ? '' : (fundingRefRow.querySelector('select').value || ''),
