@@ -1,14 +1,13 @@
 {
   "name": "camp-audit",
   "version": "0.1.0",
-  "description": "Camp Sychar CMMS audit + work-order app (NocoDB Data API front-end)",
+  "description": "Camp Sychar CMMS audit + work-order app (Postgres-backed)",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "migrate": "node scripts/migrate.js",
-    "export-nocodb": "node scripts/export-nocodb.mjs",
     "load-postgres": "node scripts/load-postgres.mjs"
   },
   "dependencies": {

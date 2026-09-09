@@ -1,9 +1,6 @@
-// Postgres-backed mirror of reportData.js's buildCapitalPlan. Kept as a separate
-// module (rather than editing reportData.js) so the live NocoDB-backed app is
-// never touched by this migration — see the brief's "build alongside, don't
-// break the current one" rule. Reuses currentComponentState() from
-// components.js UNCHANGED, so "what counts as current" stays defined once,
-// regardless of which database it reads from.
+// Report data builders, reading from Postgres. Reuses currentComponentState()
+// from components.js UNCHANGED, so "what counts as current" stays defined
+// once, regardless of which database it reads from.
 import {
   getAllComponentRowsWithAssetInfo, getBoardReportRawData, getBoardFocusItems, historicalAvgActualCost,
   getWorkPerformedRawData, getDeferredFindingsBacklogRawData,

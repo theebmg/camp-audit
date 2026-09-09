@@ -1,13 +1,9 @@
-// Postgres-backed parallel of routes/api.js — the migration brief's "build
-// alongside, cut over only when proven" path. Mounted at /api/pg, additive:
-// the live /api (NocoDB-backed) is untouched. Covers the step-4 bar: audit
-// submit + one report (capital plan) working end-to-end on Postgres.
+// The app's API — Postgres-backed. Mounted at /api/pg (kept as the mount
+// path through the NocoDB cutover; the old NocoDB-backed routes/api.js is gone).
 //
 // Property values in request/response bodies here use snake_case field KEYS
 // (e.g. "has_key") matching the assets table columns and asset_property_fields
-// catalog — NOT the NocoDB "Has Key" title-case labels the live /api uses. The
-// frontend will need a small adapter when it's pointed at this path (step 5/8);
-// that's expected, not a bug.
+// catalog.
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
