@@ -126,12 +126,14 @@ asset — uploaded once.
   / Add to Job Line / New Finding / File to Asset for reference / Void) and
   the rest stays in the inbox — a 20-photo walkthrough email can become
   three separate work orders without losing track of what's left.
-- **Email ingest** (`src/mailIngest.js`) polls an IMAP mailbox every 5
-  minutes. A subject line like "WO 1000" skips the inbox entirely and
-  attaches straight to that work order. Everything else gets fuzzy-matched
-  against asset names and offered as suggestions — never auto-assigned.
-  *This mailbox integration has not yet been exercised against a live
-  server* — see the follow-ups section below.
+- **Email ingest** (`src/routes/mail-inbound.js`) is a Mailgun inbound
+  webhook at `photos@cmms.fracturedrv.com` — originally built as an IMAP
+  poller (Build Brief v2 §5.2), replaced by Build Brief v2.1 Part 1 before
+  any mailbox was ever created. A subject line like "WO 1000" skips the
+  inbox entirely and attaches straight to that work order. Everything else
+  gets fuzzy-matched against asset names and offered as suggestions — never
+  auto-assigned. *Not yet exercised against a live Mailgun webhook* — see
+  the follow-ups section below.
 - **GPS-based suggestions**: a one-time 3-point calibration maps real-world
   GPS to the campmap's pixel space, so a photo's EXIF location can suggest
   the nearest asset during triage.
@@ -199,12 +201,13 @@ Scheduled without any extra steps.
 
 ## What's genuinely not built yet
 
-- **Live email ingest is unverified.** The code is written and defensive
-  (a bad poll logs and moves on, never crashes the app), but there were no
-  real IMAP credentials to test against this session. Add
-  `IMAP_HOST`/`IMAP_USER`/`IMAP_PASSWORD` (and optionally `IMAP_PORT`/
-  `IMAP_MAILBOX`) to `.env`, redeploy, and watch the container logs on the
-  first real poll.
+- **Live email ingest is unverified.** The route (`src/routes/mail-inbound.js`,
+  Build Brief v2.1 Part 1) is written and defensive, but there was no real
+  `MAILGUN_SIGNING_KEY` to test against this session, and the Mailgun route
+  itself still needs configuring in the Mailgun dashboard. Set
+  `MAILGUN_SIGNING_KEY` in `.env`, redeploy, point Mailgun's route at
+  `https://audit.fracturedrv.com/api/pg/mail-inbound`, and send a real
+  email.
 - **Manual photo re-selection when a report has more images than the
   embed cap** — the report auto-picks the best photos by role priority
   instead of prompting the user to choose. Worth building once real

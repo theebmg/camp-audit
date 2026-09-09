@@ -1,3 +1,72 @@
+# Runbook: Mail Ingest → Mailgun Webhook (Build Brief v2.1, Part 1)
+
+Migration 0052. Replaces Phase 5's IMAP poller entirely — see
+`toClaudeCode/BUILD_BRIEF_v2.1_corrections_verification_backups.md` for the
+brief; `BUILD_BRIEF_v2_joblines_lifecycle_attachments.md` §5.2 is marked
+superseded rather than edited, so the original design record stays intact.
+
+## What changed
+- `src/mailIngest.js` (IMAP poll via `imapflow`/`mailparser`, never
+  exercised against a live mailbox — see Phase 5's runbook below) is
+  **deleted**, along with the `setInterval` poll loop in `server.js` and the
+  `imapflow`/`mailparser` deps. There is no mailbox, no credentials, no
+  reconnect logic anymore.
+- New public route `POST /api/pg/mail-inbound` (`src/routes/mail-inbound.js`,
+  mounted in `server.js` **before** the `/api/pg` `requireAuth` block —
+  Express matches `app.use` prefixes in registration order, so mounting
+  order here isn't cosmetic). Mailgun receives mail at
+  `photos@cmms.fracturedrv.com` (its own subdomain/MX records — root-domain
+  Google Workspace mail untouched), parses the MIME itself, and POSTs here
+  with attachments as multipart file fields — no MIME parsing on our side.
+- Every request is HMAC-SHA256 verified
+  (`timestamp+token` against `MAILGUN_SIGNING_KEY`, timing-safe compare)
+  with a 5-minute replay window before anything else runs; a bad/missing
+  signature is a 401 with nothing else touched. New env vars:
+  `MAILGUN_SIGNING_KEY`, `MAIL_INBOUND_DOMAIN`.
+- Idempotency: `attachment_batches.message_id` UNIQUE, same guard as before.
+  The batch row is written **last**, in the same transaction as its
+  attachment rows (`createMailInboundBatch` in `db.js`), only after every
+  attachment has already been uploaded to Spaces — so a failed attempt
+  leaves no batch row at all, and a Mailgun retry starts clean instead of
+  being blocked by the UNIQUE constraint on a half-ingested batch. A
+  pre-upload existence check (`findAttachmentBatchByMessageId`) also skips
+  redundant storage uploads on an already-ingested retry.
+- Junk filtering, the `WO 1000` subject shortcut, and the sub-200px image
+  drop are unchanged in behavior — `content-id-map` (a Mailgun field mapping
+  Content-ID header values to attachment field names) replaces mailparser's
+  `contentDisposition`/`related` check as the way inline parts are
+  identified.
+- `attachment_batches` gained `spf_result`/`dkim_result` columns (migration
+  0052), populated from Mailgun's own verdict headers. Not used for
+  filtering — the mailbox stays deliberately open — just captured for a
+  future whitelist/spam gate.
+- New deploy requirement: the app must be reachable at a stable HTTPS URL
+  for Mailgun to POST to. Already true here — Caddy proxies
+  `audit.fracturedrv.com` → `camp-audit:3000` (see `Caddyfile.snippet`) — but
+  this is a new *dependency* that didn't exist under polling; if that route
+  ever goes down, inbound mail silently queues in Mailgun (and eventually
+  bounces) instead of failing loudly.
+
+## Known gaps / follow-ups
+- **Not yet exercised against a live Mailgun webhook** — no
+  `MAILGUN_SIGNING_KEY` was available this session, and the Mailgun route
+  (photos@cmms.fracturedrv.com → this endpoint) has to be configured in the
+  Mailgun dashboard by whoever owns that account before a real email can
+  reach it. Send a real 3-photo email once that's wired up and confirm:
+  batch row created, attachments in Spaces with thumbnails, EXIF
+  `taken_at`/GPS populated, and a deliberate replay of the same `Message-Id`
+  creating nothing new. Also confirm a `WO 1000`-subject email skips the
+  inbox.
+- `spf_result`/`dkim_result` extraction assumes Mailgun surfaces
+  `X-Mailgun-Spf`/`X-Mailgun-Dkim-Check-Result` as top-level POST fields (per
+  Mailgun's documented inbound payload); falls back to parsing
+  `message-headers` if not. Worth confirming against a real payload once one
+  arrives — this was written against documentation, not a live sample.
+- No sender whitelist (same deliberate/settled decision as Phase 5) —
+  `mail-inbound.js`'s handler is the single place to add one later.
+
+---
+
 # Runbook: Audit → Work Order (Build Brief v2, Phase 7)
 
 Phase 7 landed 2026-09-09. Migration 0051. **This is the last phase in
@@ -172,21 +241,13 @@ Phase 5 landed 2026-09-09. Migrations 0048–0049.
   and fuzzy subject-match asset suggestions
   (`suggestAssetsForText`/`nearestAssetsToGps`) surface as tappable chips in
   every action panel that needs an asset — never auto-assigned.
-- **Email ingest** (§5.2): new `src/mailIngest.js` (isolated from
-  `mailer.js` the same way `storage.js` is isolated for S3 — only module
-  that knows IMAP), polled every 5 minutes from `server.js` via
-  `setInterval`, no-ops silently when `IMAP_HOST`/`IMAP_USER`/
-  `IMAP_PASSWORD` aren't set (mirrors `mailIsConfigured()`'s convention).
-  **Not yet exercised against a live mailbox** — there were no IMAP
-  credentials available this session to test with; the code is written
-  carefully against imapflow's documented API and is defensive at every
-  step (a bad poll logs and returns, never crashes the server), but the
-  first real poll once `cmms@fracturedrv.com` credentials are in `.env`
-  should be watched. Subject `/\bWO\s*(\d+(-\d+)?)\b/i` skips the inbox
-  entirely and attaches straight to that WO (looked up by `wo_number`, so
-  it works for both split children like "1000-2" and plain ids). Junk
-  filter drops inline/related MIME parts and images under 200px on both
-  edges before they ever reach the inbox.
+- **Email ingest** (§5.2): **superseded** — this was originally built as an
+  IMAP poller against `cmms@fracturedrv.com`. That mailbox was never
+  created; Build Brief v2.1 Part 1 replaced it outright with a Mailgun
+  inbound webhook. See the "Mail Ingest → Mailgun Webhook" runbook at the
+  top of this file for what actually exists now (`src/routes/mail-inbound.js`).
+  The subject shortcut regex, fuzzy-match suggestions, and junk-image filter
+  described here carried over unchanged in behavior.
 - **Map GPS calibration** (§5.3): `map_calibration_points` table (0049),
   exactly 3 points enforced at the `createMapCalibrationPoint` layer (a 4th
   insert is rejected — delete one first). `solveAffine`/`gpsToMapPixel` in
@@ -204,13 +265,9 @@ Phase 5 landed 2026-09-09. Migrations 0048–0049.
   "shot within 4 minutes, 80 feet apart" — a GPS-haversine-distance check
   should join the time check once there's real GPS-tagged test data to
   verify against (there wasn't any this session).
-- Email ingest is unverified against a live mailbox — see above. Test the
-  first real poll once IMAP credentials exist; watch the container logs
-  (`mailIngest: poll failed: ...` / `mailIngest: failed to ingest a
-  message`) for anything imapflow's actual server behavior didn't match the
-  documented API this was written against.
-- No sender whitelist on email ingest (§5.2, settled/deliberate for now) —
-  `ingestOneMessage` is the single place to add one later.
+- Email ingest: **superseded**, see the "Mail Ingest → Mailgun Webhook"
+  runbook at the top of this file for the current gaps (it's a Mailgun
+  webhook now, not IMAP).
 - Hard-delete reaper for `deleted_at`-older-than-30-days attachments is
   still not built (same low-priority gap noted in Phase 4).
 

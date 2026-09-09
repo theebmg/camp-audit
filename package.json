@@ -17,8 +17,6 @@
     "exifr": "^7.1.3",
     "express": "^4.19.2",
     "express-session": "^1.18.0",
-    "imapflow": "^1.7.8",
-    "mailparser": "^3.9.23",
     "multer": "^2.2.0",
     "nodemailer": "^9.0.5",
     "pdfkit": "^0.20.1",

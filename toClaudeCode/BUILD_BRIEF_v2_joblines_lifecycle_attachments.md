@@ -539,7 +539,19 @@ real work.
 
 ## 5.2 Email ingest
 
-- Mailbox: `cmms@fracturedrv.com`. IMAP poll on an interval (5 min is fine).
+> **SUPERSEDED by Build Brief v2.1 Part 1.** `cmms@fracturedrv.com` was
+> never created and never will be — the design changed to a Mailgun inbound
+> webhook at `photos@cmms.fracturedrv.com` (a dedicated subdomain), with
+> Mailgun doing the MIME parsing instead of an IMAP poll +
+> `imapflow`/`mailparser`. See
+> `toClaudeCode/BUILD_BRIEF_v2.1_corrections_verification_backups.md` and
+> `update-for-claude.md`'s "Mail Ingest → Mailgun Webhook" runbook for what
+> was actually built. The subject-line shortcuts, fuzzy asset matching, and
+> junk filtering described below carried over unchanged in behavior — only
+> the transport and dedupe-key extraction changed (`message_id` UNIQUE is
+> still the guard).
+
+- ~~Mailbox: `cmms@fracturedrv.com`. IMAP poll on an interval (5 min is fine).~~
 - **Open relay for now** — no sender whitelist. Settled. Structure the code so a
   whitelist is a single check to add later.
 - `message_id` UNIQUE is the double-processing guard.
@@ -548,8 +560,8 @@ real work.
   attachments. This kills signature logos and tracking pixels. Void handles the
   rest.
 - Subject and body land on the batch.
-- Mailer code already exists (`src/mailer.js`) — outbound only. This is new
-  inbound work; keep it in its own module.
+- ~~Mailer code already exists (`src/mailer.js`) — outbound only. This is new
+  inbound work; keep it in its own module.~~
 
 ### Subject line shortcuts
 - Subject matching `/\bWO\s*(\d+(-\d+)?)\b/i` → attach directly to that work

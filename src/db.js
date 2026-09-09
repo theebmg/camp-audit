@@ -3188,6 +3188,64 @@ export async function deleteAttachmentRole(id) {
   if (rows[0]) await logActivity({ action: 'deleted', entityType: 'attachment_role', entityId: Number(id), entityLabel: rows[0].name });
 }
 
+// ── Mail-inbound ingest (Build Brief v2.1 Part 1) — the Mailgun webhook
+//    route (routes/mail-inbound.js) does signature verification, multipart
+//    parsing, junk filtering, and storage uploads; everything that touches
+//    SQL happens here, same boundary as the rest of the app. ──────────────
+
+export async function findAttachmentBatchByMessageId(messageId) {
+  const { rows } = await pool.query('SELECT id FROM attachment_batches WHERE message_id = $1', [messageId]);
+  return rows[0]?.id || null;
+}
+
+export async function findWorkOrderIdByNumber(woNumber) {
+  const { rows } = await pool.query('SELECT id FROM work_orders WHERE wo_number = $1', [woNumber]);
+  return rows[0]?.id || null;
+}
+
+// Writes the batch row and its attachments together, in one transaction, only
+// after every attachment has already been uploaded to Spaces (attachments
+// param is a list of storeAttachment() results). This is deliberate ordering,
+// not incidental: if it failed with the batch row written first and the
+// upload loop second, a retry of the same Message-Id would hit the UNIQUE
+// constraint's ON CONFLICT DO NOTHING, silently no-op, and leave the batch
+// permanently short its attachments. Writing the batch row last means a
+// failed attempt leaves no batch row at all, so Mailgun's retry starts clean.
+// Returns null (not an error) if the batch already exists — the caller's
+// idempotency case, not a failure.
+export async function createMailInboundBatch({ subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments, targetWorkOrderId }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO attachment_batches (source, subject, body_text, sender_email, message_id, received_at, spf_result, dkim_result)
+       VALUES ('email',$1,$2,$3,$4,$5,$6,$7) ON CONFLICT (message_id) DO NOTHING RETURNING id`,
+      [subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult]
+    );
+    if (!rows[0]) { await client.query('ROLLBACK'); return null; }
+    const batchId = rows[0].id;
+
+    for (const meta of attachments) {
+      const insertRes = await client.query(
+        `INSERT INTO attachments (url, thumb_url, kind, mime_type, file_size, original_filename, width, height, taken_at, gps_lat, gps_lng, source, batch_id, triage_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'email',$12,$13) RETURNING id`,
+        [meta.url, meta.thumbUrl, meta.kind, meta.mimeType, meta.fileSize, meta.originalFilename, meta.width, meta.height,
+          meta.takenAt, meta.gpsLat, meta.gpsLng, batchId, targetWorkOrderId ? 'triaged' : 'inbox']
+      );
+      if (targetWorkOrderId) {
+        await linkAttachment(insertRes.rows[0].id, { entityType: 'work_order', entityId: targetWorkOrderId }, client);
+      }
+    }
+    await client.query('COMMIT');
+    return batchId;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
 // ── Triage inbox (Build Brief v2 Phase 5, §5.3) — batches with at least one
 //    attachment still in triage_status='inbox'. A batch is a suggestion, not
 //    a commitment: acting on a subset of its photos leaves the rest in the
