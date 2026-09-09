@@ -6,15 +6,15 @@
 // approve/deny, convert to Work Order, email) lives in pg-api.js behind auth.
 import express from 'express';
 import multer from 'multer';
-import { getRequestFormFields, createMaintenanceRequest, listLocations, createRequestMessage } from '../db.js';
-import { uploadPhoto } from '../storage.js';
+import { getRequestFormFields, createMaintenanceRequest, listLocations, createRequestMessage, createAttachment } from '../db.js';
+import { storeAttachment } from '../storage.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import { renderPlainEmailHtml } from '../reportRender.js';
 
 const router = express.Router();
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024, files: 5 },
+  limits: { fileSize: 25 * 1024 * 1024, files: 5 },
   fileFilter: (req, file, cb) => cb(null, /^image\//.test(file.mimetype)),
 });
 
@@ -44,13 +44,16 @@ router.get('/locations', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Uploads unlinked — the request row doesn't exist yet at photo-upload time
+// (the form collects photos before it submits). /submit links them by id.
 router.post('/upload', upload.single('photo'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No image uploaded' });
-    const url = await uploadPhoto(req.file.buffer, {
+    const meta = await storeAttachment(req.file.buffer, {
       filename: req.file.originalname, mimetype: req.file.mimetype, category: 'requests', ownerId: 'public',
     });
-    res.json({ ok: true, url });
+    const attachment = await createAttachment(meta, { source: 'upload' });
+    res.json({ ok: true, attachmentId: attachment.Id });
   } catch (e) { next(e); }
 });
 
@@ -62,8 +65,8 @@ router.post('/submit', async (req, res, next) => {
     // Honeypot: a field named "company" that's hidden via CSS on the real form.
     // A human never fills it in; a bot filling every field will.
     if (req.body?.company) return res.json({ ok: true }); // pretend success, drop it silently
-    const { values, photoUrls } = req.body || {};
-    const request = await createMaintenanceRequest({ values: values || {}, photoUrls: Array.isArray(photoUrls) ? photoUrls : [] });
+    const { values, attachmentIds } = req.body || {};
+    const request = await createMaintenanceRequest({ values: values || {}, attachmentIds: Array.isArray(attachmentIds) ? attachmentIds : [] });
 
     if (mailIsConfigured() && request.RequesterEmail) {
       const subject = `We received your maintenance request (Ref #${request.Id})`;

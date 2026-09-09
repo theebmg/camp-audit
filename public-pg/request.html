@@ -151,19 +151,19 @@
           }
 
           const photoFiles = fd.getAll('photos').filter((f) => f && f.size);
-          const photoUrls = [];
+          const attachmentIds = [];
           for (const file of photoFiles) {
             const upFd = new FormData();
             upFd.append('photo', file);
             const res = await fetch('/api/request-portal/upload', { method: 'POST', body: upFd });
             const body = await res.json();
-            if (res.ok && body.ok) photoUrls.push(body.url);
+            if (res.ok && body.ok) attachmentIds.push(body.attachmentId);
           }
 
           const res = await fetch('/api/request-portal/submit', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ values, photoUrls, company: fd.get('company') || '' }),
+            body: JSON.stringify({ values, attachmentIds, company: fd.get('company') || '' }),
           });
           const body = await res.json();
           if (!res.ok || body.ok === false) throw new Error(body.error || 'Something went wrong — please try again.');

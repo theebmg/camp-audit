@@ -12,6 +12,7 @@ import manageRouter from './routes/manage.js';
 import reportsRouter from './routes/reports.js';
 import pgApiRouter from './routes/pg-api.js';
 import requestPortalRouter from './routes/request-portal.js';
+import mailInboundRouter from './routes/mail-inbound.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -85,6 +86,14 @@ app.get('/db-health', async (req, res) => {
   }
 });
 
+// Mailgun inbound webhook (Build Brief v2.1 Part 1, replaces the old IMAP
+// poller) — public; the caller is Mailgun, not a logged-in user, and the
+// route does its own signature verification instead of a session. MUST be
+// mounted before the '/api/pg' requireAuth block below: Express matches
+// app.use paths by prefix in registration order, so '/api/pg' would
+// otherwise intercept '/api/pg/mail-inbound/*' and reject it with
+// requireAuth before this router ever saw the request.
+app.use('/api/pg/mail-inbound', mailInboundRouter);
 // Postgres-backed parallel API (migration in progress) — additive, does not
 // replace /api. See toClaudeCode/camp-cmms-postgres-migration-brief.md.
 app.use('/api/pg', requireAuth, pgApiRouter);
@@ -116,4 +125,7 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`camp-audit listening on :${PORT}`);
+  // Email-fed triage inbox (Build Brief v2.1 Part 1) is now the Mailgun
+  // webhook at /api/pg/mail-inbound (routes/mail-inbound.js) — nothing to
+  // start here. The old IMAP poll interval is gone along with mailIngest.js.
 });

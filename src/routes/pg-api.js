@@ -11,9 +11,12 @@
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
-import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg } from '../reportDataPg.js';
-import { renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText, renderPlainEmailHtml } from '../reportRender.js';
-import { uploadPhoto } from '../storage.js';
+import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg, buildWorkPerformedReportPg, buildDeferredBacklogReportPg } from '../reportDataPg.js';
+import {
+  renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText, renderPlainEmailHtml,
+  renderWorkPerformedHtml, renderWorkPerformedText, renderDeferredBacklogHtml, renderDeferredBacklogText,
+} from '../reportRender.js';
+import { storeAttachment } from '../storage.js';
 import { renderChecklistPdf, renderWorkOrderScopePdf } from '../pdf.js';
 import { currentUsername, currentRole } from '../requestContext.js';
 import {
@@ -28,17 +31,25 @@ import {
   adminGetApplicabilityMatrix, adminSetApplicability,
   adminListSubAreas, adminCreateSubArea, adminDeleteSubArea,
   listWorkOrders, getWorkOrderDetail, createWorkOrder, updateWorkOrder, duplicateWorkOrder, getWorkOrderSummary,
+  workOrderRollup, workOrderCloseGate,
+  listWorkOrderStatuses, listJobLineStatuses,
+  adminListWorkOrderStatuses, adminCreateWorkOrderStatus, adminUpdateWorkOrderStatus, adminDeleteWorkOrderStatus,
+  adminListJobLineStatuses, adminCreateJobLineStatus, adminUpdateJobLineStatus, adminDeleteJobLineStatus,
+  getDisplaySettings, updateDisplaySettings,
   listWorkOrderTemplates, createWorkOrderTemplate, updateWorkOrderTemplate, deleteWorkOrderTemplate,
   addAssetUpdateToWorkOrder, deleteAssetUpdate, completeWorkOrder,
-  assignVolunteer, unassignVolunteer, assignVendor, unassignVendor,
+  listJobLines, getJobLine, createJobLine, updateJobLine, deleteJobLine,
+  assignVolunteerToJobLine, unassignVolunteerFromJobLine, assignVendorToJobLine, unassignVendorFromJobLine,
+  listCauses, createCause, updateCause, deleteCause,
   listVolunteers, createVolunteer, updateVolunteer, removeVolunteer,
   listVendors, createVendor, updateVendor, removeVendor,
   listSkills, createSkill, searchAssetsLive, createAssetQuick,
-  listWorkOrderTasks, createWorkOrderTask, updateWorkOrderTask, deleteWorkOrderTask,
-  listWorkOrderPhotos, createWorkOrderPhoto, deleteWorkOrderPhoto,
-  listWorkOrderTaskPhotosForWorkOrder, createWorkOrderTaskPhoto, deleteWorkOrderTaskPhoto,
+  listAttachmentsForEntity, listAttachmentsForEntities, createAttachment, createAndLinkAttachment,
+  updateAttachmentLink, detachAttachment, voidAttachment,
+  listAttachmentRoles, createAttachmentRole, updateAttachmentRole, deleteAttachmentRole,
   listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
+  listJobLinesScheduledInRange,
   generateDueWorkOrdersForRange,
   listChecklistTemplates, createChecklistTemplate, updateChecklistTemplate, deleteChecklistTemplate,
   getChecklistInstanceForWorkOrder, getChecklistInstanceForCalendarEvent,
@@ -52,38 +63,195 @@ import {
   listCabinHolders, createCabinHolder, updateCabinHolder, deleteCabinHolder,
   getAssetsReportRawData, getWorkOrdersReportRawData, getWorkOrderLogReportRawData,
   listCrewSessionsForWorkOrder, createCrewSession, deleteCrewSession, getCrewSessionReportRawData, getCrewHoursSummary,
+  getJobLinesReportRawData, getFindingsReportRawData,
   listReportFavorites, createReportFavorite, deleteReportFavorite,
   adminListRequestFields, adminCreateRequestField, adminUpdateRequestField,
   listMaintenanceRequests, getMaintenanceRequestDetail, updateMaintenanceRequestStatus,
   convertRequestToWorkOrder, linkRequestToAsset, listRequestMessages, createRequestMessage,
-  updateConditionFinding,
+  updateConditionFinding, deferFinding, dismissFinding, getFindingsSummary,
   listMapPins, setAssetMapLocation, listMapFeatures, createMapFeature, updateMapFeature, deleteMapFeature,
   listMapLayers, createMapLayer, updateMapLayer, deleteMapLayer,
+  listInboxBatches, getInboxCount, suggestAssetsForText, triageAttachToEntity, triageCreateWorkOrder, triageCreateFinding, voidAttachments,
+  splitWorkOrder, getWorkOrderFamily,
+  listMapCalibrationPoints, createMapCalibrationPoint, deleteMapCalibrationPoint, nearestAssetsToGps,
+  listJobLineTemplates, createJobLineTemplate, updateJobLineTemplate, deleteJobLineTemplate,
+  getOpenFindingsForWoCreation, createWorkOrderFromFindings,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import {
   buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows, buildCrewSessionReportRows,
+  buildJobLineReportRows, JOB_LINE_COLUMN_SPECS, buildFindingReportRows, FINDING_COLUMN_SPECS,
   assetColumnSpecs, WORK_ORDER_COLUMN_SPECS, WORK_ORDER_LOG_COLUMN_SPECS, CREW_SESSION_COLUMN_SPECS,
   columnDefsFromRows, applyReportFilters, rowsToCsv, canonicalFiltersKey,
 } from '../reports.js';
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+// 25MB, not 15 — most mail servers reject above 25MB anyway (Phase 5 email
+// ingest), so the upload path matches that ceiling everywhere, not just here.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-// Generic photo upload -> DigitalOcean Spaces, returns the URL to attach
-// wherever the caller needs it (a note, a finding, ...). category/ownerId are
-// just for readable object keys in the bucket, not access control.
-router.post('/upload', upload.single('photo'), async (req, res, next) => {
+// ---- Attachments (Build Brief v2 Phase 4) — replaces the old generic
+// /upload + nine per-locus photo tables. One route ingests (resize/thumb/
+// EXIF via storage.js) and, when entityType+entityId are given, links in the
+// same step. Omitting them uploads unlinked — the audit form and the public
+// maintenance-request portal need this because the row a photo belongs to
+// (a finding, a component event, the request itself) doesn't exist until the
+// whole form submits; the caller links it afterward, server-side. ----
+
+router.post('/attachments', upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
-    const url = await uploadPhoto(req.file.buffer, {
+    const meta = await storeAttachment(req.file.buffer, {
       filename: req.file.originalname,
       mimetype: req.file.mimetype,
       category: req.body.category || 'misc',
       ownerId: req.body.ownerId || 'unknown',
     });
-    res.json({ ok: true, url });
+    const { entityType, entityId, roleId, classification, caption } = req.body || {};
+    if (entityType && entityId) {
+      const { attachment, linkId } = await createAndLinkAttachment(meta,
+        { entityType, entityId: Number(entityId), roleId: roleId ? Number(roleId) : null, classification: classification || null, caption: caption || null },
+        { source: 'upload', uploadedBy: currentUsername() });
+      return res.json({ ok: true, attachment: { ...attachment, LinkId: linkId } });
+    }
+    const attachment = await createAttachment(meta, { source: 'upload', uploadedBy: currentUsername() });
+    res.json({ ok: true, attachment });
   } catch (e) { next(e); }
+});
+
+router.get('/attachments', async (req, res, next) => {
+  try {
+    const { entityType, entityId } = req.query;
+    if (!entityType || !entityId) return res.status(400).json({ ok: false, error: 'entityType and entityId are required' });
+    res.json({ attachments: await listAttachmentsForEntity(entityType, entityId) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/attachment-links/:linkId', async (req, res, next) => {
+  try {
+    const { roleId, classification, caption, includeInReport, sortOrder, vendorId, quotedAmount, quoteDate, isSelectedQuote } = req.body || {};
+    const updated = await updateAttachmentLink(req.params.linkId, {
+      roleId: roleId === undefined ? undefined : (roleId ? Number(roleId) : null),
+      classification, caption, includeInReport, sortOrder, vendorId: vendorId ? Number(vendorId) : undefined,
+      quotedAmount, quoteDate, isSelectedQuote,
+    });
+    if (!updated) return res.status(404).json({ ok: false, error: 'Attachment link not found' });
+    res.json({ ok: true, attachment: updated });
+  } catch (e) { next(e); }
+});
+
+// Detach — removes this one link only. Fast, no confirm expected client-side.
+router.delete('/attachment-links/:linkId', async (req, res, next) => {
+  try { await detachAttachment(req.params.linkId); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// Void — soft-deletes the file everywhere it's linked. One tap, no confirm —
+// see voidAttachment's comment in db.js for why.
+router.post('/attachments/:id/void', async (req, res, next) => {
+  try { await voidAttachment(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.get('/attachment-roles', async (req, res, next) => {
+  try { res.json({ roles: await listAttachmentRoles({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/attachment-roles', async (req, res, next) => {
+  try {
+    const { name, sortOrder } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, role: await createAttachmentRole({ name: name.trim(), sortOrder }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/attachment-roles/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, defaultIncludeInReport, active } = req.body || {};
+    const updated = await updateAttachmentRole(req.params.id, { name, sortOrder, defaultIncludeInReport, active });
+    if (!updated) return res.status(404).json({ ok: false, error: 'Role not found' });
+    res.json({ ok: true, role: updated });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/attachment-roles/:id', async (req, res, next) => {
+  try { await deleteAttachmentRole(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Triage inbox (Build Brief v2 Phase 5) ----
+
+router.get('/inbox', async (req, res, next) => {
+  try { res.json({ batches: await listInboxBatches() }); } catch (e) { next(e); }
+});
+router.get('/inbox/count', async (req, res, next) => {
+  try { res.json({ count: await getInboxCount() }); } catch (e) { next(e); }
+});
+router.get('/inbox/suggest-assets', async (req, res, next) => {
+  try {
+    const { text, lat, lng } = req.query;
+    if (lat && lng) return res.json({ suggestions: await nearestAssetsToGps(Number(lat), Number(lng)) });
+    res.json({ suggestions: await suggestAssetsForText(text || '') });
+  } catch (e) { next(e); }
+});
+router.post('/inbox/attach', async (req, res, next) => {
+  try {
+    const { attachmentIds, entityType, entityId, roleId } = req.body || {};
+    if (!Array.isArray(attachmentIds) || !attachmentIds.length) return res.status(400).json({ ok: false, error: 'attachmentIds is required' });
+    await triageAttachToEntity(attachmentIds, entityType, Number(entityId), { roleId: roleId ? Number(roleId) : null });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+router.post('/inbox/create-work-order', async (req, res, next) => {
+  try {
+    const { attachmentIds, assetId, title } = req.body || {};
+    if (!Array.isArray(attachmentIds) || !attachmentIds.length) return res.status(400).json({ ok: false, error: 'attachmentIds is required' });
+    if (!title) return res.status(400).json({ ok: false, error: 'title is required' });
+    res.json({ ok: true, ...(await triageCreateWorkOrder(attachmentIds, { assetId: assetId ? Number(assetId) : null, title })) });
+  } catch (e) { next(e); }
+});
+router.post('/inbox/create-finding', async (req, res, next) => {
+  try {
+    const { attachmentIds, assetId, severity, description } = req.body || {};
+    if (!Array.isArray(attachmentIds) || !attachmentIds.length) return res.status(400).json({ ok: false, error: 'attachmentIds is required' });
+    if (!assetId || !severity || !description) return res.status(400).json({ ok: false, error: 'assetId, severity, and description are required' });
+    res.json({ ok: true, ...(await triageCreateFinding(attachmentIds, { assetId: Number(assetId), severity, description })) });
+  } catch (e) { next(e); }
+});
+router.post('/inbox/void', async (req, res, next) => {
+  try {
+    const { attachmentIds } = req.body || {};
+    if (!Array.isArray(attachmentIds) || !attachmentIds.length) return res.status(400).json({ ok: false, error: 'attachmentIds is required' });
+    await voidAttachments(attachmentIds);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ---- Work order splitting + family (Build Brief v2 Phase 5, §5.4) ----
+
+router.post('/work-orders/:id/split', async (req, res, next) => {
+  try {
+    const { jobLineIds } = req.body || {};
+    if (!Array.isArray(jobLineIds) || !jobLineIds.length) return res.status(400).json({ ok: false, error: 'jobLineIds is required' });
+    res.json({ ok: true, ...(await splitWorkOrder(Number(req.params.id), jobLineIds.map(Number))) });
+  } catch (e) { next(e); }
+});
+router.get('/work-orders/:id/family', async (req, res, next) => {
+  try {
+    const family = await getWorkOrderFamily(req.params.id);
+    if (!family) return res.status(404).json({ ok: false, error: 'Work order not found' });
+    res.json(family);
+  } catch (e) { next(e); }
+});
+
+// ---- Map GPS calibration (Build Brief v2 Phase 5, §5.3) ----
+
+router.get('/admin/map-calibration', async (req, res, next) => {
+  try { res.json({ points: await listMapCalibrationPoints() }); } catch (e) { next(e); }
+});
+router.post('/admin/map-calibration', async (req, res, next) => {
+  try {
+    const { label, lat, lng, mapX, mapY } = req.body || {};
+    if (!label || lat == null || lng == null || mapX == null || mapY == null) return res.status(400).json({ ok: false, error: 'label, lat, lng, mapX, and mapY are all required' });
+    res.json({ ok: true, point: await createMapCalibrationPoint({ label, lat: Number(lat), lng: Number(lng), mapX: Number(mapX), mapY: Number(mapY) }) });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/map-calibration/:id', async (req, res, next) => {
+  try { await deleteMapCalibrationPoint(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 // Condition Findings severity options — mirrors the live NocoDB Severity select.
@@ -137,8 +305,9 @@ router.get('/search', async (req, res, next) => {
 
 router.get('/options', async (req, res, next) => {
   try {
-    const [propertyFields, componentSchema, buildingTypes] = await Promise.all([
+    const [propertyFields, componentSchema, buildingTypes, workOrderStatuses, jobLineStatuses, displaySettings, attachmentRoles] = await Promise.all([
       getAssetPropertyFields(), getComponentTypeCatalog(), listBuildingTypes(),
+      listWorkOrderStatuses(), listJobLineStatuses(), getDisplaySettings(), listAttachmentRoles(),
     ]);
     res.json({
       propertyFields,
@@ -146,7 +315,9 @@ router.get('/options', async (req, res, next) => {
       eventTypeOptions: componentSchema.eventTypeOptions,
       conditionOptions: componentSchema.conditionOptions,
       buildingTypes,
+      workOrderStatuses, jobLineStatuses, displaySettings,
       findingSeverity: FINDING_SEVERITY_OPTIONS,
+      attachmentRoles,
       currentUser: { username: currentUsername(), role: currentRole() },
     });
   } catch (e) { next(e); }
@@ -287,9 +458,9 @@ router.get('/assets/:id/notes', async (req, res, next) => {
 
 router.post('/assets/:id/notes', async (req, res, next) => {
   try {
-    const { note, photoUrl } = req.body || {};
+    const { note, attachmentIds } = req.body || {};
     if (!note || !note.trim()) return res.status(400).json({ ok: false, error: 'note text is required' });
-    const created = await createAssetNote(req.params.id, { note: note.trim(), photoUrl: photoUrl || null, createdBy: req.session?.user || null });
+    const created = await createAssetNote(req.params.id, { note: note.trim(), attachmentIds: Array.isArray(attachmentIds) ? attachmentIds : [], createdBy: req.session?.user || null });
     res.json({ ok: true, note: created });
   } catch (e) { next(e); }
 });
@@ -340,6 +511,59 @@ router.patch('/condition-findings/:id', async (req, res, next) => {
     res.json({ ok: true, finding });
   } catch (e) { next(e); }
 });
+router.post('/condition-findings/:id/defer', async (req, res, next) => {
+  try {
+    const { reason, revisitDate } = req.body || {};
+    const finding = await deferFinding(req.params.id, { reason, revisitDate });
+    if (!finding) return res.status(404).json({ ok: false, error: 'Condition Finding not found' });
+    res.json({ ok: true, finding });
+  } catch (e) { next(e); }
+});
+router.post('/condition-findings/:id/dismiss', async (req, res, next) => {
+  try {
+    const { note } = req.body || {};
+    const finding = await dismissFinding(req.params.id, { note });
+    if (!finding) return res.status(404).json({ ok: false, error: 'Condition Finding not found' });
+    res.json({ ok: true, finding });
+  } catch (e) { next(e); }
+});
+router.get('/findings-summary', async (req, res, next) => {
+  try { res.json(await getFindingsSummary()); } catch (e) { next(e); }
+});
+
+// ---- Create WO from findings (Build Brief v2 Phase 7, §7.2) ----
+
+router.get('/assets/:id/open-findings-for-wo', async (req, res, next) => {
+  try { res.json({ findings: await getOpenFindingsForWoCreation(req.params.id) }); } catch (e) { next(e); }
+});
+router.post('/assets/:id/create-wo-from-findings', async (req, res, next) => {
+  try {
+    const { findings } = req.body || {}; // [{ findingId, title, responsibilityClass, fundingSource, estimatedCost }]
+    if (!Array.isArray(findings) || !findings.length) return res.status(400).json({ ok: false, error: 'Select at least one finding' });
+    res.json({ ok: true, ...(await createWorkOrderFromFindings(req.params.id, findings)) });
+  } catch (e) { next(e); }
+});
+
+router.get('/admin/job-line-templates', async (req, res, next) => {
+  try { res.json({ templates: await listJobLineTemplates({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/job-line-templates', async (req, res, next) => {
+  try {
+    const { buildingTypeId, componentType, defaultTitle, defaultResponsibilityClass, defaultFundingSource, sortOrder } = req.body || {};
+    if (!defaultTitle?.trim()) return res.status(400).json({ ok: false, error: 'Default title is required' });
+    res.json({ ok: true, template: await createJobLineTemplate({ buildingTypeId, componentType, defaultTitle: defaultTitle.trim(), defaultResponsibilityClass, defaultFundingSource, sortOrder }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/job-line-templates/:id', async (req, res, next) => {
+  try {
+    const updated = await updateJobLineTemplate(req.params.id, req.body || {});
+    if (!updated) return res.status(404).json({ ok: false, error: 'Template not found' });
+    res.json({ ok: true, template: updated });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/job-line-templates/:id', async (req, res, next) => {
+  try { await deleteJobLineTemplate(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
 
 router.get('/assets/:id/history', async (req, res, next) => {
   try {
@@ -351,8 +575,8 @@ router.get('/assets/:id/history', async (req, res, next) => {
 
 router.post('/assets/:id/audit', async (req, res, next) => {
   try {
-    const { properties = {}, componentEvents = [], finding = null, generalPhotos = [] } = req.body || {};
-    const result = await submitAudit(req.params.id, { properties, componentEvents, finding, generalPhotos });
+    const { properties = {}, componentEvents = [], finding = null, generalAttachmentIds = [] } = req.body || {};
+    const result = await submitAudit(req.params.id, { properties, componentEvents, finding, generalAttachmentIds });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
@@ -390,6 +614,14 @@ async function getReportRowsAndSpecs(entity) {
   if (entity === 'crewSessions') {
     const raw = await getCrewSessionReportRawData();
     return { rows: buildCrewSessionReportRows(raw), specs: CREW_SESSION_COLUMN_SPECS };
+  }
+  if (entity === 'jobLines') {
+    const raw = await getJobLinesReportRawData();
+    return { rows: buildJobLineReportRows(raw), specs: JOB_LINE_COLUMN_SPECS };
+  }
+  if (entity === 'findings') {
+    const raw = await getFindingsReportRawData();
+    return { rows: buildFindingReportRows(raw), specs: FINDING_COLUMN_SPECS };
   }
   return null;
 }
@@ -498,6 +730,43 @@ router.post('/reports/forward-focus/send', async (req, res, next) => {
       html: renderForwardFocusHtml(data),
       text: renderForwardFocusText(data),
     });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ---- Work Performed / Deferred Backlog — named reports (Build Brief v2 Phase 6) ----
+
+router.get('/reports/work-performed/preview', async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to are required' });
+    const data = await buildWorkPerformedReportPg({ from, to });
+    res.json({ title: 'Work Performed', html: renderWorkPerformedHtml(data), text: renderWorkPerformedText(data) });
+  } catch (e) { next(e); }
+});
+router.post('/reports/work-performed/send', async (req, res, next) => {
+  try {
+    const { from, to, recipient, subject } = req.body || {};
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to are required' });
+    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
+    const data = await buildWorkPerformedReportPg({ from, to });
+    await sendMail({ to: recipient, subject: subject || `Camp Sychar — Work Performed (${from} to ${to})`, html: renderWorkPerformedHtml(data), text: renderWorkPerformedText(data) });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+router.get('/reports/deferred-backlog/preview', async (req, res, next) => {
+  try {
+    const data = await buildDeferredBacklogReportPg();
+    res.json({ title: 'Deferred Maintenance Backlog', html: renderDeferredBacklogHtml(data), text: renderDeferredBacklogText(data) });
+  } catch (e) { next(e); }
+});
+router.post('/reports/deferred-backlog/send', async (req, res, next) => {
+  try {
+    const { recipient, subject } = req.body || {};
+    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
+    const data = await buildDeferredBacklogReportPg();
+    await sendMail({ to: recipient, subject: subject || 'Camp Sychar — Deferred Maintenance Backlog', html: renderDeferredBacklogHtml(data), text: renderDeferredBacklogText(data) });
     res.json({ ok: true });
   } catch (e) { next(e); }
 });
@@ -732,36 +1001,14 @@ router.get('/work-orders/:id', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    const [tasks, checklist, logEntries, crewSessions, photos, taskPhotosByTask] = await Promise.all([
-      listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id), listWorkOrderLogEntries(req.params.id),
-      listCrewSessionsForWorkOrder(req.params.id), listWorkOrderPhotos(req.params.id), listWorkOrderTaskPhotosForWorkOrder(req.params.id),
+    const [jobLines, checklist, logEntries, crewSessions, photos] = await Promise.all([
+      listJobLines(req.params.id), getChecklistInstanceForWorkOrder(req.params.id), listWorkOrderLogEntries(req.params.id),
+      listCrewSessionsForWorkOrder(req.params.id), listAttachmentsForEntity('work_order', req.params.id),
     ]);
-    for (const t of tasks) t.Photos = taskPhotosByTask.get(t.Id) || [];
-    res.json({ ...detail, tasks, checklist, logEntries, crewSessions, photos });
+    const jobLineAttachments = await listAttachmentsForEntities('job_line', jobLines.map((jl) => jl.Id));
+    for (const jl of jobLines) jl.Photos = jobLineAttachments.get(jl.Id) || [];
+    res.json({ ...detail, jobLines, checklist, logEntries, crewSessions, photos });
   } catch (e) { next(e); }
-});
-
-// ---- Work Order / Task photos ("solution" photos — proof a job got done) ----
-
-router.post('/work-orders/:id/photos', async (req, res, next) => {
-  try {
-    const { photoUrl, caption } = req.body || {};
-    if (!photoUrl) return res.status(400).json({ ok: false, error: 'photoUrl is required' });
-    res.json({ ok: true, photo: await createWorkOrderPhoto(req.params.id, { photoUrl, caption }) });
-  } catch (e) { next(e); }
-});
-router.delete('/work-order-photos/:photoId', async (req, res, next) => {
-  try { await deleteWorkOrderPhoto(req.params.photoId); res.json({ ok: true }); } catch (e) { next(e); }
-});
-router.post('/work-order-tasks/:taskId/photos', async (req, res, next) => {
-  try {
-    const { photoUrl } = req.body || {};
-    if (!photoUrl) return res.status(400).json({ ok: false, error: 'photoUrl is required' });
-    res.json({ ok: true, photo: await createWorkOrderTaskPhoto(req.params.taskId, photoUrl) });
-  } catch (e) { next(e); }
-});
-router.delete('/work-order-task-photos/:photoId', async (req, res, next) => {
-  try { await deleteWorkOrderTaskPhoto(req.params.photoId); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 router.post('/work-orders/:id/log', async (req, res, next) => {
@@ -779,16 +1026,17 @@ router.delete('/work-order-log/:id', async (req, res, next) => {
 });
 
 // ---- Crew Sessions — attendance-based hours, optionally tied to a Work
-// Order (workOrderId) or standalone (activity label instead) ----
+// Order (workOrderId) or standalone (activity label instead). jobLineId is
+// optional (1.5) — most sessions cover general WO work, not one line. ----
 
 router.post('/crew-sessions', async (req, res, next) => {
   try {
-    const { workOrderId, activity, sessionDate, hours, note, volunteerIds, vendorIds } = req.body || {};
+    const { workOrderId, jobLineId, activity, sessionDate, hours, note, volunteerIds, vendorIds } = req.body || {};
     if (!workOrderId && !(activity || '').trim()) {
       return res.status(400).json({ ok: false, error: 'A session needs either a Work Order or an activity label' });
     }
     const session = await createCrewSession({
-      workOrderId: workOrderId || null, activity: activity?.trim() || null,
+      workOrderId: workOrderId || null, jobLineId: jobLineId || null, activity: activity?.trim() || null,
       sessionDate: sessionDate || null, hours: hours ? Number(hours) : null, note: note?.trim() || null,
       volunteerIds: (volunteerIds || []).map(Number), vendorIds: (vendorIds || []).map(Number),
     });
@@ -803,32 +1051,161 @@ router.get('/crew-hours/summary', async (req, res, next) => {
   try { res.json(await getCrewHoursSummary({ from: req.query.from || null, to: req.query.to || null })); } catch (e) { next(e); }
 });
 
-// ---- Work Order Tasks (free-text job lines — the default way to add work) ----
+// ---- Job Lines (the unit of work — Build Brief v2 Phase 1) ----
 
-router.post('/work-orders/:id/tasks', async (req, res, next) => {
+router.post('/work-orders/:id/job-lines', async (req, res, next) => {
   try {
-    const { description } = req.body || {};
-    if (!description || !description.trim()) return res.status(400).json({ ok: false, error: 'description is required' });
-    res.json({ ok: true, task: await createWorkOrderTask(req.params.id, description.trim()) });
+    const { title, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate } = req.body || {};
+    if (!title || !title.trim()) return res.status(400).json({ ok: false, error: 'title is required' });
+    res.json({
+      ok: true,
+      jobLine: await createJobLine(req.params.id, {
+        title: title.trim(), responsibilityClass, fundingSource,
+        fundingRefId: fundingRefId === '' || fundingRefId == null ? null : Number(fundingRefId),
+        estimatedHours: estimatedHours === '' || estimatedHours == null ? null : Number(estimatedHours),
+        estimatedCost: estimatedCost === '' || estimatedCost == null ? null : Number(estimatedCost),
+        scheduledDate: scheduledDate || null,
+      }),
+    });
   } catch (e) { next(e); }
 });
-router.patch('/work-order-tasks/:taskId', async (req, res, next) => {
+router.patch('/job-lines/:jobLineId', async (req, res, next) => {
   try {
-    const { description, done } = req.body || {};
-    const task = await updateWorkOrderTask(req.params.taskId, { description, done });
-    if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
-    res.json({ ok: true, task });
+    const body = req.body || {};
+    const fields = {};
+    if (body.title != null) fields.title = body.title;
+    if (body.statusId != null) fields.status_id = Number(body.statusId);
+    if (body.statusNote !== undefined) fields.statusNote = body.statusNote;
+    if (body.responsibilityClass != null) fields.responsibility_class = body.responsibilityClass;
+    if (body.fundingSource != null) fields.funding_source = body.fundingSource;
+    if (body.fundingRefId !== undefined) fields.funding_ref_id = body.fundingRefId === '' ? null : Number(body.fundingRefId);
+    if (body.estimatedHours !== undefined) fields.estimated_hours = body.estimatedHours === '' ? null : Number(body.estimatedHours);
+    if (body.actualHours !== undefined) fields.actual_hours = body.actualHours === '' ? null : Number(body.actualHours);
+    if (body.estimatedCost !== undefined) fields.estimated_cost = body.estimatedCost === '' ? null : Number(body.estimatedCost);
+    if (body.actualCost !== undefined) fields.actual_cost = body.actualCost === '' ? null : Number(body.actualCost);
+    if (body.scheduledDate !== undefined) fields.scheduled_date = body.scheduledDate;
+    if (body.complaint !== undefined) fields.complaint = body.complaint;
+    if (body.causeNote !== undefined) fields.cause_note = body.causeNote;
+    if (body.correction !== undefined) fields.correction = body.correction;
+    if (body.blockedReason !== undefined) fields.blocked_reason = body.blockedReason;
+    if (body.blockedSince !== undefined) fields.blocked_since = body.blockedSince;
+    if (body.completedDate !== undefined) fields.completed_date = body.completedDate;
+    if (body.causeIds !== undefined) fields.causeIds = (body.causeIds || []).map(Number);
+    const jobLine = await updateJobLine(req.params.jobLineId, fields);
+    if (!jobLine) return res.status(404).json({ ok: false, error: 'Job line not found' });
+    res.json({ ok: true, jobLine });
   } catch (e) { next(e); }
 });
-router.delete('/work-order-tasks/:taskId', async (req, res, next) => {
-  try { await deleteWorkOrderTask(req.params.taskId); res.json({ ok: true }); } catch (e) { next(e); }
+router.delete('/job-lines/:jobLineId', async (req, res, next) => {
+  try { await deleteJobLine(req.params.jobLineId); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.post('/job-lines/:jobLineId/volunteers', async (req, res, next) => {
+  try { res.json(await assignVolunteerToJobLine(req.params.jobLineId, req.body?.volunteerId)); } catch (e) { next(e); }
+});
+router.delete('/job-lines/:jobLineId/volunteers/:volunteerId', async (req, res, next) => {
+  try { res.json(await unassignVolunteerFromJobLine(req.params.jobLineId, req.params.volunteerId)); } catch (e) { next(e); }
+});
+router.post('/job-lines/:jobLineId/vendors', async (req, res, next) => {
+  try { res.json(await assignVendorToJobLine(req.params.jobLineId, req.body?.vendorId)); } catch (e) { next(e); }
+});
+router.delete('/job-lines/:jobLineId/vendors/:vendorId', async (req, res, next) => {
+  try { res.json(await unassignVendorFromJobLine(req.params.jobLineId, req.params.vendorId)); } catch (e) { next(e); }
+});
+
+// ---- Causes catalog (admin-editable — 1.6) ----
+router.get('/causes', async (req, res, next) => {
+  try { res.json({ causes: await listCauses({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/causes', async (req, res, next) => {
+  try {
+    const { name, sortOrder } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, cause: await createCause({ name: name.trim(), sortOrder }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/causes/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, active } = req.body || {};
+    const cause = await updateCause(req.params.id, { name, sortOrder, active });
+    if (!cause) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, cause });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/causes/:id', async (req, res, next) => {
+  try { await deleteCause(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Work order / job line status catalogs (2.1/2.2) — admin-editable,
+// read by the frontend instead of a hardcoded list (WO_STATUS_OPTIONS is
+// gone from both reports.js and app.js as of this route existing). ----
+router.get('/work-order-statuses', async (req, res, next) => {
+  try { res.json({ statuses: await listWorkOrderStatuses() }); } catch (e) { next(e); }
+});
+router.get('/job-line-statuses', async (req, res, next) => {
+  try { res.json({ statuses: await listJobLineStatuses() }); } catch (e) { next(e); }
+});
+router.get('/admin/work-order-statuses', async (req, res, next) => {
+  try { res.json({ statuses: await adminListWorkOrderStatuses() }); } catch (e) { next(e); }
+});
+router.post('/admin/work-order-statuses', async (req, res, next) => {
+  try {
+    const { name, sortOrder, color, isTerminal } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, status: await adminCreateWorkOrderStatus({ name: name.trim(), sortOrder, color, isTerminal }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/work-order-statuses/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, color, isTerminal, active } = req.body || {};
+    const status = await adminUpdateWorkOrderStatus(req.params.id, { name, sortOrder, color, isTerminal, active });
+    if (!status) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, status });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/work-order-statuses/:id', async (req, res, next) => {
+  try { await adminDeleteWorkOrderStatus(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+router.get('/admin/job-line-statuses', async (req, res, next) => {
+  try { res.json({ statuses: await adminListJobLineStatuses() }); } catch (e) { next(e); }
+});
+router.post('/admin/job-line-statuses', async (req, res, next) => {
+  try {
+    const { name, sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, status: await adminCreateJobLineStatus({ name: name.trim(), sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/job-line-statuses/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel, active } = req.body || {};
+    const status = await adminUpdateJobLineStatus(req.params.id, { name, sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel, active });
+    if (!status) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, status });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/job-line-statuses/:id', async (req, res, next) => {
+  try { await adminDeleteJobLineStatus(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Display settings (2.6) ----
+router.get('/display-settings', async (req, res, next) => {
+  try { res.json(await getDisplaySettings()); } catch (e) { next(e); }
+});
+router.put('/display-settings', async (req, res, next) => {
+  try {
+    const { woProgressWeighting, reportImageCap } = req.body || {};
+    if (woProgressWeighting !== undefined && !['cost', 'count'].includes(woProgressWeighting)) return res.status(400).json({ ok: false, error: 'woProgressWeighting must be "cost" or "count"' });
+    if (reportImageCap !== undefined && (!Number.isInteger(reportImageCap) || reportImageCap < 1)) return res.status(400).json({ ok: false, error: 'reportImageCap must be a positive integer' });
+    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting, reportImageCap }) });
+  } catch (e) { next(e); }
 });
 
 router.post('/work-orders', async (req, res, next) => {
   try {
-    const { title, assetId, locationId, priority, description, scheduledDate, responsibleSelf, assetUpdates, tasks } = req.body || {};
+    const { title, assetId, locationId, priority, description, scheduledDate, assetUpdates, jobLines } = req.body || {};
     if (!title) return res.status(400).json({ ok: false, error: 'title is required' });
-    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, responsibleSelf, assetUpdates, tasks });
+    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates, jobLines });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
@@ -848,18 +1225,12 @@ router.patch('/work-orders/:id', async (req, res, next) => {
     if (body.title != null) fields.title = body.title;
     if (body.description !== undefined) fields.description = body.description;
     if (body.priority != null) fields.priority = body.priority;
-    if (body.status != null) fields.status = body.status;
+    if (body.statusId != null) fields.status_id = Number(body.statusId);
+    if (body.deferredReason !== undefined) fields.deferred_reason = body.deferredReason;
+    if (body.revisitDate !== undefined) fields.revisit_date = body.revisitDate;
     if (body.assetId !== undefined) fields.asset_id = body.assetId === '' ? null : Number(body.assetId);
     if (body.dateReported !== undefined) fields.date_reported = body.dateReported;
     if (body.dateCompleted !== undefined) fields.date_completed = body.dateCompleted;
-    if (body.scheduledDate !== undefined) fields.scheduled_date = body.scheduledDate;
-    if (body.estimatedHours !== undefined) fields.estimated_hours = body.estimatedHours === '' ? null : Math.round(Number(body.estimatedHours));
-    if (body.actualHours !== undefined) fields.actual_hours = body.actualHours === '' ? null : Math.round(Number(body.actualHours));
-    if (body.estimatedCost !== undefined) fields.estimated_cost = body.estimatedCost === '' ? null : Number(body.estimatedCost);
-    if (body.actualCost !== undefined) fields.actual_cost = body.actualCost === '' ? null : Number(body.actualCost);
-    if (body.fundingSource != null) fields.funding_source = body.fundingSource;
-    if (body.fundingRefId !== undefined) fields.funding_ref_id = body.fundingRefId === '' ? null : Number(body.fundingRefId);
-    if (body.responsibleSelf !== undefined) fields.responsible_self = !!body.responsibleSelf;
     if (body.boardFocus !== undefined) fields.board_focus = !!body.boardFocus;
     const detail = await updateWorkOrder(req.params.id, fields);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
@@ -879,7 +1250,7 @@ router.delete('/work-orders/:id/asset-updates/:auId', async (req, res, next) => 
   try {
     const result = await deleteAssetUpdate(req.params.auId);
     if (result.notFound) return res.status(404).json({ ok: false, error: 'Not found' });
-    if (result.alreadyApplied) return res.status(400).json({ ok: false, error: 'This job line was already applied to the asset' });
+    if (result.alreadyApplied) return res.status(400).json({ ok: false, error: 'This field update was already applied to the asset' });
     res.json({ ok: true });
   } catch (e) { next(e); }
 });
@@ -890,19 +1261,6 @@ router.post('/work-orders/:id/complete', async (req, res, next) => {
     if (!result) return res.status(404).json({ ok: false, error: 'Work Order not found' });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
-});
-
-router.post('/work-orders/:id/volunteers', async (req, res, next) => {
-  try { res.json(await assignVolunteer(req.params.id, req.body?.volunteerId)); } catch (e) { next(e); }
-});
-router.delete('/work-orders/:id/volunteers/:volunteerId', async (req, res, next) => {
-  try { res.json(await unassignVolunteer(req.params.id, req.params.volunteerId)); } catch (e) { next(e); }
-});
-router.post('/work-orders/:id/vendors', async (req, res, next) => {
-  try { res.json(await assignVendor(req.params.id, req.body?.vendorId)); } catch (e) { next(e); }
-});
-router.delete('/work-orders/:id/vendors/:vendorId', async (req, res, next) => {
-  try { res.json(await unassignVendor(req.params.id, req.params.vendorId)); } catch (e) { next(e); }
 });
 
 router.get('/volunteers', async (req, res, next) => {
@@ -987,15 +1345,15 @@ router.get('/work-order-templates', async (req, res, next) => {
 });
 router.post('/work-order-templates', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds } = req.body || {};
+    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds }) });
+    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds }) });
   } catch (e) { next(e); }
 });
 router.patch('/work-order-templates/:id', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds } = req.body || {};
-    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds });
+    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds } = req.body || {};
+    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds });
     if (!template) return res.status(404).json({ ok: false, error: 'Template not found' });
     res.json({ ok: true, template });
   } catch (e) { next(e); }
@@ -1014,6 +1372,15 @@ router.get('/calendar-events', async (req, res, next) => {
     res.json({ occurrences: await listCalendarEventOccurrences(from, to) });
   } catch (e) { next(e); }
 });
+// Job lines with a scheduled_date in range — what the calendar renders for
+// "work happening on this day" (1.4: a WO's lines can have divergent dates).
+router.get('/job-lines/scheduled', async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to (YYYY-MM-DD) are required' });
+    res.json({ jobLines: await listJobLinesScheduledInRange(from, to) });
+  } catch (e) { next(e); }
+});
 router.get('/calendar-events/:id', async (req, res, next) => {
   try {
     const event = await getCalendarEvent(req.params.id);
@@ -1024,9 +1391,9 @@ router.get('/calendar-events/:id', async (req, res, next) => {
 });
 router.post('/calendar-events', async (req, res, next) => {
   try {
-    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId, workOrderTemplateId } = req.body || {};
+    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId } = req.body || {};
     if (!title || !eventDate) return res.status(400).json({ ok: false, error: 'title and eventDate are required' });
-    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId, workOrderTemplateId }) });
+    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId }) });
   } catch (e) { next(e); }
 });
 router.patch('/calendar-events/:id', async (req, res, next) => {
@@ -1040,7 +1407,7 @@ router.patch('/calendar-events/:id', async (req, res, next) => {
     if (body.recurrenceInterval != null) fields.recurrence_interval = body.recurrenceInterval;
     if (body.recurrenceEndDate !== undefined) fields.recurrence_end_date = body.recurrenceEndDate;
     if (body.workOrderId !== undefined) fields.work_order_id = body.workOrderId === '' ? null : Number(body.workOrderId);
-    if (body.workOrderTaskId !== undefined) fields.work_order_task_id = body.workOrderTaskId === '' ? null : Number(body.workOrderTaskId);
+    if (body.jobLineId !== undefined) fields.job_line_id = body.jobLineId === '' ? null : Number(body.jobLineId);
     if (body.workOrderTemplateId !== undefined) fields.work_order_template_id = body.workOrderTemplateId === '' ? null : Number(body.workOrderTemplateId);
     const event = await updateCalendarEvent(req.params.id, fields);
     if (!event) return res.status(404).json({ ok: false, error: 'Event not found' });
@@ -1131,8 +1498,8 @@ router.get('/work-orders/:id/scope-pdf', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    const [tasks, checklist] = await Promise.all([
-      listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id),
+    const [jobLines, checklist] = await Promise.all([
+      listJobLines(req.params.id), getChecklistInstanceForWorkOrder(req.params.id),
     ]);
     let checklistSteps = null;
     if (checklist) {
@@ -1150,11 +1517,11 @@ router.get('/work-orders/:id/scope-pdf', async (req, res, next) => {
       assetName: w.Asset?.Name,
       locationName: w.Location?.Name,
       priority: w.Priority,
-      scheduledDate: w['Scheduled Date'],
+      scheduledDate: detail.rollup?.EarliestScheduledDate,
       description: w.Description,
-      tasks: tasks.filter((t) => !t.Done).map((t) => t.Description),
-      volunteers: (detail.volunteers || []).map((v) => v.Name),
-      vendors: (detail.vendors || []).map((v) => v.Name),
+      tasks: jobLines.filter((l) => !l.Done).map((l) => l.Title),
+      volunteers: (detail.crewRoster?.volunteers || []).map((v) => v.Name),
+      vendors: (detail.crewRoster?.vendors || []).map((v) => v.Name),
       checklistSteps,
     });
     res.setHeader('Content-Type', 'application/pdf');

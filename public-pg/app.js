@@ -295,16 +295,162 @@ async function api(path, opts = {}) {
   return body;
 }
 
-// Uploads one file to DigitalOcean Spaces via the backend, returns its URL.
-async function uploadPhotoFile(file, category, ownerId) {
+// ---------- Attachments (Build Brief v2 Phase 4) ----------
+// One shared system for every photo/document attach point in the app — WO
+// and job-line photos, asset reference photos, component-event photos,
+// finding photos, maintenance-request photos, asset-note photos. Capture is
+// zero-decision (snap and upload); role/classification/caption are set later
+// "at a desk" via the thumbnail's tap-to-edit panel, never prompted for at
+// capture time (see the brief's "Why" section).
+
+// Uploads one file directly onto an existing entity — upload + link in one
+// request. Use uploadAttachmentUnlinked instead when the entity doesn't
+// exist yet (a form that creates its parent row on submit).
+async function uploadAttachment(file, entityType, entityId, { roleId, classification, caption, category, ownerId } = {}) {
   const fd = new FormData();
-  fd.append('photo', file);
+  fd.append('file', file);
+  fd.append('entityType', entityType);
+  fd.append('entityId', String(entityId));
+  fd.append('category', category || entityType);
+  fd.append('ownerId', String(ownerId ?? entityId));
+  if (roleId) fd.append('roleId', String(roleId));
+  if (classification) fd.append('classification', classification);
+  if (caption) fd.append('caption', caption);
+  const res = await fetch('/api/pg/attachments', { method: 'POST', body: fd });
+  const body = await res.json();
+  if (!res.ok || body.ok === false) throw new Error(body.error || 'Upload failed');
+  return body.attachment;
+}
+
+// Uploads without linking — for the audit form and the public
+// maintenance-request portal, where photos are captured before the row they
+// belong to (a finding, a component event, the request itself) is created.
+// Returns the attachment id to submit alongside the rest of the form; the
+// server links it once the parent row exists.
+async function uploadAttachmentUnlinked(file, category, ownerId) {
+  const fd = new FormData();
+  fd.append('file', file);
   fd.append('category', category);
   fd.append('ownerId', String(ownerId));
-  const res = await fetch('/api/pg/upload', { method: 'POST', body: fd });
+  const res = await fetch('/api/pg/attachments', { method: 'POST', body: fd });
   const body = await res.json();
-  if (!res.ok || body.ok === false) throw new Error(body.error || 'Photo upload failed');
-  return body.url;
+  if (!res.ok || body.ok === false) throw new Error(body.error || 'Upload failed');
+  return body.attachment.Id;
+}
+
+function attachmentThumbHtml(a) {
+  if (a.Kind === 'image') {
+    return `<img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:84px;height:84px;object-fit:cover;border-radius:8px;display:block" />`;
+  }
+  const icon = a.Kind === 'document' ? '📄' : a.Kind === 'audio' ? '🎵' : '📎';
+  return `<div style="width:84px;height:84px;border-radius:8px;background:#f0f2fb;display:flex;align-items:center;justify-content:center;font-size:28px">${icon}</div>`;
+}
+
+// Renders a thumbnail grid + "+ Add" capture control into `container`, wired
+// to attach/detach/void/edit against (entityType, entityId). Re-renders
+// itself in place after any change — callers don't need to manage state.
+//   opts: { title, defaultRoleName, inheritedClassification, accept }
+async function renderAttachmentSection(entityType, entityId, container, opts = {}) {
+  const { title = 'Photos', defaultRoleName = null, inheritedClassification = null, accept = 'image/*,application/pdf' } = opts;
+  const roles = state.options.attachmentRoles || [];
+  const defaultRole = defaultRoleName ? roles.find((r) => r.Name === defaultRoleName) : null;
+  const { attachments } = await api(`/api/pg/attachments?entityType=${entityType}&entityId=${entityId}`);
+
+  const grid = attachments.length
+    ? `<div class="attach-grid" style="display:flex;flex-wrap:wrap;gap:8px">${attachments.map((a) => `
+        <div class="attach-thumb" data-link-id="${a.LinkId}" title="${escapeHtml(a.RoleName || '')}">${attachmentThumbHtml(a)}</div>`).join('')}</div>`
+    : '<p class="muted">None yet.</p>';
+
+  container.innerHTML = `
+    <h4 style="margin:14px 0 6px">${escapeHtml(title)}</h4>
+    ${grid}
+    <div class="btn-row" style="margin-top:8px">
+      <label class="btn btn-secondary" style="cursor:pointer;margin:0">
+        + Add
+        <input type="file" accept="${accept}" capture="environment" multiple style="display:none" class="attach-input" />
+      </label>
+    </div>
+    <div class="attach-edit-panel" hidden></div>`;
+
+  container.querySelector('.attach-input').addEventListener('change', async (e) => {
+    const files = [...e.target.files];
+    if (!files.length) return;
+    try {
+      for (const file of files) {
+        await uploadAttachment(file, entityType, entityId, { roleId: defaultRole?.Id, classification: inheritedClassification });
+      }
+      renderAttachmentSection(entityType, entityId, container, opts);
+    } catch (err) { toast(err.message); }
+  });
+
+  container.querySelectorAll('.attach-thumb').forEach((el) => el.addEventListener('click', () => {
+    const a = attachments.find((x) => String(x.LinkId) === el.dataset.linkId);
+    renderAttachmentEditPanel(a, roles, entityType, entityId, container, opts);
+  }));
+}
+
+async function renderAttachmentEditPanel(a, roles, entityType, entityId, container, opts) {
+  const panel = container.querySelector('.attach-edit-panel');
+  const roleOptions = roles.map((r) => `<option value="${r.Id}" ${a.RoleId === r.Id ? 'selected' : ''}>${escapeHtml(r.Name)}</option>`).join('');
+  const quoteRoleId = roles.find((r) => r.Name === 'Quote')?.Id;
+  // Quotes attach to the job line (§6.4, "you shop the roof, not the whole
+  // cabin") — vendor/amount/date/selected only make sense there, and only
+  // once the Quote role is picked (role answers "what is this," these
+  // fields answer "whose quote and how much").
+  const vendorsRes = entityType === 'job_line' ? await api('/api/pg/vendors') : { vendors: [] };
+  panel.hidden = false;
+  panel.innerHTML = `
+    <div class="card" style="margin-top:8px">
+      <a href="${escapeHtml(a.Url)}" target="_blank" rel="noopener">${a.Kind === 'image'
+        ? `<img src="${escapeHtml(a.Url)}" alt="" style="max-width:100%;border-radius:8px;display:block" />`
+        : `Open file (${escapeHtml(a.OriginalFilename || a.Kind)})`}</a>
+      <div class="field-row"><label>Role</label><select class="attach-role"><option value="">— unset —</option>${roleOptions}</select></div>
+      <div class="field-row"><label>Caption</label><input class="attach-caption" value="${escapeHtml(a.Caption || '')}" /></div>
+      <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="attach-include" ${a.IncludeInReport ? 'checked' : ''} /> Include in board report</label>
+      ${entityType === 'job_line' ? `
+      <div class="quote-fields" ${a.RoleName === 'Quote' ? '' : 'hidden'}>
+        <div class="field-row"><label>Vendor</label><select class="attach-vendor"><option value="">— unset —</option>${vendorsRes.vendors.map((v) => `<option value="${v.Id}" ${a.VendorId === v.Id ? 'selected' : ''}>${escapeHtml(v.Name)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Amount</label><input class="attach-amount" type="number" step="0.01" value="${a.QuotedAmount ?? ''}" /></div>
+        <div class="field-row"><label>Date</label><input class="attach-quote-date" type="date" value="${(a.QuoteDate || '').slice(0, 10)}" /></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="attach-selected-quote" ${a.IsSelectedQuote ? 'checked' : ''} /> This is the selected quote</label>
+      </div>` : ''}
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary attach-save">Save</button>
+        <button type="button" class="btn btn-secondary attach-detach">Detach</button>
+        <button type="button" class="btn btn-secondary attach-void">Void</button>
+        <button type="button" class="btn btn-secondary attach-cancel">Close</button>
+      </div>
+    </div>`;
+  panel.querySelector('.attach-role')?.addEventListener('change', (e) => {
+    const qf = panel.querySelector('.quote-fields');
+    if (qf) qf.hidden = Number(e.target.value) !== quoteRoleId;
+  });
+  panel.querySelector('.attach-save').addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/attachment-links/${a.LinkId}`, { method: 'PATCH', body: JSON.stringify({
+        roleId: panel.querySelector('.attach-role').value || null,
+        caption: panel.querySelector('.attach-caption').value || null,
+        includeInReport: panel.querySelector('.attach-include').checked,
+        vendorId: panel.querySelector('.attach-vendor')?.value || null,
+        quotedAmount: panel.querySelector('.attach-amount')?.value || null,
+        quoteDate: panel.querySelector('.attach-quote-date')?.value || null,
+        isSelectedQuote: panel.querySelector('.attach-selected-quote')?.checked || false,
+      }) });
+      renderAttachmentSection(entityType, entityId, container, opts);
+    } catch (err) { toast(err.message); }
+  });
+  panel.querySelector('.attach-detach').addEventListener('click', async () => {
+    if (!await confirmDialog('Detach this file from here? The file itself is not deleted.')) return;
+    await api(`/api/pg/attachment-links/${a.LinkId}`, { method: 'DELETE' });
+    renderAttachmentSection(entityType, entityId, container, opts);
+  });
+  // One tap, no confirm — junk arrives via email in the inbox (Phase 5) and
+  // hesitation is the enemy. The file survives in Spaces either way.
+  panel.querySelector('.attach-void').addEventListener('click', async () => {
+    await api(`/api/pg/attachments/${a.Id}/void`, { method: 'POST' });
+    renderAttachmentSection(entityType, entityId, container, opts);
+  });
+  panel.querySelector('.attach-cancel').addEventListener('click', () => { panel.hidden = true; panel.innerHTML = ''; });
 }
 
 function setChrome({ title, showBack, showLogout }) {
@@ -339,6 +485,7 @@ const NAV_ITEMS = [
   { icon: '🗺️', label: 'Map', view: 'map' },
   { icon: '🗒️', label: 'Notes', view: 'notes' },
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
+  { icon: '📥', label: 'Inbox', view: 'inbox' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
   { icon: '👷', label: 'Crew', view: 'crew' },
@@ -460,6 +607,8 @@ async function render(view, params = {}) {
       locations: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderLocationsDrilldown() : renderLocations()),
       map: () => renderMap(),
       notes: () => renderNotes(),
+      inbox: () => renderInbox(),
+      createWoFromFindings: () => renderCreateWoFromFindings(params),
       assetsInLocation: () => renderAssetsInLocation(params),
       assetDetail: () => renderAssetDetail(params),
       audit: () => renderAudit(params),
@@ -477,6 +626,12 @@ async function render(view, params = {}) {
       adminApplicability: () => renderAdminApplicability(),
       adminSubAreas: () => renderAdminSubAreas(),
       adminWoTemplates: () => renderAdminWoTemplates(),
+      adminCauses: () => renderAdminCauses(),
+      adminWorkOrderStatuses: () => renderAdminWorkOrderStatuses(),
+      adminJobLineStatuses: () => renderAdminJobLineStatuses(),
+      adminAttachmentRoles: () => renderAdminAttachmentRoles(),
+      adminMapCalibration: () => renderAdminMapCalibration(),
+      adminJobLineTemplates: () => renderAdminJobLineTemplates(),
       calendar: () => renderCalendar(params),
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
@@ -523,7 +678,7 @@ function renderLogin() {
   });
 }
 
-const DASHBOARD_WIDGET_DEFAULTS = { woOverview: true, calendar: true, activity: true };
+const DASHBOARD_WIDGET_DEFAULTS = { woOverview: true, calendar: true, activity: true, findings: true };
 function getDashboardWidgetPrefs() {
   try {
     const raw = localStorage.getItem('campAuditDashboardWidgets');
@@ -556,15 +711,35 @@ async function renderDashboard() {
   let selectedWeekDate = isoDate(today);
   const weekOccByDay = new Map();
 
-  const [woSummary, calRes, scheduledWoRes, activityRes] = await Promise.all([
+  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary, inboxRes] = await Promise.all([
     prefs.woOverview ? api('/api/pg/dashboard/wo-summary') : Promise.resolve(null),
     prefs.calendar ? api(`/api/pg/calendar-events?from=${isoDate(weekStart)}&to=${isoDate(weekEnd)}`) : Promise.resolve(null),
     prefs.calendar ? api('/api/pg/work-orders') : Promise.resolve(null),
     prefs.activity ? api(`/api/pg/activity-log?limit=12${isAdmin ? '' : `&username=${encodeURIComponent(currentUser.username || '')}`}`) : Promise.resolve(null),
+    prefs.findings ? api('/api/pg/findings-summary') : Promise.resolve(null),
+    api('/api/pg/inbox/count'),
   ]);
 
-  function statTile(n, label, colorClass, filterParams) {
-    return `<div class="bucket-tile tile-${colorClass}${filterParams ? ' clickable-tile wo-filter-tile' : ''}" ${filterParams ? `data-filter='${JSON.stringify(filterParams)}'` : ''}>
+  // Open should trend to zero (3) — every finding is meant to end up with a
+  // decision made on it. The second number is the data-quality check: things
+  // nobody has even put on a work order yet.
+  function findingsSummaryHtml() {
+    if (!findingsSummary) return '';
+    return `<div class="card">
+      <h3>Findings</h3>
+      <div class="summary-buckets">
+        <div class="bucket-tile clickable-tile" data-view="reports" style="cursor:pointer"><div class="n">${findingsSummary.OpenCount}</div><div class="muted">Open (trending to zero)</div></div>
+        <div class="bucket-tile"><div class="n">${findingsSummary.NotOnAnyWorkOrderCount}</div><div class="muted">Not on any Work Order</div></div>
+      </div>
+    </div>`;
+  }
+
+  // colorClass is a fixed severity word (neutral/pop/warn/bad/good) for the
+  // schedule buckets, which aren't admin-editable data; statusColor is a
+  // literal hex from work_order_statuses for the by-status tiles, which are.
+  function statTile(n, label, colorClass, filterParams, statusColor) {
+    const style = statusColor ? ` style="background:${statusColor}1a;border-color:${statusColor}66"` : '';
+    return `<div class="bucket-tile ${statusColor ? '' : `tile-${colorClass}`}${filterParams ? ' clickable-tile wo-filter-tile' : ''}"${style} ${filterParams ? `data-filter='${JSON.stringify(filterParams)}'` : ''}>
       <div class="n">${n}</div><div class="muted">${escapeHtml(label)}</div>
     </div>`;
   }
@@ -576,11 +751,7 @@ async function renderDashboard() {
       <h3>Work Orders</h3>
       <p class="muted" style="margin-top:-6px">By status</p>
       <div class="summary-buckets">
-        ${statTile(s.Open, 'Open', 'neutral', { status: 'Open' })}
-        ${statTile(s.InProgress, 'In Progress', 'pop', { status: 'In Progress' })}
-        ${statTile(s.OnHold, 'On Hold', 'warn', { status: 'On Hold' })}
-        ${statTile(s.Urgent, 'Urgent', 'bad', { status: 'Urgent' })}
-        ${statTile(s.Done, 'Done', 'good', { status: 'Done' })}
+        ${s.ByStatus.map((st) => statTile(st.Count, st.Name, null, { status: st.Name }, st.Color)).join('')}
       </div>
       <p class="muted">By schedule (open WOs only)</p>
       <div class="summary-buckets">
@@ -639,7 +810,7 @@ async function renderDashboard() {
     return `<p class="muted" style="margin-bottom:6px">${escapeHtml(label)}</p>` + dayEvents.map((e) => e.type === 'wo'
       ? `<div class="list-item cal-strip-wo-link" style="cursor:pointer" data-wo-id="${e.Id}">
           <span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.Title)}</span>
-          <span class="pill ${woStatusPillClass(e.Status)}">${escapeHtml(e.Status || '')}</span>
+          ${statusPillHtml(e.Status, e.StatusColor)}
         </div>`
       : `<div class="list-item cal-strip-event-link" style="cursor:pointer" data-event-id="${e.Id}">
           <span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span>
@@ -673,6 +844,7 @@ async function renderDashboard() {
           <div class="list-item" data-view="locations" style="flex:1;min-width:140px">📍 Browse Locations</div>
           <div class="list-item" data-view="maintenanceLog" style="flex:1;min-width:140px">📋 Maintenance Log</div>
           <div class="list-item" data-view="capitalPlan" style="flex:1;min-width:140px">💰 Capital Plan</div>
+          <div class="list-item" data-view="inbox" style="flex:1;min-width:140px${inboxRes.count > 0 ? ';font-weight:600' : ''}">📥 Inbox${inboxRes.count > 0 ? ` <span class="pill">${inboxRes.count}</span>` : ''}</div>
         </div>
         <details style="margin-top:10px">
           <summary class="muted" style="cursor:pointer">Customize dashboard</summary>
@@ -680,10 +852,12 @@ async function renderDashboard() {
             <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="woOverview" ${prefs.woOverview ? 'checked' : ''} style="width:auto" /> Work Order overview</label>
             <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="calendar" ${prefs.calendar ? 'checked' : ''} style="width:auto" /> This week's calendar</label>
             <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="activity" ${prefs.activity ? 'checked' : ''} style="width:auto" /> Recent activity</label>
+            <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="findings" ${prefs.findings ? 'checked' : ''} style="width:auto" /> Findings</label>
           </div>
         </details>
       </div>
       ${woOverviewHtml()}
+      ${findingsSummaryHtml()}
       ${calendarStripHtml()}
       ${activityHtml()}
     `);
@@ -769,6 +943,12 @@ const ADMIN_LEAF_RENDERERS = {
   adminApplicability: (params, container) => renderAdminApplicability(container),
   adminSubAreas: (params, container) => renderAdminSubAreas(container),
   adminWoTemplates: (params, container) => renderAdminWoTemplates(container),
+  adminCauses: (params, container) => renderAdminCauses(container),
+  adminWorkOrderStatuses: (params, container) => renderAdminWorkOrderStatuses(container),
+  adminJobLineStatuses: (params, container) => renderAdminJobLineStatuses(container),
+  adminAttachmentRoles: (params, container) => renderAdminAttachmentRoles(container),
+  adminMapCalibration: (params, container) => renderAdminMapCalibration(container),
+  adminJobLineTemplates: (params, container) => renderAdminJobLineTemplates(container),
   adminChecklistTemplates: (params, container) => renderAdminChecklistTemplates(container),
   adminUsers: (params, container) => renderAdminUsers(container),
   activityLog: (params, container) => renderActivityLog(container),
@@ -939,12 +1119,15 @@ function conditionPillClass(c) {
   return '';
 }
 
-function woStatusPillClass(status) {
-  if (status === 'Done') return 'good';
-  if (status === 'Urgent') return 'bad';
-  if (status === 'In Progress') return 'pop';
-  if (status === 'On Hold') return 'warn';
-  return ''; // Open = neutral
+// Work order / job line statuses are admin-editable tables now (Phase 2) —
+// no hardcoded name->class mapping. Pills render with the status's own
+// `color` field; callers without a color on hand (a bare status name with
+// no row context) get a neutral pill instead of guessing.
+function statusColorStyle(color) {
+  return color ? ` style="background:${color}1a;color:${color};border:1px solid ${color}66"` : '';
+}
+function statusPillHtml(name, color) {
+  return name ? `<span class="pill"${statusColorStyle(color)}>${escapeHtml(name)}</span>` : '';
 }
 
 // A step with no dependency is always visible. Otherwise it's visible only
@@ -1003,7 +1186,7 @@ async function renderAssetDetail({ id }, container = app) {
   const noteRows = notes.map((n) => `
     <div class="note-item ${n.resolved ? 'resolved' : ''}" data-id="${n.id}">
       <div>${escapeHtml(n.note)}</div>
-      ${n.photo_url ? `<a href="${escapeHtml(n.photo_url)}" target="_blank" rel="noopener"><img src="${escapeHtml(n.photo_url)}" alt="" style="max-width:120px;border-radius:8px;margin-top:6px;display:block" /></a>` : ''}
+      ${(n.attachments || []).length ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${n.attachments.map((a) => `<a href="${escapeHtml(a.Url)}" target="_blank" rel="noopener"><img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:60px;height:60px;object-fit:cover;border-radius:8px" /></a>`).join('')}</div>` : ''}
       <div class="muted">${new Date(n.created_at).toLocaleDateString()}${n.created_by ? ` · ${escapeHtml(n.created_by)}` : ''}
         <a href="#" class="resolve-note" data-id="${n.id}" data-next="${!n.resolved}">${n.resolved ? 'reopen' : 'mark resolved'}</a>
       </div>
@@ -1029,19 +1212,41 @@ async function renderAssetDetail({ id }, container = app) {
 
     <div class="card"><h3>Components</h3>${componentRows}</div>
 
+    <div class="card" id="assetPhotosCard"></div>
+
     <div class="card"><h3>Work Orders (${workOrders.length})</h3>
-      ${workOrders.map((w) => `<div class="list-item" data-wo-id="${w.Id}"><span>${escapeHtml(w.Title)}</span><span class="pill ${w.Status === 'Done' ? 'good' : ''}">${escapeHtml(w.Status || '')}</span></div>`).join('') || '<p class="muted">None yet.</p>'}
+      ${workOrders.map((w) => `<div class="list-item" data-wo-id="${w.Id}"><span>${escapeHtml(w.Title)}</span>${statusPillHtml(w.Status, w.StatusColor)}</div>`).join('') || '<p class="muted">None yet.</p>'}
     </div>
 
     <div class="card"><h3>Findings (${conditionFindings.length})</h3>
-      ${conditionFindings.map((f) => `
-        <div class="list-item" style="cursor:default">
+      ${conditionFindings.some((f) => f.Status === 'Open') ? `<div class="btn-row" style="margin-bottom:10px"><button type="button" class="btn btn-primary" id="createWoFromFindingsBtn">+ Create Work Order from Findings</button></div>` : ''}
+      ${conditionFindings.map((f) => {
+        const decided = f.Status === 'Deferred' || f.Status === 'Dismissed';
+        return `
+        <div class="list-item" style="cursor:default;flex-wrap:wrap">
           <span>${escapeHtml(f.Title || '')}</span>
-          <span style="display:flex;align-items:center;gap:8px">
+          <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             <span class="pill">${escapeHtml(f.Severity || '')}</span>
+            <span class="pill">${escapeHtml(f.Status || 'Open')}</span>
             <button type="button" class="btn btn-secondary toggle-board-focus" data-id="${f.Id}" data-next="${!f.BoardFocus}" style="padding:2px 8px;font-size:0.75rem;${f.BoardFocus ? 'background:#f0f2fb' : ''}">${f.BoardFocus ? '★ Board Focus' : '☆ Flag for Board'}</button>
+            ${!decided ? `<button type="button" class="btn btn-secondary finding-defer-toggle" data-id="${f.Id}" style="padding:2px 8px;font-size:0.75rem">Defer</button>
+            <button type="button" class="btn btn-secondary finding-dismiss-toggle" data-id="${f.Id}" style="padding:2px 8px;font-size:0.75rem">Dismiss</button>` : ''}
           </span>
-        </div>`).join('') || '<p class="muted">None yet.</p>'}
+          ${f.Status === 'Deferred' ? `<p class="muted" style="flex-basis:100%;margin:4px 0 0">Deferred: ${escapeHtml(f.DeferredReason || '')}${f.RevisitDate ? ` — revisit ${formatDateNice(f.RevisitDate)}` : ''}</p>` : ''}
+          ${f.Status === 'Dismissed' ? `<p class="muted" style="flex-basis:100%;margin:4px 0 0">Dismissed: ${escapeHtml(f.DismissNote || '')}</p>` : ''}
+          ${!decided ? `
+          <div class="finding-defer-box" data-id="${f.Id}" hidden style="flex-basis:100%;margin-top:6px">
+            <div class="field-row"><label>Reason</label><input class="finding-defer-reason" /></div>
+            <div class="field-row"><label>Revisit Date</label><input class="finding-defer-date" type="date" /></div>
+            <button type="button" class="btn btn-primary finding-defer-save" data-id="${f.Id}">Save</button>
+          </div>
+          <div class="finding-dismiss-box" data-id="${f.Id}" hidden style="flex-basis:100%;margin-top:6px">
+            <div class="field-row"><label>Why dismissed?</label><input class="finding-dismiss-note" /></div>
+            <button type="button" class="btn btn-primary finding-dismiss-save" data-id="${f.Id}">Save</button>
+          </div>` : ''}
+          <div class="card" id="findingPhotos-${f.Id}" style="flex-basis:100%;margin-top:8px"></div>
+        </div>`;
+      }).join('') || '<p class="muted">None yet.</p>'}
     </div>
 
     <div class="card">
@@ -1049,12 +1254,16 @@ async function renderAssetDetail({ id }, container = app) {
       <div id="noteList">${noteRows}</div>
       <form id="noteForm" style="margin-top:10px">
         <div class="field-row"><textarea name="note" placeholder="Quick note or follow-up for this asset…" required></textarea></div>
-        <div class="field-row"><label>Photo (optional)</label><input type="file" name="photo" accept="image/*" capture="environment" /></div>
+        <div class="field-row"><label>Photo (optional)</label><input type="file" name="photo" accept="image/*" capture="environment" multiple /></div>
         <button class="btn btn-secondary" type="submit">Add Note</button>
       </form>
     </div>`;
 
+  conditionFindings.forEach((f) => renderAttachmentSection('condition_finding', f.Id, container.querySelector(`#findingPhotos-${f.Id}`), { title: 'Photos', defaultRoleName: 'Evidence' }));
+  renderAttachmentSection('asset', id, container.querySelector('#assetPhotosCard'), { title: 'Reference Photos', defaultRoleName: 'Reference' });
+
   container.querySelector('#startAuditBtn').addEventListener('click', () => go('audit', { id }));
+  container.querySelector('#createWoFromFindingsBtn')?.addEventListener('click', () => go('createWoFromFindings', { assetId: id, assetName: asset.Name }));
   container.querySelector('#viewHistoryBtn').addEventListener('click', () => go('assetHistory', { id }));
   container.querySelector('#editAssetBtn').addEventListener('click', () => go('editAsset', { id }));
   container.querySelector('#newWoBtn').addEventListener('click', () => go('newWorkOrder', { assetId: id, assetName: asset.Name }));
@@ -1072,11 +1281,11 @@ async function renderAssetDetail({ id }, container = app) {
     e.preventDefault();
     const fd = new FormData(e.target);
     const note = fd.get('note');
-    const file = fd.get('photo');
+    const files = fd.getAll('photo').filter((f) => f && f.size);
     try {
-      let photoUrl = null;
-      if (file && file.size) photoUrl = await uploadPhotoFile(file, 'notes', id);
-      await api(`/api/pg/assets/${id}/notes`, { method: 'POST', body: JSON.stringify({ note, photoUrl }) });
+      const attachmentIds = [];
+      for (const file of files) attachmentIds.push(await uploadAttachmentUnlinked(file, 'notes', id));
+      await api(`/api/pg/assets/${id}/notes`, { method: 'POST', body: JSON.stringify({ note, attachmentIds }) });
       toast('Note added');
       renderAssetDetail({ id }, container);
     } catch (err) { toast(err.message); }
@@ -1090,6 +1299,30 @@ async function renderAssetDetail({ id }, container = app) {
     await api(`/api/pg/condition-findings/${el.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ boardFocus: el.dataset.next === 'true' }) });
     renderAssetDetail({ id }, container);
   }));
+  container.querySelectorAll('.finding-defer-toggle').forEach((el) => el.addEventListener('click', () => {
+    container.querySelector(`.finding-defer-box[data-id="${el.dataset.id}"]`).hidden = false;
+  }));
+  container.querySelectorAll('.finding-dismiss-toggle').forEach((el) => el.addEventListener('click', () => {
+    container.querySelector(`.finding-dismiss-box[data-id="${el.dataset.id}"]`).hidden = false;
+  }));
+  container.querySelectorAll('.finding-defer-save').forEach((btn) => btn.addEventListener('click', async () => {
+    const box = container.querySelector(`.finding-defer-box[data-id="${btn.dataset.id}"]`);
+    try {
+      await api(`/api/pg/condition-findings/${btn.dataset.id}/defer`, { method: 'POST', body: JSON.stringify({
+        reason: box.querySelector('.finding-defer-reason').value, revisitDate: box.querySelector('.finding-defer-date').value,
+      }) });
+      toast('Finding deferred');
+      renderAssetDetail({ id }, container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.finding-dismiss-save').forEach((btn) => btn.addEventListener('click', async () => {
+    const box = container.querySelector(`.finding-dismiss-box[data-id="${btn.dataset.id}"]`);
+    try {
+      await api(`/api/pg/condition-findings/${btn.dataset.id}/dismiss`, { method: 'POST', body: JSON.stringify({ note: box.querySelector('.finding-dismiss-note').value }) });
+      toast('Finding dismissed');
+      renderAssetDetail({ id }, container);
+    } catch (err) { toast(err.message); }
+  }));
 }
 
 // A direct entry point for the "audit every building" workflow — skips the
@@ -1097,6 +1330,58 @@ async function renderAssetDetail({ id }, container = app) {
 // know (or want to search for) the asset by name. Picking one hands straight
 // off to the same renderAudit used from Asset Detail; nothing about the audit
 // form itself changes.
+// Build Brief v2 Phase 7 (§7.2) — the end-of-walkthrough screen: every open
+// finding for this asset, listed with a checkbox and a pre-filled line
+// title from its template. Untick anything not going on this WO. One button
+// creates the WO with one job line per checked finding, each carrying its
+// condition_finding_id so Phase 3's auto-schedule fires for free.
+async function renderCreateWoFromFindings({ assetId, assetName }) {
+  setChrome({ title: 'Create WO from Findings', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const { findings } = await api(`/api/pg/assets/${assetId}/open-findings-for-wo`);
+
+  if (!findings.length) {
+    app.innerHTML = `<div class="card"><h3>Create Work Order from Findings</h3><p class="muted">No open findings for ${escapeHtml(assetName)}.</p></div>`;
+    return;
+  }
+
+  app.innerHTML = `
+    <div class="card">
+      <h3>Create Work Order from Findings — ${escapeHtml(assetName)}</h3>
+      <p class="muted">Every open finding for this asset, pre-filled from its template where one matches. Untick anything not going on this WO — funding and responsibility get fine-tuned afterward on the WO screen, where there's a keyboard.</p>
+      <form id="cwfForm">
+        ${findings.map((f) => `
+          <div class="card" style="background:transparent;border:1px solid var(--border,#ccc)">
+            <label style="display:flex;align-items:flex-start;gap:8px;font-weight:400;cursor:pointer">
+              <input type="checkbox" class="cwf-check" data-id="${f.Id}" checked style="margin-top:4px;width:18px;height:18px;flex-shrink:0" />
+              <span style="flex:1">
+                <div class="muted" style="font-size:0.8rem">${escapeHtml(f.Severity || '')}${f.Description ? ` · ${escapeHtml(f.Description)}` : ''}</div>
+                <input class="cwf-title" data-id="${f.Id}" value="${escapeHtml(f.SuggestedTitle)}" style="margin-top:6px" />
+              </span>
+            </label>
+          </div>`).join('')}
+        <button class="btn btn-primary" type="submit" style="margin-top:12px">Create Work Order</button>
+      </form>
+    </div>`;
+
+  const findingById = new Map(findings.map((f) => [f.Id, f]));
+  app.querySelector('#cwfForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const selections = [...app.querySelectorAll('.cwf-check:checked')].map((cb) => {
+      const id = Number(cb.dataset.id);
+      const f = findingById.get(id);
+      const title = app.querySelector(`.cwf-title[data-id="${id}"]`).value.trim() || f.SuggestedTitle;
+      return { findingId: id, title, responsibilityClass: f.SuggestedResponsibilityClass, fundingSource: f.SuggestedFundingSource, estimatedCost: f.EstimatedCost };
+    });
+    if (!selections.length) { toast('Check at least one finding'); return; }
+    try {
+      const { workOrderId } = await api(`/api/pg/assets/${assetId}/create-wo-from-findings`, { method: 'POST', body: JSON.stringify({ findings: selections }) });
+      toast('Work order created');
+      go('workOrderDetail', { id: workOrderId }, { replace: true });
+    } catch (err) { toast(err.message); }
+  });
+}
+
 async function renderAuditPicker() {
   setChrome({ title: 'Start Audit', showBack: false, showLogout: true });
   app.innerHTML = `
@@ -1154,7 +1439,7 @@ async function renderAudit({ id }) {
           </div>
           <div class="field-row"><label>Material</label><input class="comp-material" /></div>
           <div class="field-row"><label>Notes</label><textarea class="comp-notes"></textarea></div>
-          <div class="field-row"><label>Photo (optional)</label><input type="file" class="comp-photo" accept="image/*" capture="environment" /></div>
+          <div class="field-row"><label>Photo (optional)</label><input type="file" class="comp-photo" accept="image/*" capture="environment" multiple /></div>
           <label class="flag-check"><input type="checkbox" class="comp-flag-toggle" /> 🚩 Flag for follow-up</label>
           <div class="flag-note-wrap" hidden><input type="text" class="comp-flag-note" placeholder="Optional note" /></div>
         </div>`).join('')}
@@ -1232,10 +1517,11 @@ async function renderAudit({ id }) {
       const notes = card.querySelector('.comp-notes').value;
       const flagged = !!card.querySelector('.comp-flag-toggle')?.checked;
       const flagNote = flagged ? (card.querySelector('.comp-flag-note')?.value.trim() || null) : null;
-      const photoFile = card.querySelector('.comp-photo')?.files?.[0];
-      if (!condition && !material && !notes && !flagged && !photoFile) continue; // skip untouched component cards
-      const photoUrl = photoFile && photoFile.size ? await uploadPhotoFile(photoFile, 'components', id) : null;
-      componentEvents.push({ componentType: card.dataset.component, eventType, condition, material, notes, flagged, flagNote, photoUrl });
+      const photoFiles = [...(card.querySelector('.comp-photo')?.files || [])].filter((f) => f && f.size);
+      if (!condition && !material && !notes && !flagged && !photoFiles.length) continue; // skip untouched component cards
+      const attachmentIds = [];
+      for (const file of photoFiles) attachmentIds.push(await uploadAttachmentUnlinked(file, 'components', id));
+      componentEvents.push({ componentType: card.dataset.component, eventType, condition, material, notes, flagged, flagNote, attachmentIds });
     }
 
     const severity = fd.get('findingSeverity');
@@ -1246,13 +1532,13 @@ async function renderAudit({ id }) {
     try {
       let finding = null;
       if (severity && description) {
-        const photoUrls = [];
-        for (const file of findingPhotos) photoUrls.push(await uploadPhotoFile(file, 'findings', id));
-        finding = { severity, description, photoUrls };
+        const attachmentIds = [];
+        for (const file of findingPhotos) attachmentIds.push(await uploadAttachmentUnlinked(file, 'findings', id));
+        finding = { severity, description, attachmentIds };
       }
-      const generalPhotos = [];
-      for (const file of generalPhotoFiles) generalPhotos.push(await uploadPhotoFile(file, 'asset-photos', id));
-      await api(`/api/pg/assets/${id}/audit`, { method: 'POST', body: JSON.stringify({ properties: propertiesOut, componentEvents, finding, generalPhotos }) });
+      const generalAttachmentIds = [];
+      for (const file of generalPhotoFiles) generalAttachmentIds.push(await uploadAttachmentUnlinked(file, 'asset-photos', id));
+      await api(`/api/pg/assets/${id}/audit`, { method: 'POST', body: JSON.stringify({ properties: propertiesOut, componentEvents, finding, generalAttachmentIds }) });
       toast('Audit submitted');
       state.stack.pop(); // drop this audit entry
       go('assetDetail', { id }, { replace: true });
@@ -1280,13 +1566,15 @@ async function renderAssetHistory({ id }) {
           <span class="pill ${conditionPillClass(h.Condition)}">${escapeHtml(h.Condition || '')}</span></div>
         <div class="muted">${escapeHtml(formatDateNice(h['Observed/Installed Date']))} · ${escapeHtml(h.Material || '')}</div>
         ${h.Notes ? `<div>${escapeHtml(h.Notes)}</div>` : ''}
-        ${h['Photo URL'] ? `<a href="${escapeHtml(h['Photo URL'])}" target="_blank" rel="noopener"><img src="${escapeHtml(h['Photo URL'])}" alt="" style="max-width:120px;border-radius:8px;margin-top:6px;display:block" /></a>` : ''}
+        <div id="compPhotos-${h.Id}" style="margin-top:6px"></div>
       </div>` : `
       <div class="card">
         <div><strong>${escapeHtml(h.Label)}</strong> changed</div>
         <div class="muted">${escapeHtml(h['Old Value'] ?? '—')} → <strong>${escapeHtml(h['New Value'] ?? '—')}</strong></div>
         <div class="muted">${new Date(h.ChangedAt).toLocaleString()}${h.ChangedBy ? ` · ${escapeHtml(h.ChangedBy)}` : ''}</div>
       </div>`).join('') : '<p class="muted">No history yet.</p>');
+
+  history.forEach((h) => renderAttachmentSection('asset_component', h.Id, app.querySelector(`#compPhotos-${h.Id}`), { title: 'Photos', defaultRoleName: 'Evidence', inheritedClassification: h['Component Type'] }));
 }
 
 // ---------- Interactive Map ----------
@@ -2331,7 +2619,7 @@ async function renderCapitalPlan() {
         ${g.LinkedAssets?.length ? `<p class="muted">Linked asset${g.LinkedAssets.length > 1 ? 's' : ''}: ${g.LinkedAssets.map((a) => `<a href="#" class="budget-asset-link" data-asset-id="${a.Id}">${escapeHtml(a.Name)}</a>`).join(', ')}</p>` : ''}
         ${g.Items.length ? g.Items.map((it) => `<div class="list-item budget-wo-link" data-wo-id="${it.WorkOrderId}">
           <span>${escapeHtml(it.Title)}</span>
-          <span class="pill ${woStatusPillClass(it.Status)}">${escapeHtml(it.Status)} · ${moneyFmt(it.Cost)}</span>
+          <span class="pill">${escapeHtml(it.Status)} · ${moneyFmt(it.Cost)}</span>
         </div>`).join('') : '<p class="muted">No work orders tagged to this yet.</p>'}
         <div class="btn-row"><button class="btn btn-secondary delete-fund-entity" data-kind="${kind}" data-id="${g.Id}" data-name="${escapeHtml(g.Name)}">Delete</button></div>
       </div>
@@ -2591,6 +2879,238 @@ async function renderNotes() {
   draw();
 }
 
+// ---------- Triage Inbox (Build Brief v2 Phase 5) ----------
+// Grid of thumbnails, newest batch first, grouped by batch. A batch is a
+// suggestion, not a commitment — acting on some of its photos leaves the
+// rest in the inbox, so one email can become several work orders. Selection
+// and the action bar are scoped per batch, matching "repeat until empty."
+
+// Groups a batch's photos by EXIF taken_at proximity (within 5 min) — "these
+// were shot in one pass" — so one tap selects the cluster instead of
+// hand-picking each thumbnail. GPS-distance refinement is a documented
+// follow-up (see update-for-claude.md); time alone is what's implemented.
+function clusterInboxAttachments(attachments) {
+  const withTime = attachments.filter((a) => a.TakenAt).sort((a, b) => new Date(a.TakenAt) - new Date(b.TakenAt));
+  if (withTime.length < 2) return [];
+  const clusters = [];
+  let current = [withTime[0]];
+  for (let i = 1; i < withTime.length; i++) {
+    const gapMs = new Date(withTime[i].TakenAt) - new Date(withTime[i - 1].TakenAt);
+    if (gapMs <= 5 * 60 * 1000) current.push(withTime[i]);
+    else { clusters.push(current); current = [withTime[i]]; }
+  }
+  clusters.push(current);
+  return clusters.filter((c) => c.length > 1);
+}
+
+async function renderInbox() {
+  setChrome({ title: 'Inbox', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const { batches } = await api('/api/pg/inbox');
+
+  if (!batches.length) {
+    app.innerHTML = `<div class="card"><h3>Inbox</h3><p class="muted">Nothing to triage. Photos land here from email (once configured) or the "Attach file" button — direct uploads on an asset/WO/job line skip the inbox entirely.</p></div>`;
+    return;
+  }
+
+  app.innerHTML = batches.map((b) => {
+    const clusters = clusterInboxAttachments(b.Attachments);
+    return `
+    <div class="card inbox-batch" data-batch-id="${b.Id}">
+      <h3>${escapeHtml(b.Subject || '(no subject)')}</h3>
+      <p class="muted">${b.SenderEmail ? escapeHtml(b.SenderEmail) + ' · ' : ''}${new Date(b.ReceivedAt).toLocaleString()} · ${b.Attachments.length} photo${b.Attachments.length === 1 ? '' : 's'}</p>
+      ${clusters.length ? `<div class="btn-row" style="margin-bottom:8px">${clusters.map((c, i) => `<button type="button" class="btn btn-secondary cluster-select" data-ids="${c.map((a) => a.Id).join(',')}">Select cluster ${i + 1} (${c.length}, ~${Math.round((new Date(c[c.length - 1].TakenAt) - new Date(c[0].TakenAt)) / 60000)}min)</button>`).join('')}</div>` : ''}
+      <div class="attach-grid" style="display:flex;flex-wrap:wrap;gap:8px">
+        ${b.Attachments.map((a) => `
+          <label class="inbox-thumb" style="position:relative;cursor:pointer;display:block">
+            <input type="checkbox" class="inbox-select" value="${a.Id}" style="position:absolute;top:2px;left:2px;z-index:1;width:20px;height:20px" />
+            ${a.Kind === 'image'
+              ? `<img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:84px;height:84px;object-fit:cover;border-radius:8px;display:block" />`
+              : `<div style="width:84px;height:84px;border-radius:8px;background:#f0f2fb;display:flex;align-items:center;justify-content:center;font-size:28px">📄</div>`}
+          </label>`).join('')}
+      </div>
+      <div class="btn-row" style="margin-top:10px">
+        <button type="button" class="btn btn-secondary batch-select-all">Select All</button>
+        <button type="button" class="btn btn-primary batch-action" data-action="createWo">Create WO</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="addToWo">Add to Existing WO</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="addToLine">Add to Job Line</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="newFinding">New Finding</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="fileAsset">File to Asset (reference)</button>
+        <button type="button" class="btn btn-secondary batch-action" data-action="void">Void</button>
+      </div>
+      <div class="batch-action-panel" hidden></div>
+    </div>`;
+  }).join('');
+
+  batches.forEach((b) => wireInboxBatch(b));
+}
+
+function wireInboxBatch(batch) {
+  const card = app.querySelector(`.inbox-batch[data-batch-id="${batch.Id}"]`);
+  if (!card) return;
+  const panel = card.querySelector('.batch-action-panel');
+
+  const selectedIds = () => [...card.querySelectorAll('.inbox-select:checked')].map((el) => Number(el.value));
+
+  card.querySelector('.batch-select-all').addEventListener('click', () => {
+    card.querySelectorAll('.inbox-select').forEach((el) => { el.checked = true; });
+  });
+  card.querySelectorAll('.cluster-select').forEach((btn) => btn.addEventListener('click', () => {
+    const ids = new Set(btn.dataset.ids.split(',').map(Number));
+    card.querySelectorAll('.inbox-select').forEach((el) => { el.checked = ids.has(Number(el.value)); });
+  }));
+
+  async function afterAction() {
+    toast('Done');
+    renderInbox();
+  }
+
+  // Nearest-asset-from-GPS + fuzzy subject-match suggestions (§5.3/§5.2) —
+  // "confirm or correct" instead of a blind search. Never auto-assigns.
+  async function suggestionsHtml() {
+    const ids = selectedIds();
+    const withGps = batch.Attachments.find((a) => ids.includes(a.Id) && a.GpsLat != null);
+    const [textSugg, gpsSugg] = await Promise.all([
+      api(`/api/pg/inbox/suggest-assets?text=${encodeURIComponent(batch.Subject || '')}`),
+      withGps ? api(`/api/pg/inbox/suggest-assets?lat=${withGps.GpsLat}&lng=${withGps.GpsLng}`) : Promise.resolve({ suggestions: [] }),
+    ]);
+    const all = [...gpsSugg.suggestions, ...textSugg.suggestions].filter((s, i, arr) => arr.findIndex((x) => x.Id === s.Id) === i).slice(0, 3);
+    if (!all.length) return '';
+    return `<div class="btn-row" style="margin-bottom:8px">${all.map((s) => `<button type="button" class="btn btn-secondary suggest-asset-btn" data-id="${s.Id}" data-name="${escapeHtml(s.Name)}">📍 ${escapeHtml(s.Name)}</button>`).join('')}</div>`;
+  }
+
+  card.querySelectorAll('.batch-action').forEach((btn) => btn.addEventListener('click', async () => {
+    const ids = selectedIds();
+    if (!ids.length) { toast('Select at least one photo first'); return; }
+    const action = btn.dataset.action;
+
+    if (action === 'void') {
+      try { await api('/api/pg/inbox/void', { method: 'POST', body: JSON.stringify({ attachmentIds: ids }) }); await afterAction(); }
+      catch (err) { toast(err.message); }
+      return;
+    }
+
+    panel.hidden = false;
+    const suggHtml = await suggestionsHtml();
+
+    if (action === 'createWo') {
+      panel.innerHTML = `<div class="card" style="margin-top:8px">
+        ${suggHtml}
+        <div class="field-row"><label>Asset</label><div class="asset-picker"></div></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="use-subject-title" checked /> Use subject as work order title</label>
+        <div class="field-row title-row" hidden><label>Title</label><input class="wo-title" value="${escapeHtml(batch.Subject || '')}" /></div>
+        <div class="btn-row"><button type="button" class="btn btn-primary panel-confirm">Create Work Order</button><button type="button" class="btn btn-secondary panel-cancel">Cancel</button></div>
+      </div>`;
+      let asset = null;
+      mountAssetCombobox(panel.querySelector('.asset-picker'), { onSelect: (a) => { asset = a; } });
+      panel.querySelectorAll('.suggest-asset-btn').forEach((sb) => sb.addEventListener('click', () => {
+        asset = { Id: Number(sb.dataset.id), Name: sb.dataset.name };
+        panel.querySelector('.ac-input').value = sb.dataset.name;
+      }));
+      panel.querySelector('.use-subject-title').addEventListener('change', (e) => { panel.querySelector('.title-row').hidden = e.target.checked; });
+      panel.querySelector('.panel-cancel').addEventListener('click', () => { panel.hidden = true; });
+      panel.querySelector('.panel-confirm').addEventListener('click', async () => {
+        const title = panel.querySelector('.use-subject-title').checked ? (batch.Subject || 'Work Order') : panel.querySelector('.wo-title').value.trim();
+        if (!title) { toast('Title is required'); return; }
+        try {
+          const { workOrderId } = await api('/api/pg/inbox/create-work-order', { method: 'POST', body: JSON.stringify({ attachmentIds: ids, assetId: asset?.Id || null, title }) });
+          toast('Work order created');
+          go('workOrderDetail', { id: workOrderId });
+        } catch (err) { toast(err.message); }
+      });
+    } else if (action === 'fileAsset') {
+      panel.innerHTML = `<div class="card" style="margin-top:8px">
+        ${suggHtml}
+        <div class="field-row"><label>Asset</label><div class="asset-picker"></div></div>
+        <div class="btn-row"><button type="button" class="btn btn-primary panel-confirm">File Photos</button><button type="button" class="btn btn-secondary panel-cancel">Cancel</button></div>
+      </div>`;
+      let asset = null;
+      mountAssetCombobox(panel.querySelector('.asset-picker'), { onSelect: (a) => { asset = a; } });
+      panel.querySelectorAll('.suggest-asset-btn').forEach((sb) => sb.addEventListener('click', () => {
+        asset = { Id: Number(sb.dataset.id), Name: sb.dataset.name };
+        panel.querySelector('.ac-input').value = sb.dataset.name;
+      }));
+      panel.querySelector('.panel-cancel').addEventListener('click', () => { panel.hidden = true; });
+      panel.querySelector('.panel-confirm').addEventListener('click', async () => {
+        if (!asset) { toast('Pick an asset first'); return; }
+        try {
+          await api('/api/pg/inbox/attach', { method: 'POST', body: JSON.stringify({ attachmentIds: ids, entityType: 'asset', entityId: asset.Id }) });
+          await afterAction();
+        } catch (err) { toast(err.message); }
+      });
+    } else if (action === 'newFinding') {
+      panel.innerHTML = `<div class="card" style="margin-top:8px">
+        ${suggHtml}
+        <div class="field-row"><label>Asset</label><div class="asset-picker"></div></div>
+        <div class="field-row"><label>Severity</label><select class="finding-severity">${(state.options.findingSeverity || []).map((s) => `<option>${escapeHtml(s)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Description</label><textarea class="finding-description"></textarea></div>
+        <div class="btn-row"><button type="button" class="btn btn-primary panel-confirm">Create Finding</button><button type="button" class="btn btn-secondary panel-cancel">Cancel</button></div>
+      </div>`;
+      let asset = null;
+      mountAssetCombobox(panel.querySelector('.asset-picker'), { onSelect: (a) => { asset = a; } });
+      panel.querySelectorAll('.suggest-asset-btn').forEach((sb) => sb.addEventListener('click', () => {
+        asset = { Id: Number(sb.dataset.id), Name: sb.dataset.name };
+        panel.querySelector('.ac-input').value = sb.dataset.name;
+      }));
+      panel.querySelector('.panel-cancel').addEventListener('click', () => { panel.hidden = true; });
+      panel.querySelector('.panel-confirm').addEventListener('click', async () => {
+        const description = panel.querySelector('.finding-description').value.trim();
+        if (!asset || !description) { toast('Asset and description are required'); return; }
+        try {
+          await api('/api/pg/inbox/create-finding', { method: 'POST', body: JSON.stringify({
+            attachmentIds: ids, assetId: asset.Id, severity: panel.querySelector('.finding-severity').value, description,
+          }) });
+          await afterAction();
+        } catch (err) { toast(err.message); }
+      });
+    } else if (action === 'addToWo' || action === 'addToLine') {
+      panel.innerHTML = `<div class="card" style="margin-top:8px">
+        ${suggHtml}
+        <div class="field-row"><label>Asset</label><div class="asset-picker"></div></div>
+        <div class="field-row wo-row" hidden><label>Work Order</label><select class="wo-picker"></select></div>
+        ${action === 'addToLine' ? '<div class="field-row line-row" hidden><label>Job Line</label><select class="line-picker"></select></div>' : ''}
+        <div class="btn-row"><button type="button" class="btn btn-primary panel-confirm">Attach</button><button type="button" class="btn btn-secondary panel-cancel">Cancel</button></div>
+      </div>`;
+      let asset = null;
+      const woRow = panel.querySelector('.wo-row');
+      const woPicker = panel.querySelector('.wo-picker');
+      const lineRow = panel.querySelector('.line-row');
+      const linePicker = panel.querySelector('.line-picker');
+      async function loadWos(a) {
+        const detail = await api(`/api/pg/assets/${a.Id}`);
+        woRow.hidden = false;
+        woPicker.innerHTML = detail.workOrders.map((w) => `<option value="${w.Id}">${escapeHtml(w.Title)} (${escapeHtml(w.Status)})</option>`).join('') || '<option value="">— none —</option>';
+        if (action === 'addToLine' && detail.workOrders.length) await loadLines(detail.workOrders[0].Id);
+      }
+      async function loadLines(woId) {
+        if (!linePicker) return;
+        const wo = await api(`/api/pg/work-orders/${woId}`);
+        lineRow.hidden = false;
+        linePicker.innerHTML = (wo.jobLines || []).map((jl) => `<option value="${jl.Id}">${escapeHtml(jl.Title)}</option>`).join('') || '<option value="">— none —</option>';
+      }
+      mountAssetCombobox(panel.querySelector('.asset-picker'), { onSelect: (a) => { asset = a; if (a) loadWos(a); } });
+      panel.querySelectorAll('.suggest-asset-btn').forEach((sb) => sb.addEventListener('click', () => {
+        asset = { Id: Number(sb.dataset.id), Name: sb.dataset.name };
+        panel.querySelector('.ac-input').value = sb.dataset.name;
+        loadWos(asset);
+      }));
+      woPicker.addEventListener('change', () => { if (action === 'addToLine') loadLines(woPicker.value); });
+      panel.querySelector('.panel-cancel').addEventListener('click', () => { panel.hidden = true; });
+      panel.querySelector('.panel-confirm').addEventListener('click', async () => {
+        const woId = woPicker.value;
+        if (!woId) { toast('Pick a work order first'); return; }
+        const entityType = action === 'addToLine' ? 'job_line' : 'work_order';
+        const entityId = action === 'addToLine' ? linePicker.value : woId;
+        if (action === 'addToLine' && !entityId) { toast('Pick a job line first'); return; }
+        try {
+          await api('/api/pg/inbox/attach', { method: 'POST', body: JSON.stringify({ attachmentIds: ids, entityType, entityId: Number(entityId) }) });
+          await afterAction();
+        } catch (err) { toast(err.message); }
+      });
+    }
+  }));
+}
+
 async function renderMaintenanceLog() {
   setChrome({ title: 'Maintenance Log', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
@@ -2636,6 +3156,8 @@ async function renderMaintenanceLog() {
 const REPORT_ENTITIES = [
   { key: 'assets', label: 'Assets' },
   { key: 'workOrders', label: 'Work Orders' },
+  { key: 'jobLines', label: 'Job Lines' },
+  { key: 'findings', label: 'Findings' },
   { key: 'workOrderLog', label: 'Progress Log' },
   { key: 'crewSessions', label: 'Crew Sessions' },
 ];
@@ -2672,6 +3194,8 @@ const REPORT_TABS = [
   { key: 'explorer', label: 'Data Explorer' },
   { key: 'board', label: 'Board Report' },
   { key: 'forwardFocus', label: 'Forward Focus' },
+  { key: 'workPerformed', label: 'Work Performed' },
+  { key: 'deferredBacklog', label: 'Deferred Backlog' },
 ];
 function reportsTabsHtml(mode) {
   return `<div class="card">
@@ -2691,6 +3215,8 @@ async function renderReports(params = {}) {
   const mode = REPORT_TABS.some((t) => t.key === params.mode) ? params.mode : 'explorer';
   if (mode === 'board') return renderBoardReport();
   if (mode === 'forwardFocus') return renderForwardFocusReport();
+  if (mode === 'workPerformed') return renderWorkPerformedReport();
+  if (mode === 'deferredBacklog') return renderDeferredBacklogReport();
   return renderReportsExplorer(params);
 }
 
@@ -3107,6 +3633,82 @@ async function renderForwardFocusReport() {
   draw();
 }
 
+// "Work Performed in a Date Range" (§6.2.1) — the fall-to-spring board
+// document: job lines completed in range, grouped by building, regardless
+// of whether their parent WO is fully closed yet.
+async function renderWorkPerformedReport() {
+  setChrome({ title: 'Reports', showBack: false, showLogout: true });
+  const todayStr = isoDate(new Date());
+  const sixMonthsAgo = new Date(); sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  let from = isoDate(sixMonthsAgo);
+  let to = todayStr;
+  let report = null;
+  let generating = false;
+
+  function draw() {
+    setApp(`
+      ${reportsTabsHtml('workPerformed')}
+      <div class="card">
+        <h3>Work Performed</h3>
+        <p class="muted">Job lines completed in this range, grouped by building — proves activity even while a big multi-line job is still open. After photos embed (capped per work order in Admin → Work Order Statuses).</p>
+        <div class="field-row"><label>Range</label>
+          <div class="report-date-range">
+            <input type="date" id="wpFrom" value="${from}" />
+            <span class="muted">to</span>
+            <input type="date" id="wpTo" value="${to}" />
+          </div>
+        </div>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="wpGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
+      </div>
+      ${reportPreviewAreaHtml(report)}`);
+    wireReportsTabs();
+    document.getElementById('wpGenBtn').addEventListener('click', generate);
+    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/work-performed/send', sendBody: () => ({ from, to }) });
+  }
+
+  async function generate() {
+    from = document.getElementById('wpFrom').value || from;
+    to = document.getElementById('wpTo').value || to;
+    generating = true; draw();
+    try { report = await api(`/api/pg/reports/work-performed/preview?from=${from}&to=${to}`); }
+    catch (err) { toast(err.message); }
+    generating = false; draw();
+  }
+
+  draw();
+}
+
+// "Deferred Maintenance Backlog" (§6.2.2) — the capital-campaign argument:
+// every deferred finding, grouped by severity, with dollar totals.
+async function renderDeferredBacklogReport() {
+  setChrome({ title: 'Reports', showBack: false, showLogout: true });
+  let report = null;
+  let generating = false;
+
+  function draw() {
+    setApp(`
+      ${reportsTabsHtml('deferredBacklog')}
+      <div class="card">
+        <h3>Deferred Maintenance Backlog</h3>
+        <p class="muted">Every deferred finding, grouped by severity, with dollar totals — a standard capital-planning document.</p>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="dbGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
+      </div>
+      ${reportPreviewAreaHtml(report)}`);
+    wireReportsTabs();
+    document.getElementById('dbGenBtn').addEventListener('click', generate);
+    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/deferred-backlog/send', sendBody: () => ({}) });
+  }
+
+  async function generate() {
+    generating = true; draw();
+    try { report = await api('/api/pg/reports/deferred-backlog/preview'); }
+    catch (err) { toast(err.message); }
+    generating = false; draw();
+  }
+
+  draw();
+}
+
 // ---------- Edit Asset (full direct edit — core fields + every property field,
 // no conditional hiding, distinct from the guided Audit walkthrough) ----------
 
@@ -3190,7 +3792,12 @@ const ADMIN_CATEGORIES = {
     icon: '🧾', title: 'Work Orders', description: 'Templates and checklists for repeatable work',
     items: [
       { view: 'adminWoTemplates', icon: '🧾', label: 'Work Order Templates' },
+      { view: 'adminJobLineTemplates', icon: '🧩', label: 'Job Line Templates' },
       { view: 'adminChecklistTemplates', icon: '✅', label: 'Checklist Templates' },
+      { view: 'adminCauses', icon: '🔍', label: 'Causes' },
+      { view: 'adminWorkOrderStatuses', icon: '🚦', label: 'Work Order Statuses' },
+      { view: 'adminJobLineStatuses', icon: '🚦', label: 'Job Line Statuses' },
+      { view: 'adminAttachmentRoles', icon: '📎', label: 'Attachment Roles' },
     ],
   },
   requests: {
@@ -3209,6 +3816,7 @@ const ADMIN_CATEGORIES = {
     icon: '🕘', title: 'System', description: 'What has been done across the app',
     items: [
       { view: 'activityLog', icon: '🕘', label: 'Activity Log' },
+      { view: 'adminMapCalibration', icon: '🧭', label: 'Map GPS Calibration' },
     ],
   },
 };
@@ -3416,16 +4024,24 @@ async function renderAdminWoTemplates(container = app) {
   const fieldTitles = optsRes.propertyFields.map((f) => f.title);
   let editingId = null; // null | 'new' | number
 
-  const taskRowHtml = (text = '') => `<div class="inline-add-row task-row"><input class="task-text" value="${escapeHtml(text)}" placeholder="Task description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>`;
-  const jobLineRowHtml = (row = {}) => `<div class="inline-add-row jl-row" style="align-items:center">
-      <select class="jl-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
-      <input class="jl-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
+  // job_line_defaults holds partial job-line objects (title + responsibility
+  // class); asset_update_defaults is the separate, older "also change an
+  // asset field" blueprint — the two got renamed apart in migration 0038/0039
+  // specifically so "job line" stops meaning two different things.
+  const jlDefaultRowHtml = (row = {}) => `<div class="inline-add-row jld-row" style="align-items:center">
+    <input class="jld-title" value="${escapeHtml(row.title || '')}" placeholder="Job line title…" style="flex:1" />
+    <select class="jld-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${row.responsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+    <button type="button" class="btn btn-secondary row-remove">✕</button>
+  </div>`;
+  const auDefaultRowHtml = (row = {}) => `<div class="inline-add-row aud-row" style="align-items:center">
+      <select class="aud-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
+      <input class="aud-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
       <button type="button" class="btn btn-secondary row-remove">✕</button>
     </div>`;
 
   function formHtml(t) {
-    const taskRows = (t?.TaskDefaults || []).map(taskRowHtml).join('');
-    const jlRows = (t?.JobLineDefaults || []).map(jobLineRowHtml).join('');
+    const jlRows = (t?.JobLineDefaults || []).map(jlDefaultRowHtml).join('');
+    const auRows = (t?.AssetUpdateDefaults || []).map(auDefaultRowHtml).join('');
     return `<div class="card">
       <h3>${t ? `Edit "${escapeHtml(t.Name)}"` : 'New Template'}</h3>
       <div class="field-row"><label>Template Name</label><input class="tf-name" value="${escapeHtml(t?.Name || '')}" placeholder="e.g. Winterization" required /></div>
@@ -3434,15 +4050,15 @@ async function renderAdminWoTemplates(container = app) {
         <select class="tf-priority"><option value="">— none —</option>${['Low', 'Medium', 'High', 'Urgent'].map((p) => `<option ${t?.DefaultPriority === p ? 'selected' : ''}>${p}</option>`).join('')}</select>
       </div>
       <div class="field-row"><label>Default Description</label><textarea class="tf-description">${escapeHtml(t?.DefaultDescription || '')}</textarea></div>
-      <div class="field-row"><label>Default Tasks</label>
-        <p class="muted" style="margin:2px 0 8px">Pre-fills these scope-of-work tasks on every WO created from this template.</p>
-        <div class="tf-tasks">${taskRows}</div>
-        <button type="button" class="btn btn-secondary tf-add-task" style="margin-top:6px">+ Add Task</button>
+      <div class="field-row"><label>Default Job Lines</label>
+        <p class="muted" style="margin:2px 0 8px">Pre-fills these job lines (title + responsibility) on every WO created from this template. Funding/hours/cost are set per use.</p>
+        <div class="tf-job-lines">${jlRows}</div>
+        <button type="button" class="btn btn-secondary tf-add-line" style="margin-top:6px">+ Add Job Line</button>
       </div>
       <details style="margin:12px 0">
         <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
-        <div class="tf-job-lines" style="margin-top:8px">${jlRows}</div>
-        <button type="button" class="btn btn-secondary tf-add-line" style="margin-top:6px">+ Add Field Update</button>
+        <div class="tf-asset-updates" style="margin-top:8px">${auRows}</div>
+        <button type="button" class="btn btn-secondary tf-add-au" style="margin-top:6px">+ Add Field Update</button>
       </details>
       <div class="btn-row">
         <button class="btn btn-primary tf-save" data-id="${t?.Id ?? ''}">Save Template</button>
@@ -3457,17 +4073,17 @@ async function renderAdminWoTemplates(container = app) {
         <div>
           <strong>${escapeHtml(t.Name)}</strong>
           <div class="muted">${escapeHtml(t.DefaultTitle || '')}${t.DefaultPriority ? ' · ' + escapeHtml(t.DefaultPriority) : ''}</div>
-          ${t.TaskDefaults?.length ? `<div class="muted">${t.TaskDefaults.length} default task${t.TaskDefaults.length > 1 ? 's' : ''}</div>` : ''}
+          ${t.JobLineDefaults?.length ? `<div class="muted">${t.JobLineDefaults.length} default job line${t.JobLineDefaults.length > 1 ? 's' : ''}</div>` : ''}
         </div>
         <div class="btn-row" style="margin-top:0">
           <button class="btn btn-secondary tpl-edit" data-id="${t.Id}">Edit</button>
           <button class="btn btn-secondary tpl-delete" data-id="${t.Id}" data-name="${escapeHtml(t.Name)}">Delete</button>
         </div>
-      </div>`).join('') || '<p class="muted">🧾 No templates yet — save your repeatable tasks here.</p>';
+      </div>`).join('') || '<p class="muted">🧾 No templates yet — save your repeatable job lines here.</p>';
 
     setApp(`
       <div class="card"><h3>Work Order Templates</h3>
-        <p class="muted">Canned setups for repeatable tasks — pick one from "New Work Order" instead of retyping everything.</p>
+        <p class="muted">Canned setups for repeatable jobs — pick one from "New Work Order" instead of retyping everything.</p>
       </div>
       ${list}
       ${editingId === 'new' ? formHtml(null) : `<div class="btn-row" style="margin:4px 0 16px"><button class="btn btn-secondary" id="newTplBtn">+ New Template</button></div>`}
@@ -3480,12 +4096,12 @@ async function renderAdminWoTemplates(container = app) {
     container.querySelector('#newTplBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
     container.querySelectorAll('.tpl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
     container.querySelectorAll('.tf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
-    container.querySelectorAll('.tf-add-task').forEach((btn) => btn.addEventListener('click', () => {
-      btn.previousElementSibling.insertAdjacentHTML('beforeend', taskRowHtml());
+    container.querySelectorAll('.tf-add-line').forEach((btn) => btn.addEventListener('click', () => {
+      btn.previousElementSibling.insertAdjacentHTML('beforeend', jlDefaultRowHtml());
       wireRemoveButtons();
     }));
-    container.querySelectorAll('.tf-add-line').forEach((btn) => btn.addEventListener('click', () => {
-      btn.previousElementSibling.insertAdjacentHTML('beforeend', jobLineRowHtml());
+    container.querySelectorAll('.tf-add-au').forEach((btn) => btn.addEventListener('click', () => {
+      btn.previousElementSibling.insertAdjacentHTML('beforeend', auDefaultRowHtml());
       wireRemoveButtons();
     }));
     wireRemoveButtons();
@@ -3501,15 +4117,17 @@ async function renderAdminWoTemplates(container = app) {
       const card = btn.closest('.card');
       const name = card.querySelector('.tf-name').value.trim();
       if (!name) { toast('Template name is required'); return; }
-      const taskDefaults = [...card.querySelectorAll('.task-row .task-text')].map((el) => el.value.trim()).filter(Boolean);
-      const jobLineDefaults = [...card.querySelectorAll('.jl-row')].map((row) => ({
-        targetField: row.querySelector('.jl-field').value, newValue: row.querySelector('.jl-value').value,
+      const jobLineDefaults = [...card.querySelectorAll('.jld-row')].map((row) => ({
+        title: row.querySelector('.jld-title').value.trim(), responsibilityClass: row.querySelector('.jld-resp').value,
+      })).filter((r) => r.title);
+      const assetUpdateDefaults = [...card.querySelectorAll('.aud-row')].map((row) => ({
+        targetField: row.querySelector('.aud-field').value, newValue: row.querySelector('.aud-value').value,
       })).filter((r) => r.newValue.trim());
       const fields = {
         name, defaultTitle: card.querySelector('.tf-title').value.trim(),
         defaultPriority: card.querySelector('.tf-priority').value,
         defaultDescription: card.querySelector('.tf-description').value.trim(),
-        taskDefaults, jobLineDefaults,
+        jobLineDefaults, assetUpdateDefaults,
       };
       const id = btn.dataset.id;
       try {
@@ -3525,6 +4143,74 @@ async function renderAdminWoTemplates(container = app) {
   }
 
   draw();
+}
+
+// Build Brief v2 Phase 7 (§7.1) — wording/defaults for the "Create WO from
+// Findings" screen, keyed loosely by building type + component type. Most
+// specific match wins server-side (matchJobLineTemplate in db.js); this
+// page is plain CRUD, same shape as Causes/Attachment Roles.
+async function renderAdminJobLineTemplates(container = app) {
+  if (container === app) setChrome({ title: 'Job Line Templates', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { templates } = await api('/api/pg/admin/job-line-templates');
+  const buildingTypes = state.options.buildingTypes || [];
+  const componentTypes = state.options.componentTypeOptions || [];
+  const buildingTypeName = (id) => buildingTypes.find((b) => b.Id === id)?.Name;
+
+  const rows = templates.map((t) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap">
+      <span><strong>${escapeHtml(t.DefaultTitle)}</strong>
+        <div class="muted" style="font-weight:400">${[buildingTypeName(t.BuildingTypeId), t.ComponentType].filter(Boolean).join(' · ') || 'Matches anything'}
+          ${t.DefaultResponsibilityClass ? ` · ${escapeHtml(RESPONSIBILITY_CLASS_LABELS[t.DefaultResponsibilityClass] || t.DefaultResponsibilityClass)}` : ''}
+          ${!t.Active ? ' · <span class="pill">inactive</span>' : ''}</div></span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary jlt-toggle-active" data-id="${t.Id}" data-active="${t.Active}">${t.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary jlt-delete" data-id="${t.Id}" data-name="${escapeHtml(t.DefaultTitle)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No templates yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Job Line Templates</h3>
+      <p class="muted">Wording and defaults only — never grouping. A finding on Roof for a Cabin seeds a line titled "Roof repair — {asset}" with class and funding pre-filled. Use <code>{asset}</code> in the title to substitute the asset's name. Leave Building Type and/or Component Type unset to match more broadly.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Template</h3>
+      <form id="addJltForm">
+        <div class="field-row"><label>Default Title</label><input name="defaultTitle" placeholder="e.g. Roof repair — {asset}" required /></div>
+        <div class="field-row"><label>Building Type (optional)</label><select name="buildingTypeId"><option value="">— any —</option>${buildingTypes.map((b) => `<option value="${b.Id}">${escapeHtml(b.Name)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Component Type (optional)</label><select name="componentType"><option value="">— any —</option>${componentTypes.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Default Responsibility</label><select name="defaultResponsibilityClass"><option value="">— unset —</option>${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Default Funding Source</label><select name="defaultFundingSource"><option value="">— unset —</option>${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}">${escapeHtml(v)}</option>`).join('')}</select></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.jlt-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/job-line-templates/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) });
+      renderAdminJobLineTemplates(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.jlt-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete template "${btn.dataset.name}"?`)) return;
+    try {
+      await api(`/api/pg/admin/job-line-templates/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Template deleted');
+      renderAdminJobLineTemplates(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addJltForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/job-line-templates', { method: 'POST', body: JSON.stringify({
+        defaultTitle: fd.get('defaultTitle'), buildingTypeId: fd.get('buildingTypeId') || null, componentType: fd.get('componentType') || null,
+        defaultResponsibilityClass: fd.get('defaultResponsibilityClass') || null, defaultFundingSource: fd.get('defaultFundingSource') || null,
+      }) });
+      renderAdminJobLineTemplates(container);
+    } catch (err) { toast(err.message); }
+  });
 }
 
 function renderAdminAddFieldChoice(params = {}, container = app, { onOpenTool } = {}) {
@@ -3801,6 +4487,326 @@ async function renderAdminApplicability(container = app) {
   }));
 }
 
+// Causes catalog (1.6) — admin-editable dropdown a job line's Cause
+// multi-select reads from. Deactivating (not deleting) is the default path
+// once a cause is in use, same in-use-guard pattern as sub-areas/building
+// types; deleting a never-used cause is still allowed.
+// Work order statuses (2.2) — admin-editable, seeded with Reported/Assessed/
+// Scheduled/In Progress/Done/Deferred/Cancelled. No "Urgent" or "On Hold"
+// here on purpose: Urgent is a priority (see the priority column), and
+// Blocked lives on the job line — see the Job Line Statuses page.
+async function renderAdminWorkOrderStatuses(container = app) {
+  if (container === app) setChrome({ title: 'Work Order Statuses', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const [{ statuses }, displaySettings] = await Promise.all([
+    api('/api/pg/admin/work-order-statuses'), api('/api/pg/display-settings'),
+  ]);
+
+  const rows = statuses.map((s) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap">
+      <span><span class="pill" style="background:${s.Color}1a;color:${s.Color};border:1px solid ${s.Color}66">${escapeHtml(s.Name)}</span>
+        ${s.IsTerminal ? '<span class="muted">terminal</span>' : ''}${!s.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary wos-toggle-active" data-id="${s.Id}" data-active="${s.Active}">${s.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary wos-delete" data-id="${s.Id}" data-name="${escapeHtml(s.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No statuses defined.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Work Order Statuses</h3>
+      <p class="muted">The pipeline a work order moves through. Terminal statuses (Done/Deferred/Cancelled) no longer block on the close gate.</p>
+    </div>
+    <div class="card">
+      <h3>Grid progress bar weighting</h3>
+      <p class="muted">Whether the work order grid's progress bar defaults to cost-weighted (recommended — the board sees money, not just line count) or line-count-weighted.</p>
+      <select id="progressWeightingSelect">
+        <option value="cost" ${displaySettings.WoProgressWeighting === 'cost' ? 'selected' : ''}>Cost-weighted</option>
+        <option value="count" ${displaySettings.WoProgressWeighting === 'count' ? 'selected' : ''}>Line-count-weighted</option>
+      </select>
+    </div>
+    <div class="card">
+      <h3>Report embedded-photo cap</h3>
+      <p class="muted">Max images embedded per work order in the Work Performed report — the rest fall back to links. Forty embedded photos is a 60MB email that bounces off half the board's mail servers.</p>
+      <input id="reportImageCapInput" type="number" min="1" max="20" value="${displaySettings.ReportImageCap}" style="max-width:100px" />
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Status</h3>
+      <form id="addWosForm">
+        <div class="field-row"><label>Name</label><input name="name" required /></div>
+        <div class="field-row"><label>Color</label><input name="color" type="color" value="#888888" /></div>
+        <div class="field-row"><label>Terminal</label>
+          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="isTerminal" style="margin-right:6px" />No longer blocks anything downstream</label>
+        </div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelector('#progressWeightingSelect').addEventListener('change', async (e) => {
+    try {
+      await api('/api/pg/display-settings', { method: 'PUT', body: JSON.stringify({ woProgressWeighting: e.target.value }) });
+      toast('Saved');
+      if (state.options) state.options.displaySettings = await api('/api/pg/display-settings');
+    } catch (err) { toast(err.message); }
+  });
+  container.querySelector('#reportImageCapInput').addEventListener('change', async (e) => {
+    try {
+      await api('/api/pg/display-settings', { method: 'PUT', body: JSON.stringify({ reportImageCap: Number(e.target.value) }) });
+      toast('Saved');
+      if (state.options) state.options.displaySettings = await api('/api/pg/display-settings');
+    } catch (err) { toast(err.message); }
+  });
+  container.querySelectorAll('.wos-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try { await api(`/api/pg/admin/work-order-statuses/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) }); renderAdminWorkOrderStatuses(container); }
+    catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.wos-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete status "${btn.dataset.name}"? Only possible if no work order uses it — deactivate instead if it's in use.`)) return;
+    try { await api(`/api/pg/admin/work-order-statuses/${btn.dataset.id}`, { method: 'DELETE' }); toast('Deleted'); renderAdminWorkOrderStatuses(container); }
+    catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addWosForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/work-order-statuses', { method: 'POST', body: JSON.stringify({ name: fd.get('name'), color: fd.get('color'), isTerminal: fd.has('isTerminal') }) });
+      renderAdminWorkOrderStatuses(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+// Job line statuses (2.1) — is_terminal and counts_as_work_performed are
+// separate flags on purpose: "Not Needed" is terminal but isn't work
+// performed, which is what makes "12 completed, 3 not needed" an honest
+// board sentence instead of "15 closed."
+async function renderAdminJobLineStatuses(container = app) {
+  if (container === app) setChrome({ title: 'Job Line Statuses', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { statuses } = await api('/api/pg/admin/job-line-statuses');
+
+  const rows = statuses.map((s) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap">
+      <span><span class="pill" style="background:${s.Color}1a;color:${s.Color};border:1px solid ${s.Color}66">${escapeHtml(s.Name)}</span>
+        ${s.IsTerminal ? '<span class="muted">terminal</span>' : ''}${s.CountsAsWorkPerformed ? '<span class="muted">counts as work performed</span>' : ''}${s.RequiresNote ? `<span class="muted">requires note: "${escapeHtml(s.NoteLabel || '')}"</span>` : ''}${!s.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary jls-toggle-active" data-id="${s.Id}" data-active="${s.Active}">${s.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary jls-delete" data-id="${s.Id}" data-name="${escapeHtml(s.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No statuses defined.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Job Line Statuses</h3>
+      <p class="muted">What a job line's own progress dropdown offers. Blocked is not a status — see blocked_reason on the job line itself.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Status</h3>
+      <form id="addJlsForm">
+        <div class="field-row"><label>Name</label><input name="name" required /></div>
+        <div class="field-row"><label>Color</label><input name="color" type="color" value="#888888" /></div>
+        <div class="field-row"><label>Terminal</label>
+          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="isTerminal" style="margin-right:6px" />No longer blocks the WO from closing</label>
+        </div>
+        <div class="field-row"><label>Counts as Work Performed</label>
+          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="countsAsWorkPerformed" style="margin-right:6px" />Real work happened (not just "decided not needed")</label>
+        </div>
+        <div class="field-row"><label>Requires Note</label>
+          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="requiresNote" style="margin-right:6px" />Won't save without an answer</label>
+        </div>
+        <div class="field-row"><label>Note Prompt</label><input name="noteLabel" placeholder="e.g. Why was this not needed?" /></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.jls-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try { await api(`/api/pg/admin/job-line-statuses/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) }); renderAdminJobLineStatuses(container); }
+    catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.jls-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete status "${btn.dataset.name}"? Only possible if no job line uses it — deactivate instead if it's in use.`)) return;
+    try { await api(`/api/pg/admin/job-line-statuses/${btn.dataset.id}`, { method: 'DELETE' }); toast('Deleted'); renderAdminJobLineStatuses(container); }
+    catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addJlsForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/job-line-statuses', { method: 'POST', body: JSON.stringify({
+        name: fd.get('name'), color: fd.get('color'), isTerminal: fd.has('isTerminal'),
+        countsAsWorkPerformed: fd.has('countsAsWorkPerformed'), requiresNote: fd.has('requiresNote'), noteLabel: fd.get('noteLabel') || null,
+      }) });
+      renderAdminJobLineStatuses(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+async function renderAdminCauses(container = app) {
+  if (container === app) setChrome({ title: 'Causes', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { causes } = await api('/api/pg/causes');
+
+  const rows = causes.map((c) => `
+    <div class="list-item" style="cursor:default">
+      <span>${escapeHtml(c.Name)}${!c.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary cause-toggle-active" data-id="${c.Id}" data-active="${c.Active}">${c.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary cause-delete" data-id="${c.Id}" data-name="${escapeHtml(c.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No causes defined yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Causes</h3>
+      <p class="muted">What a job line's problem is attributed to — the dropdown that gets counted (see Cause Note on the job line for freetext detail). Adding one here is the only way it becomes selectable; freetext never gets promoted into this list.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Cause</h3>
+      <form id="addCauseForm">
+        <div class="field-row"><label>Name</label><input name="name" placeholder="e.g. Rot" required /></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.cause-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/causes/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) });
+      renderAdminCauses(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.cause-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete cause "${btn.dataset.name}"? Only possible if no job line uses it — deactivate instead if it's in use.`)) return;
+    try {
+      await api(`/api/pg/admin/causes/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Cause deleted');
+      renderAdminCauses(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addCauseForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/causes', { method: 'POST', body: JSON.stringify({ name: fd.get('name') }) });
+      renderAdminCauses(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+// Build Brief v2 Phase 4 (§4.3): what an attachment IS relative to whatever
+// it's linked to — Before/After/Evidence/Quote/etc. "Default include in
+// report" pre-ticks the report checkbox for that role (still overridable per
+// link) — tagging something "After / Repair" is already saying "this is the
+// proof."
+async function renderAdminAttachmentRoles(container = app) {
+  if (container === app) setChrome({ title: 'Attachment Roles', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { roles } = await api('/api/pg/attachment-roles');
+
+  const rows = roles.map((r) => `
+    <div class="list-item" style="cursor:default">
+      <span>${escapeHtml(r.Name)}${r.DefaultIncludeInReport ? ' <span class="pill">in report by default</span>' : ''}${!r.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary role-toggle-report" data-id="${r.Id}" data-next="${!r.DefaultIncludeInReport}">${r.DefaultIncludeInReport ? 'Unset' : 'Set'} report default</button>
+        <button class="btn btn-secondary role-toggle-active" data-id="${r.Id}" data-active="${r.Active}">${r.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary role-delete" data-id="${r.Id}" data-name="${escapeHtml(r.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No attachment roles defined yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Attachment Roles</h3>
+      <p class="muted">What a photo or document IS relative to the record it's attached to — Before/After/Evidence/Quote/etc. Lives on the link, not the file, so the same photo can be "After / Repair" on a job line and "Reference" on the asset at once.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Role</h3>
+      <form id="addRoleForm">
+        <div class="field-row"><label>Name</label><input name="name" placeholder="e.g. Warranty" required /></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.role-toggle-report').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/attachment-roles/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ defaultIncludeInReport: btn.dataset.next === 'true' }) });
+      renderAdminAttachmentRoles(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.role-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/attachment-roles/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) });
+      renderAdminAttachmentRoles(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.role-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete role "${btn.dataset.name}"? Only possible if no attachment uses it — deactivate instead if it's in use.`)) return;
+    try {
+      await api(`/api/pg/admin/attachment-roles/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Role deleted');
+      renderAdminAttachmentRoles(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addRoleForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/attachment-roles', { method: 'POST', body: JSON.stringify({ name: fd.get('name') }) });
+      renderAdminAttachmentRoles(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+// Build Brief v2 Phase 5 (§5.3): the one-time affine calibration that makes
+// "nearest-asset suggestion from GPS" possible in the inbox. Needs exactly 3
+// non-collinear reference points — pick 3 assets whose real-world GPS
+// coordinates you know AND whose map_x/map_y are already set on the
+// interactive Map (open the Map, click the asset's pin, its coordinates are
+// shown there), then enter both here for each.
+async function renderAdminMapCalibration(container = app) {
+  if (container === app) setChrome({ title: 'Map GPS Calibration', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { points } = await api('/api/pg/admin/map-calibration');
+
+  const rows = points.map((p) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap">
+      <span><strong>${escapeHtml(p.Label)}</strong><div class="muted" style="font-weight:400">GPS ${p.Lat}, ${p.Lng} → map ${p.MapX}, ${p.MapY}</div></span>
+      <button class="btn btn-secondary calib-delete" data-id="${p.Id}" data-name="${escapeHtml(p.Label)}">Delete</button>
+    </div>`).join('') || '<p class="muted">No calibration points yet — GPS-based inbox suggestions are disabled until 3 are added.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Map GPS Calibration</h3>
+      <p class="muted">Exactly 3 non-collinear points, real-world GPS → campmap.webp pixel coordinates. Powers "nearest asset" suggestions in the Inbox when a photo carries EXIF GPS. Pick 3 assets you're sure of — open the Map, tap the asset's pin to read its map_x/map_y, and pair that with its actual GPS coordinates (from your phone, standing at the asset).</p>
+      <p class="muted">${points.length}/3 points set${points.length >= 3 ? ' — calibrated.' : '.'}</p>
+    </div>
+    <div class="card">${rows}</div>
+    ${points.length < 3 ? `
+    <div class="card">
+      <h3>Add Point</h3>
+      <form id="addCalibForm">
+        <div class="field-row"><label>Label</label><input name="label" placeholder="e.g. Main Lodge" required /></div>
+        <div class="field-row"><label>GPS Latitude</label><input name="lat" type="number" step="any" required /></div>
+        <div class="field-row"><label>GPS Longitude</label><input name="lng" type="number" step="any" required /></div>
+        <div class="field-row"><label>Map X (pixels)</label><input name="mapX" type="number" step="any" required /></div>
+        <div class="field-row"><label>Map Y (pixels)</label><input name="mapY" type="number" step="any" required /></div>
+        <button class="btn btn-primary" type="submit">Add Point</button>
+      </form>
+    </div>` : ''}`;
+
+  container.querySelectorAll('.calib-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete calibration point "${btn.dataset.name}"?`)) return;
+    await api(`/api/pg/admin/map-calibration/${btn.dataset.id}`, { method: 'DELETE' });
+    renderAdminMapCalibration(container);
+  }));
+  container.querySelector('#addCalibForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/map-calibration', { method: 'POST', body: JSON.stringify({
+        label: fd.get('label'), lat: fd.get('lat'), lng: fd.get('lng'), mapX: fd.get('mapX'), mapY: fd.get('mapY'),
+      }) });
+      renderAdminMapCalibration(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
 async function renderAdminSubAreas(container = app) {
   if (container === app) setChrome({ title: 'Component Sub-Areas', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
@@ -3857,8 +4863,8 @@ function openDayPanel(dateKey, entries) {
         <h3 style="margin:0">${escapeHtml(label)}</h3>
         <button class="btn btn-secondary" id="closeDayPanelBtn">✕</button>
       </div>
-      ${entries.length ? entries.map((e) => e.type === 'wo'
-        ? `<div class="list-item day-panel-entry" data-wo-id="${e.Id}"><span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.Title)}</span><span class="pill ${woStatusPillClass(e.Status)}">${escapeHtml(e.Status)}</span></div>`
+      ${entries.length ? entries.map((e) => e.type === 'jobLine'
+        ? `<div class="list-item day-panel-entry" data-wo-id="${e.WorkOrderId}"><span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span>${statusPillHtml(e.WorkOrderStatus, e.WorkOrderStatusColor)}</div>`
         : `<div class="list-item day-panel-entry" data-event-id="${e.Id}"><span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`
       ).join('') : '<p class="muted">Nothing scheduled this day.</p>'}
       <div class="btn-row"><button class="btn btn-primary" id="dayPanelAddEventBtn">+ Add Event This Day</button></div>
@@ -3891,18 +4897,21 @@ async function renderCalendar(params = {}) {
     const fromStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-01`;
     const toStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
 
-    const [{ workOrders }, { occurrences }] = await Promise.all([
+    // Job lines, not work orders, are what actually gets scheduled (1.4) — a
+    // WO's lines can have divergent dates (vendor Tuesday, volunteers
+    // Saturday, same WO), so the grid shows one entry per line. The "Scheduled
+    // Date" on /work-orders is still there for the sidebar/unscheduled check
+    // (it's the earliest-line rollup — see listWorkOrders in db.js).
+    const [{ workOrders }, { occurrences }, { jobLines: scheduledJobLines }] = await Promise.all([
       api('/api/pg/work-orders'), api(`/api/pg/calendar-events?from=${fromStr}&to=${toStr}`),
+      api(`/api/pg/job-lines/scheduled?from=${fromStr}&to=${toStr}`),
     ]);
 
     dayEntriesMap = new Map();
-    for (const w of workOrders) {
-      const sd = w['Scheduled Date'];
-      if (!sd) continue;
-      const key = sd.slice(0, 10);
-      if (key < fromStr || key > toStr) continue;
+    for (const jl of scheduledJobLines) {
+      const key = jl.ScheduledDate.slice(0, 10);
       if (!dayEntriesMap.has(key)) dayEntriesMap.set(key, []);
-      dayEntriesMap.get(key).push({ type: 'wo', ...w });
+      dayEntriesMap.get(key).push({ type: 'jobLine', ...jl });
     }
     for (const occ of occurrences) {
       if (!dayEntriesMap.has(occ.OccurrenceDate)) dayEntriesMap.set(occ.OccurrenceDate, []);
@@ -3910,8 +4919,8 @@ async function renderCalendar(params = {}) {
     }
     const allUnscheduled = workOrders.filter((w) => !w['Scheduled Date']);
 
-    const entryHtml = (e) => e.type === 'wo'
-      ? `<div class="cal-entry" data-wo-id="${e.Id}"><span class="pill ${woStatusPillClass(e.Status)}">🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.Title)} — ${escapeHtml(e.Status)}</span></div>`
+    const entryHtml = (e) => e.type === 'jobLine'
+      ? `<div class="cal-entry" data-wo-id="${e.WorkOrderId}"><span class="pill"${statusColorStyle(e.WorkOrderStatusColor)}>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span></div>`
       : `<div class="cal-entry" data-event-id="${e.Id}"><span class="pill pop">📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`;
 
     const cells = [];
@@ -3951,7 +4960,7 @@ async function renderCalendar(params = {}) {
             <p class="muted">Set a Scheduled Date on a work order to place it on the calendar.</p>
             ${allUnscheduled.length ? allUnscheduled.map((w) => `<div class="list-item" data-wo-id="${w.Id}">
               <span>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</span>
-              <span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status)}</span>
+              ${statusPillHtml(w.Status, w.StatusColor)}
             </div>`).join('') : '<p class="muted">None — everything is scheduled. 🎉</p>'}
           </div>
         </div>
@@ -4007,12 +5016,14 @@ function wireRecurrenceToggle(root) {
   });
 }
 
-// Link-to-Work-Order(-Task) fields shared by New/Edit Calendar Event. Picking a
-// Work Order auto-fills Title/Description/Date from it and reveals a Task
-// dropdown scoped to that WO's tasks; picking a task narrows Title further to
-// the task's own text. This only fires on user-driven changes — initial render
-// for an existing event never overwrites its saved fields.
-function calendarLinkFieldsHtml({ workOrders, workOrderTemplates = [], initialTasks = [], ev = {} }) {
+// Link-to-Work-Order(-Job-Line) fields shared by New/Edit Calendar Event.
+// Picking a Work Order auto-fills Title/Description from it and reveals a Job
+// Line dropdown scoped to that WO's lines; picking a line narrows Title
+// further to the line's own text and fills the date from the line's own
+// scheduled_date (a WO has no single date of its own since Phase 1 — see
+// 1.2/1.4). This only fires on user-driven changes — initial render for an
+// existing event never overwrites its saved fields.
+function calendarLinkFieldsHtml({ workOrders, workOrderTemplates = [], initialJobLines = [], ev = {} }) {
   const hasWo = !!ev.WorkOrderId;
   return `
     <div class="field-row"><label>Link to Work Order (optional)</label>
@@ -4022,10 +5033,10 @@ function calendarLinkFieldsHtml({ workOrders, workOrderTemplates = [], initialTa
       </select>
     </div>
     <div class="field-row" id="linkTaskRow" ${hasWo ? '' : 'hidden'}>
-      <label>Link to Task (optional)</label>
-      <select name="workOrderTaskId" id="linkTaskId">
+      <label>Link to Job Line (optional)</label>
+      <select name="jobLineId" id="linkTaskId">
         <option value="">— whole work order —</option>
-        ${initialTasks.map((t) => `<option value="${t.Id}" ${ev.WorkOrderTaskId === t.Id ? 'selected' : ''}>${escapeHtml(t.Description)}${t.Done ? ' (done)' : ''}</option>`).join('')}
+        ${initialJobLines.map((l) => `<option value="${l.Id}" ${ev.JobLineId === l.Id ? 'selected' : ''}>${escapeHtml(l.Title)}${l.Done ? ' (done)' : ''}</option>`).join('')}
       </select>
     </div>
     <div class="field-row"><label>Auto-generate from PM Template (optional)</label>
@@ -4044,31 +5055,31 @@ function wireCalendarLinkFields(root) {
   const titleInput = root.querySelector('[name="title"]');
   const descInput = root.querySelector('[name="description"]');
   const dateInput = root.querySelector('[name="eventDate"]');
-  let currentTasks = [];
+  let currentJobLines = [];
 
   woSelect.addEventListener('change', async () => {
     const woId = woSelect.value;
     taskSelect.innerHTML = '<option value="">— whole work order —</option>';
-    currentTasks = [];
+    currentJobLines = [];
     if (!woId) { taskRow.hidden = true; return; }
     taskRow.hidden = false;
     tplSelect.value = '';
-    const { workOrder, tasks } = await api(`/api/pg/work-orders/${woId}`);
-    currentTasks = tasks;
-    taskSelect.innerHTML += tasks.map((t) => `<option value="${t.Id}">${escapeHtml(t.Description)}${t.Done ? ' (done)' : ''}</option>`).join('');
+    const { workOrder, jobLines } = await api(`/api/pg/work-orders/${woId}`);
+    currentJobLines = jobLines;
+    taskSelect.innerHTML += jobLines.map((l) => `<option value="${l.Id}">${escapeHtml(l.Title)}${l.Done ? ' (done)' : ''}</option>`).join('');
     titleInput.value = workOrder.Title;
     descInput.value = workOrder.Description || '';
-    if (workOrder['Scheduled Date']) dateInput.value = workOrder['Scheduled Date'].slice(0, 10);
   });
 
   taskSelect.addEventListener('change', () => {
-    const taskId = taskSelect.value;
-    if (!taskId) return;
-    const task = currentTasks.find((t) => String(t.Id) === taskId);
+    const jobLineId = taskSelect.value;
+    if (!jobLineId) return;
+    const jobLine = currentJobLines.find((l) => String(l.Id) === jobLineId);
     const woLabel = woSelect.selectedOptions[0]?.textContent || '';
-    if (task) {
-      titleInput.value = task.Description;
-      descInput.value = `Task from Work Order: ${woLabel}`;
+    if (jobLine) {
+      titleInput.value = jobLine.Title;
+      descInput.value = `Job line from Work Order: ${woLabel}`;
+      if (jobLine.ScheduledDate) dateInput.value = jobLine.ScheduledDate.slice(0, 10);
     }
   });
 
@@ -4112,7 +5123,7 @@ async function renderNewCalendarEvent(params = {}) {
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || undefined,
         workOrderId: fd.get('workOrderId') || undefined,
-        workOrderTaskId: fd.get('workOrderTaskId') || undefined,
+        jobLineId: fd.get('jobLineId') || undefined,
         workOrderTemplateId: fd.get('workOrderTemplateId') || undefined,
       }) });
       toast('Event created');
@@ -4131,7 +5142,7 @@ async function renderCalendarEventDetail({ id }) {
   const { workOrders } = workOrdersRes;
   const checklistTemplates = tplRes.templates;
   const workOrderTemplates = woTplRes.templates;
-  const initialTasks = ev.WorkOrderId ? (await api(`/api/pg/work-orders/${ev.WorkOrderId}`)).tasks : [];
+  const initialJobLines = ev.WorkOrderId ? (await api(`/api/pg/work-orders/${ev.WorkOrderId}`)).jobLines : [];
 
   const checklistHtml = checklist ? checklistHtmlFor(checklist)
     : (checklistTemplates.length ? `
@@ -4148,11 +5159,11 @@ async function renderCalendarEventDetail({ id }) {
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${(ev.EventDate || '').slice(0, 10)}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(ev.Description || '')}</textarea></div>
         ${recurrenceFieldsHtml(ev)}
-        ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates, initialTasks, ev })}
+        ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates, initialJobLines, ev })}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       ${ev.WorkOrderId ? `<div class="btn-row"><button class="btn btn-secondary" id="viewWoBtn">View Linked Work Order</button></div>` : ''}
-      ${ev.TaskDescription ? `<p class="muted">Linked to task: "${escapeHtml(ev.TaskDescription)}"</p>` : ''}
+      ${ev.JobLineTitle ? `<p class="muted">Linked to job line: "${escapeHtml(ev.JobLineTitle)}"</p>` : ''}
       <div class="btn-row"><button class="btn btn-secondary" id="deleteEventBtn">Delete Event</button></div>
     </div>
     ${checklistHtml}`);
@@ -4170,7 +5181,7 @@ async function renderCalendarEventDetail({ id }) {
         title: fd.get('title'), eventDate: fd.get('eventDate'), description: fd.get('description'),
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || '', workOrderId: fd.get('workOrderId') || '',
-        workOrderTaskId: fd.get('workOrderTaskId') || '', workOrderTemplateId: fd.get('workOrderTemplateId') || '',
+        jobLineId: fd.get('jobLineId') || '', workOrderTemplateId: fd.get('workOrderTemplateId') || '',
       }) });
       toast('Event updated');
       renderCalendarEventDetail({ id });
@@ -4355,7 +5366,7 @@ function daysSince(dateStr) {
 
 const WO_SCHEDULE_FILTER_LABELS = { pastDue: 'Past Due', dueToday: 'Due Today', dueFuture: 'Due Later', unscheduled: 'Unscheduled' };
 function matchesScheduleFilter(w, key) {
-  if (w.Status === 'Done') return false;
+  if (w.StatusIsTerminal) return false;
   const sd = w['Scheduled Date'] ? w['Scheduled Date'].slice(0, 10) : null;
   const todayStr = isoDate(new Date());
   if (key === 'unscheduled') return !sd;
@@ -4366,6 +5377,28 @@ function matchesScheduleFilter(w, key) {
   return true;
 }
 
+// Segmented progress bar (2.6) — one segment per job-line status present,
+// sized by the admin's chosen weighting (cost-weighted by default: finishing
+// two of three lines while the roof — most of the money — sits untouched
+// should not read as "mostly done"). Falls back to line-count share when
+// nothing has a cost yet, so a freshly-scoped WO doesn't render an empty bar.
+function woProgressBarHtml(w) {
+  if (!w.LineCount || !w.StatusBreakdown?.length) return '';
+  const weighting = state.options?.displaySettings?.WoProgressWeighting || 'cost';
+  const totalCost = w.StatusBreakdown.reduce((s, x) => s + Number(x.cost || 0), 0);
+  const segments = w.StatusBreakdown.map((s) => {
+    const share = (weighting === 'cost' && totalCost > 0)
+      ? Number(s.cost || 0) / totalCost
+      : Number(s.lineCount || 0) / w.LineCount;
+    return `<div style="flex:${Math.max(share, 0.03)};background:${s.color}" title="${escapeHtml(s.name)}"></div>`;
+  }).join('');
+  const costPart = w['Estimated Cost'] ? `${moneyFmt(w['Actual Cost'] || 0)} of ${moneyFmt(w['Estimated Cost'])}` : null;
+  const hoursPart = w['Estimated Hours'] ? `${w['Actual Hours'] || 0} of ${w['Estimated Hours']} hrs` : null;
+  return `
+    <div style="display:flex;height:6px;border-radius:3px;overflow:hidden;background:rgba(128,128,128,0.2);margin:4px 0">${segments}</div>
+    <div class="muted" style="font-size:0.78rem">${w.TerminalLineCount}/${w.LineCount} lines${costPart ? ` · ${costPart}` : ''}${hoursPart ? ` · ${hoursPart}` : ''}</div>`;
+}
+
 async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder } = {}) {
   if (container === app) setChrome({ title: 'Work Orders', showBack: false, showLogout: true });
   container.innerHTML = LOADING_HTML;
@@ -4374,12 +5407,37 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
   let statusFilter = params.status || null;
   let scheduleFilter = params.schedule || null;
   let selectedWoId = null;
+  // Grid defaults to split roots only, one row per family, with a "+N
+  // splits" chip; clicking it expands the children nested inline (§5.4
+  // Display). A filter toggle shows every split flat when wanted.
+  let showAllSplits = false;
+  const expandedRoots = new Set();
+
+  function buildDisplayList(list) {
+    if (showAllSplits) return list.map((w) => ({ w, indent: w.SplitRootId !== w.Id, splitCount: 0 }));
+    const byRoot = new Map();
+    for (const w of list) {
+      if (!byRoot.has(w.SplitRootId)) byRoot.set(w.SplitRootId, []);
+      byRoot.get(w.SplitRootId).push(w);
+    }
+    const out = [];
+    for (const members of byRoot.values()) {
+      const root = members.find((m) => m.Id === m.SplitRootId) || [...members].sort((a, b) => a.Id - b.Id)[0];
+      const children = members.filter((m) => m.Id !== root.Id).sort((a, b) => a.Id - b.Id);
+      out.push({ w: root, indent: false, splitCount: children.length });
+      if (expandedRoots.has(root.Id)) children.forEach((c) => out.push({ w: c, indent: true, splitCount: 0 }));
+    }
+    return out;
+  }
 
   function draw() {
     const mode = onOpenWorkOrder ? 'cards' : getTableViewMode();
     const visibleWOs = workOrders.filter((w) =>
       (!statusFilter || w.Status === statusFilter) && (!scheduleFilter || matchesScheduleFilter(w, scheduleFilter)));
-    const cardRows = visibleWOs.map((w) => {
+    const displayList = buildDisplayList(visibleWOs);
+    const splitChipHtml = (item) => item.splitCount > 0
+      ? ` <button type="button" class="split-expand-chip pill" data-id="${item.w.Id}" style="cursor:pointer;border:none">${expandedRoots.has(item.w.Id) ? '▾' : '▸'} +${item.splitCount} split${item.splitCount === 1 ? '' : 's'}</button>` : '';
+    const cardRows = displayList.map(({ w, indent, splitCount }, idx) => {
       const days = daysSince(w['Date Reported']);
       const bits = [];
       if (cols.asset && w.Asset) bits.push(escapeHtml(w.Asset.Name));
@@ -4389,18 +5447,18 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
       if (cols.dateCreated && w['Date Reported']) bits.push(`Created ${formatDateNice(w['Date Reported'])}`);
       if (cols.estHours && w['Estimated Hours'] != null) bits.push(`${w['Estimated Hours']}h est.`);
       if (cols.estCost && w['Estimated Cost'] != null) bits.push(`$${Number(w['Estimated Cost']).toLocaleString()} est.`);
-      return `<div class="list-item ${onOpenWorkOrder && selectedWoId === w.Id ? 'cal-strip-selected' : ''}" style="flex-wrap:wrap" data-id="${w.Id}">
-        <span>${escapeHtml(w.Title)}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}</span>
-        ${cols.status ? `<span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status || '')}</span>` : ''}
+      return `<div class="list-item ${onOpenWorkOrder && selectedWoId === w.Id ? 'cal-strip-selected' : ''}" style="flex-wrap:wrap${indent ? ';margin-left:20px;border-left:2px solid var(--border,#ccc)' : ''}" data-id="${w.Id}">
+        <span>WO ${escapeHtml(w.WoNumber || w.Id)} — ${escapeHtml(w.Title)}${w.IsBlocked ? ' 🚧' : ''}${splitChipHtml({ w, splitCount })}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}${woProgressBarHtml(w)}</span>
+        ${cols.status ? statusPillHtml(w.Status, w.StatusColor) : ''}
       </div>`;
     }).join('') || `<p class="muted">${(statusFilter || scheduleFilter) ? 'Nothing matches this filter.' : 'No work orders yet.'}</p>`;
 
-    const tableRows = visibleWOs.map((w) => {
+    const tableRows = displayList.map(({ w, indent, splitCount }) => {
       const days = daysSince(w['Date Reported']);
       return `<tr class="clickable-row" data-id="${w.Id}">
-        <td data-label="Title">${escapeHtml(w.Title)}</td>
+        <td data-label="Title"${indent ? ' style="padding-left:24px"' : ''}>WO ${escapeHtml(w.WoNumber || w.Id)} — ${escapeHtml(w.Title)}${w.IsBlocked ? ' 🚧' : ''}${splitChipHtml({ w, splitCount })}${woProgressBarHtml(w)}</td>
         ${cols.asset ? `<td data-label="Asset">${escapeHtml(w.Asset?.Name || '—')}</td>` : ''}
-        ${cols.status ? `<td data-label="Status"><span class="pill ${woStatusPillClass(w.Status)}">${escapeHtml(w.Status || '')}</span></td>` : ''}
+        ${cols.status ? `<td data-label="Status">${statusPillHtml(w.Status, w.StatusColor)}</td>` : ''}
         ${cols.priority ? `<td data-label="Priority">${escapeHtml(w.Priority || '')}</td>` : ''}
         ${cols.daysSinceCreated ? `<td data-label="Days Since Created">${days != null ? days : '—'}</td>` : ''}
         ${cols.scheduledDate ? `<td data-label="Scheduled Date">${formatDateNice(w['Scheduled Date']) || '—'}</td>` : ''}
@@ -4415,6 +5473,7 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
     setApp(`
       <div class="btn-row" style="margin-bottom:12px;justify-content:space-between">
         <button class="btn btn-primary" id="newWoBtnTop">+ New Work Order</button>
+        <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" id="showAllSplitsToggle" ${showAllSplits ? 'checked' : ''} style="width:auto" /> Show all splits flat</label>
         ${onOpenWorkOrder ? '' : tableViewToggleHtml(mode)}
       </div>
       ${filterLabel ? `<div class="btn-row" style="margin:-6px 0 12px"><button class="btn btn-secondary" id="clearWoFilter">✕ Filtered: ${escapeHtml(filterLabel)}</button></div>` : ''}
@@ -4437,6 +5496,13 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
 
     container.querySelector('#newWoBtnTop').addEventListener('click', () => go('newWorkOrder', {}));
     container.querySelector('#clearWoFilter')?.addEventListener('click', () => { statusFilter = null; scheduleFilter = null; draw(); });
+    container.querySelector('#showAllSplitsToggle')?.addEventListener('change', (e) => { showAllSplits = e.target.checked; draw(); });
+    container.querySelectorAll('.split-expand-chip').forEach((el) => el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const id = Number(el.dataset.id);
+      if (expandedRoots.has(id)) expandedRoots.delete(id); else expandedRoots.add(id);
+      draw();
+    }));
     container.querySelectorAll('.list-item[data-id], tr.clickable-row').forEach((el) => el.addEventListener('click', () => {
       if (onOpenWorkOrder) { selectedWoId = Number(el.dataset.id); draw(); onOpenWorkOrder(el.dataset.id); }
       else go('workOrderDetail', { id: el.dataset.id });
@@ -4509,10 +5575,6 @@ async function renderRequestDetail({ id }, container = app) {
     api(`/api/pg/requests/${id}`), api(`/api/pg/requests/${id}/messages`),
   ]);
 
-  const photosHtml = request.Photos.length
-    ? `<div style="display:flex;flex-wrap:wrap;gap:8px">${request.Photos.map((p) => `<a href="${escapeHtml(p.Url)}" target="_blank" rel="noopener"><img src="${escapeHtml(p.Url)}" alt="" style="width:100px;height:100px;object-fit:cover;border-radius:8px" /></a>`).join('')}</div>`
-    : '<p class="muted">No photos attached.</p>';
-
   const customFieldsHtml = request.CustomFields.length
     ? request.CustomFields.map((f) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(f.label)}</span><span>${escapeHtml(f.value)}</span></div>`).join('')
     : '';
@@ -4540,8 +5602,7 @@ async function renderRequestDetail({ id }, container = app) {
       <h4 style="margin:14px 0 6px">Description</h4>
       <p>${escapeHtml(request.Description || '—')}</p>
       ${customFieldsHtml ? `<h4 style="margin:14px 0 6px">Additional Details</h4>${customFieldsHtml}` : ''}
-      <h4 style="margin:14px 0 6px">Photos</h4>
-      ${photosHtml}
+      <div id="requestPhotosCard"></div>
     </div>
 
     <div class="card">
@@ -4577,6 +5638,8 @@ async function renderRequestDetail({ id }, container = app) {
         <button class="btn btn-primary" type="submit">Send Email</button>
       </form>
     </div>`;
+
+  renderAttachmentSection('maintenance_request', id, container.querySelector('#requestPhotosCard'), { title: 'Photos', defaultRoleName: 'Evidence' });
 
   mountAssetCombobox(container.querySelector('#assetPickerWrap'), {
     initialAsset: request.AssetId ? { Id: request.AssetId, Name: request.AssetName } : null,
@@ -4622,14 +5685,68 @@ async function renderRequestDetail({ id }, container = app) {
   });
 }
 
+const RESPONSIBILITY_CLASS_LABELS = { self: 'Self', volunteer: 'Volunteer', vendor: 'Vendor', cabin_holder: 'Cabin-Holder' };
+
+// Job line creation flow (Build Brief v2, 1.7): each "+ Add job line" row
+// captures title, responsibility class, funding source + ref, estimated
+// hours/cost, and a scheduled date that defaults to the WO's own date.
+// Which SPECIFIC volunteer/vendor does the work is deferred to the WO detail
+// page after creation — same precedent this form already used for
+// responsibleSelf/crew before Phase 1, and the same "capture must be
+// zero-decision, classify later" principle the brief opens with.
 async function renderNewWorkOrder({ assetId, assetName }) {
   setChrome({ title: 'New Work Order', showBack: true, showLogout: true });
-  const { templates } = await api('/api/pg/work-order-templates');
+  const [{ templates }, campaignRes, cabinRes, otherRes] = await Promise.all([
+    api('/api/pg/work-order-templates'),
+    api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
+  ]);
+  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
   const fieldTitles = state.options.propertyFields.map((f) => f.title);
+
+  const fundingRefOptionsHtml = (source, selectedId) =>
+    (fundingEntities[source] || []).map((e) => `<option value="${e.Id}" ${e.Id === selectedId ? 'selected' : ''}>${escapeHtml(e.Name)}</option>`).join('');
+
+  const jobLineRowHtml = (row = {}) => {
+    const fundingSource = row.fundingSource || 'operating_budget';
+    return `<div class="card jl-row" style="margin-bottom:10px">
+      <div class="field-row"><label>Title</label><input class="jl-title" value="${escapeHtml(row.title || '')}" placeholder="e.g. Roof repair" required /></div>
+      <div class="field-row"><label>Responsibility</label>
+        <select class="jl-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${row.responsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+      </div>
+      <div class="field-row"><label>Funding Source</label>
+        <select class="jl-funding-source">${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}" ${fundingSource === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+      </div>
+      <div class="field-row jl-funding-ref-row" ${fundingSource === 'operating_budget' ? 'hidden' : ''}>
+        <label>${escapeHtml(FUNDING_SOURCE_LABELS[fundingSource] || '')}</label>
+        <select class="jl-funding-ref">${fundingRefOptionsHtml(fundingSource, row.fundingRefId)}</select>
+      </div>
+      <div class="field-row"><label>Est. Hours</label><input class="jl-est-hours" type="number" min="0" value="${row.estimatedHours ?? ''}" /></div>
+      <div class="field-row"><label>Est. Cost</label><input class="jl-est-cost" type="number" step="0.01" min="0" value="${row.estimatedCost ?? ''}" /></div>
+      <div class="field-row"><label>Scheduled Date</label><input class="jl-scheduled-date" type="date" value="${row.scheduledDate || ''}" />
+        <p class="muted" style="margin-top:2px;font-size:0.8rem">Defaults to the work order's date if left blank.</p>
+      </div>
+      <button type="button" class="btn btn-secondary row-remove">✕ Remove line</button>
+    </div>`;
+  };
+  function wireJobLineRow(row) {
+    const sourceSelect = row.querySelector('.jl-funding-source');
+    const refRow = row.querySelector('.jl-funding-ref-row');
+    const refLabel = refRow.querySelector('label');
+    const refSelect = row.querySelector('.jl-funding-ref');
+    sourceSelect.addEventListener('change', () => {
+      const source = sourceSelect.value;
+      if (source === 'operating_budget') { refRow.hidden = true; return; }
+      refRow.hidden = false;
+      refLabel.textContent = FUNDING_SOURCE_LABELS[source];
+      refSelect.innerHTML = fundingRefOptionsHtml(source, null);
+    });
+    row.querySelector('.row-remove').onclick = () => row.remove();
+  }
+
   const taskRowHtml = (text = '') => `<div class="inline-add-row task-row"><input class="task-text" value="${escapeHtml(text)}" placeholder="Task description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>`;
-  const jobLineRowHtml = (row = {}) => `<div class="inline-add-row jl-row" style="align-items:center">
-    <select class="jl-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
-    <input class="jl-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
+  const assetUpdateRowHtml = (row = {}) => `<div class="inline-add-row au-row" style="align-items:center">
+    <select class="au-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
+    <input class="au-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
     <button type="button" class="btn btn-secondary row-remove">✕</button>
   </div>`;
 
@@ -4648,20 +5765,17 @@ async function renderNewWorkOrder({ assetId, assetName }) {
           <select name="priority"><option>Low</option><option selected>Medium</option><option>High</option><option>Urgent</option></select>
         </div>
         <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" /></div>
-        <div class="field-row"><label>Responsible Party</label>
-          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="responsibleSelf" style="margin-right:6px" />Self</label>
-          <p class="muted" style="margin-top:4px">Volunteers/Vendors are assigned after creation, from the work order's detail page.</p>
-        </div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
-        <div class="field-row"><label>Tasks (scope of work)</label>
-          <div class="task-rows"></div>
-          <button type="button" class="btn btn-secondary" id="addTaskRowBtn" style="margin-top:6px">+ Add Task</button>
+        <div class="field-row"><label>Job Lines</label>
+          <p class="muted" style="margin:2px 0 8px">Each line is its own hours, cost, funding, and responsibility — a vendor on the roof, volunteers on the deck, same work order.</p>
+          <div class="jl-rows"></div>
+          <button type="button" class="btn btn-secondary" id="addJlRowBtn" style="margin-top:6px">+ Add Job Line</button>
         </div>
         <details style="margin:16px 0">
           <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
           <p class="muted" style="margin:8px 0">Only for the rare case this WO should change a stable asset fact — most work orders don't need this.</p>
-          <div class="jl-rows"></div>
-          <button type="button" class="btn btn-secondary" id="addJlBtn" style="margin-top:6px">+ Add Field Update</button>
+          <div class="au-rows"></div>
+          <button type="button" class="btn btn-secondary" id="addAuBtn" style="margin-top:6px">+ Add Field Update</button>
         </details>
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Create Work Order</button>
@@ -4673,15 +5787,17 @@ async function renderNewWorkOrder({ assetId, assetName }) {
   let assetPicker = null;
   if (!assetId) assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'));
 
-  function wireRowRemove() { app.querySelectorAll('.row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); }); }
-  document.getElementById('addTaskRowBtn').addEventListener('click', () => {
-    document.querySelector('.task-rows').insertAdjacentHTML('beforeend', taskRowHtml());
+  function wireRowRemove() { app.querySelectorAll('.au-row .row-remove, .task-row .row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); }); }
+  function addJobLineRow(row) {
+    document.querySelector('.jl-rows').insertAdjacentHTML('beforeend', jobLineRowHtml(row));
+    wireJobLineRow(document.querySelector('.jl-rows').lastElementChild);
+  }
+  document.getElementById('addJlRowBtn').addEventListener('click', () => addJobLineRow());
+  document.getElementById('addAuBtn').addEventListener('click', () => {
+    document.querySelector('.au-rows').insertAdjacentHTML('beforeend', assetUpdateRowHtml());
     wireRowRemove();
   });
-  document.getElementById('addJlBtn').addEventListener('click', () => {
-    document.querySelector('.jl-rows').insertAdjacentHTML('beforeend', jobLineRowHtml());
-    wireRowRemove();
-  });
+  addJobLineRow(); // start with one blank line — the common case is at least one
 
   document.getElementById('tplPicker')?.addEventListener('change', (e) => {
     const tpl = templates.find((t) => t.Id === Number(e.target.value));
@@ -4690,8 +5806,10 @@ async function renderNewWorkOrder({ assetId, assetName }) {
     if (tpl.DefaultTitle) form.title.value = tpl.DefaultTitle;
     if (tpl.DefaultPriority) form.priority.value = tpl.DefaultPriority;
     if (tpl.DefaultDescription) form.description.value = tpl.DefaultDescription;
-    document.querySelector('.task-rows').innerHTML = (tpl.TaskDefaults || []).map(taskRowHtml).join('');
-    document.querySelector('.jl-rows').innerHTML = (tpl.JobLineDefaults || []).map(jobLineRowHtml).join('');
+    document.querySelector('.jl-rows').innerHTML = '';
+    (tpl.JobLineDefaults || []).forEach((l) => addJobLineRow({ ...(typeof l === 'string' ? { title: l } : l), responsibilityClass: (typeof l === 'object' && l.responsibilityClass) || tpl.DefaultResponsibilityClass }));
+    if (!(tpl.JobLineDefaults || []).length) addJobLineRow();
+    document.querySelector('.au-rows').innerHTML = (tpl.AssetUpdateDefaults || []).map(assetUpdateRowHtml).join('');
     wireRowRemove();
     toast(`Prefilled from "${tpl.Name}" — review before creating`);
   });
@@ -4703,15 +5821,22 @@ async function renderNewWorkOrder({ assetId, assetName }) {
     const title = fd.get('title');
     const finalAssetId = assetId || assetPicker?.getSelected()?.Id;
     if (!finalAssetId) { toast('Pick an asset first (or add a new one)'); return; }
-    const tasks = [...document.querySelectorAll('.task-row .task-text')].map((el) => el.value.trim()).filter(Boolean);
-    const assetUpdates = [...document.querySelectorAll('.jl-row')].map((row) => ({
-      targetField: row.querySelector('.jl-field').value, newValue: row.querySelector('.jl-value').value,
+    const jobLines = [...document.querySelectorAll('.jl-row')].map((row) => ({
+      title: row.querySelector('.jl-title').value.trim(),
+      responsibilityClass: row.querySelector('.jl-resp').value,
+      fundingSource: row.querySelector('.jl-funding-source').value,
+      fundingRefId: row.querySelector('.jl-funding-ref-row').hidden ? null : (row.querySelector('.jl-funding-ref').value || null),
+      estimatedHours: row.querySelector('.jl-est-hours').value || null,
+      estimatedCost: row.querySelector('.jl-est-cost').value || null,
+      scheduledDate: row.querySelector('.jl-scheduled-date').value || null,
+    })).filter((l) => l.title);
+    const assetUpdates = [...document.querySelectorAll('.au-row')].map((row) => ({
+      targetField: row.querySelector('.au-field').value, newValue: row.querySelector('.au-value').value,
     })).filter((r) => r.newValue.trim());
     try {
       const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({
         title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description'),
-        scheduledDate: fd.get('scheduledDate') || undefined, tasks, assetUpdates,
-        responsibleSelf: fd.has('responsibleSelf'),
+        scheduledDate: fd.get('scheduledDate') || undefined, jobLines, assetUpdates,
       }) });
       toast('Work order created');
       go('workOrderDetail', { id: result.workOrderId }, { replace: true });
@@ -4722,192 +5847,121 @@ async function renderNewWorkOrder({ assetId, assetName }) {
 const FUNDING_SOURCE_LABELS = {
   operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other',
 };
-const FUNDING_SOURCE_ENDPOINT = {
-  capital_campaign: 'budget/capital-campaign-projects', cabin_holder: 'budget/cabin-holders', other: 'budget/other-categories',
-};
-// Search-as-you-type combobox for linking a Capital Campaign Project /
-// Cabin-Holder / Other category — same interaction pattern as
-// mountAssetCombobox (type to search; if it doesn't exist, an inline
-// "+ Add new" form creates it on the fly with its full fields).
-function mountFundingCombobox(container, { kind, entities, initialEntity = null, onSelect = () => {} }) {
-  let selected = initialEntity;
-  container.classList.add('ac-wrap');
-  container.innerHTML = `
-    <input type="text" class="ac-input" autocomplete="off" placeholder="Search or create a ${escapeHtml(FUNDING_SOURCE_LABELS[kind])}…"
-      value="${initialEntity ? escapeHtml(initialEntity.Name) : ''}" />
-    <div class="ac-results" hidden></div>`;
-  const input = container.querySelector('.ac-input');
-  const resultsEl = container.querySelector('.ac-results');
+// The old WO-level funding combobox (search/inline-create) was retired with
+// Phase 1 — funding now lives per-line via a plain <select> populated from
+// fundingEntities (see jobLineRowHtml/jobLineCardHtml). Creating a brand new
+// Capital Campaign Project / Cabin-Holder / Other category happens on the
+// Capital Plan page (renderCapitalPlan), which already has full CRUD for
+// all three — a job line just picks from what exists there.
 
-  function renderResults(query) {
-    const q = query.toLowerCase();
-    const matches = entities.filter((ent) => ent.Name.toLowerCase().includes(q));
-    const rows = matches.map((ent) => `
-      <div class="ac-item" data-id="${ent.Id}" data-name="${escapeHtml(ent.Name)}">
-        ${escapeHtml(ent.Name)}${ent.Description ? ` <span class="muted">— ${escapeHtml(ent.Description)}</span>` : ''}
-      </div>`).join('');
-    const addRow = query ? `<div class="ac-item ac-add" data-add-name="${escapeHtml(query)}">➕ Create new ${escapeHtml(FUNDING_SOURCE_LABELS[kind])} "${escapeHtml(query)}"…</div>` : '';
-    resultsEl.innerHTML = rows + addRow;
-    resultsEl.hidden = false;
-    resultsEl.querySelectorAll('.ac-item[data-id]').forEach((el) => el.addEventListener('click', () => {
-      selected = entities.find((ent) => ent.Id === Number(el.dataset.id));
-      input.value = el.dataset.name;
-      resultsEl.hidden = true;
-      onSelect(selected);
-    }));
-    resultsEl.querySelector('.ac-add')?.addEventListener('click', () => showQuickCreateForm(resultsEl.querySelector('.ac-add').dataset.addName));
-  }
+// One job line's full edit surface — title/responsibility/funding/hours/cost/
+// schedule up top (the 1.7 creation fields, still editable after), then
+// complaint/cause/correction (1.6 — filled in during/after the work) and
+// blocked state (columns land in Phase 1; the WO-level derived badge and
+// close-gate logic are Phase 2), then its own crew and photos. Collapsed by
+// default (<details>) so N lines on one WO doesn't turn the page into an
+// unreadable wall on a phone.
+function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }) {
+  const fundingSource = jl.FundingSource || 'operating_budget';
+  const fundingRefOptions = (fundingEntities[fundingSource] || []).map((e) => `<option value="${e.Id}" ${e.Id === jl.FundingRefId ? 'selected' : ''}>${escapeHtml(e.Name)}</option>`).join('');
+  const selectedCauseIds = new Set((jl.Causes || []).map((c) => c.Id));
+  const summaryBits = [
+    RESPONSIBILITY_CLASS_LABELS[jl.ResponsibilityClass] || jl.ResponsibilityClass,
+    jl.EstimatedCost != null ? `$${Number(jl.EstimatedCost).toLocaleString()} est.` : null,
+    jl.EstimatedHours != null ? `${jl.EstimatedHours}h est.` : null,
+    jl.ScheduledDate ? `Sched. ${formatDateNice(jl.ScheduledDate)}` : null,
+    jl.BlockedReason ? '🚧 Blocked' : null,
+  ].filter(Boolean).join(' · ');
 
-  function showQuickCreateForm(name) {
-    resultsEl.innerHTML = `<div class="ac-item" style="cursor:default">
-      <div class="field-row" style="margin-bottom:8px"><label>Name</label><input class="ac-new-name" value="${escapeHtml(name)}" /></div>
-      <div class="field-row" style="margin-bottom:8px"><label>Description (optional)</label><textarea class="ac-new-desc"></textarea></div>
-      <div class="btn-row" style="margin-top:0">
-        <button type="button" class="btn btn-primary ac-create-confirm">Create</button>
-        <button type="button" class="btn btn-secondary ac-create-cancel">Cancel</button>
+  return `<details class="card jl-card" data-id="${jl.Id}">
+    <summary style="cursor:pointer;display:flex;align-items:center;gap:10px;list-style:none">
+      <input type="checkbox" class="jl-split-select" value="${jl.Id}" title="Select to split off into a new work order" onclick="event.stopPropagation()" style="width:18px;height:18px;flex-shrink:0" />
+      ${statusPillHtml(jl.StatusName, jl.StatusColor)}
+      <span style="flex:1;${jl.StatusIsTerminal ? 'text-decoration:line-through;color:var(--muted)' : ''}">
+        <strong>${escapeHtml(jl.Title)}</strong>
+        <div class="muted" style="font-weight:400;font-size:0.85rem">${summaryBits}</div>
+      </span>
+    </summary>
+    <form class="jl-edit-form" style="margin-top:12px">
+      <div class="field-row"><label>Status</label>
+        <select class="jl-e-status">${jobLineStatuses.map((s) => `<option value="${s.Id}" data-requires-note="${s.RequiresNote}" data-note-label="${escapeHtml(s.NoteLabel || '')}" ${jl.StatusId === s.Id ? 'selected' : ''}>${escapeHtml(s.Name)}</option>`).join('')}</select>
       </div>
-    </div>`;
-    resultsEl.querySelector('.ac-create-cancel').addEventListener('click', () => { resultsEl.hidden = true; });
-    resultsEl.querySelector('.ac-create-confirm').addEventListener('click', async () => {
-      const finalName = resultsEl.querySelector('.ac-new-name').value.trim();
-      if (!finalName) { toast('Name is required'); return; }
-      const description = resultsEl.querySelector('.ac-new-desc').value.trim();
-      try {
-        const { item } = await api(`/api/pg/${FUNDING_SOURCE_ENDPOINT[kind]}`, { method: 'POST', body: JSON.stringify({ name: finalName, description, notes: description }) });
-        entities.push(item);
-        selected = item;
-        input.value = item.Name;
-        resultsEl.hidden = true;
-        toast(`${FUNDING_SOURCE_LABELS[kind]} "${item.Name}" created`);
-        onSelect(selected);
-      } catch (err) { toast(err.message); }
-    });
-  }
+      <div class="field-row jl-e-status-note-row" hidden>
+        <label class="jl-e-status-note-label">Note</label>
+        <input class="jl-e-status-note" placeholder="Required for this status" />
+      </div>
+      <div class="field-row"><label>Title</label><input class="jl-e-title" value="${escapeHtml(jl.Title)}" required /></div>
+      <div class="field-row"><label>Responsibility</label>
+        <select class="jl-e-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${jl.ResponsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+      </div>
+      <div class="field-row"><label>Funding Source</label>
+        <select class="jl-e-funding-source">${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}" ${fundingSource === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+      </div>
+      <div class="field-row jl-e-funding-ref-row" ${fundingSource === 'operating_budget' ? 'hidden' : ''}>
+        <label>${escapeHtml(FUNDING_SOURCE_LABELS[fundingSource] || '')}</label>
+        <select class="jl-e-funding-ref">${fundingRefOptions}</select>
+      </div>
+      <div class="field-row"><label>Estimated Hours</label><input class="jl-e-est-hours" type="number" min="0" value="${jl.EstimatedHours ?? ''}" /></div>
+      <div class="field-row"><label>Actual Hours</label><input class="jl-e-act-hours" type="number" min="0" value="${jl.ActualHours ?? ''}" /></div>
+      <div class="field-row"><label>Estimated Cost</label><input class="jl-e-est-cost" type="number" step="0.01" min="0" value="${jl.EstimatedCost ?? ''}" /></div>
+      <div class="field-row"><label>Actual Cost</label><input class="jl-e-act-cost" type="number" step="0.01" min="0" value="${jl.ActualCost ?? ''}" /></div>
+      <div class="field-row"><label>Scheduled Date</label><input class="jl-e-scheduled-date" type="date" value="${(jl.ScheduledDate || '').slice(0, 10)}" /></div>
+      <div class="field-row"><label>Complaint</label><textarea class="jl-e-complaint" placeholder="What's wrong?">${escapeHtml(jl.Complaint || '')}</textarea></div>
+      <div class="field-row"><label>Cause</label>
+        <div class="skill-chips">${causesCatalog.map((c) => `<label class="skill-chip ${selectedCauseIds.has(c.Id) ? 'selected' : ''}" style="cursor:pointer"><input type="checkbox" class="jl-e-cause" value="${c.Id}" style="margin-right:6px" ${selectedCauseIds.has(c.Id) ? 'checked' : ''} />${escapeHtml(c.Name)}</label>`).join('')}</div>
+        <p class="muted" style="font-size:0.8rem;margin-top:4px">The dropdown is what gets counted. Add "Unknown" rather than guessing.</p>
+      </div>
+      <div class="field-row"><label>Cause Note</label><textarea class="jl-e-cause-note" placeholder="Freetext detail — never becomes a new cause option">${escapeHtml(jl.CauseNote || '')}</textarea></div>
+      <div class="field-row"><label>Correction</label><textarea class="jl-e-correction" placeholder="What was done to fix it?">${escapeHtml(jl.Correction || '')}</textarea></div>
+      <div class="field-row"><label>Blocked Reason</label><input class="jl-e-blocked-reason" value="${escapeHtml(jl.BlockedReason || '')}" placeholder="Leave blank if not blocked" /></div>
+      <div class="field-row"><label>Blocked Since</label><input class="jl-e-blocked-since" type="date" value="${(jl.BlockedSince || '').slice(0, 10)}" /></div>
+      <div class="btn-row">
+        <button class="btn btn-primary jl-save-btn" type="submit">Save Line</button>
+        <button class="btn btn-secondary jl-delete-btn" type="button" data-label="${escapeHtml(jl.Title)}">Delete Line</button>
+      </div>
+    </form>
 
-  input.addEventListener('input', () => {
-    selected = null;
-    onSelect(null);
-    const q = input.value.trim();
-    if (!q) { resultsEl.hidden = true; return; }
-    renderResults(q);
-  });
-  input.addEventListener('focus', () => { if (input.value.trim()) renderResults(input.value.trim()); });
-  document.addEventListener('click', (e) => { if (!container.contains(e.target)) resultsEl.hidden = true; });
-
-  return {
-    getSelected: () => selected,
-    setSelected: (ent) => { selected = ent; input.value = ent ? ent.Name : ''; resultsEl.hidden = true; },
-  };
-}
-
-function fundingFieldsHtml(wo) {
-  const hasTarget = wo.FundingSource && wo.FundingSource !== 'operating_budget';
-  return `
-    <div class="field-row"><label>Funding Source</label>
-      <select name="fundingSource" id="fundingSource">
-        ${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}" ${wo.FundingSource === k ? 'selected' : ''}>${v}</option>`).join('')}
-      </select>
+    <div style="margin-top:14px">
+      <h4 style="margin-bottom:6px">Assigned to this line</h4>
+      ${(jl.volunteers || []).map((v) => `<div class="list-item" style="cursor:default"><span>👷 ${escapeHtml(v.Name)}</span><button class="btn btn-secondary jl-unassign-vol" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('')}
+      ${(jl.vendors || []).map((v) => `<div class="list-item" style="cursor:default"><span>🔧 ${escapeHtml(v.Name)}</span><button class="btn btn-secondary jl-unassign-ven" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('')}
+      ${!(jl.volunteers || []).length && !(jl.vendors || []).length ? '<p class="muted">None assigned.</p>' : ''}
+      <div class="field-row"><select class="jl-assign-picker"><option value="">— assign volunteer or vendor —</option>
+        ${(state._allVolunteers || []).filter((v) => !(jl.volunteers || []).some((a) => a.Id === v.Id)).map((v) => `<option value="vol:${v.Id}">👷 ${escapeHtml(v.Name)}</option>`).join('')}
+        ${(state._allVendors || []).filter((v) => !(jl.vendors || []).some((a) => a.Id === v.Id)).map((v) => `<option value="ven:${v.Id}">🔧 ${escapeHtml(v.Name)}</option>`).join('')}
+      </select></div>
     </div>
-    <div class="field-row" id="fundingRefRow" ${hasTarget ? '' : 'hidden'}>
-      <label id="fundingRefLabel">${FUNDING_SOURCE_LABELS[wo.FundingSource] || ''}</label>
-      <div id="fundingRefPicker"></div>
-    </div>`;
-}
-function wireFundingFields(root, fundingEntities, wo, getCurrentAsset) {
-  const sourceSelect = root.querySelector('#fundingSource');
-  const refRow = root.querySelector('#fundingRefRow');
-  const refLabel = root.querySelector('#fundingRefLabel');
-  const pickerEl = root.querySelector('#fundingRefPicker');
-  let picker = null;
 
-  function mountPicker(kind, initialEntity) {
-    picker = mountFundingCombobox(pickerEl, { kind, entities: fundingEntities[kind] || [], initialEntity });
-  }
-  if (sourceSelect.value !== 'operating_budget') {
-    const known = fundingEntities[sourceSelect.value]?.find((e) => e.Id === wo.FundingRefId);
-    const initial = known || (wo.FundingRefId ? { Id: wo.FundingRefId, Name: wo.FundingRefLabel } : null);
-    mountPicker(sourceSelect.value, initial);
-  }
-
-  sourceSelect.addEventListener('change', () => {
-    const source = sourceSelect.value;
-    if (source === 'operating_budget') { refRow.hidden = true; return; }
-    refRow.hidden = false;
-    refLabel.textContent = FUNDING_SOURCE_LABELS[source];
-    mountPicker(source, null);
-    // Cabin-holder auto-link: if the WO's asset already has a lodge-holder
-    // name on file, find (or create) the matching cabin-holder and select
-    // it automatically — the whole point being one less manual step.
-    if (source === 'cabin_holder') autoLinkCabinHolder();
-  });
-
-  async function autoLinkCabinHolder() {
-    const asset = getCurrentAsset() || wo.Asset;
-    const lodgeHolder = asset?.LodgeHolder?.trim();
-    if (!lodgeHolder) return;
-    const list = fundingEntities.cabin_holder || [];
-    let match = list.find((c) => c.Name.toLowerCase() === lodgeHolder.toLowerCase());
-    if (!match) {
-      try {
-        const { item } = await api('/api/pg/budget/cabin-holders', { method: 'POST', body: JSON.stringify({ name: lodgeHolder }) });
-        list.push(item);
-        match = item;
-        toast(`Linked cabin-holder "${lodgeHolder}" (created from this asset's records)`);
-      } catch (err) { toast(err.message); return; }
-    } else {
-      toast(`Linked cabin-holder "${match.Name}" (from this asset's records)`);
-    }
-    picker?.setSelected(match);
-  }
-
-  return { getPicker: () => picker };
+    <div style="margin-top:14px" id="jlPhotos-${jl.Id}"></div>
+  </details>`;
 }
 
 async function renderWorkOrderDetail({ id }, container = app) {
   if (container === app) setChrome({ title: 'Work Order', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
-  const [detail, allVolunteers, allVendors, skillsRes, tplRes, campaignRes, cabinRes, otherRes] = await Promise.all([
+  const [detail, allVolunteers, allVendors, skillsRes, tplRes, campaignRes, cabinRes, otherRes, causesRes] = await Promise.all([
     api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'), api('/api/pg/skills'),
     api('/api/pg/checklist-templates'),
     api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
+    api('/api/pg/causes'),
   ]);
   const allSkills = skillsRes.skills.map((s) => s.Name);
   const checklistTemplates = tplRes.templates;
   const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
-  const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist, logEntries, crewSessions, photos } = detail;
+  const causesCatalog = causesRes.causes;
+  const { workOrder: wo, rollup, crewRoster, closeGate, assetUpdates, jobLines, checklist, logEntries, crewSessions } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
+  // Job-line pickers (assign-crew, crew-session attendee union) read the full
+  // roster off `state` rather than threading it through every helper — same
+  // trick the rest of this file uses for state.options.
+  state._allVolunteers = allVolunteers.volunteers;
+  state._allVendors = allVendors.vendors;
 
-  // Small (56px) thumbnails, unbounded count — the schema doesn't cap how
-  // many "solution" photos a task or WO can have; only the report/export
-  // picker later limits how many actually go on the page.
-  const taskPhotoThumbs = (taskId, taskPhotos = []) => `
-    ${taskPhotos.map((p) => `
-      <div class="photo-thumb" style="width:56px;height:56px">
-        <img src="${p.Url}" alt="" />
-        <button type="button" class="photo-remove delete-task-photo" data-id="${p.Id}">&times;</button>
-      </div>`).join('')}
-    <button type="button" class="btn btn-secondary add-task-photo-btn" data-task-id="${taskId}" style="padding:4px 8px;font-size:0.8rem">📷 Add Photo</button>
-    <input type="file" class="task-photo-input" data-task-id="${taskId}" accept="image/*" capture="environment" multiple hidden />`;
+  const jobLineRows = jobLines.map((jl) => jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses })).join('')
+    || '<p class="muted">No job lines yet — add the scope of work below.</p>';
 
-  const taskRows = tasks.map((t) => `
-    <div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start">
-      <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
-        <input type="checkbox" class="task-toggle" data-id="${t.Id}" ${t.Done ? 'checked' : ''} />
-        <span style="${t.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(t.Description)}</span>
-      </label>
-      <button class="btn btn-secondary delete-task" data-id="${t.Id}" data-label="${escapeHtml(t.Description)}">Delete</button>
-      <div style="flex-basis:100%;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px">
-        ${taskPhotoThumbs(t.Id, t.Photos)}
-      </div>
-    </div>`).join('') || '<p class="muted">No tasks yet — add the scope of work below.</p>';
-
-  const woPhotoRows = (photos || []).map((p) => `
-    <div class="photo-thumb">
-      <img src="${p.Url}" alt="${escapeHtml(p.Caption || '')}" />
-      <button type="button" class="photo-remove delete-wo-photo" data-id="${p.Id}">&times;</button>
-    </div>`).join('');
-
-  const WO_STATUS_OPTIONS = ['Open', 'In Progress', 'On Hold', 'Urgent', 'Done'];
+  const workOrderStatuses = state.options.workOrderStatuses; // admin-editable (2.2) — never hardcode this list
+  const jobLineStatuses = state.options.jobLineStatuses; // admin-editable (2.1)
   const logRows = logEntries.map((e) => `
     <div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start">
       <div style="flex:1;min-width:200px">
@@ -4945,62 +5999,81 @@ async function renderWorkOrderDetail({ id }, container = app) {
       <button class="btn btn-secondary delete-crew-session" data-id="${s.Id}" style="align-self:center">Delete</button>
     </div>`).join('') || '<p class="muted">No sessions logged yet.</p>';
 
-  const assignedVolIds = new Set(volunteers.map((v) => v.Id));
-  const assignedVenIds = new Set(vendors.map((v) => v.Id));
-  const availableVols = allVolunteers.volunteers.filter((v) => !assignedVolIds.has(v.Id));
-  const availableVens = allVendors.vendors.filter((v) => !assignedVenIds.has(v.Id));
+
+  // Read-only rollup — hours/cost/funding/schedule now live on job lines
+  // (Phase 1); this is workOrderRollup() surfaced, never editable directly.
+  const rollupHtml = `
+    <div class="card">
+      <h4 style="margin-top:0">Rollup (from ${rollup.LineCount} job line${rollup.LineCount === 1 ? '' : 's'})</h4>
+      <p class="muted" style="margin:-4px 0 8px">
+        ${rollup.EstimatedCost ? `$${rollup.EstimatedCost.toLocaleString()} est.` : 'No cost estimated yet'}${rollup.ActualCost ? ` · $${rollup.ActualCost.toLocaleString()} actual` : ''}
+        · ${rollup.EstimatedHours || 0}h est.${rollup.ActualHours ? ` · ${rollup.ActualHours}h actual` : ''}
+      </p>
+      ${rollup.FundingBreakdown.length ? `<div class="muted" style="font-size:0.85rem">
+        ${rollup.FundingBreakdown.map((f) => `${FUNDING_SOURCE_LABELS[f.FundingSource] || f.FundingSource}${f.FundingRefLabel ? ` (${escapeHtml(f.FundingRefLabel)})` : ''}: $${f.Cost.toLocaleString()}`).join(' · ')}
+      </div>` : ''}
+      ${rollup.EarliestScheduledDate ? `<p class="muted" style="margin-bottom:0"><a href="#" id="viewOnCalendarLink">📅 Earliest scheduled line: ${formatDateNice(rollup.EarliestScheduledDate)}</a></p>` : ''}
+    </div>`;
 
   container.innerHTML = `
+    ${(closeGate.ReadyToClose && !wo.StatusIsTerminal) ? `
+    <div class="card" style="border:1px solid #22c55e66;background:#22c55e0d">
+      <strong>All job lines are finished.</strong>
+      <p class="muted" style="margin:4px 0 8px">Review the costs above and use "Complete Work Order" below when ready — closing is never automatic.</p>
+    </div>` : ''}
     <div class="card">
-      <h3>${escapeHtml(wo.Title)}</h3>
-      ${wo['Scheduled Date'] ? `<p class="muted"><a href="#" id="viewOnCalendarLink">📅 View on Calendar (${new Date(wo['Scheduled Date']).toLocaleDateString('default', { month: 'long', year: 'numeric' })})</a></p>` : ''}
+      <h3>WO ${escapeHtml(wo.WoNumber || wo.Id)} — ${escapeHtml(wo.Title)}</h3>
       <form id="woFieldsForm">
         <div class="field-row"><label>Asset</label><div id="woAssetPicker"></div></div>
         <div class="field-row"><label>Status</label>
-          <select name="status">${['Open', 'In Progress', 'On Hold', 'Urgent', 'Done'].map((s) => `<option ${wo.Status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+          <select name="statusId" id="woStatusSelect">${workOrderStatuses.map((s) => `<option value="${s.Id}" ${wo.StatusId === s.Id ? 'selected' : ''}>${escapeHtml(s.Name)}</option>`).join('')}</select>
         </div>
+        <div class="field-row" id="deferredFieldsRow" ${workOrderStatuses.find((s) => s.Id === wo.StatusId)?.Name === 'Deferred' ? '' : 'hidden'}>
+          <label>Deferred Reason</label><input name="deferredReason" value="${escapeHtml(wo.DeferredReason || '')}" placeholder="Why is this being deferred?" />
+          <label style="margin-top:8px">Revisit Date</label><input name="revisitDate" type="date" value="${(wo.RevisitDate || '').slice(0, 10)}" />
+        </div>
+        ${wo.IsBlocked ? `<p class="muted">🚧 Blocked — see the blocked job line below for the reason.</p>` : ''}
         <div class="field-row"><label>Priority</label>
           <select name="priority">${['Low', 'Medium', 'High', 'Urgent'].map((s) => `<option ${wo.Priority === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         </div>
-        <div class="field-row"><label>Responsible Party</label>
-          <div class="skill-chips">
-            <label class="skill-chip ${wo.ResponsibleSelf ? 'selected' : ''}" style="cursor:pointer"><input type="checkbox" name="responsibleSelf" style="margin-right:6px" ${wo.ResponsibleSelf ? 'checked' : ''} />Self</label>
-            <span class="pill ${volunteers.length ? 'good' : ''}" title="Set in Assigned Crew below">Volunteer${volunteers.length ? '' : ' (none assigned)'}</span>
-            <span class="pill ${vendors.length ? 'good' : ''}" title="Set in Assigned Crew below">Vendor${vendors.length ? '' : ' (none assigned)'}</span>
-          </div>
-        </div>
-        <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" value="${(wo['Scheduled Date'] || '').slice(0, 10)}" /></div>
         <div class="field-row"><label>Board Focus</label>
           <label class="skill-chip ${wo.BoardFocus ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="boardFocus" style="margin-right:6px" ${wo.BoardFocus ? 'checked' : ''} />Flag for board report</label>
         </div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(wo.Description || '')}</textarea></div>
-        <div class="field-row"><label>Estimated Hours</label><input name="estimatedHours" type="number" value="${wo['Estimated Hours'] ?? ''}" /></div>
-        <div class="field-row"><label>Actual Hours</label><input name="actualHours" type="number" value="${wo['Actual Hours'] ?? ''}" /></div>
-        <div class="field-row"><label>Estimated Cost</label><input name="estimatedCost" type="number" step="0.01" value="${wo['Estimated Cost'] ?? ''}" /></div>
-        <div class="field-row"><label>Actual Cost</label><input name="actualCost" type="number" step="0.01" value="${wo['Actual Cost'] ?? ''}" /></div>
-        ${fundingFieldsHtml(wo)}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       <div class="btn-row">
-        <button class="btn btn-primary" id="completeWoBtn" ${wo.Status === 'Done' ? 'disabled' : ''}>${wo.Status === 'Done' ? 'Completed' : 'Complete Work Order'}</button>
+        <button class="btn btn-primary" id="completeWoBtn" ${wo.StatusIsTerminal ? 'disabled' : ''}>${wo.StatusIsTerminal ? wo.Status : 'Complete Work Order'}</button>
         <a class="btn btn-secondary" href="/api/pg/work-orders/${id}/scope-pdf" target="_blank" rel="noopener" title="A printable job description to hand a vendor or volunteer — no cost figures included">🖨️ Scope of Work (PDF)</a>
         <button class="btn btn-secondary" id="duplicateWoBtn">Duplicate</button>
+        <button class="btn btn-secondary" id="familyBtn">Family</button>
       </div>
+      <div id="familyPanel" hidden></div>
+    </div>
+
+    ${rollupHtml}
+
+    <div class="card">
+      <h3>Documents</h3>
+      <p class="muted">Whole-job attachments not tied to one line — permits, invoices, warranty docs. Work photos belong on the job line they're proof of, below.</p>
+      <div id="woPhotosCard"></div>
     </div>
 
     <div class="card">
-      <h3>Photos</h3>
-      <p class="muted">Finished-work photos for this job — "before/after/finished" shots, distinct from audit/condition photos. These are what a Reports export can attach.</p>
-      ${photos?.length ? `<div class="photo-grid">${woPhotoRows}</div>` : '<p class="muted">No photos yet.</p>'}
-      <input type="file" id="woPhotoInput" accept="image/*" capture="environment" multiple hidden />
-      <button type="button" class="btn btn-secondary" id="addWoPhotoBtn">+ Add Photo</button>
-    </div>
-
-    <div class="card">
-      <h3>Tasks</h3>
-      <p class="muted">The scope of work — plain checklist items, not tied to any audit field. Each task can carry its own completion photos too.</p>
-      ${taskRows}
-      <div class="inline-add-row"><input class="new-task-input" placeholder="Add a task…" /><button type="button" class="btn btn-secondary" id="addTaskBtn">+</button></div>
+      <h3>Job Lines</h3>
+      <p class="muted">The unit of work — hours, cost, funding, responsibility, and scope all live on the line. A vendor on the roof, volunteers on the deck, one work order. Check lines above and use Split to move them into a new sibling work order (e.g. the roof needs a specialist, the deck doesn't).</p>
+      ${!wo.StatusIsTerminal ? `<div class="btn-row"><button type="button" class="btn btn-secondary" id="splitLinesBtn">Split Selected Lines Into New WO</button></div>` : ''}
+      ${jobLineRows}
+      <div class="card" style="margin-top:10px;background:transparent;border:1px dashed var(--border,#ccc)">
+        <h4 style="margin-top:0">+ Add Job Line</h4>
+        <form id="addJlForm">
+          <div class="field-row"><label>Title</label><input name="title" placeholder="e.g. Roof repair" required /></div>
+          <div class="field-row"><label>Responsibility</label>
+            <select name="responsibilityClass">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
+          </div>
+          <button class="btn btn-primary" type="submit">Add Job Line</button>
+        </form>
+      </div>
     </div>
 
     <div class="card">
@@ -5011,7 +6084,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <div class="field-row"><label>Note</label><textarea name="note" required placeholder="What did you do?"></textarea></div>
         <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
         <div class="field-row"><label>Update Status To (optional)</label>
-          <select name="statusChange"><option value="" selected>— no change —</option>${WO_STATUS_OPTIONS.map((s) => `<option>${s}</option>`).join('')}</select>
+          <select name="statusChange"><option value="" selected>— no change —</option>${workOrderStatuses.filter((s) => s.Name !== 'Deferred').map((s) => `<option>${escapeHtml(s.Name)}</option>`).join('')}</select>
+          <p class="muted" style="font-size:0.8rem;margin-top:4px">Deferring requires a reason and revisit date — use the Status field above for that.</p>
         </div>
         <button class="btn btn-primary" type="submit">Add Log Entry</button>
       </form>
@@ -5023,7 +6097,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
       <p class="muted" style="margin-top:8px">Only for the rare case this WO should change a stable asset fact (e.g. Window Count after installing new windows) — most work orders don't need this.</p>
       ${fieldUpdateRows}
-      <form id="addJobLineForm" style="margin-top:10px">
+      <form id="addAssetUpdateForm" style="margin-top:10px">
         <div class="field-row"><label>Field</label><select name="targetField" required><option value="">— select —</option>${propertyFieldTitles.map((t) => `<option>${escapeHtml(t)}</option>`).join('')}</select></div>
         <div class="field-row"><label>New Value</label><input name="newValue" required /></div>
         <button class="btn btn-secondary" type="submit">Add Field Update</button>
@@ -5031,71 +6105,37 @@ async function renderWorkOrderDetail({ id }, container = app) {
     </details>
 
     <div class="card">
-      <h3>Assigned Crew</h3>
-      <h4 style="margin-bottom:6px">Volunteers</h4>
-      ${volunteers.map((v) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(v.Name)}</span><button class="btn btn-secondary unassign-vol" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('') || '<p class="muted">None assigned.</p>'}
-      <form id="assignVolForm" style="margin-top:8px">
-        <div class="field-row"><select name="volunteerId"><option value="">— add existing volunteer —</option>${availableVols.map((v) => `<option value="${v.Id}">${escapeHtml(v.Name)}</option>`).join('')}</select></div>
-        <button class="btn btn-secondary" type="submit">Assign</button>
-      </form>
-      <button type="button" class="btn btn-secondary" id="newVolToggle" style="margin-top:6px">+ New Volunteer</button>
-      <div id="newVolBox" hidden style="margin-top:10px">
-        <div class="field-row"><label>Name</label><input id="newVolName" required /></div>
-        <div class="field-row"><label>Phone</label><input id="newVolPhone" class="phone-input" type="tel" /></div>
-        <div class="field-row"><label>Skills</label>
-          <div class="skill-chips" id="newVolSkills">${skillChipsHtml(allSkills, [])}</div>
-          <div class="inline-add-row"><input class="new-skill-input" placeholder="Add a new skill…" /><button type="button" class="btn btn-secondary add-skill-btn">+</button></div>
-        </div>
-        <button type="button" class="btn btn-primary" id="newVolSave">Add & Assign</button>
-      </div>
-
-      <h4 style="margin:16px 0 6px">Vendors</h4>
-      ${vendors.map((v) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(v.Name)}</span><button class="btn btn-secondary unassign-ven" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('') || '<p class="muted">None assigned.</p>'}
-      <form id="assignVenForm" style="margin-top:8px">
-        <div class="field-row"><select name="vendorId"><option value="">— add existing vendor —</option>${availableVens.map((v) => `<option value="${v.Id}">${escapeHtml(v.Name)}</option>`).join('')}</select></div>
-        <button class="btn btn-secondary" type="submit">Assign</button>
-      </form>
-      <button type="button" class="btn btn-secondary" id="newVenToggle" style="margin-top:6px">+ New Vendor</button>
-      <div id="newVenBox" hidden style="margin-top:10px">
-        <div class="field-row"><label>Name</label><input id="newVenName" required /></div>
-        <div class="field-row"><label>Phone</label><input id="newVenPhone" class="phone-input" type="tel" /></div>
-        <div class="field-row"><label>Specialties</label>
-          <div class="skill-chips" id="newVenSkills">${skillChipsHtml(allSkills, [])}</div>
-          <div class="inline-add-row"><input class="new-skill-input" placeholder="Add a new specialty…" /><button type="button" class="btn btn-secondary add-skill-btn">+</button></div>
-        </div>
-        <button type="button" class="btn btn-primary" id="newVenSave">Add & Assign</button>
-      </div>
-    </div>
-
-    <div class="card">
       <h3>Crew Sessions</h3>
       <p class="muted">Attendance-based hours — who was here, and for how long, each time work happened on this job. Feeds the Hours report.</p>
       ${crewSessionRows}
-      ${(volunteers.length || vendors.length) ? `
+      ${(crewRoster.volunteers.length || crewRoster.vendors.length) ? `
       <form id="addCrewSessionForm" style="margin-top:10px">
         <div class="field-row"><label>Date</label><input name="sessionDate" type="date" value="${isoDate(new Date())}" required /></div>
         <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
+        <div class="field-row"><label>Job Line (optional)</label>
+          <select name="jobLineId"><option value="">— general WO time —</option>${jobLines.map((jl) => `<option value="${jl.Id}">${escapeHtml(jl.Title)}</option>`).join('')}</select>
+        </div>
         <div class="field-row"><label>Who was here?</label>
           <div class="skill-chips" id="sessionAttendeeChips">
-            ${volunteers.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="vol" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
-            ${vendors.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="ven" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
+            ${crewRoster.volunteers.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="vol" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
+            ${crewRoster.vendors.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="ven" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
           </div>
         </div>
         <div class="field-row"><label>Note (optional)</label><input name="note" placeholder="Anything worth noting" /></div>
         <button class="btn btn-primary" type="submit">Log Session</button>
-      </form>` : '<p class="muted">Assign crew above before logging a session.</p>'}
+      </form>` : '<p class="muted">Assign crew to a job line above before logging a session.</p>'}
     </div>`;
 
   const assetPicker = mountAssetCombobox(container.querySelector('#woAssetPicker'), { initialAsset: wo.Asset });
-  const fundingFieldsCtrl = wireFundingFields(container.querySelector('#woFieldsForm'), fundingEntities, wo, () => assetPicker.getSelected());
 
-  const selfCheckbox = container.querySelector('input[name="responsibleSelf"]');
-  selfCheckbox?.addEventListener('change', () => {
-    selfCheckbox.closest('.skill-chip').classList.toggle('selected', selfCheckbox.checked);
-  });
   const boardFocusCheckbox = container.querySelector('input[name="boardFocus"]');
   boardFocusCheckbox?.addEventListener('change', () => {
     boardFocusCheckbox.closest('.skill-chip').classList.toggle('selected', boardFocusCheckbox.checked);
+  });
+
+  container.querySelector('#woStatusSelect').addEventListener('change', (e) => {
+    const statusName = workOrderStatuses.find((s) => s.Id === Number(e.target.value))?.Name;
+    container.querySelector('#deferredFieldsRow').hidden = statusName !== 'Deferred';
   });
 
   container.querySelector('#woFieldsForm').addEventListener('submit', async (e) => {
@@ -5103,21 +6143,11 @@ async function renderWorkOrderDetail({ id }, container = app) {
     if (!await confirmDialog('Save changes to this work order?')) return;
     const fd = new FormData(e.target);
     const newAsset = assetPicker.getSelected();
-    const fundingSource = fd.get('fundingSource');
-    const fundingRefEntity = fundingSource === 'operating_budget' ? null : fundingFieldsCtrl.getPicker()?.getSelected();
-    const fundingRefId = fundingSource === 'operating_budget' ? '' : fundingRefEntity?.Id;
-    if (fundingSource !== 'operating_budget' && !fundingRefId) {
-      toast(`Choose a ${FUNDING_SOURCE_LABELS[fundingSource]} to link this to`); return;
-    }
     try {
       await api(`/api/pg/work-orders/${id}`, { method: 'PATCH', body: JSON.stringify({
         assetId: newAsset ? newAsset.Id : (wo.Asset ? wo.Asset.Id : ''),
-        status: fd.get('status'), priority: fd.get('priority'), description: fd.get('description'),
-        scheduledDate: fd.get('scheduledDate') || '',
-        estimatedHours: fd.get('estimatedHours'), actualHours: fd.get('actualHours'),
-        estimatedCost: fd.get('estimatedCost'), actualCost: fd.get('actualCost'),
-        fundingSource, fundingRefId,
-        responsibleSelf: fd.has('responsibleSelf'),
+        statusId: Number(fd.get('statusId')), priority: fd.get('priority'), description: fd.get('description'),
+        deferredReason: fd.get('deferredReason') || undefined, revisitDate: fd.get('revisitDate') || undefined,
         boardFocus: fd.has('boardFocus'),
       }) });
       toast('Work order updated');
@@ -5135,67 +6165,140 @@ async function renderWorkOrderDetail({ id }, container = app) {
 
   container.querySelector('#viewOnCalendarLink')?.addEventListener('click', (e) => {
     e.preventDefault();
-    const d = new Date(wo['Scheduled Date']);
+    const d = new Date(rollup.EarliestScheduledDate);
     go('calendar', { month: d.getMonth(), year: d.getFullYear(), fromWorkOrderId: id, fromWorkOrderTitle: wo.Title });
   });
 
-  container.querySelector('#addTaskBtn').addEventListener('click', async () => {
-    const input = container.querySelector('.new-task-input');
-    const description = input.value.trim();
-    if (!description) return;
+  container.querySelector('#splitLinesBtn')?.addEventListener('click', async () => {
+    const jobLineIds = [...container.querySelectorAll('.jl-split-select:checked')].map((el) => Number(el.value));
+    if (!jobLineIds.length) { toast('Check at least one job line first'); return; }
+    if (!await confirmDialog(`Split ${jobLineIds.length} line(s) into a new sibling work order? Their hours, cost, crew, status, and photos move with them.`, { confirmLabel: 'Split' })) return;
     try {
-      await api(`/api/pg/work-orders/${id}/tasks`, { method: 'POST', body: JSON.stringify({ description }) });
+      const result = await api(`/api/pg/work-orders/${id}/split`, { method: 'POST', body: JSON.stringify({ jobLineIds }) });
+      toast(`Created WO ${result.woNumber}`);
+      go('workOrderDetail', { id: result.workOrderId });
+    } catch (err) { toast(err.message); }
+  });
+
+  container.querySelector('#familyBtn')?.addEventListener('click', async () => {
+    const panel = container.querySelector('#familyPanel');
+    if (!panel.hidden) { panel.hidden = true; return; }
+    panel.hidden = false;
+    panel.innerHTML = LOADING_HTML;
+    const family = await api(`/api/pg/work-orders/${id}/family`);
+    if (family.Members.length < 2) {
+      panel.innerHTML = '<p class="muted" style="margin-top:8px">This work order has never been split — it\'s its own family of one.</p>';
+      return;
+    }
+    panel.innerHTML = `
+      <div class="card" style="margin-top:8px;background:transparent">
+        <p class="muted">Combined across the whole family: <strong>$${family.TotalCost.toLocaleString()}</strong> · <strong>${family.TotalHours}h</strong></p>
+        ${family.Members.map((m) => `
+          <div class="list-item family-member-link" data-id="${m.Id}" style="cursor:pointer">
+            <span>WO ${escapeHtml(m.WoNumber)}${m.Id === Number(id) ? ' (this one)' : ''} — ${escapeHtml(m.Title)}</span>
+            ${statusPillHtml(m.Status, m.StatusColor)}
+          </div>`).join('')}
+      </div>`;
+    panel.querySelectorAll('.family-member-link').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.id })));
+  });
+
+  container.querySelector('#addJlForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api(`/api/pg/work-orders/${id}/job-lines`, { method: 'POST', body: JSON.stringify({
+        title: fd.get('title'), responsibilityClass: fd.get('responsibilityClass'),
+      }) });
       renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
-  container.querySelectorAll('.task-toggle').forEach((cb) => cb.addEventListener('change', async () => {
-    try { await api(`/api/pg/work-order-tasks/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderWorkOrderDetail({ id }, container); }
-    catch (err) { toast(err.message); }
-  }));
-  container.querySelectorAll('.delete-task').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog(`Delete task "${btn.dataset.label}"?`)) return;
-    try { await api(`/api/pg/work-order-tasks/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
-    catch (err) { toast(err.message); }
-  }));
 
-  container.querySelector('#addWoPhotoBtn')?.addEventListener('click', () => container.querySelector('#woPhotoInput').click());
-  container.querySelector('#woPhotoInput')?.addEventListener('change', async (e) => {
-    const files = [...e.target.files];
-    if (!files.length) return;
-    try {
-      for (const file of files) {
-        const url = await uploadPhotoFile(file, 'work-orders', id);
-        await api(`/api/pg/work-orders/${id}/photos`, { method: 'POST', body: JSON.stringify({ photoUrl: url }) });
-      }
+  container.querySelectorAll('.jl-card').forEach((card) => {
+    const jlId = card.dataset.id;
+    const jl = jobLines.find((l) => String(l.Id) === jlId);
+
+    const statusSelect = card.querySelector('.jl-e-status');
+    const statusNoteRow = card.querySelector('.jl-e-status-note-row');
+    function syncStatusNoteVisibility() {
+      const opt = statusSelect.selectedOptions[0];
+      const requiresNote = opt?.dataset.requiresNote === 'true';
+      statusNoteRow.hidden = !requiresNote;
+      statusNoteRow.querySelector('.jl-e-status-note-label').textContent = opt?.dataset.noteLabel || 'Note';
+      statusNoteRow.querySelector('.jl-e-status-note').placeholder = opt?.dataset.noteLabel || 'Required for this status';
+    }
+    statusSelect.addEventListener('change', syncStatusNoteVisibility);
+    syncStatusNoteVisibility();
+
+    const fundingSourceSelect = card.querySelector('.jl-e-funding-source');
+    const fundingRefRow = card.querySelector('.jl-e-funding-ref-row');
+    fundingSourceSelect.addEventListener('change', () => {
+      const source = fundingSourceSelect.value;
+      if (source === 'operating_budget') { fundingRefRow.hidden = true; return; }
+      fundingRefRow.hidden = false;
+      fundingRefRow.querySelector('label').textContent = FUNDING_SOURCE_LABELS[source];
+      fundingRefRow.querySelector('select').innerHTML = (fundingEntities[source] || []).map((ent) => `<option value="${ent.Id}">${escapeHtml(ent.Name)}</option>`).join('');
+    });
+
+    card.querySelectorAll('.jl-e-cause').forEach((cb) => cb.addEventListener('change', () => {
+      cb.closest('.skill-chip').classList.toggle('selected', cb.checked);
+    }));
+
+    card.querySelector('.jl-edit-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const causeIds = [...card.querySelectorAll('.jl-e-cause:checked')].map((cb) => Number(cb.value));
+      try {
+        await api(`/api/pg/job-lines/${jlId}`, { method: 'PATCH', body: JSON.stringify({
+          title: card.querySelector('.jl-e-title').value.trim(),
+          statusId: Number(statusSelect.value), statusNote: card.querySelector('.jl-e-status-note').value,
+          responsibilityClass: card.querySelector('.jl-e-resp').value,
+          fundingSource: fundingSourceSelect.value,
+          fundingRefId: fundingRefRow.hidden ? '' : (fundingRefRow.querySelector('select').value || ''),
+          estimatedHours: card.querySelector('.jl-e-est-hours').value,
+          actualHours: card.querySelector('.jl-e-act-hours').value,
+          estimatedCost: card.querySelector('.jl-e-est-cost').value,
+          actualCost: card.querySelector('.jl-e-act-cost').value,
+          scheduledDate: card.querySelector('.jl-e-scheduled-date').value,
+          complaint: card.querySelector('.jl-e-complaint').value,
+          causeNote: card.querySelector('.jl-e-cause-note').value,
+          correction: card.querySelector('.jl-e-correction').value,
+          blockedReason: card.querySelector('.jl-e-blocked-reason').value,
+          blockedSince: card.querySelector('.jl-e-blocked-since').value,
+          causeIds,
+        }) });
+        toast('Job line saved');
+        renderWorkOrderDetail({ id }, container);
+      } catch (err) { toast(err.message); }
+    });
+    card.querySelector('.jl-delete-btn').addEventListener('click', async () => {
+      if (!await confirmDialog(`Delete job line "${card.querySelector('.jl-delete-btn').dataset.label}"? This removes its hours, cost, and crew assignments too.`)) return;
+      try { await api(`/api/pg/job-lines/${jlId}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
+      catch (err) { toast(err.message); }
+    });
+
+    card.querySelector('.jl-assign-picker').addEventListener('change', async (e) => {
+      const [kind, entId] = e.target.value.split(':');
+      if (!kind) return;
+      try {
+        if (kind === 'vol') await api(`/api/pg/job-lines/${jlId}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: Number(entId) }) });
+        else await api(`/api/pg/job-lines/${jlId}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: Number(entId) }) });
+        renderWorkOrderDetail({ id }, container);
+      } catch (err) { toast(err.message); }
+    });
+    card.querySelectorAll('.jl-unassign-vol').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!await confirmDialog(`Remove ${btn.dataset.name} from this line?`)) return;
+      await api(`/api/pg/job-lines/${jlId}/volunteers/${btn.dataset.id}`, { method: 'DELETE' });
       renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
+    }));
+    card.querySelectorAll('.jl-unassign-ven').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!await confirmDialog(`Remove ${btn.dataset.name} from this line?`)) return;
+      await api(`/api/pg/job-lines/${jlId}/vendors/${btn.dataset.id}`, { method: 'DELETE' });
+      renderWorkOrderDetail({ id }, container);
+    }));
+
+    renderAttachmentSection('job_line', jlId, card.querySelector(`#jlPhotos-${jlId}`), { title: 'Photos', defaultRoleName: 'During' });
   });
-  container.querySelectorAll('.delete-wo-photo').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog('Delete this photo?')) return;
-    try { await api(`/api/pg/work-order-photos/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
-    catch (err) { toast(err.message); }
-  }));
 
-  container.querySelectorAll('.add-task-photo-btn').forEach((btn) => btn.addEventListener('click', () => {
-    container.querySelector(`.task-photo-input[data-task-id="${btn.dataset.taskId}"]`).click();
-  }));
-  container.querySelectorAll('.task-photo-input').forEach((input) => input.addEventListener('change', async (e) => {
-    const files = [...e.target.files];
-    if (!files.length) return;
-    const taskId = input.dataset.taskId;
-    try {
-      for (const file of files) {
-        const url = await uploadPhotoFile(file, 'work-order-tasks', taskId);
-        await api(`/api/pg/work-order-tasks/${taskId}/photos`, { method: 'POST', body: JSON.stringify({ photoUrl: url }) });
-      }
-      renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
-  }));
-  container.querySelectorAll('.delete-task-photo').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog('Delete this photo?')) return;
-    try { await api(`/api/pg/work-order-task-photos/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
-    catch (err) { toast(err.message); }
-  }));
+  renderAttachmentSection('work_order', id, container.querySelector('#woPhotosCard'), { title: 'Documents', defaultRoleName: 'Documentation', accept: 'image/*,application/pdf' });
 
   container.querySelector('#addLogEntryForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -5223,7 +6326,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
     const chips = [...container.querySelectorAll('.crew-attendee-chip.selected')];
     try {
       await api('/api/pg/crew-sessions', { method: 'POST', body: JSON.stringify({
-        workOrderId: Number(id), sessionDate: fd.get('sessionDate'), hours: fd.get('hours') || undefined, note: fd.get('note') || undefined,
+        workOrderId: Number(id), jobLineId: fd.get('jobLineId') || undefined,
+        sessionDate: fd.get('sessionDate'), hours: fd.get('hours') || undefined, note: fd.get('note') || undefined,
         volunteerIds: chips.filter((c) => c.dataset.kind === 'vol').map((c) => Number(c.dataset.id)),
         vendorIds: chips.filter((c) => c.dataset.kind === 'ven').map((c) => Number(c.dataset.id)),
       }) });
@@ -5264,7 +6368,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
     } catch (err) { toast(err.message); }
   });
 
-  container.querySelector('#addJobLineForm').addEventListener('submit', async (e) => {
+  container.querySelector('#addAssetUpdateForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
@@ -5277,64 +6381,6 @@ async function renderWorkOrderDetail({ id }, container = app) {
     if (!await confirmDialog(`Delete the "${btn.dataset.label}" field update?`)) return;
     try { await api(`/api/pg/work-orders/${id}/asset-updates/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
-  }));
-
-  container.querySelector('#assignVolForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const volunteerId = new FormData(e.target).get('volunteerId');
-    if (!volunteerId) return;
-    await api(`/api/pg/work-orders/${id}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: Number(volunteerId) }) });
-    renderWorkOrderDetail({ id }, container);
-  });
-  container.querySelector('#assignVenForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const vendorId = new FormData(e.target).get('vendorId');
-    if (!vendorId) return;
-    await api(`/api/pg/work-orders/${id}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: Number(vendorId) }) });
-    renderWorkOrderDetail({ id }, container);
-  });
-
-  container.querySelector('#newVolToggle').addEventListener('click', () => openCrewAddBox('newVolBox', 'newVenBox'));
-  container.querySelector('#newVenToggle').addEventListener('click', () => openCrewAddBox('newVenBox', 'newVolBox'));
-  wireSkillChipToggle(container.querySelector('#newVolSkills'));
-  wireSkillChipToggle(container.querySelector('#newVenSkills'));
-  container.querySelectorAll('.add-skill-btn').forEach(wireAddSkillButton);
-  wirePhoneFormatting(container);
-  container.querySelector('#newVolSave').addEventListener('click', async () => {
-    const name = container.querySelector('#newVolName').value.trim();
-    if (!name) { toast('Name is required'); return; }
-    try {
-      const { volunteer } = await api('/api/pg/volunteers', { method: 'POST', body: JSON.stringify({
-        name, phone: container.querySelector('#newVolPhone').value.trim(),
-        skill: selectedSkillsOf(container.querySelector('#newVolSkills')),
-      }) });
-      await api(`/api/pg/work-orders/${id}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: volunteer.Id }) });
-      toast('Volunteer added and assigned');
-      renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
-  });
-  container.querySelector('#newVenSave').addEventListener('click', async () => {
-    const name = container.querySelector('#newVenName').value.trim();
-    if (!name) { toast('Name is required'); return; }
-    try {
-      const { vendor } = await api('/api/pg/vendors', { method: 'POST', body: JSON.stringify({
-        name, phone: container.querySelector('#newVenPhone').value.trim(),
-        specialty: selectedSkillsOf(container.querySelector('#newVenSkills')),
-      }) });
-      await api(`/api/pg/work-orders/${id}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: vendor.Id }) });
-      toast('Vendor added and assigned');
-      renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
-  });
-  container.querySelectorAll('.unassign-vol').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog(`Remove ${btn.dataset.name} from this work order?`)) return;
-    await api(`/api/pg/work-orders/${id}/volunteers/${btn.dataset.id}`, { method: 'DELETE' });
-    renderWorkOrderDetail({ id }, container);
-  }));
-  container.querySelectorAll('.unassign-ven').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog(`Remove ${btn.dataset.name} from this work order?`)) return;
-    await api(`/api/pg/work-orders/${id}/vendors/${btn.dataset.id}`, { method: 'DELETE' });
-    renderWorkOrderDetail({ id }, container);
   }));
 }
 
@@ -5352,33 +6398,6 @@ function wireSkillChipToggle(container) {
 }
 function selectedSkillsOf(container) {
   return [...container.querySelectorAll('.skill-chip.selected')].map((c) => c.dataset.skill);
-}
-
-// The "+ New Volunteer" / "+ New Vendor" inline boxes on WO Detail are mutually
-// exclusive — opening one while the other has unsaved text/skills prompts to
-// discard rather than silently leaving both open (a prior bug).
-function crewAddBoxHasData(boxId) {
-  const box = document.getElementById(boxId);
-  const hasText = [...box.querySelectorAll('input')].some((i) => i.value.trim());
-  const hasSkills = box.querySelectorAll('.skill-chip.selected').length > 0;
-  return hasText || hasSkills;
-}
-function resetCrewAddBox(boxId) {
-  const box = document.getElementById(boxId);
-  box.querySelectorAll('input').forEach((i) => { i.value = ''; });
-  box.querySelectorAll('.skill-chip.selected').forEach((c) => c.classList.remove('selected'));
-  box.hidden = true;
-}
-async function openCrewAddBox(openId, otherId) {
-  const otherBox = document.getElementById(otherId);
-  if (!otherBox.hidden) {
-    if (crewAddBoxHasData(otherId)) {
-      const label = otherId === 'newVolBox' ? 'volunteer' : 'vendor';
-      if (!await confirmDialog(`You have unsaved new-${label} info entered. Discard it and continue?`)) return;
-    }
-    resetCrewAddBox(otherId);
-  }
-  document.getElementById(openId).hidden = false;
 }
 
 // US phone auto-format as you type: 5551234567 -> (555) 123-4567.
