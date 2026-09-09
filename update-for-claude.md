@@ -1,3 +1,54 @@
+# Runbook: Audit → Work Order (Build Brief v2, Phase 7)
+
+Phase 7 landed 2026-09-09. Migration 0051. **This is the last phase in
+`toClaudeCode/BUILD_BRIEF_v2_joblines_lifecycle_attachments.md`** — its own
+"Build order" section only defines Phases 1–7; there is no Phase 8 or 9 in
+this brief.
+
+## What changed
+- `job_line_templates` table (§7.1) — wording/defaults only, keyed loosely
+  by `building_type_id` and `component_type` (most-specific-match-wins:
+  building+component, then component alone, then building alone, then no
+  match). `component_type` is a text FK to `component_type_catalog`, same
+  pattern as `attachments.classification` from Phase 4 — not a new
+  `component_types` table. Seeded with 4 starter examples (Roof/Siding/
+  Foundation/Windows, matching `component_type_catalog`'s own seed).
+  `{asset}` in `default_title` substitutes the asset's name at use time.
+  Admin CRUD at Admin → Work Orders → Job Line Templates.
+- **Create WO from Findings** (§7.2): Asset Detail's Findings card gained a
+  "+ Create Work Order from Findings" button (shown only when at least one
+  Open finding exists) → `renderCreateWoFromFindings` in app.js — every
+  open finding for the asset, a checkbox each, pre-filled/editable line
+  title from `getOpenFindingsForWoCreation`'s template match (falls back to
+  the finding's own title when nothing matches). One submit calls
+  `createWorkOrderFromFindings(assetId, selections)` in db.js, which
+  creates the WO then calls the **existing** `createJobLine` once per
+  selected finding with `conditionFindingId` set — Phase 3's
+  auto-schedule-on-link fires for each one for free, so every finding on
+  the new WO moves Open → Scheduled without any new status-transition code.
+  Templates stay strictly 1:1 with findings (§7.1's explicit constraint) —
+  this function has no path that groups two findings onto one line.
+- Fixture-tested end to end: seeded a Roof-sourced open finding, verified
+  the template match produced the exact seeded title with `{asset}`
+  substituted, verified the created job line carried the right
+  `condition_finding_id`/responsibility/funding, and verified the finding's
+  status flipped to `Scheduled` automatically — before considering this
+  phase (and the whole brief) done.
+
+## Known gaps / follow-ups
+- Template matching only looks at a finding's `source_component_type`
+  (set when a finding comes from a component-event flag during audit).
+  Findings sourced from a property-flag (`source_field_key`) or created
+  manually (neither field set) always fall back to the finding's own title
+  — there's no building-type-only template path exercised by real data
+  yet, though the matching function supports it.
+- No UI surfaces `job_line_templates` anywhere except the admin CRUD page
+  and the create-WO-from-findings screen's silent pre-fill — there's no
+  "which template matched and why" indicator if a title looks wrong. Low
+  priority; the title field is editable right there regardless.
+
+---
+
 # Runbook: Reports (Build Brief v2, Phase 6)
 
 Phase 6 landed 2026-09-09. Migration 0050.

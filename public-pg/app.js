@@ -608,6 +608,7 @@ async function render(view, params = {}) {
       map: () => renderMap(),
       notes: () => renderNotes(),
       inbox: () => renderInbox(),
+      createWoFromFindings: () => renderCreateWoFromFindings(params),
       assetsInLocation: () => renderAssetsInLocation(params),
       assetDetail: () => renderAssetDetail(params),
       audit: () => renderAudit(params),
@@ -630,6 +631,7 @@ async function render(view, params = {}) {
       adminJobLineStatuses: () => renderAdminJobLineStatuses(),
       adminAttachmentRoles: () => renderAdminAttachmentRoles(),
       adminMapCalibration: () => renderAdminMapCalibration(),
+      adminJobLineTemplates: () => renderAdminJobLineTemplates(),
       calendar: () => renderCalendar(params),
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
@@ -946,6 +948,7 @@ const ADMIN_LEAF_RENDERERS = {
   adminJobLineStatuses: (params, container) => renderAdminJobLineStatuses(container),
   adminAttachmentRoles: (params, container) => renderAdminAttachmentRoles(container),
   adminMapCalibration: (params, container) => renderAdminMapCalibration(container),
+  adminJobLineTemplates: (params, container) => renderAdminJobLineTemplates(container),
   adminChecklistTemplates: (params, container) => renderAdminChecklistTemplates(container),
   adminUsers: (params, container) => renderAdminUsers(container),
   activityLog: (params, container) => renderActivityLog(container),
@@ -1216,6 +1219,7 @@ async function renderAssetDetail({ id }, container = app) {
     </div>
 
     <div class="card"><h3>Findings (${conditionFindings.length})</h3>
+      ${conditionFindings.some((f) => f.Status === 'Open') ? `<div class="btn-row" style="margin-bottom:10px"><button type="button" class="btn btn-primary" id="createWoFromFindingsBtn">+ Create Work Order from Findings</button></div>` : ''}
       ${conditionFindings.map((f) => {
         const decided = f.Status === 'Deferred' || f.Status === 'Dismissed';
         return `
@@ -1259,6 +1263,7 @@ async function renderAssetDetail({ id }, container = app) {
   renderAttachmentSection('asset', id, container.querySelector('#assetPhotosCard'), { title: 'Reference Photos', defaultRoleName: 'Reference' });
 
   container.querySelector('#startAuditBtn').addEventListener('click', () => go('audit', { id }));
+  container.querySelector('#createWoFromFindingsBtn')?.addEventListener('click', () => go('createWoFromFindings', { assetId: id, assetName: asset.Name }));
   container.querySelector('#viewHistoryBtn').addEventListener('click', () => go('assetHistory', { id }));
   container.querySelector('#editAssetBtn').addEventListener('click', () => go('editAsset', { id }));
   container.querySelector('#newWoBtn').addEventListener('click', () => go('newWorkOrder', { assetId: id, assetName: asset.Name }));
@@ -1325,6 +1330,58 @@ async function renderAssetDetail({ id }, container = app) {
 // know (or want to search for) the asset by name. Picking one hands straight
 // off to the same renderAudit used from Asset Detail; nothing about the audit
 // form itself changes.
+// Build Brief v2 Phase 7 (§7.2) — the end-of-walkthrough screen: every open
+// finding for this asset, listed with a checkbox and a pre-filled line
+// title from its template. Untick anything not going on this WO. One button
+// creates the WO with one job line per checked finding, each carrying its
+// condition_finding_id so Phase 3's auto-schedule fires for free.
+async function renderCreateWoFromFindings({ assetId, assetName }) {
+  setChrome({ title: 'Create WO from Findings', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const { findings } = await api(`/api/pg/assets/${assetId}/open-findings-for-wo`);
+
+  if (!findings.length) {
+    app.innerHTML = `<div class="card"><h3>Create Work Order from Findings</h3><p class="muted">No open findings for ${escapeHtml(assetName)}.</p></div>`;
+    return;
+  }
+
+  app.innerHTML = `
+    <div class="card">
+      <h3>Create Work Order from Findings — ${escapeHtml(assetName)}</h3>
+      <p class="muted">Every open finding for this asset, pre-filled from its template where one matches. Untick anything not going on this WO — funding and responsibility get fine-tuned afterward on the WO screen, where there's a keyboard.</p>
+      <form id="cwfForm">
+        ${findings.map((f) => `
+          <div class="card" style="background:transparent;border:1px solid var(--border,#ccc)">
+            <label style="display:flex;align-items:flex-start;gap:8px;font-weight:400;cursor:pointer">
+              <input type="checkbox" class="cwf-check" data-id="${f.Id}" checked style="margin-top:4px;width:18px;height:18px;flex-shrink:0" />
+              <span style="flex:1">
+                <div class="muted" style="font-size:0.8rem">${escapeHtml(f.Severity || '')}${f.Description ? ` · ${escapeHtml(f.Description)}` : ''}</div>
+                <input class="cwf-title" data-id="${f.Id}" value="${escapeHtml(f.SuggestedTitle)}" style="margin-top:6px" />
+              </span>
+            </label>
+          </div>`).join('')}
+        <button class="btn btn-primary" type="submit" style="margin-top:12px">Create Work Order</button>
+      </form>
+    </div>`;
+
+  const findingById = new Map(findings.map((f) => [f.Id, f]));
+  app.querySelector('#cwfForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const selections = [...app.querySelectorAll('.cwf-check:checked')].map((cb) => {
+      const id = Number(cb.dataset.id);
+      const f = findingById.get(id);
+      const title = app.querySelector(`.cwf-title[data-id="${id}"]`).value.trim() || f.SuggestedTitle;
+      return { findingId: id, title, responsibilityClass: f.SuggestedResponsibilityClass, fundingSource: f.SuggestedFundingSource, estimatedCost: f.EstimatedCost };
+    });
+    if (!selections.length) { toast('Check at least one finding'); return; }
+    try {
+      const { workOrderId } = await api(`/api/pg/assets/${assetId}/create-wo-from-findings`, { method: 'POST', body: JSON.stringify({ findings: selections }) });
+      toast('Work order created');
+      go('workOrderDetail', { id: workOrderId }, { replace: true });
+    } catch (err) { toast(err.message); }
+  });
+}
+
 async function renderAuditPicker() {
   setChrome({ title: 'Start Audit', showBack: false, showLogout: true });
   app.innerHTML = `
@@ -3735,6 +3792,7 @@ const ADMIN_CATEGORIES = {
     icon: '🧾', title: 'Work Orders', description: 'Templates and checklists for repeatable work',
     items: [
       { view: 'adminWoTemplates', icon: '🧾', label: 'Work Order Templates' },
+      { view: 'adminJobLineTemplates', icon: '🧩', label: 'Job Line Templates' },
       { view: 'adminChecklistTemplates', icon: '✅', label: 'Checklist Templates' },
       { view: 'adminCauses', icon: '🔍', label: 'Causes' },
       { view: 'adminWorkOrderStatuses', icon: '🚦', label: 'Work Order Statuses' },
@@ -4085,6 +4143,74 @@ async function renderAdminWoTemplates(container = app) {
   }
 
   draw();
+}
+
+// Build Brief v2 Phase 7 (§7.1) — wording/defaults for the "Create WO from
+// Findings" screen, keyed loosely by building type + component type. Most
+// specific match wins server-side (matchJobLineTemplate in db.js); this
+// page is plain CRUD, same shape as Causes/Attachment Roles.
+async function renderAdminJobLineTemplates(container = app) {
+  if (container === app) setChrome({ title: 'Job Line Templates', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { templates } = await api('/api/pg/admin/job-line-templates');
+  const buildingTypes = state.options.buildingTypes || [];
+  const componentTypes = state.options.componentTypeOptions || [];
+  const buildingTypeName = (id) => buildingTypes.find((b) => b.Id === id)?.Name;
+
+  const rows = templates.map((t) => `
+    <div class="list-item" style="cursor:default;flex-wrap:wrap">
+      <span><strong>${escapeHtml(t.DefaultTitle)}</strong>
+        <div class="muted" style="font-weight:400">${[buildingTypeName(t.BuildingTypeId), t.ComponentType].filter(Boolean).join(' · ') || 'Matches anything'}
+          ${t.DefaultResponsibilityClass ? ` · ${escapeHtml(RESPONSIBILITY_CLASS_LABELS[t.DefaultResponsibilityClass] || t.DefaultResponsibilityClass)}` : ''}
+          ${!t.Active ? ' · <span class="pill">inactive</span>' : ''}</div></span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary jlt-toggle-active" data-id="${t.Id}" data-active="${t.Active}">${t.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary jlt-delete" data-id="${t.Id}" data-name="${escapeHtml(t.DefaultTitle)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No templates yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Job Line Templates</h3>
+      <p class="muted">Wording and defaults only — never grouping. A finding on Roof for a Cabin seeds a line titled "Roof repair — {asset}" with class and funding pre-filled. Use <code>{asset}</code> in the title to substitute the asset's name. Leave Building Type and/or Component Type unset to match more broadly.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Template</h3>
+      <form id="addJltForm">
+        <div class="field-row"><label>Default Title</label><input name="defaultTitle" placeholder="e.g. Roof repair — {asset}" required /></div>
+        <div class="field-row"><label>Building Type (optional)</label><select name="buildingTypeId"><option value="">— any —</option>${buildingTypes.map((b) => `<option value="${b.Id}">${escapeHtml(b.Name)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Component Type (optional)</label><select name="componentType"><option value="">— any —</option>${componentTypes.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Default Responsibility</label><select name="defaultResponsibilityClass"><option value="">— unset —</option>${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Default Funding Source</label><select name="defaultFundingSource"><option value="">— unset —</option>${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}">${escapeHtml(v)}</option>`).join('')}</select></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.jlt-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/job-line-templates/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) });
+      renderAdminJobLineTemplates(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.jlt-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete template "${btn.dataset.name}"?`)) return;
+    try {
+      await api(`/api/pg/admin/job-line-templates/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Template deleted');
+      renderAdminJobLineTemplates(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addJltForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/job-line-templates', { method: 'POST', body: JSON.stringify({
+        defaultTitle: fd.get('defaultTitle'), buildingTypeId: fd.get('buildingTypeId') || null, componentType: fd.get('componentType') || null,
+        defaultResponsibilityClass: fd.get('defaultResponsibilityClass') || null, defaultFundingSource: fd.get('defaultFundingSource') || null,
+      }) });
+      renderAdminJobLineTemplates(container);
+    } catch (err) { toast(err.message); }
+  });
 }
 
 function renderAdminAddFieldChoice(params = {}, container = app, { onOpenTool } = {}) {

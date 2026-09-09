@@ -74,6 +74,8 @@ import {
   listInboxBatches, getInboxCount, suggestAssetsForText, triageAttachToEntity, triageCreateWorkOrder, triageCreateFinding, voidAttachments,
   splitWorkOrder, getWorkOrderFamily,
   listMapCalibrationPoints, createMapCalibrationPoint, deleteMapCalibrationPoint, nearestAssetsToGps,
+  listJobLineTemplates, createJobLineTemplate, updateJobLineTemplate, deleteJobLineTemplate,
+  getOpenFindingsForWoCreation, createWorkOrderFromFindings,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import {
@@ -527,6 +529,40 @@ router.post('/condition-findings/:id/dismiss', async (req, res, next) => {
 });
 router.get('/findings-summary', async (req, res, next) => {
   try { res.json(await getFindingsSummary()); } catch (e) { next(e); }
+});
+
+// ---- Create WO from findings (Build Brief v2 Phase 7, §7.2) ----
+
+router.get('/assets/:id/open-findings-for-wo', async (req, res, next) => {
+  try { res.json({ findings: await getOpenFindingsForWoCreation(req.params.id) }); } catch (e) { next(e); }
+});
+router.post('/assets/:id/create-wo-from-findings', async (req, res, next) => {
+  try {
+    const { findings } = req.body || {}; // [{ findingId, title, responsibilityClass, fundingSource, estimatedCost }]
+    if (!Array.isArray(findings) || !findings.length) return res.status(400).json({ ok: false, error: 'Select at least one finding' });
+    res.json({ ok: true, ...(await createWorkOrderFromFindings(req.params.id, findings)) });
+  } catch (e) { next(e); }
+});
+
+router.get('/admin/job-line-templates', async (req, res, next) => {
+  try { res.json({ templates: await listJobLineTemplates({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/job-line-templates', async (req, res, next) => {
+  try {
+    const { buildingTypeId, componentType, defaultTitle, defaultResponsibilityClass, defaultFundingSource, sortOrder } = req.body || {};
+    if (!defaultTitle?.trim()) return res.status(400).json({ ok: false, error: 'Default title is required' });
+    res.json({ ok: true, template: await createJobLineTemplate({ buildingTypeId, componentType, defaultTitle: defaultTitle.trim(), defaultResponsibilityClass, defaultFundingSource, sortOrder }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/job-line-templates/:id', async (req, res, next) => {
+  try {
+    const updated = await updateJobLineTemplate(req.params.id, req.body || {});
+    if (!updated) return res.status(404).json({ ok: false, error: 'Template not found' });
+    res.json({ ok: true, template: updated });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/job-line-templates/:id', async (req, res, next) => {
+  try { await deleteJobLineTemplate(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 router.get('/assets/:id/history', async (req, res, next) => {

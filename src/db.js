@@ -1953,6 +1953,105 @@ export async function getFindingsSummary() {
   return { OpenCount: Number(rows[0].open_count), NotOnAnyWorkOrderCount: Number(rows[0].not_on_wo_count) };
 }
 
+// ── Job line templates (Build Brief v2 Phase 7, §7.1) — admin-editable
+//    wording/defaults, keyed loosely by building type + component type,
+//    same data-driven pattern as question_applicability/
+//    component_sub_areas. Templates supply defaults only, never grouping —
+//    findings stay 1:1 with the job lines they become. ─────────────────────
+
+function jobLineTemplateRowShape(r) {
+  return {
+    Id: r.id, BuildingTypeId: r.building_type_id, ComponentType: r.component_type,
+    DefaultTitle: r.default_title, DefaultResponsibilityClass: r.default_responsibility_class,
+    DefaultFundingSource: r.default_funding_source, SortOrder: r.sort_order, Active: r.active,
+  };
+}
+export async function listJobLineTemplates({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(`SELECT * FROM job_line_templates ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, id`);
+  return rows.map(jobLineTemplateRowShape);
+}
+export async function createJobLineTemplate({ buildingTypeId, componentType, defaultTitle, defaultResponsibilityClass, defaultFundingSource, sortOrder = 100 }) {
+  const { rows } = await pool.query(
+    `INSERT INTO job_line_templates (building_type_id, component_type, default_title, default_responsibility_class, default_funding_source, sort_order)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [buildingTypeId || null, componentType || null, defaultTitle, defaultResponsibilityClass || null, defaultFundingSource || null, sortOrder]
+  );
+  await logActivity({ action: 'created', entityType: 'job_line_template', entityId: rows[0].id, entityLabel: rows[0].default_title });
+  return jobLineTemplateRowShape(rows[0]);
+}
+export async function updateJobLineTemplate(id, { buildingTypeId, componentType, defaultTitle, defaultResponsibilityClass, defaultFundingSource, sortOrder, active }) {
+  const { rows } = await pool.query(
+    `UPDATE job_line_templates SET
+       building_type_id = COALESCE($2, building_type_id), component_type = COALESCE($3, component_type),
+       default_title = COALESCE($4, default_title), default_responsibility_class = COALESCE($5, default_responsibility_class),
+       default_funding_source = COALESCE($6, default_funding_source), sort_order = COALESCE($7, sort_order), active = COALESCE($8, active)
+     WHERE id = $1 RETURNING *`,
+    [id, buildingTypeId ?? null, componentType ?? null, defaultTitle ?? null, defaultResponsibilityClass ?? null, defaultFundingSource ?? null, sortOrder ?? null, active ?? null]
+  );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'job_line_template', entityId: rows[0].id, entityLabel: rows[0].default_title });
+  return rows[0] ? jobLineTemplateRowShape(rows[0]) : null;
+}
+export async function deleteJobLineTemplate(id) {
+  const { rows } = await pool.query('DELETE FROM job_line_templates WHERE id = $1 RETURNING default_title', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'job_line_template', entityId: Number(id), entityLabel: rows[0].default_title });
+}
+
+// Most specific match wins: building type + component type, then component
+// type alone, then building type alone. Never guesses across component
+// types — a Roof template must not apply to a Foundation finding.
+function matchJobLineTemplate(templates, buildingTypeId, componentType) {
+  return templates.find((t) => t.BuildingTypeId === buildingTypeId && t.ComponentType === componentType)
+    || (componentType ? templates.find((t) => !t.BuildingTypeId && t.ComponentType === componentType) : null)
+    || (buildingTypeId ? templates.find((t) => t.BuildingTypeId === buildingTypeId && !t.ComponentType) : null)
+    || null;
+}
+
+// ── Create WO from findings (Build Brief v2 Phase 7, §7.2) — the end of a
+//    walkthrough: every open finding for the asset, pre-filled from its
+//    template, one checkbox each. Untick anything not going on this WO. ────
+
+// Every open finding for the asset, each with its template-suggested line
+// title (falling back to the finding's own title when no template matches)
+// so the "New WO" screen can render checkboxes with editable titles already
+// filled in — capture stays fast, nothing is guessed silently.
+export async function getOpenFindingsForWoCreation(assetId) {
+  const [findingsRes, assetRes, templates] = await Promise.all([
+    pool.query(`SELECT * FROM condition_findings WHERE asset_id = $1 AND status = 'Open' ORDER BY id`, [assetId]),
+    pool.query('SELECT name, building_type_id FROM assets WHERE id = $1', [assetId]),
+    listJobLineTemplates(),
+  ]);
+  const asset = assetRes.rows[0];
+  return findingsRes.rows.map((f) => {
+    const tmpl = matchJobLineTemplate(templates, asset?.building_type_id, f.source_component_type);
+    const suggestedTitle = tmpl ? tmpl.DefaultTitle.replace('{asset}', asset?.name || `Asset #${assetId}`) : f.title;
+    return {
+      Id: f.id, Title: f.title, Severity: f.severity, Description: f.description, EstimatedCost: f.estimated_cost,
+      SuggestedTitle: suggestedTitle,
+      SuggestedResponsibilityClass: tmpl?.DefaultResponsibilityClass || 'self',
+      SuggestedFundingSource: tmpl?.DefaultFundingSource || 'operating_budget',
+    };
+  });
+}
+
+// One job line per checked finding, `condition_finding_id` set on each —
+// createJobLine's existing auto-schedule-on-link (Phase 3) fires for every
+// one, so every finding on this WO moves Open -> Scheduled for free. Funding
+// and responsibility class get adjusted afterward on the WO screen, where
+// there's a keyboard (§7.2) — this only needs to get the WO created fast.
+export async function createWorkOrderFromFindings(assetId, findingSelections) {
+  if (!findingSelections?.length) { const e = new Error('Select at least one finding'); e.status = 400; throw e; }
+  const assetRes = await pool.query('SELECT name FROM assets WHERE id = $1', [assetId]);
+  const assetName = assetRes.rows[0]?.name || `Asset #${assetId}`;
+  const { workOrderId } = await createWorkOrder({ title: `Findings — ${assetName}`, assetId });
+  for (const sel of findingSelections) {
+    await createJobLine(workOrderId, {
+      title: sel.title, responsibilityClass: sel.responsibilityClass || 'self', fundingSource: sel.fundingSource || 'operating_budget',
+      estimatedCost: sel.estimatedCost ?? null, conditionFindingId: sel.findingId,
+    });
+  }
+  return { workOrderId };
+}
+
 // Everything currently flagged board_focus, across both Work Orders and
 // Condition Findings — the Forward Focus report's raw material.
 export async function getBoardFocusItems() {
