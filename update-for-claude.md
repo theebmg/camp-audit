@@ -1,3 +1,78 @@
+# Runbook: Rollup Verification (Build Brief v2.1, Part 2)
+
+No new migration. `scripts/verify-rollups.js` builds a known fixture (one WO,
+three job lines — Roof/Deck/Windows — mixed funding sources, two crew
+sessions, a split, a Not Needed status), asserts every derived number against
+hand-calculated expected values from the brief, prints a pass/fail table, and
+deletes everything it created in a `finally` block. Re-run it after touching
+any job-line/work-order rollup:
+
+```
+docker run --rm --network nocodb_default -v $(pwd):/app -w /app \
+  --env-file .env node:22-alpine node scripts/verify-rollups.js
+```
+
+First run: 30/31 assertions passed, 1 failed. Four real bugs found and fixed
+as a result (not test-authoring mistakes — verified by re-reading each bug's
+own governing migration comment and the brief's own wording before touching
+anything):
+
+- **Crew session hours never reached any rollup.** Migration 0036's own
+  comment says "Line actual hours = sum of crew_sessions.hours where
+  job_line_id matches; WO actual hours = sum of all sessions on the WO,
+  line-attributed or not" — but `workOrderRollup()`/`JOB_LINE_ROLLUP_SQL`
+  only ever summed the hand-typed `job_lines.actual_hours` column;
+  crew_sessions was written to but never read back into a total, anywhere.
+  Fixed by adding `JOB_LINE_SESSION_HOURS_SQL` (a job_line-id-keyed
+  pre-aggregate, joined so it can never fan out the SUMs beside it) into
+  `workOrderRollup`, `JOB_LINE_ROLLUP_SQL`, `getJobLinesReportRawData`, and
+  `getWorkPerformedRawData` — hours logged as a session now count, whether
+  attributed to a line or left at the WO level. The job-line edit form's
+  Actual Hours `<input>` is deliberately untouched — it still shows/edits
+  only the hand-typed value, never a blended total, so re-saving the form
+  can never double-count a session's hours into itself.
+- **`PercentCompleteCost`/`PercentCompleteCount` used the wrong "done"
+  flag and the wrong cost basis.** They counted a line as progress once its
+  status was `is_terminal`, which counts "Not Needed" as progress — exactly
+  what migration 0041's own comment says the two flags (`is_terminal` vs
+  `counts_as_work_performed`) exist to NOT conflate. They also weighted by
+  `COALESCE(actual_cost, estimated_cost)`, which lets a completed line's
+  cost overrun quietly inflate "how much is done" system-wide. Fixed to use
+  `counts_as_work_performed` and `estimated_cost` throughout (see
+  `JOB_LINE_STATUS_BREAKDOWN_SQL`'s comment) — these fields are computed but
+  currently unused by any frontend view (the WO grid's segmented bar builds
+  its own segments straight from `StatusBreakdown`), so this was a silent
+  latent bug, not a visibly-wrong number on screen today.
+- **`getWorkOrderFamily`'s combined total used `rollup.ActualCost ||
+  rollup.EstimatedCost || 0` per member WO.** Wrong two ways: it drops a
+  WO's not-yet-actualed lines entirely the moment that same WO has even one
+  actualed line (falls through to `ActualCost` and discards the rest), and
+  `||` treats a legitimate `ActualCost` of 0 as falsy. A split's family
+  total (shown on the WO detail page's Family panel) could silently differ
+  from the pre-split parent's total — exactly the failure Build Brief
+  v2.1 Part 2's Scenario C exists to catch. Fixed: `EstimatedCost`/
+  `ActualCost`/`EstimatedHours`/`ActualHours` are now plain sums across
+  members (no blending), and the single blended `TotalCost` the UI reads is
+  computed directly from `job_lines` with the same per-line
+  `COALESCE(actual_cost, estimated_cost, 0)` convention used everywhere else
+  in the app, not derived from each member's already-summed totals.
+- **`splitWorkOrder`'s first child off a fresh WO was numbered `-1`, not
+  `-2`.** §5.4 is explicit: "The original stays `1000`, never gets
+  relabelled `1000-1`" and "Children: `1000-2`, `1000-3`, …" — the root
+  occupies suffix 1 implicitly. The suffix computation defaulted an
+  unsuffixed wo_number (the root, always present in the sibling set) to 0,
+  so the very first split undercounted by one. Fixed by defaulting to 1.
+  Caught only by actually creating a WO and splitting it, same as the
+  `wo_number`/GPS `NaN` bugs Phase 5 caught by smoke-testing rather than
+  code review.
+
+Everything else the brief named — the capital plan/budget view per-line
+itemization (`getBudgetOverview`), the Work Performed report's
+`counts_as_work_performed` filter, split integrity (attachments/crew
+sessions/findings move with the job line for free, since nothing else
+points at the WO), and the close gate ("no non-terminal lines") — checked
+out correct as built; no changes needed there.
+
 # Runbook: Mail Ingest → Mailgun Webhook (Build Brief v2.1, Part 1)
 
 Migration 0052. Replaces Phase 5's IMAP poller entirely — see

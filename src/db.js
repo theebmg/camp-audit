@@ -547,23 +547,60 @@ export async function getAssetsReportRawData() {
   return { assets: assetsRows.rows, propertyFields, eavByAsset, componentRowsByAsset, flagsByAsset };
 }
 
+// Crew-session hours attributed to one job line, pre-aggregated to a single
+// row per job_line_id BEFORE it's ever joined to job_lines — a line can have
+// several sessions, so joining the raw crew_sessions table directly would
+// fan out job_lines rows and inflate every other SUM() alongside it. Reused
+// everywhere a job line's "actual hours" needs to reflect logged crew time,
+// not just what was hand-typed into the Actual Hours field (migration 0036's
+// intent — "Line actual hours = sum of crew_sessions.hours where job_line_id
+// matches" — which nothing had actually implemented until Build Brief v2.1
+// Part 2's rollup verification caught the gap: a crew session never moved
+// any actual_hours total by a single hour before this).
+const JOB_LINE_SESSION_HOURS_SQL = `
+  SELECT job_line_id, SUM(hours) AS session_hours
+  FROM crew_sessions WHERE job_line_id IS NOT NULL AND hours IS NOT NULL
+  GROUP BY job_line_id
+`;
+
 // Shared rollup subquery: every work order's job lines summed into one row
 // (hours/cost totals, line count, earliest scheduled date, distinct
 // responsibility classes present). Embedded via LEFT JOIN everywhere a list
 // of work orders needs its lines' totals without an N+1 query per row — see
 // workOrderRollup() below for the single-WO, richer version (with per-
 // funding-source breakdown) the WO detail page needs.
+//
+// actual_hours = SUM(job_lines.actual_hours) [hand-typed] + attributed
+// session hours + unattributed (job_line_id IS NULL) session hours on this
+// WO — genuine WO-level time (e.g. general site cleanup on a multi-line WO)
+// has nowhere to live on any one job line, so it's added once at the WO
+// level here rather than per line (see JOB_LINE_SESSION_HOURS_SQL's comment
+// and migration 0036). The inner subquery pre-aggregates per line first so
+// the outer LEFT JOIN to unattributed WO-level hours can't fan out the
+// per-line SUMs above it.
 const JOB_LINE_ROLLUP_SQL = `
-  SELECT work_order_id,
-    COUNT(*) AS line_count,
-    COALESCE(SUM(estimated_hours), 0) AS estimated_hours,
-    COALESCE(SUM(actual_hours), 0) AS actual_hours,
-    COALESCE(SUM(estimated_cost), 0) AS estimated_cost,
-    COALESCE(SUM(actual_cost), 0) AS actual_cost,
-    MIN(scheduled_date) AS earliest_scheduled_date,
-    COALESCE(ARRAY_AGG(DISTINCT responsibility_class), '{}') AS responsibility_classes,
-    COALESCE(ARRAY_AGG(DISTINCT funding_source), '{}') AS funding_sources
-  FROM job_lines GROUP BY work_order_id
+  SELECT jl_agg.work_order_id, jl_agg.line_count, jl_agg.estimated_hours,
+    jl_agg.actual_hours + COALESCE(unattr.hours, 0) AS actual_hours,
+    jl_agg.estimated_cost, jl_agg.actual_cost, jl_agg.earliest_scheduled_date,
+    jl_agg.responsibility_classes, jl_agg.funding_sources
+  FROM (
+    SELECT jl.work_order_id,
+      COUNT(*) AS line_count,
+      COALESCE(SUM(jl.estimated_hours), 0) AS estimated_hours,
+      COALESCE(SUM(jl.actual_hours), 0) + COALESCE(SUM(lh.session_hours), 0) AS actual_hours,
+      COALESCE(SUM(jl.estimated_cost), 0) AS estimated_cost,
+      COALESCE(SUM(jl.actual_cost), 0) AS actual_cost,
+      MIN(jl.scheduled_date) AS earliest_scheduled_date,
+      COALESCE(ARRAY_AGG(DISTINCT jl.responsibility_class), '{}') AS responsibility_classes,
+      COALESCE(ARRAY_AGG(DISTINCT jl.funding_source), '{}') AS funding_sources
+    FROM job_lines jl
+    LEFT JOIN (${JOB_LINE_SESSION_HOURS_SQL}) lh ON lh.job_line_id = jl.id
+    GROUP BY jl.work_order_id
+  ) jl_agg
+  LEFT JOIN (
+    SELECT work_order_id, SUM(hours) AS hours FROM crew_sessions
+    WHERE job_line_id IS NULL AND hours IS NOT NULL GROUP BY work_order_id
+  ) unattr ON unattr.work_order_id = jl_agg.work_order_id
 `;
 
 export async function getWorkOrdersReportRawData() {
@@ -619,7 +656,8 @@ export async function getWorkOrderLogReportRawData() {
 export async function getJobLinesReportRawData() {
   const { rows } = await pool.query(`
     SELECT jl.id, jl.title, jl.complaint, jl.correction, jl.responsibility_class, jl.funding_source,
-           jl.estimated_hours, jl.actual_hours, jl.estimated_cost, jl.actual_cost, jl.scheduled_date, jl.completed_date,
+           jl.estimated_hours, COALESCE(jl.actual_hours, 0) + COALESCE(lh.session_hours, 0) AS actual_hours,
+           jl.estimated_cost, jl.actual_cost, jl.scheduled_date, jl.completed_date,
            jls.name AS status, jls.counts_as_work_performed,
            w.id AS work_order_id, w.wo_number, w.title AS wo_title,
            a.name AS asset_name, l.name AS location_name, pr.name AS project_name,
@@ -631,6 +669,7 @@ export async function getJobLinesReportRawData() {
     LEFT JOIN assets a ON a.id = w.asset_id
     LEFT JOIN locations l ON l.id = w.location_id
     LEFT JOIN projects pr ON pr.id = w.project_id
+    LEFT JOIN (${JOB_LINE_SESSION_HOURS_SQL}) lh ON lh.job_line_id = jl.id
     ORDER BY jl.id DESC`
   );
   const [causeRows, volRows, venRows] = await Promise.all([
@@ -702,7 +741,8 @@ async function getReportImagesForJobLines(jobLineIds, jobLineToWoMap, cap) {
 // the big multi-line jobs are legitimately still open.
 export async function getWorkPerformedRawData({ from, to }) {
   const { rows } = await pool.query(
-    `SELECT jl.id, jl.title, jl.correction, jl.completed_date, jl.actual_cost, jl.estimated_cost, jl.actual_hours,
+    `SELECT jl.id, jl.title, jl.correction, jl.completed_date, jl.actual_cost, jl.estimated_cost,
+            COALESCE(jl.actual_hours, 0) + COALESCE(lh.session_hours, 0) AS actual_hours,
             w.id AS work_order_id, w.wo_number, w.title AS wo_title,
             a.name AS asset_name, COALESCE(l.name, al.name) AS location_name
      FROM job_lines jl
@@ -711,6 +751,7 @@ export async function getWorkPerformedRawData({ from, to }) {
      LEFT JOIN assets a ON a.id = w.asset_id
      LEFT JOIN locations l ON l.id = w.location_id
      LEFT JOIN locations al ON al.id = a.location_id
+     LEFT JOIN (${JOB_LINE_SESSION_HOURS_SQL}) lh ON lh.job_line_id = jl.id
      WHERE jls.counts_as_work_performed AND jl.completed_date BETWEEN $1 AND $2
      ORDER BY COALESCE(l.name, al.name) NULLS LAST, w.id, jl.sort_order`,
     [from, to]
@@ -1259,20 +1300,40 @@ export async function getWorkOrderSummary() {
 }
 
 // Per-work-order breakdown of job-line cost/count by status — the segmented
-// progress bar (2.6). "% complete" counts a line as done once its status is
-// terminal (Not Needed counts toward progress even though it's excluded from
-// "work performed" reporting — see job_line_statuses' migration comment).
-// Cost-weighted is the board-facing default: finishing the deck while the
-// roof (most of the money) sits untouched should not read as "mostly done."
+// progress bar (2.6) and its two derived numbers below.
+//
+// terminal_cost/terminal_lines (is_terminal-based) back TerminalLineCount,
+// the "X/Y lines" caption under the bar — "no longer blocks the WO from
+// closing" is genuinely what that caption means, so Not Needed/Cancelled
+// correctly count there.
+//
+// performed_est_cost/performed_lines (counts_as_work_performed-based, and
+// estimated_cost throughout rather than COALESCE(actual,estimated)) back
+// PercentCompleteCost/PercentCompleteCount below — "how much of the planned
+// work is actually done." These must NOT reuse the terminal/actual-cost
+// numbers above: is_terminal wrongly counts a "Not Needed" line as progress
+// (job_line_statuses' migration 0041 comment is explicit that the two flags
+// mean different things and neither is derivable from the other), and mixing
+// actual cost into a lines-in-progress' still-estimated total skews the %
+// by whatever those completed lines ran over or under budget — e.g. a line
+// that finished $750 over its $8000 estimate should count as "$8000 of
+// planned work done," not silently inflate the whole WO's % complete because
+// the numerator grew and the denominator (for the lines still estimated)
+// didn't.
 const JOB_LINE_STATUS_BREAKDOWN_SQL = `
   SELECT t.work_order_id,
     json_agg(json_build_object('statusId', s.id, 'name', s.name, 'color', s.color, 'isTerminal', s.is_terminal, 'lineCount', t.line_count, 'cost', t.cost) ORDER BY s.sort_order) AS breakdown,
     SUM(CASE WHEN s.is_terminal THEN t.cost ELSE 0 END) AS terminal_cost,
     SUM(t.cost) AS total_cost,
     SUM(CASE WHEN s.is_terminal THEN t.line_count ELSE 0 END) AS terminal_lines,
-    SUM(t.line_count) AS total_lines
+    SUM(t.line_count) AS total_lines,
+    SUM(CASE WHEN s.counts_as_work_performed THEN t.est_cost ELSE 0 END) AS performed_est_cost,
+    SUM(t.est_cost) AS total_est_cost,
+    SUM(CASE WHEN s.counts_as_work_performed THEN t.line_count ELSE 0 END) AS performed_lines
   FROM (
-    SELECT work_order_id, status_id, COUNT(*) AS line_count, SUM(COALESCE(actual_cost, estimated_cost, 0)) AS cost
+    SELECT work_order_id, status_id, COUNT(*) AS line_count,
+           SUM(COALESCE(actual_cost, estimated_cost, 0)) AS cost,
+           SUM(COALESCE(estimated_cost, 0)) AS est_cost
     FROM job_lines GROUP BY work_order_id, status_id
   ) t
   JOIN job_line_statuses s ON s.id = t.status_id
@@ -1286,6 +1347,7 @@ export async function listWorkOrders() {
             jl.earliest_scheduled_date AS scheduled_date,
             jl.line_count, jl.estimated_hours, jl.estimated_cost, jl.actual_hours, jl.actual_cost,
             slb.breakdown, slb.terminal_cost, slb.total_cost, slb.terminal_lines, slb.total_lines,
+            slb.performed_est_cost, slb.total_est_cost, slb.performed_lines,
             w.asset_id, a.name AS asset_name, w.location_id, l.name AS location_name,
             EXISTS (SELECT 1 FROM job_lines bjl WHERE bjl.work_order_id = w.id AND bjl.blocked_reason IS NOT NULL) AS is_blocked
      FROM work_orders w
@@ -1297,10 +1359,11 @@ export async function listWorkOrders() {
      ORDER BY w.id DESC`
   );
   return rows.map((r) => {
-    const totalCost = Number(r.total_cost || 0);
     const totalLines = Number(r.total_lines || 0);
-    const terminalCost = Number(r.terminal_cost || 0);
     const terminalLines = Number(r.terminal_lines || 0);
+    const totalEstCost = Number(r.total_est_cost || 0);
+    const performedEstCost = Number(r.performed_est_cost || 0);
+    const performedLines = Number(r.performed_lines || 0);
     return {
       Id: r.id, Title: r.title, WoNumber: r.wo_number, ParentWoId: r.parent_wo_id, SplitRootId: r.split_root_id,
       Status: r.status, StatusId: r.status_id, StatusColor: r.status_color, StatusIsTerminal: r.status_is_terminal,
@@ -1314,8 +1377,8 @@ export async function listWorkOrders() {
       'Actual Cost': r.actual_cost != null ? Number(r.actual_cost) : null,
       StatusBreakdown: r.breakdown || [],
       TerminalLineCount: terminalLines,
-      PercentCompleteCost: totalCost > 0 ? terminalCost / totalCost : (totalLines > 0 ? terminalLines / totalLines : 0),
-      PercentCompleteCount: totalLines > 0 ? terminalLines / totalLines : 0,
+      PercentCompleteCost: totalEstCost > 0 ? performedEstCost / totalEstCost : (totalLines > 0 ? performedLines / totalLines : 0),
+      PercentCompleteCount: totalLines > 0 ? performedLines / totalLines : 0,
       Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
       Location: r.location_id ? { Id: r.location_id, Name: r.location_name } : null,
     };
@@ -1338,17 +1401,27 @@ async function getAssetUpdatesForWorkOrder(woId) {
 export async function workOrderRollup(woId) {
   const { rows } = await pool.query(
     `SELECT COUNT(*) AS line_count,
-            COALESCE(SUM(estimated_hours), 0) AS estimated_hours,
-            COALESCE(SUM(actual_hours), 0) AS actual_hours,
-            COALESCE(SUM(estimated_cost), 0) AS estimated_cost,
-            COALESCE(SUM(actual_cost), 0) AS actual_cost,
-            MIN(scheduled_date) AS earliest_scheduled_date,
-            MAX(scheduled_date) AS latest_scheduled_date,
-            COALESCE(ARRAY_AGG(DISTINCT responsibility_class), '{}') AS responsibility_classes
-     FROM job_lines WHERE work_order_id = $1`,
+            COALESCE(SUM(jl.estimated_hours), 0) AS estimated_hours,
+            COALESCE(SUM(jl.actual_hours), 0) + COALESCE(SUM(lh.session_hours), 0) AS actual_hours_from_lines,
+            COALESCE(SUM(jl.estimated_cost), 0) AS estimated_cost,
+            COALESCE(SUM(jl.actual_cost), 0) AS actual_cost,
+            MIN(jl.scheduled_date) AS earliest_scheduled_date,
+            MAX(jl.scheduled_date) AS latest_scheduled_date,
+            COALESCE(ARRAY_AGG(DISTINCT jl.responsibility_class), '{}') AS responsibility_classes
+     FROM job_lines jl
+     LEFT JOIN (${JOB_LINE_SESSION_HOURS_SQL}) lh ON lh.job_line_id = jl.id
+     WHERE jl.work_order_id = $1`,
     [woId]
   );
   const r = rows[0];
+  // Genuine WO-level time (job_line_id IS NULL — e.g. general site cleanup
+  // across a multi-line WO) has no one line to attribute to, so it's added
+  // once here rather than per line — see JOB_LINE_SESSION_HOURS_SQL's comment.
+  const { rows: unattrRows } = await pool.query(
+    `SELECT COALESCE(SUM(hours), 0) AS hours FROM crew_sessions WHERE work_order_id = $1 AND job_line_id IS NULL AND hours IS NOT NULL`,
+    [woId]
+  );
+  const actualHours = Number(r.actual_hours_from_lines) + Number(unattrRows[0].hours);
   const fundingRes = await pool.query(
     `SELECT funding_source, funding_ref_id, SUM(COALESCE(actual_cost, estimated_cost, 0)) AS cost
      FROM job_lines WHERE work_order_id = $1 GROUP BY funding_source, funding_ref_id`,
@@ -1361,7 +1434,7 @@ export async function workOrderRollup(woId) {
   })));
   return {
     LineCount: Number(r.line_count),
-    EstimatedHours: Number(r.estimated_hours), ActualHours: Number(r.actual_hours),
+    EstimatedHours: Number(r.estimated_hours), ActualHours: actualHours,
     EstimatedCost: Number(r.estimated_cost), ActualCost: Number(r.actual_cost),
     EarliestScheduledDate: r.earliest_scheduled_date, LatestScheduledDate: r.latest_scheduled_date,
     ResponsibilityClasses: r.responsibility_classes,
@@ -3363,7 +3436,13 @@ export async function splitWorkOrder(woId, jobLineIds) {
     const rootId = wo.split_root_id;
     const rootRes = await client.query('SELECT wo_number FROM work_orders WHERE id = $1', [rootId]);
     const siblingsRes = await client.query('SELECT wo_number FROM work_orders WHERE split_root_id = $1', [rootId]);
-    const nextSuffix = 1 + Math.max(0, ...siblingsRes.rows.map((r) => Number(r.wo_number.match(/-(\d+)$/)?.[1]) || 0));
+    // The root itself occupies suffix 1 (it's never relabelled "-1" — §5.4 —
+    // but the FIRST child off it must still be "-2", not "-1"), so an
+    // unsuffixed wo_number (the root, always present in this result set)
+    // falls back to 1, not 0. Falling back to 0 here was a real bug: the
+    // very first split off a fresh WO produced "-1" instead of "-2" (caught
+    // by scripts/verify-rollups.js, Build Brief v2.1 Part 2).
+    const nextSuffix = 1 + Math.max(1, ...siblingsRes.rows.map((r) => Number(r.wo_number.match(/-(\d+)$/)?.[1]) || 1));
     const newWoNumber = `${rootRes.rows[0].wo_number}-${nextSuffix}`;
 
     // Child starts at Assessed or Scheduled (§5.4) — Scheduled if any moved
@@ -3409,15 +3488,40 @@ export async function getWorkOrderFamily(woId) {
      WHERE w.split_root_id = $1 ORDER BY w.id`,
     [rootId]
   );
-  let totalCost = 0, totalHours = 0;
+  // EstimatedCost/ActualCost/EstimatedHours/ActualHours are plain sums across
+  // members — a split must not change the family total (Build Brief v2.1
+  // Part 2, Scenario C). Previously this summed `rollup.ActualCost ||
+  // rollup.EstimatedCost || 0` per WO, which is wrong two ways: it drops a
+  // WO's estimated-only lines entirely the moment that SAME wo also has even
+  // one actualed line (falls through to ActualCost, discarding the rest),
+  // and `||` treats a legitimate ActualCost of 0 as falsy and silently
+  // substitutes EstimatedCost instead.
+  let estimatedCost = 0, actualCost = 0, estimatedHours = 0, actualHours = 0;
   const memberDetails = [];
   for (const m of members) {
     const rollup = await workOrderRollup(m.id);
     memberDetails.push({ Id: m.id, WoNumber: m.wo_number, Title: m.title, Status: m.status_name, StatusColor: m.status_color, Rollup: rollup });
-    totalCost += rollup.ActualCost || rollup.EstimatedCost || 0;
-    totalHours += rollup.ActualHours || rollup.EstimatedHours || 0;
+    estimatedCost += rollup.EstimatedCost;
+    actualCost += rollup.ActualCost;
+    estimatedHours += rollup.EstimatedHours;
+    actualHours += rollup.ActualHours;
   }
-  return { RootId: rootId, Members: memberDetails, TotalCost: totalCost, TotalHours: totalHours };
+  // TotalCost is the single blended figure the Family panel shows — same
+  // actual-or-estimated-per-line convention as getBudgetOverview (see its
+  // header comment), computed directly from job_lines so a WO with a mix of
+  // actualed and not-yet-actualed lines contributes both correctly instead
+  // of the all-or-nothing WO-level fallback above.
+  const { rows: costRows } = await pool.query(
+    `SELECT COALESCE(SUM(COALESCE(jl.actual_cost, jl.estimated_cost, 0)), 0) AS cost
+     FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id WHERE w.split_root_id = $1`,
+    [rootId]
+  );
+  return {
+    RootId: rootId, Members: memberDetails,
+    EstimatedCost: estimatedCost, ActualCost: actualCost,
+    EstimatedHours: estimatedHours, ActualHours: actualHours,
+    TotalCost: Number(costRows[0].cost), TotalHours: actualHours || estimatedHours,
+  };
 }
 
 // ── Map GPS calibration (Build Brief v2 Phase 5, §5.3) — a one-time affine
