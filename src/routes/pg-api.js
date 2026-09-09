@@ -335,7 +335,8 @@ router.patch('/assets/:id/building-type', async (req, res, next) => {
 });
 
 // ---- Interactive map — pins are assets with map_x/map_y set (image-pixel
-// coords on campmap.webp, 2500x3700, origin top-left — never lat/lng).
+// coords on the base map image — see CAMP_MAP_IMAGE in public-pg/app.js —
+// origin top-left — never lat/lng).
 // Buildings are already `assets` rows (asset_type = 'Camp Building', etc.),
 // which is also where condition_findings/work_orders key off of, so pins
 // only live on assets; `locations` has no map presence of its own. ----

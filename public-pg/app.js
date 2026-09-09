@@ -1578,8 +1578,8 @@ async function renderAssetHistory({ id }) {
 }
 
 // ---------- Interactive Map ----------
-// Pins are assets with map_x/map_y set (image-pixel coords on campmap.webp,
-// 2500x3700, top-left origin — never lat/lng). Every point/line/zone
+// Pins are assets with map_x/map_y set (image-pixel coords on the base map
+// image below, top-left origin — never lat/lng). Every point/line/zone
 // dropped on the map — Electrical, Trash, Water valves, Sewer, or anything
 // invented later — belongs to a map_layer (name/color/icon/z-order/
 // visibility/condition-coloring): layers are DATA managed entirely from
@@ -1589,6 +1589,18 @@ async function renderAssetHistory({ id }) {
 // condition_findings.severity — never stored. Every edit (drag, reshape,
 // add, delete, layer CRUD) writes straight through to the API on its own —
 // there's no separate "Save" step to remember.
+//
+// Base map image — the ONE place this is configured (viewBox, the <image>
+// element, and the "Fit map" reset all read from this, not their own copies)
+// so swapping the image file is a one-line change here plus dropping the new
+// file in this directory. Width/height MUST match the file's actual pixel
+// dimensions or the SVG <image> element stretches it to fit, distorting the
+// image. Swapping the file does NOT move any existing map_x/map_y pin, map
+// feature, or GPS calibration point — those are pixel coordinates against
+// whatever image was loaded when they were placed, so a new image with a
+// different frame/scale/orientation leaves them all pointing at the wrong
+// spot until someone repositions them by hand.
+const CAMP_MAP_IMAGE = { href: 'camp-map-2026-09.png', width: 3000, height: 1808 };
 const MAP_SWATCHES = ['#2b6cb0', '#8a6d3b', '#5c8a4e', '#c0433a', '#d0902a', '#6b4fa0', '#4b6b5c', '#8a8272'];
 const MAP_SEVERITY_COLORS = { none: '#0ca30c', warn: '#fab219', serious: '#ec835a', critical: '#d03b3b' };
 const MAP_GEOM_LABEL = { point: 'points', line: 'lines', zone: 'zones', mixed: 'mixed' };
@@ -1672,7 +1684,7 @@ async function renderMap() {
         <button type="button" class="btn btn-secondary" id="mapAddLayerBtn" style="width:100%;margin-top:8px">+ Add layer</button>
       </div>
       <div class="map-stage">
-        <svg id="mapSvg" viewBox="0 0 2500 3700" preserveAspectRatio="xMidYMid meet"></svg>
+        <svg id="mapSvg" viewBox="0 0 ${CAMP_MAP_IMAGE.width} ${CAMP_MAP_IMAGE.height}" preserveAspectRatio="xMidYMid meet"></svg>
         <button type="button" id="mapFinish" class="btn btn-primary map-finish">Finish shape (Enter)</button>
         <div class="map-zoom">
           <button type="button" id="mapZin" title="Zoom in">+</button>
@@ -1691,7 +1703,7 @@ function initMapEditor({ pins, features, layers }) {
   const E = (t, a, p) => { const n = document.createElementNS(NS, t); for (const k in a) n.setAttribute(k, a[k]); if (p) p.appendChild(n); return n; };
 
   const gBase = E('g', {}, svg);
-  const baseImg = E('image', { href: 'campmap.webp', x: 0, y: 0, width: 2500, height: 3700 }, gBase);
+  const baseImg = E('image', { href: CAMP_MAP_IMAGE.href, x: 0, y: 0, width: CAMP_MAP_IMAGE.width, height: CAMP_MAP_IMAGE.height }, gBase);
   const gLabels = E('g', {}, svg);
   const gHandles = E('g', {}, svg);
 
@@ -1752,13 +1764,12 @@ function initMapEditor({ pins, features, layers }) {
     return !l || l.DefaultVisible !== false;
   }
   function dOf(pts, closed) { return 'M' + pts.map((p) => p.join(',')).join(' L ') + (closed ? ' Z' : ''); }
-  // The stage is landscape but campmap.webp is portrait (2500x3700), so
-  // preserveAspectRatio="xMidYMid meet" always letterboxes it — the SVG
-  // element's own bounding box is wider (or taller) than the image actually
-  // rendered inside it. Screen<->map conversions have to go through the
-  // fitted rect (the box the image is actually drawn into), not the raw
-  // element bounding box, or every click/drag lands off by the letterbox
-  // margin.
+  // Whenever the stage's aspect ratio doesn't exactly match CAMP_MAP_IMAGE's,
+  // preserveAspectRatio="xMidYMid meet" letterboxes it — the SVG element's
+  // own bounding box is wider (or taller) than the image actually rendered
+  // inside it. Screen<->map conversions have to go through the fitted rect
+  // (the box the image is actually drawn into), not the raw element bounding
+  // box, or every click/drag lands off by the letterbox margin.
   function fittedRect() {
     const r = svg.getBoundingClientRect(), vb = svg.viewBox.baseVal;
     const fscale = Math.min((r.width || 1) / vb.width, (r.height || 1) / vb.height) || 1;
@@ -2456,7 +2467,7 @@ function initMapEditor({ pins, features, layers }) {
   document.getElementById('mapDim').addEventListener('input', (e) => { baseImg.setAttribute('opacity', 1 - e.target.value / 100); });
   document.getElementById('mapZin').addEventListener('click', () => zoom(0.8));
   document.getElementById('mapZout').addEventListener('click', () => zoom(1.25));
-  document.getElementById('mapFit').addEventListener('click', () => { svg.setAttribute('viewBox', '0 0 2500 3700'); render(); });
+  document.getElementById('mapFit').addEventListener('click', () => { svg.setAttribute('viewBox', `0 0 ${CAMP_MAP_IMAGE.width} ${CAMP_MAP_IMAGE.height}`); render(); });
   function zoom(f) {
     const vb = svg.viewBox.baseVal, cx = vb.x + vb.width / 2, cy = vb.y + vb.height / 2;
     vb.width *= f; vb.height *= f; vb.x = cx - vb.width / 2; vb.y = cy - vb.height / 2;
@@ -4773,7 +4784,7 @@ async function renderAdminMapCalibration(container = app) {
 
   container.innerHTML = `
     <div class="card"><h3>Map GPS Calibration</h3>
-      <p class="muted">Exactly 3 non-collinear points, real-world GPS → campmap.webp pixel coordinates. Powers "nearest asset" suggestions in the Inbox when a photo carries EXIF GPS. Pick 3 assets you're sure of — open the Map, tap the asset's pin to read its map_x/map_y, and pair that with its actual GPS coordinates (from your phone, standing at the asset).</p>
+      <p class="muted">Exactly 3 non-collinear points, real-world GPS → base map pixel coordinates. Powers "nearest asset" suggestions in the Inbox when a photo carries EXIF GPS. Pick 3 assets you're sure of — open the Map, tap the asset's pin to read its map_x/map_y, and pair that with its actual GPS coordinates (from your phone, standing at the asset). If the base map image has ever been swapped, these points need to be re-picked against the current image — they're pixel coordinates against whatever image was loaded when they were set.</p>
       <p class="muted">${points.length}/3 points set${points.length >= 3 ? ' — calibrated.' : '.'}</p>
     </div>
     <div class="card">${rows}</div>

@@ -2568,7 +2568,8 @@ export async function createAssetQuick({ name, locationId, assetType }) {
 }
 
 // ── Interactive Map — pins are assets with map_x/map_y set (image-pixel
-//    coords on campmap.webp, not lat/lng). A pin's color is derived, never
+//    coords on the base map image — see CAMP_MAP_IMAGE in public-pg/app.js
+//    for the current file — not lat/lng). A pin's color is derived, never
 //    stored — the worst OPEN condition_findings.severity for that asset —
 //    but only when its layer has color_by_condition=true; otherwise it's a
 //    flat layer color. Severity strings are "N - Label" (see
@@ -3525,7 +3526,7 @@ export async function getWorkOrderFamily(woId) {
 }
 
 // ── Map GPS calibration (Build Brief v2 Phase 5, §5.3) — a one-time affine
-//    fit from real-world GPS to campmap.webp image-pixel space, from exactly
+//    fit from real-world GPS to the base map image's pixel space, from exactly
 //    3 non-collinear reference points (assets already carry map_x/map_y —
 //    migration 0027). Recomputed live from whatever points are stored rather
 //    than cached, so editing a point via the admin/map UI takes effect
