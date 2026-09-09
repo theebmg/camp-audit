@@ -68,6 +68,86 @@ export function buildWorkOrderReportRows({ workOrders, volByWo, venByWo }) {
   });
 }
 
+// Build Brief v2 Phase 6 (§6.1) — the job line, not the work order, is the
+// report's grain. A WO with lines from three funding sources shows as three
+// rows, correctly, because that WO's money really does come from three
+// places (same reasoning as buildWorkOrderReportRows' arrays, one level down).
+export function buildJobLineReportRows({ jobLines, causesByLine, volByLine, venByLine }) {
+  return jobLines.map((jl) => ({
+    'Job Line': jl.title, 'Work Order': jl.wo_title, 'WO Number': jl.wo_number,
+    Status: jl.status, 'Counts As Work Performed': jl.counts_as_work_performed ? 'Yes' : 'No',
+    Responsibility: RESPONSIBILITY_LABELS[jl.responsibility_class] || jl.responsibility_class,
+    'Funding Source': FUNDING_SOURCE_LABELS[jl.funding_source] || jl.funding_source,
+    Asset: jl.asset_name, Location: jl.location_name, Project: jl.project_name,
+    'Scheduled Date': jl.scheduled_date, 'Completed Date': jl.completed_date,
+    'Estimated Cost': jl.estimated_cost, 'Actual Cost': jl.actual_cost,
+    'Estimated Hours': jl.estimated_hours, 'Actual Hours': jl.actual_hours,
+    Cause: (causesByLine.get(jl.id) || []).join(', ') || null,
+    Volunteers: (volByLine.get(jl.id) || []).join(', ') || null,
+    Vendors: (venByLine.get(jl.id) || []).join(', ') || null,
+    'Quotes Received': Number(jl.quote_count || 0),
+    _id: jl.work_order_id,
+    _entity: 'workOrder',
+  }));
+}
+
+export const JOB_LINE_COLUMN_SPECS = [
+  { key: 'Job Line', label: 'Job Line', group: 'Job Line Info', default: true },
+  { key: 'Work Order', label: 'Work Order', group: 'Job Line Info', default: true },
+  { key: 'WO Number', label: 'WO Number', group: 'Job Line Info' },
+  { key: 'Status', label: 'Status', group: 'Job Line Info', default: true },
+  { key: 'Counts As Work Performed', label: 'Counts As Work Performed', options: ['Yes', 'No'], group: 'Job Line Info', default: true },
+  { key: 'Responsibility', label: 'Responsibility', options: ['Self', 'Volunteer', 'Vendor', 'Cabin-Holder'], group: 'Job Line Info' },
+  { key: 'Funding Source', label: 'Funding Source', options: Object.values(FUNDING_SOURCE_LABELS), group: 'Job Line Info' },
+  { key: 'Asset', label: 'Asset', group: 'Job Line Info', default: true },
+  { key: 'Location', label: 'Location', group: 'Job Line Info' },
+  { key: 'Project', label: 'Project', group: 'Job Line Info' },
+  { key: 'Scheduled Date', label: 'Scheduled Date', group: 'Dates & Cost', type: 'date' },
+  { key: 'Completed Date', label: 'Completed Date', group: 'Dates & Cost', type: 'date', default: true },
+  { key: 'Estimated Cost', label: 'Estimated Cost', group: 'Dates & Cost' },
+  { key: 'Actual Cost', label: 'Actual Cost', group: 'Dates & Cost', default: true },
+  { key: 'Estimated Hours', label: 'Estimated Hours', group: 'Dates & Cost' },
+  { key: 'Actual Hours', label: 'Actual Hours', group: 'Dates & Cost' },
+  { key: 'Cause', label: 'Cause', group: 'Job Line Info' },
+  { key: 'Volunteers', label: 'Volunteers', group: 'Crew' },
+  { key: 'Vendors', label: 'Vendors', group: 'Crew' },
+  { key: 'Quotes Received', label: 'Quotes Received', group: 'Crew' },
+];
+
+// Findings report source (§6.1/§6.2.4) — "Open Findings Not On Any Work
+// Order" is just this source filtered to Status=Open, On Work Order=No; no
+// bespoke report needed for that one (unlike the Deferred backlog, which
+// needs severity grouping + dollar totals — see reportDataPg.js).
+export function buildFindingReportRows({ findings }) {
+  return findings.map((f) => ({
+    Title: f.title, Severity: f.severity, Status: f.status,
+    Asset: f.asset_name, Location: f.location_name,
+    'Date Identified': f.date_identified, 'Estimated Cost': f.estimated_cost,
+    'On Work Order': f.on_work_order ? 'Yes' : 'No',
+    'Board Focus': f.board_focus ? 'Yes' : 'No',
+    'Deferred Reason': f.deferred_reason, 'Revisit Date': f.revisit_date, 'Dismiss Note': f.dismiss_note,
+    Description: f.description,
+    _id: f.id,
+    _entity: 'conditionFinding',
+  }));
+}
+
+export const FINDING_COLUMN_SPECS = [
+  { key: 'Title', label: 'Title', group: 'Finding Info', default: true },
+  { key: 'Severity', label: 'Severity', group: 'Finding Info', default: true },
+  { key: 'Status', label: 'Status', options: ['Open', 'Scheduled', 'Resolved', 'Deferred', 'Dismissed'], group: 'Finding Info', default: true },
+  { key: 'Asset', label: 'Asset', group: 'Finding Info', default: true },
+  { key: 'Location', label: 'Location', group: 'Finding Info' },
+  { key: 'Date Identified', label: 'Date Identified', group: 'Finding Info', type: 'date' },
+  { key: 'Estimated Cost', label: 'Estimated Cost', group: 'Finding Info', default: true },
+  { key: 'On Work Order', label: 'On Work Order', options: ['Yes', 'No'], group: 'Finding Info', default: true },
+  { key: 'Board Focus', label: 'Board Focus', options: ['Yes', 'No'], group: 'Finding Info' },
+  { key: 'Deferred Reason', label: 'Deferred Reason', group: 'Finding Info' },
+  { key: 'Revisit Date', label: 'Revisit Date', group: 'Finding Info', type: 'date' },
+  { key: 'Dismiss Note', label: 'Dismiss Note', group: 'Finding Info' },
+  { key: 'Description', label: 'Description', group: 'Finding Info' },
+];
+
 // "Progress made" — one row per Work Order Log entry (status change / note /
 // hours logged), not per Work Order, so a status change and a later note both
 // show up as their own dated row. Row clicks land on the parent Work Order

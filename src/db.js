@@ -613,6 +613,133 @@ export async function getWorkOrderLogReportRawData() {
   return { logEntries: rows };
 }
 
+// Build Brief v2 Phase 6 (§6.1) — job lines as a first-class report source,
+// not a sub-detail of work orders. quote_count backs the "Quotes received"
+// column (§6.4) — shopping discipline visible across every job at once.
+export async function getJobLinesReportRawData() {
+  const { rows } = await pool.query(`
+    SELECT jl.id, jl.title, jl.complaint, jl.correction, jl.responsibility_class, jl.funding_source,
+           jl.estimated_hours, jl.actual_hours, jl.estimated_cost, jl.actual_cost, jl.scheduled_date, jl.completed_date,
+           jls.name AS status, jls.counts_as_work_performed,
+           w.id AS work_order_id, w.wo_number, w.title AS wo_title,
+           a.name AS asset_name, l.name AS location_name, pr.name AS project_name,
+           (SELECT count(*) FROM attachment_links al2 JOIN attachment_roles ar2 ON ar2.id = al2.role_id
+            WHERE al2.entity_type = 'job_line' AND al2.entity_id = jl.id AND ar2.name = 'Quote') AS quote_count
+    FROM job_lines jl
+    JOIN job_line_statuses jls ON jls.id = jl.status_id
+    JOIN work_orders w ON w.id = jl.work_order_id
+    LEFT JOIN assets a ON a.id = w.asset_id
+    LEFT JOIN locations l ON l.id = w.location_id
+    LEFT JOIN projects pr ON pr.id = w.project_id
+    ORDER BY jl.id DESC`
+  );
+  const [causeRows, volRows, venRows] = await Promise.all([
+    pool.query(`SELECT jlc.job_line_id, c.name FROM job_line_causes jlc JOIN causes c ON c.id = jlc.cause_id`),
+    pool.query(`SELECT jlv.job_line_id, v.name FROM job_line_volunteers jlv JOIN volunteers v ON v.id = jlv.volunteer_id`),
+    pool.query(`SELECT jlv.job_line_id, vd.name FROM job_line_vendors jlv JOIN vendors vd ON vd.id = jlv.vendor_id`),
+  ]);
+  const groupBy = (list, keyField) => { const m = new Map(); for (const r of list) { if (!m.has(r[keyField])) m.set(r[keyField], []); m.get(r[keyField]).push(r.name); } return m; };
+  return {
+    jobLines: rows,
+    causesByLine: groupBy(causeRows.rows, 'job_line_id'),
+    volByLine: groupBy(volRows.rows, 'job_line_id'),
+    venByLine: groupBy(venRows.rows, 'job_line_id'),
+  };
+}
+
+// Findings as a first-class report source — covers "Open Findings Not On
+// Any Work Order" (§6.2.4) as a filter on OnWorkOrder=No rather than a
+// bespoke report, since it needs no grouping/totals beyond a list.
+export async function getFindingsReportRawData() {
+  const { rows } = await pool.query(`
+    SELECT cf.id, cf.title, cf.severity, cf.status, cf.description, cf.estimated_cost, cf.date_identified,
+           cf.deferred_reason, cf.revisit_date, cf.dismiss_note, cf.board_focus,
+           a.name AS asset_name, COALESCE(l.name, al.name) AS location_name,
+           EXISTS (SELECT 1 FROM job_lines jl WHERE jl.condition_finding_id = cf.id) AS on_work_order
+    FROM condition_findings cf
+    LEFT JOIN assets a ON a.id = cf.asset_id
+    LEFT JOIN locations l ON l.id = cf.location_id
+    LEFT JOIN locations al ON al.id = a.location_id
+    ORDER BY cf.id DESC`
+  );
+  return { findings: rows };
+}
+
+// ── Named reports (Build Brief v2 Phase 6, §6.2) ────────────────────────────
+
+// Images only, capped per work order (§6.3) — documents link, never embed.
+// Auto-selected by role priority (a role's own sort_order, so "Before/After"
+// naturally sorts ahead of "Reference") then link sort_order/upload time.
+// Brief also asks for a manual reselect-when-over-cap step in the UI; not
+// built this phase (no real photo data existed to validate a picker
+// against) — see update-for-claude.md's Phase 6 runbook.
+async function getReportImagesForJobLines(jobLineIds, jobLineToWoMap, cap) {
+  const byWo = new Map();
+  if (!jobLineIds.length) return byWo;
+  const { rows } = await pool.query(
+    `SELECT al.entity_id AS job_line_id, a.id, a.url, a.thumb_url, a.caption, ar.sort_order AS role_sort, al.sort_order, al.created_at
+     FROM attachment_links al
+     JOIN attachments a ON a.id = al.attachment_id AND a.deleted_at IS NULL AND a.kind = 'image'
+     LEFT JOIN attachment_roles ar ON ar.id = al.role_id
+     WHERE al.entity_type = 'job_line' AND al.entity_id = ANY($1::int[]) AND al.include_in_report
+     ORDER BY COALESCE(ar.sort_order, 999), al.sort_order, al.created_at`,
+    [jobLineIds]
+  );
+  for (const r of rows) {
+    const woId = jobLineToWoMap.get(r.job_line_id);
+    if (woId == null) continue;
+    if (!byWo.has(woId)) byWo.set(woId, []);
+    const list = byWo.get(woId);
+    if (list.length < cap) list.push({ Id: r.id, Url: r.url, ThumbUrl: r.thumb_url, Caption: r.caption });
+  }
+  return byWo;
+}
+
+// "Work Performed in a Date Range" (§6.2.1) — job lines with
+// counts_as_work_performed=true and a completed_date in range, REGARDLESS of
+// the parent WO's status. This is deliberate and is the whole reason job
+// lines report independently: it proves six months of activity while half
+// the big multi-line jobs are legitimately still open.
+export async function getWorkPerformedRawData({ from, to }) {
+  const { rows } = await pool.query(
+    `SELECT jl.id, jl.title, jl.correction, jl.completed_date, jl.actual_cost, jl.estimated_cost, jl.actual_hours,
+            w.id AS work_order_id, w.wo_number, w.title AS wo_title,
+            a.name AS asset_name, COALESCE(l.name, al.name) AS location_name
+     FROM job_lines jl
+     JOIN job_line_statuses jls ON jls.id = jl.status_id
+     JOIN work_orders w ON w.id = jl.work_order_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN locations l ON l.id = w.location_id
+     LEFT JOIN locations al ON al.id = a.location_id
+     WHERE jls.counts_as_work_performed AND jl.completed_date BETWEEN $1 AND $2
+     ORDER BY COALESCE(l.name, al.name) NULLS LAST, w.id, jl.sort_order`,
+    [from, to]
+  );
+  const { ReportImageCap } = await getDisplaySettings();
+  const jobLineToWoMap = new Map(rows.map((r) => [r.id, r.work_order_id]));
+  const imagesByWo = await getReportImagesForJobLines(rows.map((r) => r.id), jobLineToWoMap, ReportImageCap);
+  return { lines: rows, imagesByWo };
+}
+
+// "Deferred Maintenance Backlog" (§6.2.2) — likely the single most useful
+// artifact this system produces (the brief's own words): every deferred
+// finding, grouped by severity, with dollar totals. The capital-campaign
+// argument, built as a named report rather than assembled from filters
+// because the grouping/totals are the point.
+export async function getDeferredFindingsBacklogRawData() {
+  const { rows } = await pool.query(
+    `SELECT cf.id, cf.title, cf.severity, cf.estimated_cost, cf.deferred_reason, cf.revisit_date,
+            a.name AS asset_name, COALESCE(l.name, al.name) AS location_name
+     FROM condition_findings cf
+     LEFT JOIN assets a ON a.id = cf.asset_id
+     LEFT JOIN locations l ON l.id = cf.location_id
+     LEFT JOIN locations al ON al.id = a.location_id
+     WHERE cf.status = 'Deferred'
+     ORDER BY cf.severity DESC, cf.estimated_cost DESC NULLS LAST`
+  );
+  return { findings: rows };
+}
+
 // Saved Reports-tab filter combinations ("favorites") — scoped to the
 // current session's username so each person's list is their own, same
 // attribution pattern as activity_log/audit flags.
@@ -1389,15 +1516,18 @@ export async function adminDeleteJobLineStatus(id) {
 // ── Display settings (2.6) — single admin-wide toggle for now: whether the
 //    WO grid's progress bar defaults to cost-weighted or line-count-weighted. ─
 export async function getDisplaySettings() {
-  const { rows } = await pool.query('SELECT wo_progress_weighting FROM display_settings ORDER BY id LIMIT 1');
-  return { WoProgressWeighting: rows[0]?.wo_progress_weighting || 'cost' };
+  const { rows } = await pool.query('SELECT wo_progress_weighting, report_image_cap FROM display_settings ORDER BY id LIMIT 1');
+  return { WoProgressWeighting: rows[0]?.wo_progress_weighting || 'cost', ReportImageCap: rows[0]?.report_image_cap ?? 4 };
 }
-export async function updateDisplaySettings({ woProgressWeighting }) {
+export async function updateDisplaySettings({ woProgressWeighting, reportImageCap }) {
   await pool.query(
-    `UPDATE display_settings SET wo_progress_weighting = $1 WHERE id = (SELECT id FROM display_settings ORDER BY id LIMIT 1)`,
-    [woProgressWeighting]
+    `UPDATE display_settings SET
+       wo_progress_weighting = COALESCE($1, wo_progress_weighting),
+       report_image_cap = COALESCE($2, report_image_cap)
+     WHERE id = (SELECT id FROM display_settings ORDER BY id LIMIT 1)`,
+    [woProgressWeighting || null, reportImageCap ?? null]
   );
-  await logActivity({ action: 'updated', entityType: 'display_settings', entityLabel: 'WO progress weighting', details: woProgressWeighting });
+  await logActivity({ action: 'updated', entityType: 'display_settings', entityLabel: 'display settings', details: `weighting=${woProgressWeighting || '—'} imageCap=${reportImageCap ?? '—'}` });
   return getDisplaySettings();
 }
 async function resolveWorkOrderStatusId(nameOrId) {

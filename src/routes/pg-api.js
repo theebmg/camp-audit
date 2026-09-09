@@ -11,8 +11,11 @@
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
-import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg } from '../reportDataPg.js';
-import { renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText, renderPlainEmailHtml } from '../reportRender.js';
+import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg, buildWorkPerformedReportPg, buildDeferredBacklogReportPg } from '../reportDataPg.js';
+import {
+  renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText, renderPlainEmailHtml,
+  renderWorkPerformedHtml, renderWorkPerformedText, renderDeferredBacklogHtml, renderDeferredBacklogText,
+} from '../reportRender.js';
 import { storeAttachment } from '../storage.js';
 import { renderChecklistPdf, renderWorkOrderScopePdf } from '../pdf.js';
 import { currentUsername, currentRole } from '../requestContext.js';
@@ -60,6 +63,7 @@ import {
   listCabinHolders, createCabinHolder, updateCabinHolder, deleteCabinHolder,
   getAssetsReportRawData, getWorkOrdersReportRawData, getWorkOrderLogReportRawData,
   listCrewSessionsForWorkOrder, createCrewSession, deleteCrewSession, getCrewSessionReportRawData, getCrewHoursSummary,
+  getJobLinesReportRawData, getFindingsReportRawData,
   listReportFavorites, createReportFavorite, deleteReportFavorite,
   adminListRequestFields, adminCreateRequestField, adminUpdateRequestField,
   listMaintenanceRequests, getMaintenanceRequestDetail, updateMaintenanceRequestStatus,
@@ -74,6 +78,7 @@ import {
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import {
   buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows, buildCrewSessionReportRows,
+  buildJobLineReportRows, JOB_LINE_COLUMN_SPECS, buildFindingReportRows, FINDING_COLUMN_SPECS,
   assetColumnSpecs, WORK_ORDER_COLUMN_SPECS, WORK_ORDER_LOG_COLUMN_SPECS, CREW_SESSION_COLUMN_SPECS,
   columnDefsFromRows, applyReportFilters, rowsToCsv, canonicalFiltersKey,
 } from '../reports.js';
@@ -574,6 +579,14 @@ async function getReportRowsAndSpecs(entity) {
     const raw = await getCrewSessionReportRawData();
     return { rows: buildCrewSessionReportRows(raw), specs: CREW_SESSION_COLUMN_SPECS };
   }
+  if (entity === 'jobLines') {
+    const raw = await getJobLinesReportRawData();
+    return { rows: buildJobLineReportRows(raw), specs: JOB_LINE_COLUMN_SPECS };
+  }
+  if (entity === 'findings') {
+    const raw = await getFindingsReportRawData();
+    return { rows: buildFindingReportRows(raw), specs: FINDING_COLUMN_SPECS };
+  }
   return null;
 }
 
@@ -681,6 +694,43 @@ router.post('/reports/forward-focus/send', async (req, res, next) => {
       html: renderForwardFocusHtml(data),
       text: renderForwardFocusText(data),
     });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ---- Work Performed / Deferred Backlog — named reports (Build Brief v2 Phase 6) ----
+
+router.get('/reports/work-performed/preview', async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to are required' });
+    const data = await buildWorkPerformedReportPg({ from, to });
+    res.json({ title: 'Work Performed', html: renderWorkPerformedHtml(data), text: renderWorkPerformedText(data) });
+  } catch (e) { next(e); }
+});
+router.post('/reports/work-performed/send', async (req, res, next) => {
+  try {
+    const { from, to, recipient, subject } = req.body || {};
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to are required' });
+    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
+    const data = await buildWorkPerformedReportPg({ from, to });
+    await sendMail({ to: recipient, subject: subject || `Camp Sychar — Work Performed (${from} to ${to})`, html: renderWorkPerformedHtml(data), text: renderWorkPerformedText(data) });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+router.get('/reports/deferred-backlog/preview', async (req, res, next) => {
+  try {
+    const data = await buildDeferredBacklogReportPg();
+    res.json({ title: 'Deferred Maintenance Backlog', html: renderDeferredBacklogHtml(data), text: renderDeferredBacklogText(data) });
+  } catch (e) { next(e); }
+});
+router.post('/reports/deferred-backlog/send', async (req, res, next) => {
+  try {
+    const { recipient, subject } = req.body || {};
+    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
+    const data = await buildDeferredBacklogReportPg();
+    await sendMail({ to: recipient, subject: subject || 'Camp Sychar — Deferred Maintenance Backlog', html: renderDeferredBacklogHtml(data), text: renderDeferredBacklogText(data) });
     res.json({ ok: true });
   } catch (e) { next(e); }
 });
@@ -1108,9 +1158,10 @@ router.get('/display-settings', async (req, res, next) => {
 });
 router.put('/display-settings', async (req, res, next) => {
   try {
-    const { woProgressWeighting } = req.body || {};
-    if (!['cost', 'count'].includes(woProgressWeighting)) return res.status(400).json({ ok: false, error: 'woProgressWeighting must be "cost" or "count"' });
-    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting }) });
+    const { woProgressWeighting, reportImageCap } = req.body || {};
+    if (woProgressWeighting !== undefined && !['cost', 'count'].includes(woProgressWeighting)) return res.status(400).json({ ok: false, error: 'woProgressWeighting must be "cost" or "count"' });
+    if (reportImageCap !== undefined && (!Number.isInteger(reportImageCap) || reportImageCap < 1)) return res.status(400).json({ ok: false, error: 'reportImageCap must be a positive integer' });
+    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting, reportImageCap }) });
   } catch (e) { next(e); }
 });
 

@@ -4,7 +4,10 @@
 // break the current one" rule. Reuses currentComponentState() from
 // components.js UNCHANGED, so "what counts as current" stays defined once,
 // regardless of which database it reads from.
-import { getAllComponentRowsWithAssetInfo, getBoardReportRawData, getBoardFocusItems, historicalAvgActualCost } from './db.js';
+import {
+  getAllComponentRowsWithAssetInfo, getBoardReportRawData, getBoardFocusItems, historicalAvgActualCost,
+  getWorkPerformedRawData, getDeferredFindingsBacklogRawData,
+} from './db.js';
 import { currentComponentState } from './components.js';
 import { FUNDING_SOURCE_LABELS } from './reports.js';
 
@@ -150,4 +153,60 @@ export async function buildForwardFocusReportPg() {
   items.sort((a, b) => (b.cost ?? -Infinity) - (a.cost ?? -Infinity));
   const total = items.reduce((sum, i) => sum + (i.cost || 0), 0);
   return { items, total };
+}
+
+// Build Brief v2 Phase 6 (§6.2.1) — grouped by building (Location), with
+// each building's total cost/hours and its lines' embedded After photos.
+// Every line shows regardless of its parent WO's status — see
+// getWorkPerformedRawData's comment for why that's the whole point.
+export async function buildWorkPerformedReportPg({ from, to }) {
+  const { lines, imagesByWo } = await getWorkPerformedRawData({ from, to });
+
+  const byLocation = new Map();
+  for (const l of lines) {
+    const key = l.location_name || 'Unassigned';
+    if (!byLocation.has(key)) byLocation.set(key, []);
+    byLocation.get(key).push({
+      id: l.id, title: l.title, correction: l.correction, completedDate: l.completed_date,
+      cost: Number(l.actual_cost ?? l.estimated_cost ?? 0), hours: Number(l.actual_hours ?? 0),
+      workOrderId: l.work_order_id, woNumber: l.wo_number, woTitle: l.wo_title, assetName: l.asset_name,
+      images: imagesByWo.get(l.work_order_id) || [],
+    });
+  }
+  const buildings = [...byLocation.entries()].map(([location, lineItems]) => ({
+    location, lines: lineItems,
+    totalCost: lineItems.reduce((s, i) => s + i.cost, 0),
+    totalHours: lineItems.reduce((s, i) => s + i.hours, 0),
+  })).sort((a, b) => a.location.localeCompare(b.location));
+
+  return {
+    from, to, buildings,
+    totalLines: lines.length,
+    totalCost: buildings.reduce((s, b) => s + b.totalCost, 0),
+    totalHours: buildings.reduce((s, b) => s + b.totalHours, 0),
+  };
+}
+
+// Build Brief v2 Phase 6 (§6.2.2) — "the single most useful artifact this
+// system produces." Grouped by severity (worst first), each group's dollar
+// total is the capital-campaign argument.
+export async function buildDeferredBacklogReportPg() {
+  const { findings } = await getDeferredFindingsBacklogRawData();
+  const bySeverity = new Map();
+  for (const f of findings) {
+    const key = f.severity || 'Unspecified';
+    if (!bySeverity.has(key)) bySeverity.set(key, []);
+    bySeverity.get(key).push({
+      id: f.id, title: f.title, assetName: f.asset_name, locationName: f.location_name,
+      cost: f.estimated_cost != null ? Number(f.estimated_cost) : null,
+      deferredReason: f.deferred_reason, revisitDate: f.revisit_date,
+    });
+  }
+  // condition_findings.severity is free text like "5 - Safety-Critical" —
+  // sorting descending puts the highest number (most severe) first without
+  // needing a hardcoded severity order table.
+  const groups = [...bySeverity.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([severity, items]) => ({
+    severity, items, totalCost: items.reduce((s, i) => s + (i.cost || 0), 0),
+  }));
+  return { groups, totalCost: groups.reduce((s, g) => s + g.totalCost, 0), totalCount: findings.length };
 }

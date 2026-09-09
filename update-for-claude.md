@@ -1,3 +1,82 @@
+# Runbook: Reports (Build Brief v2, Phase 6)
+
+Phase 6 landed 2026-09-09. Migration 0050.
+
+## What changed
+- **Job Lines and Findings are now Reports v1 sources** (§6.1), alongside
+  Assets/Work Orders/Progress Log/Crew Sessions — same generic column/
+  filter/CSV machinery (`reports.js`'s `columnDefsFromRows`/
+  `applyReportFilters`/`rowsToCsv`), just two new raw-data functions
+  (`getJobLinesReportRawData`/`getFindingsReportRawData` in db.js) and two
+  new row-builders + column specs (`buildJobLineReportRows`/
+  `JOB_LINE_COLUMN_SPECS`, `buildFindingReportRows`/`FINDING_COLUMN_SPECS`
+  in reports.js). "Open Findings Not On Any Work Order" (§6.2.4) is just the
+  Findings source filtered to Status=Open, On Work Order=No — no bespoke
+  report needed, it's a plain list with no grouping/totals.
+- **Two new bespoke named reports** (§6.2), same preview/send pattern as
+  the existing Board/Forward Focus reports (`reportDataPg.js` builds the
+  data, `reportRender.js` renders HTML/text, a `GET .../preview` +
+  `POST .../send` route pair, a `render*Report()` frontend function using
+  the shared `reportPreviewAreaHtml`/`wireReportPreviewArea` widgets):
+  - **Work Performed** (`buildWorkPerformedReportPg`) — job lines with
+    `counts_as_work_performed = true` and `completed_date` in range,
+    **regardless of the parent WO's status** (the brief's own point: proves
+    six months of activity while a multi-line job is still legitimately
+    open), grouped by building (`location_name`, falling back to the
+    asset's location when the WO itself has none set), with each building's
+    total cost/hours and its lines' After photos embedded.
+  - **Deferred Maintenance Backlog** (`buildDeferredBacklogReportPg`) —
+    every `status = 'Deferred'` finding, grouped by severity (string-sorted
+    descending, since severity is free text like "5 - Safety-Critical" —
+    works without a hardcoded severity-order table), each group's dollar
+    total, overall total.
+- **Attachment embedding** (§6.3): `getReportImagesForJobLines` in db.js is
+  the shared helper — only `kind = 'image'` links with
+  `include_in_report = true` qualify (documents were already excluded by
+  construction, never fetched); capped per work order at
+  `display_settings.report_image_cap` (new column, migration 0050, default
+  4, admin control added to the Work Order Statuses admin page next to the
+  progress-weighting toggle); auto-selected by role `sort_order` (so
+  Before/After naturally wins over Reference) then link `sort_order`/upload
+  time. Embeds use the attachment's existing full (2000px) URL directly —
+  **no separate ~1200px variant was generated**; adding a third stored size
+  per photo for a cosmetic difference from the already-web-reasonable full
+  size wasn't worth it, documented here as a deliberate simplification.
+- **Quotes** (§6.4): the shared attachment edit panel
+  (`renderAttachmentEditPanel` in app.js) now shows vendor/amount/date/
+  "selected quote" fields — only when `entityType === 'job_line'` and the
+  chosen role is "Quote" (toggles live as the role dropdown changes). Saved
+  via the same `PATCH /attachment-links/:id` route Phase 4 built, now
+  passing through `vendorId`/`quotedAmount`/`quoteDate`/`isSelectedQuote`
+  (the columns already existed on `attachment_links` from Phase 4's
+  schema). Job Line report gained a "Quotes Received" column (count of
+  `Quote`-role attachments on that line) — "shopping discipline visible
+  across every job at once," per the brief.
+- All four new report data-building functions were fixture-tested end to
+  end against the live DB (create a real job line/finding, verify grouping
+  + cost totals + image embedding, then delete the fixture) before
+  considering this phase done — not just syntax-checked.
+
+## Known gaps / follow-ups
+- **The brief's "let the user select which images are embedded when more
+  than the cap qualifies" (§6.3) is not built.** Auto-selection (role
+  priority, then order) stands in for it. There was no real multi-photo
+  test data this session to validate a picker UI against, and the
+  interactive-reselect-before-send flow is a real UI addition (the preview
+  step would need to let the user check/uncheck candidates, then resubmit
+  the chosen set to `/send`) — worth building once real board-report photo
+  volume exists to design against.
+- No dedicated "Quote Comparison" tabular report — the Quotes UI lives
+  inline on the job line (attachment edit panel) and the "Quotes Received"
+  count is in the Job Line report; a report that lists one row per quote
+  (vendor/amount/date/selected) across every job at once, per §6.4's exact
+  wording, isn't built. Low priority until quote volume exists to make it
+  useful.
+- Work Performed's "grouped by building" uses `locations.name` — if this
+  camp's mental model of "building" ever diverges from the `Location`
+  table (e.g. multiple buildings share one Location row), this grouping
+  will need revisiting. No evidence of that in the current data.
+
 # Runbook: Inbox, Email Ingest, Splitting (Build Brief v2, Phase 5)
 
 Phase 5 landed 2026-09-09. Migrations 0048–0049.

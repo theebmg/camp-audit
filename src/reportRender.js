@@ -217,6 +217,62 @@ export function renderForwardFocusText({ items, total }) {
   return lines.join('\n');
 }
 
+// "Work Performed in a Date Range" (§6.2.1) — grouped by building, images
+// embed (After photos, capped per WO — see getReportImagesForJobLines),
+// documents would link but this report only ever shows images by
+// construction (image-kind filter is in the raw-data query).
+export function renderWorkPerformedHtml({ from, to, buildings, totalLines, totalCost, totalHours }) {
+  const buildingHtml = (b) => `
+    <h3 style="margin:20px 0 4px;font-size:1rem;">${escapeHtml(b.location)} <span style="color:#6b7086;font-weight:400;font-size:0.85rem;">— ${fmtMoney(b.totalCost)} · ${b.totalHours}h</span></h3>
+    ${b.lines.map((l) => `
+      <div style="border-bottom:1px solid #eef0f6;padding:10px 0;">
+        <div><strong>${escapeHtml(l.title)}</strong> — WO ${escapeHtml(l.woNumber || l.workOrderId)}${l.assetName ? ` · ${escapeHtml(l.assetName)}` : ''}</div>
+        <div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(fmtDate(l.completedDate))} · ${fmtMoney(l.cost)}${l.hours ? ` · ${l.hours}h` : ''}</div>
+        ${l.correction ? `<div style="font-size:0.9rem;margin-top:2px;">${escapeHtml(l.correction)}</div>` : ''}
+        ${l.images.length ? `<div style="margin-top:6px;">${l.images.map((img) => `<img src="${escapeHtml(img.Url)}" alt="${escapeHtml(img.Caption || '')}" style="max-width:220px;max-height:220px;border-radius:8px;margin:0 6px 6px 0;" />`).join('')}</div>` : ''}
+      </div>`).join('')}`;
+  return htmlShell('Work Performed', `${from} to ${to} · ${totalLines} line(s) · ${fmtMoney(totalCost)} · ${totalHours}h`, `
+    ${buildings.map(buildingHtml).join('') || '<p style="color:#6b7086;">No completed work in this range.</p>'}
+  `);
+}
+export function renderWorkPerformedText({ from, to, buildings, totalLines, totalCost, totalHours }) {
+  const lines = ['CAMP SYCHAR — WORK PERFORMED', `${from} to ${to} — ${totalLines} line(s), ${fmtMoney(totalCost)}, ${totalHours}h`, ''];
+  buildings.forEach((b) => {
+    lines.push(`${b.location} — ${fmtMoney(b.totalCost)}, ${b.totalHours}h`);
+    b.lines.forEach((l) => lines.push(`  ${fmtDate(l.completedDate)}  ${l.title} (WO ${l.woNumber || l.workOrderId}${l.assetName ? `, ${l.assetName}` : ''}) — ${fmtMoney(l.cost)}`));
+  });
+  if (!buildings.length) lines.push('No completed work in this range.');
+  return lines.join('\n');
+}
+
+// "Deferred Maintenance Backlog" (§6.2.2) — grouped by severity, worst
+// first, each group's dollar total.
+export function renderDeferredBacklogHtml({ groups, totalCost, totalCount }) {
+  const groupHtml = (g) => `
+    <h3 style="margin:20px 0 4px;font-size:1rem;">${escapeHtml(g.severity)} <span style="color:#6b7086;font-weight:400;font-size:0.85rem;">— ${fmtMoney(g.totalCost)}</span></h3>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:10px;">
+      ${g.items.map((i) => `
+        <tr>
+          <td style="padding:6px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.title)}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.assetName || i.locationName || '—')}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #eef0f6;">${escapeHtml(i.deferredReason || '—')}${i.revisitDate ? ` — revisit ${fmtDate(i.revisitDate)}` : ''}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid #eef0f6;text-align:right;">${fmtMoney(i.cost)}</td>
+        </tr>`).join('')}
+    </table>`;
+  return htmlShell('Deferred Maintenance Backlog', `${totalCount} deferred finding(s) · ${fmtMoney(totalCost)} total`, `
+    ${groups.map(groupHtml).join('') || '<p style="color:#6b7086;">Nothing deferred right now.</p>'}
+  `);
+}
+export function renderDeferredBacklogText({ groups, totalCost, totalCount }) {
+  const lines = ['CAMP SYCHAR — DEFERRED MAINTENANCE BACKLOG', `${totalCount} deferred finding(s) — ${fmtMoney(totalCost)} total`, ''];
+  groups.forEach((g) => {
+    lines.push(`${g.severity} — ${fmtMoney(g.totalCost)}`);
+    g.items.forEach((i) => lines.push(`  ${i.title} (${i.assetName || i.locationName || '—'}) — ${fmtMoney(i.cost)}${i.deferredReason ? ` — ${i.deferredReason}` : ''}${i.revisitDate ? `, revisit ${fmtDate(i.revisitDate)}` : ''}`));
+  });
+  if (!groups.length) lines.push('Nothing deferred right now.');
+  return lines.join('\n');
+}
+
 // Turns a plain-text message (a Requester notification, a free-form message
 // from the Requests inbox) into a simple branded HTML body — same htmlShell
 // as every other report email, just a preformatted paragraph instead of a

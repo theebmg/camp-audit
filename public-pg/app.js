@@ -389,9 +389,15 @@ async function renderAttachmentSection(entityType, entityId, container, opts = {
   }));
 }
 
-function renderAttachmentEditPanel(a, roles, entityType, entityId, container, opts) {
+async function renderAttachmentEditPanel(a, roles, entityType, entityId, container, opts) {
   const panel = container.querySelector('.attach-edit-panel');
   const roleOptions = roles.map((r) => `<option value="${r.Id}" ${a.RoleId === r.Id ? 'selected' : ''}>${escapeHtml(r.Name)}</option>`).join('');
+  const quoteRoleId = roles.find((r) => r.Name === 'Quote')?.Id;
+  // Quotes attach to the job line (§6.4, "you shop the roof, not the whole
+  // cabin") — vendor/amount/date/selected only make sense there, and only
+  // once the Quote role is picked (role answers "what is this," these
+  // fields answer "whose quote and how much").
+  const vendorsRes = entityType === 'job_line' ? await api('/api/pg/vendors') : { vendors: [] };
   panel.hidden = false;
   panel.innerHTML = `
     <div class="card" style="margin-top:8px">
@@ -401,6 +407,13 @@ function renderAttachmentEditPanel(a, roles, entityType, entityId, container, op
       <div class="field-row"><label>Role</label><select class="attach-role"><option value="">— unset —</option>${roleOptions}</select></div>
       <div class="field-row"><label>Caption</label><input class="attach-caption" value="${escapeHtml(a.Caption || '')}" /></div>
       <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="attach-include" ${a.IncludeInReport ? 'checked' : ''} /> Include in board report</label>
+      ${entityType === 'job_line' ? `
+      <div class="quote-fields" ${a.RoleName === 'Quote' ? '' : 'hidden'}>
+        <div class="field-row"><label>Vendor</label><select class="attach-vendor"><option value="">— unset —</option>${vendorsRes.vendors.map((v) => `<option value="${v.Id}" ${a.VendorId === v.Id ? 'selected' : ''}>${escapeHtml(v.Name)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Amount</label><input class="attach-amount" type="number" step="0.01" value="${a.QuotedAmount ?? ''}" /></div>
+        <div class="field-row"><label>Date</label><input class="attach-quote-date" type="date" value="${(a.QuoteDate || '').slice(0, 10)}" /></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="attach-selected-quote" ${a.IsSelectedQuote ? 'checked' : ''} /> This is the selected quote</label>
+      </div>` : ''}
       <div class="btn-row">
         <button type="button" class="btn btn-primary attach-save">Save</button>
         <button type="button" class="btn btn-secondary attach-detach">Detach</button>
@@ -408,12 +421,20 @@ function renderAttachmentEditPanel(a, roles, entityType, entityId, container, op
         <button type="button" class="btn btn-secondary attach-cancel">Close</button>
       </div>
     </div>`;
+  panel.querySelector('.attach-role')?.addEventListener('change', (e) => {
+    const qf = panel.querySelector('.quote-fields');
+    if (qf) qf.hidden = Number(e.target.value) !== quoteRoleId;
+  });
   panel.querySelector('.attach-save').addEventListener('click', async () => {
     try {
       await api(`/api/pg/attachment-links/${a.LinkId}`, { method: 'PATCH', body: JSON.stringify({
         roleId: panel.querySelector('.attach-role').value || null,
         caption: panel.querySelector('.attach-caption').value || null,
         includeInReport: panel.querySelector('.attach-include').checked,
+        vendorId: panel.querySelector('.attach-vendor')?.value || null,
+        quotedAmount: panel.querySelector('.attach-amount')?.value || null,
+        quoteDate: panel.querySelector('.attach-quote-date')?.value || null,
+        isSelectedQuote: panel.querySelector('.attach-selected-quote')?.checked || false,
       }) });
       renderAttachmentSection(entityType, entityId, container, opts);
     } catch (err) { toast(err.message); }
@@ -3078,6 +3099,8 @@ async function renderMaintenanceLog() {
 const REPORT_ENTITIES = [
   { key: 'assets', label: 'Assets' },
   { key: 'workOrders', label: 'Work Orders' },
+  { key: 'jobLines', label: 'Job Lines' },
+  { key: 'findings', label: 'Findings' },
   { key: 'workOrderLog', label: 'Progress Log' },
   { key: 'crewSessions', label: 'Crew Sessions' },
 ];
@@ -3114,6 +3137,8 @@ const REPORT_TABS = [
   { key: 'explorer', label: 'Data Explorer' },
   { key: 'board', label: 'Board Report' },
   { key: 'forwardFocus', label: 'Forward Focus' },
+  { key: 'workPerformed', label: 'Work Performed' },
+  { key: 'deferredBacklog', label: 'Deferred Backlog' },
 ];
 function reportsTabsHtml(mode) {
   return `<div class="card">
@@ -3133,6 +3158,8 @@ async function renderReports(params = {}) {
   const mode = REPORT_TABS.some((t) => t.key === params.mode) ? params.mode : 'explorer';
   if (mode === 'board') return renderBoardReport();
   if (mode === 'forwardFocus') return renderForwardFocusReport();
+  if (mode === 'workPerformed') return renderWorkPerformedReport();
+  if (mode === 'deferredBacklog') return renderDeferredBacklogReport();
   return renderReportsExplorer(params);
 }
 
@@ -3542,6 +3569,82 @@ async function renderForwardFocusReport() {
   async function generate() {
     generating = true; draw();
     try { report = await api('/api/pg/reports/forward-focus/preview'); }
+    catch (err) { toast(err.message); }
+    generating = false; draw();
+  }
+
+  draw();
+}
+
+// "Work Performed in a Date Range" (§6.2.1) — the fall-to-spring board
+// document: job lines completed in range, grouped by building, regardless
+// of whether their parent WO is fully closed yet.
+async function renderWorkPerformedReport() {
+  setChrome({ title: 'Reports', showBack: false, showLogout: true });
+  const todayStr = isoDate(new Date());
+  const sixMonthsAgo = new Date(); sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  let from = isoDate(sixMonthsAgo);
+  let to = todayStr;
+  let report = null;
+  let generating = false;
+
+  function draw() {
+    setApp(`
+      ${reportsTabsHtml('workPerformed')}
+      <div class="card">
+        <h3>Work Performed</h3>
+        <p class="muted">Job lines completed in this range, grouped by building — proves activity even while a big multi-line job is still open. After photos embed (capped per work order in Admin → Work Order Statuses).</p>
+        <div class="field-row"><label>Range</label>
+          <div class="report-date-range">
+            <input type="date" id="wpFrom" value="${from}" />
+            <span class="muted">to</span>
+            <input type="date" id="wpTo" value="${to}" />
+          </div>
+        </div>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="wpGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
+      </div>
+      ${reportPreviewAreaHtml(report)}`);
+    wireReportsTabs();
+    document.getElementById('wpGenBtn').addEventListener('click', generate);
+    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/work-performed/send', sendBody: () => ({ from, to }) });
+  }
+
+  async function generate() {
+    from = document.getElementById('wpFrom').value || from;
+    to = document.getElementById('wpTo').value || to;
+    generating = true; draw();
+    try { report = await api(`/api/pg/reports/work-performed/preview?from=${from}&to=${to}`); }
+    catch (err) { toast(err.message); }
+    generating = false; draw();
+  }
+
+  draw();
+}
+
+// "Deferred Maintenance Backlog" (§6.2.2) — the capital-campaign argument:
+// every deferred finding, grouped by severity, with dollar totals.
+async function renderDeferredBacklogReport() {
+  setChrome({ title: 'Reports', showBack: false, showLogout: true });
+  let report = null;
+  let generating = false;
+
+  function draw() {
+    setApp(`
+      ${reportsTabsHtml('deferredBacklog')}
+      <div class="card">
+        <h3>Deferred Maintenance Backlog</h3>
+        <p class="muted">Every deferred finding, grouped by severity, with dollar totals — a standard capital-planning document.</p>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="dbGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
+      </div>
+      ${reportPreviewAreaHtml(report)}`);
+    wireReportsTabs();
+    document.getElementById('dbGenBtn').addEventListener('click', generate);
+    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/deferred-backlog/send', sendBody: () => ({}) });
+  }
+
+  async function generate() {
+    generating = true; draw();
+    try { report = await api('/api/pg/reports/deferred-backlog/preview'); }
     catch (err) { toast(err.message); }
     generating = false; draw();
   }
@@ -4295,6 +4398,11 @@ async function renderAdminWorkOrderStatuses(container = app) {
         <option value="count" ${displaySettings.WoProgressWeighting === 'count' ? 'selected' : ''}>Line-count-weighted</option>
       </select>
     </div>
+    <div class="card">
+      <h3>Report embedded-photo cap</h3>
+      <p class="muted">Max images embedded per work order in the Work Performed report — the rest fall back to links. Forty embedded photos is a 60MB email that bounces off half the board's mail servers.</p>
+      <input id="reportImageCapInput" type="number" min="1" max="20" value="${displaySettings.ReportImageCap}" style="max-width:100px" />
+    </div>
     <div class="card">${rows}</div>
     <div class="card">
       <h3>Add Status</h3>
@@ -4311,6 +4419,13 @@ async function renderAdminWorkOrderStatuses(container = app) {
   container.querySelector('#progressWeightingSelect').addEventListener('change', async (e) => {
     try {
       await api('/api/pg/display-settings', { method: 'PUT', body: JSON.stringify({ woProgressWeighting: e.target.value }) });
+      toast('Saved');
+      if (state.options) state.options.displaySettings = await api('/api/pg/display-settings');
+    } catch (err) { toast(err.message); }
+  });
+  container.querySelector('#reportImageCapInput').addEventListener('change', async (e) => {
+    try {
+      await api('/api/pg/display-settings', { method: 'PUT', body: JSON.stringify({ reportImageCap: Number(e.target.value) }) });
       toast('Saved');
       if (state.options) state.options.displaySettings = await api('/api/pg/display-settings');
     } catch (err) { toast(err.message); }
