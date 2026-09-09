@@ -1,3 +1,65 @@
+# NocoDB and Atlas removed; Postgres app is now the live app (2026-09-09)
+
+**Correction to a standing assumption:** `BUILD_BRIEF_v2.1`'s opening line —
+"Follow-on to `BUILD_BRIEF_v2_joblines_lifecycle_attachments.md`, all seven
+phases of which are complete and deployed" — was read by later work
+(including this session, initially) as meaning the NocoDB→Postgres
+migration was *finished*. It wasn't. "Complete and deployed" meant the v2
+Postgres API (`routes/pg-api.js` and friends) existed and worked at
+`/api/pg`, served under `/next` — not that the app had been cut over to it.
+Until today, `src/server.js` still mounted the NocoDB-backed `routes/api.js`
+as the live `/api`, served `public/` (the NocoDB-era frontend) at `/`, and
+`/health` checked NocoDB reachability, not Postgres. Step 8 of
+`toClaudeCode/camp-cmms-postgres-migration-brief.md` ("cut the live app
+over to Postgres only after it matches the NocoDB app's behavior") had
+never actually been done. If you're reading an older brief or an older
+version of this file and it implies NocoDB is just "a viewer" at this
+point — it wasn't, until this session.
+
+**What changed, in three stages (full audit + decisions were reviewed with
+Ben first — see session history if you need the reasoning):**
+
+1. **Cutover.** Confirmed `/api/pg` covered everything `/api` did (one real
+   gap found and fixed: `public-pg/index.html`'s `/style.css` dependency,
+   which only lived in the now-deleted `public/` — moved it into
+   `public-pg/`). Made `public-pg/` the app served at `/`; `/next` and
+   `/next/*` now 301-redirect to the root equivalent instead of serving a
+   second copy. Deleted the NocoDB-backed code path entirely: `src/nocodb.js`,
+   `src/routes/api.js`, `src/routes/manage.js`, `src/reportData.js`,
+   `src/routes/reports.js` (and the four now-dead legacy report renderers in
+   `reportRender.js` that only it used), `public/`, `scripts/export-nocodb.mjs`.
+   Rewrote `/health` to ping Postgres; folded the old `/db-health` into it
+   (same check, no need for two). Removed all `NC_*` env vars everywhere
+   (`.env`, `.env.example`, `docker-compose.yml`) — the app now boots with
+   none present.
+2. **NocoDB removed.** Container + image gone. The `nocodb` database
+   (metadata only — never held camp data) dropped from the shared `nocodb-db`
+   Postgres server; the `camp` database and the `nocodb-db` container itself
+   are untouched and unaffected — they were always separate databases on one
+   server, never the same database. `nocodb.fracturedrv.com` no longer
+   routes anywhere (Caddy block removed). `nocodb-backup.sh` and its cron
+   deleted (it only ever backed up the `nocodb` database — `camp`'s own
+   backup, `scripts/backup.sh`, is untouched and still runs nightly).
+3. **Atlas removed.** The old pre-NocoDB Atlas CMMS stack (`atlas_db`,
+   `atlas-cmms-backend`, `atlas-cmms-frontend`, `atlas_minio`, `atlas_caddy`)
+   had already been shut down before this session — only a stray stopped
+   `atlas_nginx` container, four orphaned `atlas-cmms_*` volumes (including
+   ~73MB of old Atlas Postgres data, explicitly not archived — confirmed not
+   needed), the `atlas-cmms_default` network, and unmounted config
+   (`/root/docker-compose.yml`, `/root/.env`, `/root/Caddyfile`,
+   `/root/nginx.conf`) remained. All deleted, along with the four
+   Atlas-only Docker images (frontend/backend/minio/nginx, ~1.2GB).
+
+**Current state:** three containers total — `camp-audit`, `nocodb-db`
+(hosts only the `camp` database now), `nocodb_caddy`. The app is served at
+the root of `https://audit.fracturedrv.com/`. No NocoDB, no Atlas, no `/next`
+prefix. `cmms.fracturedrv.com` DNS/MX was NOT touched (Mailgun inbound mail
+lives there) — see the audit notes if you need the discrepancy that was
+flagged there (no MX record was actually found from this host at audit
+time, despite an SPF record existing).
+
+---
+
 # Runbook: Database Backups (Build Brief v2.1, Part 3)
 
 No migration; no application code touched. `scripts/backup.sh`, cron'd
