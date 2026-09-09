@@ -477,6 +477,7 @@ async function render(view, params = {}) {
       adminApplicability: () => renderAdminApplicability(),
       adminSubAreas: () => renderAdminSubAreas(),
       adminWoTemplates: () => renderAdminWoTemplates(),
+      adminCauses: () => renderAdminCauses(),
       calendar: () => renderCalendar(params),
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
@@ -769,6 +770,7 @@ const ADMIN_LEAF_RENDERERS = {
   adminApplicability: (params, container) => renderAdminApplicability(container),
   adminSubAreas: (params, container) => renderAdminSubAreas(container),
   adminWoTemplates: (params, container) => renderAdminWoTemplates(container),
+  adminCauses: (params, container) => renderAdminCauses(container),
   adminChecklistTemplates: (params, container) => renderAdminChecklistTemplates(container),
   adminUsers: (params, container) => renderAdminUsers(container),
   activityLog: (params, container) => renderActivityLog(container),
@@ -3191,6 +3193,7 @@ const ADMIN_CATEGORIES = {
     items: [
       { view: 'adminWoTemplates', icon: '🧾', label: 'Work Order Templates' },
       { view: 'adminChecklistTemplates', icon: '✅', label: 'Checklist Templates' },
+      { view: 'adminCauses', icon: '🔍', label: 'Causes' },
     ],
   },
   requests: {
@@ -3416,16 +3419,24 @@ async function renderAdminWoTemplates(container = app) {
   const fieldTitles = optsRes.propertyFields.map((f) => f.title);
   let editingId = null; // null | 'new' | number
 
-  const taskRowHtml = (text = '') => `<div class="inline-add-row task-row"><input class="task-text" value="${escapeHtml(text)}" placeholder="Task description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>`;
-  const jobLineRowHtml = (row = {}) => `<div class="inline-add-row jl-row" style="align-items:center">
-      <select class="jl-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
-      <input class="jl-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
+  // job_line_defaults holds partial job-line objects (title + responsibility
+  // class); asset_update_defaults is the separate, older "also change an
+  // asset field" blueprint — the two got renamed apart in migration 0038/0039
+  // specifically so "job line" stops meaning two different things.
+  const jlDefaultRowHtml = (row = {}) => `<div class="inline-add-row jld-row" style="align-items:center">
+    <input class="jld-title" value="${escapeHtml(row.title || '')}" placeholder="Job line title…" style="flex:1" />
+    <select class="jld-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${row.responsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+    <button type="button" class="btn btn-secondary row-remove">✕</button>
+  </div>`;
+  const auDefaultRowHtml = (row = {}) => `<div class="inline-add-row aud-row" style="align-items:center">
+      <select class="aud-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
+      <input class="aud-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
       <button type="button" class="btn btn-secondary row-remove">✕</button>
     </div>`;
 
   function formHtml(t) {
-    const taskRows = (t?.TaskDefaults || []).map(taskRowHtml).join('');
-    const jlRows = (t?.JobLineDefaults || []).map(jobLineRowHtml).join('');
+    const jlRows = (t?.JobLineDefaults || []).map(jlDefaultRowHtml).join('');
+    const auRows = (t?.AssetUpdateDefaults || []).map(auDefaultRowHtml).join('');
     return `<div class="card">
       <h3>${t ? `Edit "${escapeHtml(t.Name)}"` : 'New Template'}</h3>
       <div class="field-row"><label>Template Name</label><input class="tf-name" value="${escapeHtml(t?.Name || '')}" placeholder="e.g. Winterization" required /></div>
@@ -3434,15 +3445,15 @@ async function renderAdminWoTemplates(container = app) {
         <select class="tf-priority"><option value="">— none —</option>${['Low', 'Medium', 'High', 'Urgent'].map((p) => `<option ${t?.DefaultPriority === p ? 'selected' : ''}>${p}</option>`).join('')}</select>
       </div>
       <div class="field-row"><label>Default Description</label><textarea class="tf-description">${escapeHtml(t?.DefaultDescription || '')}</textarea></div>
-      <div class="field-row"><label>Default Tasks</label>
-        <p class="muted" style="margin:2px 0 8px">Pre-fills these scope-of-work tasks on every WO created from this template.</p>
-        <div class="tf-tasks">${taskRows}</div>
-        <button type="button" class="btn btn-secondary tf-add-task" style="margin-top:6px">+ Add Task</button>
+      <div class="field-row"><label>Default Job Lines</label>
+        <p class="muted" style="margin:2px 0 8px">Pre-fills these job lines (title + responsibility) on every WO created from this template. Funding/hours/cost are set per use.</p>
+        <div class="tf-job-lines">${jlRows}</div>
+        <button type="button" class="btn btn-secondary tf-add-line" style="margin-top:6px">+ Add Job Line</button>
       </div>
       <details style="margin:12px 0">
         <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
-        <div class="tf-job-lines" style="margin-top:8px">${jlRows}</div>
-        <button type="button" class="btn btn-secondary tf-add-line" style="margin-top:6px">+ Add Field Update</button>
+        <div class="tf-asset-updates" style="margin-top:8px">${auRows}</div>
+        <button type="button" class="btn btn-secondary tf-add-au" style="margin-top:6px">+ Add Field Update</button>
       </details>
       <div class="btn-row">
         <button class="btn btn-primary tf-save" data-id="${t?.Id ?? ''}">Save Template</button>
@@ -3457,17 +3468,17 @@ async function renderAdminWoTemplates(container = app) {
         <div>
           <strong>${escapeHtml(t.Name)}</strong>
           <div class="muted">${escapeHtml(t.DefaultTitle || '')}${t.DefaultPriority ? ' · ' + escapeHtml(t.DefaultPriority) : ''}</div>
-          ${t.TaskDefaults?.length ? `<div class="muted">${t.TaskDefaults.length} default task${t.TaskDefaults.length > 1 ? 's' : ''}</div>` : ''}
+          ${t.JobLineDefaults?.length ? `<div class="muted">${t.JobLineDefaults.length} default job line${t.JobLineDefaults.length > 1 ? 's' : ''}</div>` : ''}
         </div>
         <div class="btn-row" style="margin-top:0">
           <button class="btn btn-secondary tpl-edit" data-id="${t.Id}">Edit</button>
           <button class="btn btn-secondary tpl-delete" data-id="${t.Id}" data-name="${escapeHtml(t.Name)}">Delete</button>
         </div>
-      </div>`).join('') || '<p class="muted">🧾 No templates yet — save your repeatable tasks here.</p>';
+      </div>`).join('') || '<p class="muted">🧾 No templates yet — save your repeatable job lines here.</p>';
 
     setApp(`
       <div class="card"><h3>Work Order Templates</h3>
-        <p class="muted">Canned setups for repeatable tasks — pick one from "New Work Order" instead of retyping everything.</p>
+        <p class="muted">Canned setups for repeatable jobs — pick one from "New Work Order" instead of retyping everything.</p>
       </div>
       ${list}
       ${editingId === 'new' ? formHtml(null) : `<div class="btn-row" style="margin:4px 0 16px"><button class="btn btn-secondary" id="newTplBtn">+ New Template</button></div>`}
@@ -3480,12 +3491,12 @@ async function renderAdminWoTemplates(container = app) {
     container.querySelector('#newTplBtn')?.addEventListener('click', () => { editingId = 'new'; draw(); });
     container.querySelectorAll('.tpl-edit').forEach((btn) => btn.addEventListener('click', () => { editingId = Number(btn.dataset.id); draw(); }));
     container.querySelectorAll('.tf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
-    container.querySelectorAll('.tf-add-task').forEach((btn) => btn.addEventListener('click', () => {
-      btn.previousElementSibling.insertAdjacentHTML('beforeend', taskRowHtml());
+    container.querySelectorAll('.tf-add-line').forEach((btn) => btn.addEventListener('click', () => {
+      btn.previousElementSibling.insertAdjacentHTML('beforeend', jlDefaultRowHtml());
       wireRemoveButtons();
     }));
-    container.querySelectorAll('.tf-add-line').forEach((btn) => btn.addEventListener('click', () => {
-      btn.previousElementSibling.insertAdjacentHTML('beforeend', jobLineRowHtml());
+    container.querySelectorAll('.tf-add-au').forEach((btn) => btn.addEventListener('click', () => {
+      btn.previousElementSibling.insertAdjacentHTML('beforeend', auDefaultRowHtml());
       wireRemoveButtons();
     }));
     wireRemoveButtons();
@@ -3501,15 +3512,17 @@ async function renderAdminWoTemplates(container = app) {
       const card = btn.closest('.card');
       const name = card.querySelector('.tf-name').value.trim();
       if (!name) { toast('Template name is required'); return; }
-      const taskDefaults = [...card.querySelectorAll('.task-row .task-text')].map((el) => el.value.trim()).filter(Boolean);
-      const jobLineDefaults = [...card.querySelectorAll('.jl-row')].map((row) => ({
-        targetField: row.querySelector('.jl-field').value, newValue: row.querySelector('.jl-value').value,
+      const jobLineDefaults = [...card.querySelectorAll('.jld-row')].map((row) => ({
+        title: row.querySelector('.jld-title').value.trim(), responsibilityClass: row.querySelector('.jld-resp').value,
+      })).filter((r) => r.title);
+      const assetUpdateDefaults = [...card.querySelectorAll('.aud-row')].map((row) => ({
+        targetField: row.querySelector('.aud-field').value, newValue: row.querySelector('.aud-value').value,
       })).filter((r) => r.newValue.trim());
       const fields = {
         name, defaultTitle: card.querySelector('.tf-title').value.trim(),
         defaultPriority: card.querySelector('.tf-priority').value,
         defaultDescription: card.querySelector('.tf-description').value.trim(),
-        taskDefaults, jobLineDefaults,
+        jobLineDefaults, assetUpdateDefaults,
       };
       const id = btn.dataset.id;
       try {
@@ -3801,6 +3814,61 @@ async function renderAdminApplicability(container = app) {
   }));
 }
 
+// Causes catalog (1.6) — admin-editable dropdown a job line's Cause
+// multi-select reads from. Deactivating (not deleting) is the default path
+// once a cause is in use, same in-use-guard pattern as sub-areas/building
+// types; deleting a never-used cause is still allowed.
+async function renderAdminCauses(container = app) {
+  if (container === app) setChrome({ title: 'Causes', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { causes } = await api('/api/pg/causes');
+
+  const rows = causes.map((c) => `
+    <div class="list-item" style="cursor:default">
+      <span>${escapeHtml(c.Name)}${!c.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary cause-toggle-active" data-id="${c.Id}" data-active="${c.Active}">${c.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary cause-delete" data-id="${c.Id}" data-name="${escapeHtml(c.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No causes defined yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Causes</h3>
+      <p class="muted">What a job line's problem is attributed to — the dropdown that gets counted (see Cause Note on the job line for freetext detail). Adding one here is the only way it becomes selectable; freetext never gets promoted into this list.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Cause</h3>
+      <form id="addCauseForm">
+        <div class="field-row"><label>Name</label><input name="name" placeholder="e.g. Rot" required /></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.cause-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/causes/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) });
+      renderAdminCauses(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.cause-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete cause "${btn.dataset.name}"? Only possible if no job line uses it — deactivate instead if it's in use.`)) return;
+    try {
+      await api(`/api/pg/admin/causes/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Cause deleted');
+      renderAdminCauses(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addCauseForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/causes', { method: 'POST', body: JSON.stringify({ name: fd.get('name') }) });
+      renderAdminCauses(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
 async function renderAdminSubAreas(container = app) {
   if (container === app) setChrome({ title: 'Component Sub-Areas', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
@@ -3857,8 +3925,8 @@ function openDayPanel(dateKey, entries) {
         <h3 style="margin:0">${escapeHtml(label)}</h3>
         <button class="btn btn-secondary" id="closeDayPanelBtn">✕</button>
       </div>
-      ${entries.length ? entries.map((e) => e.type === 'wo'
-        ? `<div class="list-item day-panel-entry" data-wo-id="${e.Id}"><span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.Title)}</span><span class="pill ${woStatusPillClass(e.Status)}">${escapeHtml(e.Status)}</span></div>`
+      ${entries.length ? entries.map((e) => e.type === 'jobLine'
+        ? `<div class="list-item day-panel-entry" data-wo-id="${e.WorkOrderId}"><span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span><span class="pill ${woStatusPillClass(e.WorkOrderStatus)}">${escapeHtml(e.WorkOrderStatus || '')}</span></div>`
         : `<div class="list-item day-panel-entry" data-event-id="${e.Id}"><span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`
       ).join('') : '<p class="muted">Nothing scheduled this day.</p>'}
       <div class="btn-row"><button class="btn btn-primary" id="dayPanelAddEventBtn">+ Add Event This Day</button></div>
@@ -3891,18 +3959,21 @@ async function renderCalendar(params = {}) {
     const fromStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-01`;
     const toStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
 
-    const [{ workOrders }, { occurrences }] = await Promise.all([
+    // Job lines, not work orders, are what actually gets scheduled (1.4) — a
+    // WO's lines can have divergent dates (vendor Tuesday, volunteers
+    // Saturday, same WO), so the grid shows one entry per line. The "Scheduled
+    // Date" on /work-orders is still there for the sidebar/unscheduled check
+    // (it's the earliest-line rollup — see listWorkOrders in db.js).
+    const [{ workOrders }, { occurrences }, { jobLines: scheduledJobLines }] = await Promise.all([
       api('/api/pg/work-orders'), api(`/api/pg/calendar-events?from=${fromStr}&to=${toStr}`),
+      api(`/api/pg/job-lines/scheduled?from=${fromStr}&to=${toStr}`),
     ]);
 
     dayEntriesMap = new Map();
-    for (const w of workOrders) {
-      const sd = w['Scheduled Date'];
-      if (!sd) continue;
-      const key = sd.slice(0, 10);
-      if (key < fromStr || key > toStr) continue;
+    for (const jl of scheduledJobLines) {
+      const key = jl.ScheduledDate.slice(0, 10);
       if (!dayEntriesMap.has(key)) dayEntriesMap.set(key, []);
-      dayEntriesMap.get(key).push({ type: 'wo', ...w });
+      dayEntriesMap.get(key).push({ type: 'jobLine', ...jl });
     }
     for (const occ of occurrences) {
       if (!dayEntriesMap.has(occ.OccurrenceDate)) dayEntriesMap.set(occ.OccurrenceDate, []);
@@ -3910,8 +3981,8 @@ async function renderCalendar(params = {}) {
     }
     const allUnscheduled = workOrders.filter((w) => !w['Scheduled Date']);
 
-    const entryHtml = (e) => e.type === 'wo'
-      ? `<div class="cal-entry" data-wo-id="${e.Id}"><span class="pill ${woStatusPillClass(e.Status)}">🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.Title)} — ${escapeHtml(e.Status)}</span></div>`
+    const entryHtml = (e) => e.type === 'jobLine'
+      ? `<div class="cal-entry" data-wo-id="${e.WorkOrderId}"><span class="pill ${woStatusPillClass(e.WorkOrderStatus)}">🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span></div>`
       : `<div class="cal-entry" data-event-id="${e.Id}"><span class="pill pop">📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`;
 
     const cells = [];
@@ -4007,12 +4078,14 @@ function wireRecurrenceToggle(root) {
   });
 }
 
-// Link-to-Work-Order(-Task) fields shared by New/Edit Calendar Event. Picking a
-// Work Order auto-fills Title/Description/Date from it and reveals a Task
-// dropdown scoped to that WO's tasks; picking a task narrows Title further to
-// the task's own text. This only fires on user-driven changes — initial render
-// for an existing event never overwrites its saved fields.
-function calendarLinkFieldsHtml({ workOrders, workOrderTemplates = [], initialTasks = [], ev = {} }) {
+// Link-to-Work-Order(-Job-Line) fields shared by New/Edit Calendar Event.
+// Picking a Work Order auto-fills Title/Description from it and reveals a Job
+// Line dropdown scoped to that WO's lines; picking a line narrows Title
+// further to the line's own text and fills the date from the line's own
+// scheduled_date (a WO has no single date of its own since Phase 1 — see
+// 1.2/1.4). This only fires on user-driven changes — initial render for an
+// existing event never overwrites its saved fields.
+function calendarLinkFieldsHtml({ workOrders, workOrderTemplates = [], initialJobLines = [], ev = {} }) {
   const hasWo = !!ev.WorkOrderId;
   return `
     <div class="field-row"><label>Link to Work Order (optional)</label>
@@ -4022,10 +4095,10 @@ function calendarLinkFieldsHtml({ workOrders, workOrderTemplates = [], initialTa
       </select>
     </div>
     <div class="field-row" id="linkTaskRow" ${hasWo ? '' : 'hidden'}>
-      <label>Link to Task (optional)</label>
-      <select name="workOrderTaskId" id="linkTaskId">
+      <label>Link to Job Line (optional)</label>
+      <select name="jobLineId" id="linkTaskId">
         <option value="">— whole work order —</option>
-        ${initialTasks.map((t) => `<option value="${t.Id}" ${ev.WorkOrderTaskId === t.Id ? 'selected' : ''}>${escapeHtml(t.Description)}${t.Done ? ' (done)' : ''}</option>`).join('')}
+        ${initialJobLines.map((l) => `<option value="${l.Id}" ${ev.JobLineId === l.Id ? 'selected' : ''}>${escapeHtml(l.Title)}${l.Done ? ' (done)' : ''}</option>`).join('')}
       </select>
     </div>
     <div class="field-row"><label>Auto-generate from PM Template (optional)</label>
@@ -4044,31 +4117,31 @@ function wireCalendarLinkFields(root) {
   const titleInput = root.querySelector('[name="title"]');
   const descInput = root.querySelector('[name="description"]');
   const dateInput = root.querySelector('[name="eventDate"]');
-  let currentTasks = [];
+  let currentJobLines = [];
 
   woSelect.addEventListener('change', async () => {
     const woId = woSelect.value;
     taskSelect.innerHTML = '<option value="">— whole work order —</option>';
-    currentTasks = [];
+    currentJobLines = [];
     if (!woId) { taskRow.hidden = true; return; }
     taskRow.hidden = false;
     tplSelect.value = '';
-    const { workOrder, tasks } = await api(`/api/pg/work-orders/${woId}`);
-    currentTasks = tasks;
-    taskSelect.innerHTML += tasks.map((t) => `<option value="${t.Id}">${escapeHtml(t.Description)}${t.Done ? ' (done)' : ''}</option>`).join('');
+    const { workOrder, jobLines } = await api(`/api/pg/work-orders/${woId}`);
+    currentJobLines = jobLines;
+    taskSelect.innerHTML += jobLines.map((l) => `<option value="${l.Id}">${escapeHtml(l.Title)}${l.Done ? ' (done)' : ''}</option>`).join('');
     titleInput.value = workOrder.Title;
     descInput.value = workOrder.Description || '';
-    if (workOrder['Scheduled Date']) dateInput.value = workOrder['Scheduled Date'].slice(0, 10);
   });
 
   taskSelect.addEventListener('change', () => {
-    const taskId = taskSelect.value;
-    if (!taskId) return;
-    const task = currentTasks.find((t) => String(t.Id) === taskId);
+    const jobLineId = taskSelect.value;
+    if (!jobLineId) return;
+    const jobLine = currentJobLines.find((l) => String(l.Id) === jobLineId);
     const woLabel = woSelect.selectedOptions[0]?.textContent || '';
-    if (task) {
-      titleInput.value = task.Description;
-      descInput.value = `Task from Work Order: ${woLabel}`;
+    if (jobLine) {
+      titleInput.value = jobLine.Title;
+      descInput.value = `Job line from Work Order: ${woLabel}`;
+      if (jobLine.ScheduledDate) dateInput.value = jobLine.ScheduledDate.slice(0, 10);
     }
   });
 
@@ -4112,7 +4185,7 @@ async function renderNewCalendarEvent(params = {}) {
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || undefined,
         workOrderId: fd.get('workOrderId') || undefined,
-        workOrderTaskId: fd.get('workOrderTaskId') || undefined,
+        jobLineId: fd.get('jobLineId') || undefined,
         workOrderTemplateId: fd.get('workOrderTemplateId') || undefined,
       }) });
       toast('Event created');
@@ -4131,7 +4204,7 @@ async function renderCalendarEventDetail({ id }) {
   const { workOrders } = workOrdersRes;
   const checklistTemplates = tplRes.templates;
   const workOrderTemplates = woTplRes.templates;
-  const initialTasks = ev.WorkOrderId ? (await api(`/api/pg/work-orders/${ev.WorkOrderId}`)).tasks : [];
+  const initialJobLines = ev.WorkOrderId ? (await api(`/api/pg/work-orders/${ev.WorkOrderId}`)).jobLines : [];
 
   const checklistHtml = checklist ? checklistHtmlFor(checklist)
     : (checklistTemplates.length ? `
@@ -4148,11 +4221,11 @@ async function renderCalendarEventDetail({ id }) {
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${(ev.EventDate || '').slice(0, 10)}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(ev.Description || '')}</textarea></div>
         ${recurrenceFieldsHtml(ev)}
-        ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates, initialTasks, ev })}
+        ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates, initialJobLines, ev })}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       ${ev.WorkOrderId ? `<div class="btn-row"><button class="btn btn-secondary" id="viewWoBtn">View Linked Work Order</button></div>` : ''}
-      ${ev.TaskDescription ? `<p class="muted">Linked to task: "${escapeHtml(ev.TaskDescription)}"</p>` : ''}
+      ${ev.JobLineTitle ? `<p class="muted">Linked to job line: "${escapeHtml(ev.JobLineTitle)}"</p>` : ''}
       <div class="btn-row"><button class="btn btn-secondary" id="deleteEventBtn">Delete Event</button></div>
     </div>
     ${checklistHtml}`);
@@ -4170,7 +4243,7 @@ async function renderCalendarEventDetail({ id }) {
         title: fd.get('title'), eventDate: fd.get('eventDate'), description: fd.get('description'),
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || '', workOrderId: fd.get('workOrderId') || '',
-        workOrderTaskId: fd.get('workOrderTaskId') || '', workOrderTemplateId: fd.get('workOrderTemplateId') || '',
+        jobLineId: fd.get('jobLineId') || '', workOrderTemplateId: fd.get('workOrderTemplateId') || '',
       }) });
       toast('Event updated');
       renderCalendarEventDetail({ id });
@@ -4622,14 +4695,68 @@ async function renderRequestDetail({ id }, container = app) {
   });
 }
 
+const RESPONSIBILITY_CLASS_LABELS = { self: 'Self', volunteer: 'Volunteer', vendor: 'Vendor', cabin_holder: 'Cabin-Holder' };
+
+// Job line creation flow (Build Brief v2, 1.7): each "+ Add job line" row
+// captures title, responsibility class, funding source + ref, estimated
+// hours/cost, and a scheduled date that defaults to the WO's own date.
+// Which SPECIFIC volunteer/vendor does the work is deferred to the WO detail
+// page after creation — same precedent this form already used for
+// responsibleSelf/crew before Phase 1, and the same "capture must be
+// zero-decision, classify later" principle the brief opens with.
 async function renderNewWorkOrder({ assetId, assetName }) {
   setChrome({ title: 'New Work Order', showBack: true, showLogout: true });
-  const { templates } = await api('/api/pg/work-order-templates');
+  const [{ templates }, campaignRes, cabinRes, otherRes] = await Promise.all([
+    api('/api/pg/work-order-templates'),
+    api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
+  ]);
+  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
   const fieldTitles = state.options.propertyFields.map((f) => f.title);
+
+  const fundingRefOptionsHtml = (source, selectedId) =>
+    (fundingEntities[source] || []).map((e) => `<option value="${e.Id}" ${e.Id === selectedId ? 'selected' : ''}>${escapeHtml(e.Name)}</option>`).join('');
+
+  const jobLineRowHtml = (row = {}) => {
+    const fundingSource = row.fundingSource || 'operating_budget';
+    return `<div class="card jl-row" style="margin-bottom:10px">
+      <div class="field-row"><label>Title</label><input class="jl-title" value="${escapeHtml(row.title || '')}" placeholder="e.g. Roof repair" required /></div>
+      <div class="field-row"><label>Responsibility</label>
+        <select class="jl-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${row.responsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+      </div>
+      <div class="field-row"><label>Funding Source</label>
+        <select class="jl-funding-source">${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}" ${fundingSource === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+      </div>
+      <div class="field-row jl-funding-ref-row" ${fundingSource === 'operating_budget' ? 'hidden' : ''}>
+        <label>${escapeHtml(FUNDING_SOURCE_LABELS[fundingSource] || '')}</label>
+        <select class="jl-funding-ref">${fundingRefOptionsHtml(fundingSource, row.fundingRefId)}</select>
+      </div>
+      <div class="field-row"><label>Est. Hours</label><input class="jl-est-hours" type="number" min="0" value="${row.estimatedHours ?? ''}" /></div>
+      <div class="field-row"><label>Est. Cost</label><input class="jl-est-cost" type="number" step="0.01" min="0" value="${row.estimatedCost ?? ''}" /></div>
+      <div class="field-row"><label>Scheduled Date</label><input class="jl-scheduled-date" type="date" value="${row.scheduledDate || ''}" />
+        <p class="muted" style="margin-top:2px;font-size:0.8rem">Defaults to the work order's date if left blank.</p>
+      </div>
+      <button type="button" class="btn btn-secondary row-remove">✕ Remove line</button>
+    </div>`;
+  };
+  function wireJobLineRow(row) {
+    const sourceSelect = row.querySelector('.jl-funding-source');
+    const refRow = row.querySelector('.jl-funding-ref-row');
+    const refLabel = refRow.querySelector('label');
+    const refSelect = row.querySelector('.jl-funding-ref');
+    sourceSelect.addEventListener('change', () => {
+      const source = sourceSelect.value;
+      if (source === 'operating_budget') { refRow.hidden = true; return; }
+      refRow.hidden = false;
+      refLabel.textContent = FUNDING_SOURCE_LABELS[source];
+      refSelect.innerHTML = fundingRefOptionsHtml(source, null);
+    });
+    row.querySelector('.row-remove').onclick = () => row.remove();
+  }
+
   const taskRowHtml = (text = '') => `<div class="inline-add-row task-row"><input class="task-text" value="${escapeHtml(text)}" placeholder="Task description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>`;
-  const jobLineRowHtml = (row = {}) => `<div class="inline-add-row jl-row" style="align-items:center">
-    <select class="jl-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
-    <input class="jl-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
+  const assetUpdateRowHtml = (row = {}) => `<div class="inline-add-row au-row" style="align-items:center">
+    <select class="au-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
+    <input class="au-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
     <button type="button" class="btn btn-secondary row-remove">✕</button>
   </div>`;
 
@@ -4648,20 +4775,17 @@ async function renderNewWorkOrder({ assetId, assetName }) {
           <select name="priority"><option>Low</option><option selected>Medium</option><option>High</option><option>Urgent</option></select>
         </div>
         <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" /></div>
-        <div class="field-row"><label>Responsible Party</label>
-          <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="responsibleSelf" style="margin-right:6px" />Self</label>
-          <p class="muted" style="margin-top:4px">Volunteers/Vendors are assigned after creation, from the work order's detail page.</p>
-        </div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
-        <div class="field-row"><label>Tasks (scope of work)</label>
-          <div class="task-rows"></div>
-          <button type="button" class="btn btn-secondary" id="addTaskRowBtn" style="margin-top:6px">+ Add Task</button>
+        <div class="field-row"><label>Job Lines</label>
+          <p class="muted" style="margin:2px 0 8px">Each line is its own hours, cost, funding, and responsibility — a vendor on the roof, volunteers on the deck, same work order.</p>
+          <div class="jl-rows"></div>
+          <button type="button" class="btn btn-secondary" id="addJlRowBtn" style="margin-top:6px">+ Add Job Line</button>
         </div>
         <details style="margin:16px 0">
           <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
           <p class="muted" style="margin:8px 0">Only for the rare case this WO should change a stable asset fact — most work orders don't need this.</p>
-          <div class="jl-rows"></div>
-          <button type="button" class="btn btn-secondary" id="addJlBtn" style="margin-top:6px">+ Add Field Update</button>
+          <div class="au-rows"></div>
+          <button type="button" class="btn btn-secondary" id="addAuBtn" style="margin-top:6px">+ Add Field Update</button>
         </details>
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Create Work Order</button>
@@ -4673,15 +4797,17 @@ async function renderNewWorkOrder({ assetId, assetName }) {
   let assetPicker = null;
   if (!assetId) assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'));
 
-  function wireRowRemove() { app.querySelectorAll('.row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); }); }
-  document.getElementById('addTaskRowBtn').addEventListener('click', () => {
-    document.querySelector('.task-rows').insertAdjacentHTML('beforeend', taskRowHtml());
+  function wireRowRemove() { app.querySelectorAll('.au-row .row-remove, .task-row .row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); }); }
+  function addJobLineRow(row) {
+    document.querySelector('.jl-rows').insertAdjacentHTML('beforeend', jobLineRowHtml(row));
+    wireJobLineRow(document.querySelector('.jl-rows').lastElementChild);
+  }
+  document.getElementById('addJlRowBtn').addEventListener('click', () => addJobLineRow());
+  document.getElementById('addAuBtn').addEventListener('click', () => {
+    document.querySelector('.au-rows').insertAdjacentHTML('beforeend', assetUpdateRowHtml());
     wireRowRemove();
   });
-  document.getElementById('addJlBtn').addEventListener('click', () => {
-    document.querySelector('.jl-rows').insertAdjacentHTML('beforeend', jobLineRowHtml());
-    wireRowRemove();
-  });
+  addJobLineRow(); // start with one blank line — the common case is at least one
 
   document.getElementById('tplPicker')?.addEventListener('change', (e) => {
     const tpl = templates.find((t) => t.Id === Number(e.target.value));
@@ -4690,8 +4816,10 @@ async function renderNewWorkOrder({ assetId, assetName }) {
     if (tpl.DefaultTitle) form.title.value = tpl.DefaultTitle;
     if (tpl.DefaultPriority) form.priority.value = tpl.DefaultPriority;
     if (tpl.DefaultDescription) form.description.value = tpl.DefaultDescription;
-    document.querySelector('.task-rows').innerHTML = (tpl.TaskDefaults || []).map(taskRowHtml).join('');
-    document.querySelector('.jl-rows').innerHTML = (tpl.JobLineDefaults || []).map(jobLineRowHtml).join('');
+    document.querySelector('.jl-rows').innerHTML = '';
+    (tpl.JobLineDefaults || []).forEach((l) => addJobLineRow({ ...(typeof l === 'string' ? { title: l } : l), responsibilityClass: (typeof l === 'object' && l.responsibilityClass) || tpl.DefaultResponsibilityClass }));
+    if (!(tpl.JobLineDefaults || []).length) addJobLineRow();
+    document.querySelector('.au-rows').innerHTML = (tpl.AssetUpdateDefaults || []).map(assetUpdateRowHtml).join('');
     wireRowRemove();
     toast(`Prefilled from "${tpl.Name}" — review before creating`);
   });
@@ -4703,15 +4831,22 @@ async function renderNewWorkOrder({ assetId, assetName }) {
     const title = fd.get('title');
     const finalAssetId = assetId || assetPicker?.getSelected()?.Id;
     if (!finalAssetId) { toast('Pick an asset first (or add a new one)'); return; }
-    const tasks = [...document.querySelectorAll('.task-row .task-text')].map((el) => el.value.trim()).filter(Boolean);
-    const assetUpdates = [...document.querySelectorAll('.jl-row')].map((row) => ({
-      targetField: row.querySelector('.jl-field').value, newValue: row.querySelector('.jl-value').value,
+    const jobLines = [...document.querySelectorAll('.jl-row')].map((row) => ({
+      title: row.querySelector('.jl-title').value.trim(),
+      responsibilityClass: row.querySelector('.jl-resp').value,
+      fundingSource: row.querySelector('.jl-funding-source').value,
+      fundingRefId: row.querySelector('.jl-funding-ref-row').hidden ? null : (row.querySelector('.jl-funding-ref').value || null),
+      estimatedHours: row.querySelector('.jl-est-hours').value || null,
+      estimatedCost: row.querySelector('.jl-est-cost').value || null,
+      scheduledDate: row.querySelector('.jl-scheduled-date').value || null,
+    })).filter((l) => l.title);
+    const assetUpdates = [...document.querySelectorAll('.au-row')].map((row) => ({
+      targetField: row.querySelector('.au-field').value, newValue: row.querySelector('.au-value').value,
     })).filter((r) => r.newValue.trim());
     try {
       const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({
         title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description'),
-        scheduledDate: fd.get('scheduledDate') || undefined, tasks, assetUpdates,
-        responsibleSelf: fd.has('responsibleSelf'),
+        scheduledDate: fd.get('scheduledDate') || undefined, jobLines, assetUpdates,
       }) });
       toast('Work order created');
       go('workOrderDetail', { id: result.workOrderId }, { replace: true });
@@ -4722,184 +4857,119 @@ async function renderNewWorkOrder({ assetId, assetName }) {
 const FUNDING_SOURCE_LABELS = {
   operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other',
 };
-const FUNDING_SOURCE_ENDPOINT = {
-  capital_campaign: 'budget/capital-campaign-projects', cabin_holder: 'budget/cabin-holders', other: 'budget/other-categories',
-};
-// Search-as-you-type combobox for linking a Capital Campaign Project /
-// Cabin-Holder / Other category — same interaction pattern as
-// mountAssetCombobox (type to search; if it doesn't exist, an inline
-// "+ Add new" form creates it on the fly with its full fields).
-function mountFundingCombobox(container, { kind, entities, initialEntity = null, onSelect = () => {} }) {
-  let selected = initialEntity;
-  container.classList.add('ac-wrap');
-  container.innerHTML = `
-    <input type="text" class="ac-input" autocomplete="off" placeholder="Search or create a ${escapeHtml(FUNDING_SOURCE_LABELS[kind])}…"
-      value="${initialEntity ? escapeHtml(initialEntity.Name) : ''}" />
-    <div class="ac-results" hidden></div>`;
-  const input = container.querySelector('.ac-input');
-  const resultsEl = container.querySelector('.ac-results');
+// The old WO-level funding combobox (search/inline-create) was retired with
+// Phase 1 — funding now lives per-line via a plain <select> populated from
+// fundingEntities (see jobLineRowHtml/jobLineCardHtml). Creating a brand new
+// Capital Campaign Project / Cabin-Holder / Other category happens on the
+// Capital Plan page (renderCapitalPlan), which already has full CRUD for
+// all three — a job line just picks from what exists there.
 
-  function renderResults(query) {
-    const q = query.toLowerCase();
-    const matches = entities.filter((ent) => ent.Name.toLowerCase().includes(q));
-    const rows = matches.map((ent) => `
-      <div class="ac-item" data-id="${ent.Id}" data-name="${escapeHtml(ent.Name)}">
-        ${escapeHtml(ent.Name)}${ent.Description ? ` <span class="muted">— ${escapeHtml(ent.Description)}</span>` : ''}
-      </div>`).join('');
-    const addRow = query ? `<div class="ac-item ac-add" data-add-name="${escapeHtml(query)}">➕ Create new ${escapeHtml(FUNDING_SOURCE_LABELS[kind])} "${escapeHtml(query)}"…</div>` : '';
-    resultsEl.innerHTML = rows + addRow;
-    resultsEl.hidden = false;
-    resultsEl.querySelectorAll('.ac-item[data-id]').forEach((el) => el.addEventListener('click', () => {
-      selected = entities.find((ent) => ent.Id === Number(el.dataset.id));
-      input.value = el.dataset.name;
-      resultsEl.hidden = true;
-      onSelect(selected);
-    }));
-    resultsEl.querySelector('.ac-add')?.addEventListener('click', () => showQuickCreateForm(resultsEl.querySelector('.ac-add').dataset.addName));
-  }
+// One job line's full edit surface — title/responsibility/funding/hours/cost/
+// schedule up top (the 1.7 creation fields, still editable after), then
+// complaint/cause/correction (1.6 — filled in during/after the work) and
+// blocked state (columns land in Phase 1; the WO-level derived badge and
+// close-gate logic are Phase 2), then its own crew and photos. Collapsed by
+// default (<details>) so N lines on one WO doesn't turn the page into an
+// unreadable wall on a phone.
+function jobLineCardHtml(jl, { fundingEntities, causesCatalog }) {
+  const fundingSource = jl.FundingSource || 'operating_budget';
+  const fundingRefOptions = (fundingEntities[fundingSource] || []).map((e) => `<option value="${e.Id}" ${e.Id === jl.FundingRefId ? 'selected' : ''}>${escapeHtml(e.Name)}</option>`).join('');
+  const selectedCauseIds = new Set((jl.Causes || []).map((c) => c.Id));
+  const summaryBits = [
+    RESPONSIBILITY_CLASS_LABELS[jl.ResponsibilityClass] || jl.ResponsibilityClass,
+    jl.EstimatedCost != null ? `$${Number(jl.EstimatedCost).toLocaleString()} est.` : null,
+    jl.EstimatedHours != null ? `${jl.EstimatedHours}h est.` : null,
+    jl.ScheduledDate ? `Sched. ${formatDateNice(jl.ScheduledDate)}` : null,
+    jl.BlockedReason ? '🚧 Blocked' : null,
+  ].filter(Boolean).join(' · ');
 
-  function showQuickCreateForm(name) {
-    resultsEl.innerHTML = `<div class="ac-item" style="cursor:default">
-      <div class="field-row" style="margin-bottom:8px"><label>Name</label><input class="ac-new-name" value="${escapeHtml(name)}" /></div>
-      <div class="field-row" style="margin-bottom:8px"><label>Description (optional)</label><textarea class="ac-new-desc"></textarea></div>
-      <div class="btn-row" style="margin-top:0">
-        <button type="button" class="btn btn-primary ac-create-confirm">Create</button>
-        <button type="button" class="btn btn-secondary ac-create-cancel">Cancel</button>
+  return `<details class="card jl-card" data-id="${jl.Id}">
+    <summary style="cursor:pointer;display:flex;align-items:center;gap:10px;list-style:none">
+      <input type="checkbox" class="jl-done-toggle" data-id="${jl.Id}" ${jl.Done ? 'checked' : ''} onclick="event.stopPropagation()" />
+      <span style="flex:1;${jl.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">
+        <strong>${escapeHtml(jl.Title)}</strong>
+        <div class="muted" style="font-weight:400;font-size:0.85rem">${summaryBits}</div>
+      </span>
+    </summary>
+    <form class="jl-edit-form" style="margin-top:12px">
+      <div class="field-row"><label>Title</label><input class="jl-e-title" value="${escapeHtml(jl.Title)}" required /></div>
+      <div class="field-row"><label>Responsibility</label>
+        <select class="jl-e-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${jl.ResponsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
       </div>
-    </div>`;
-    resultsEl.querySelector('.ac-create-cancel').addEventListener('click', () => { resultsEl.hidden = true; });
-    resultsEl.querySelector('.ac-create-confirm').addEventListener('click', async () => {
-      const finalName = resultsEl.querySelector('.ac-new-name').value.trim();
-      if (!finalName) { toast('Name is required'); return; }
-      const description = resultsEl.querySelector('.ac-new-desc').value.trim();
-      try {
-        const { item } = await api(`/api/pg/${FUNDING_SOURCE_ENDPOINT[kind]}`, { method: 'POST', body: JSON.stringify({ name: finalName, description, notes: description }) });
-        entities.push(item);
-        selected = item;
-        input.value = item.Name;
-        resultsEl.hidden = true;
-        toast(`${FUNDING_SOURCE_LABELS[kind]} "${item.Name}" created`);
-        onSelect(selected);
-      } catch (err) { toast(err.message); }
-    });
-  }
+      <div class="field-row"><label>Funding Source</label>
+        <select class="jl-e-funding-source">${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}" ${fundingSource === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+      </div>
+      <div class="field-row jl-e-funding-ref-row" ${fundingSource === 'operating_budget' ? 'hidden' : ''}>
+        <label>${escapeHtml(FUNDING_SOURCE_LABELS[fundingSource] || '')}</label>
+        <select class="jl-e-funding-ref">${fundingRefOptions}</select>
+      </div>
+      <div class="field-row"><label>Estimated Hours</label><input class="jl-e-est-hours" type="number" min="0" value="${jl.EstimatedHours ?? ''}" /></div>
+      <div class="field-row"><label>Actual Hours</label><input class="jl-e-act-hours" type="number" min="0" value="${jl.ActualHours ?? ''}" /></div>
+      <div class="field-row"><label>Estimated Cost</label><input class="jl-e-est-cost" type="number" step="0.01" min="0" value="${jl.EstimatedCost ?? ''}" /></div>
+      <div class="field-row"><label>Actual Cost</label><input class="jl-e-act-cost" type="number" step="0.01" min="0" value="${jl.ActualCost ?? ''}" /></div>
+      <div class="field-row"><label>Scheduled Date</label><input class="jl-e-scheduled-date" type="date" value="${(jl.ScheduledDate || '').slice(0, 10)}" /></div>
+      <div class="field-row"><label>Complaint</label><textarea class="jl-e-complaint" placeholder="What's wrong?">${escapeHtml(jl.Complaint || '')}</textarea></div>
+      <div class="field-row"><label>Cause</label>
+        <div class="skill-chips">${causesCatalog.map((c) => `<label class="skill-chip ${selectedCauseIds.has(c.Id) ? 'selected' : ''}" style="cursor:pointer"><input type="checkbox" class="jl-e-cause" value="${c.Id}" style="margin-right:6px" ${selectedCauseIds.has(c.Id) ? 'checked' : ''} />${escapeHtml(c.Name)}</label>`).join('')}</div>
+        <p class="muted" style="font-size:0.8rem;margin-top:4px">The dropdown is what gets counted. Add "Unknown" rather than guessing.</p>
+      </div>
+      <div class="field-row"><label>Cause Note</label><textarea class="jl-e-cause-note" placeholder="Freetext detail — never becomes a new cause option">${escapeHtml(jl.CauseNote || '')}</textarea></div>
+      <div class="field-row"><label>Correction</label><textarea class="jl-e-correction" placeholder="What was done to fix it?">${escapeHtml(jl.Correction || '')}</textarea></div>
+      <div class="field-row"><label>Blocked Reason</label><input class="jl-e-blocked-reason" value="${escapeHtml(jl.BlockedReason || '')}" placeholder="Leave blank if not blocked" /></div>
+      <div class="field-row"><label>Blocked Since</label><input class="jl-e-blocked-since" type="date" value="${(jl.BlockedSince || '').slice(0, 10)}" /></div>
+      <div class="btn-row">
+        <button class="btn btn-primary jl-save-btn" type="submit">Save Line</button>
+        <button class="btn btn-secondary jl-delete-btn" type="button" data-label="${escapeHtml(jl.Title)}">Delete Line</button>
+      </div>
+    </form>
 
-  input.addEventListener('input', () => {
-    selected = null;
-    onSelect(null);
-    const q = input.value.trim();
-    if (!q) { resultsEl.hidden = true; return; }
-    renderResults(q);
-  });
-  input.addEventListener('focus', () => { if (input.value.trim()) renderResults(input.value.trim()); });
-  document.addEventListener('click', (e) => { if (!container.contains(e.target)) resultsEl.hidden = true; });
-
-  return {
-    getSelected: () => selected,
-    setSelected: (ent) => { selected = ent; input.value = ent ? ent.Name : ''; resultsEl.hidden = true; },
-  };
-}
-
-function fundingFieldsHtml(wo) {
-  const hasTarget = wo.FundingSource && wo.FundingSource !== 'operating_budget';
-  return `
-    <div class="field-row"><label>Funding Source</label>
-      <select name="fundingSource" id="fundingSource">
-        ${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}" ${wo.FundingSource === k ? 'selected' : ''}>${v}</option>`).join('')}
-      </select>
+    <div style="margin-top:14px">
+      <h4 style="margin-bottom:6px">Assigned to this line</h4>
+      ${(jl.volunteers || []).map((v) => `<div class="list-item" style="cursor:default"><span>👷 ${escapeHtml(v.Name)}</span><button class="btn btn-secondary jl-unassign-vol" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('')}
+      ${(jl.vendors || []).map((v) => `<div class="list-item" style="cursor:default"><span>🔧 ${escapeHtml(v.Name)}</span><button class="btn btn-secondary jl-unassign-ven" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('')}
+      ${!(jl.volunteers || []).length && !(jl.vendors || []).length ? '<p class="muted">None assigned.</p>' : ''}
+      <div class="field-row"><select class="jl-assign-picker"><option value="">— assign volunteer or vendor —</option>
+        ${(state._allVolunteers || []).filter((v) => !(jl.volunteers || []).some((a) => a.Id === v.Id)).map((v) => `<option value="vol:${v.Id}">👷 ${escapeHtml(v.Name)}</option>`).join('')}
+        ${(state._allVendors || []).filter((v) => !(jl.vendors || []).some((a) => a.Id === v.Id)).map((v) => `<option value="ven:${v.Id}">🔧 ${escapeHtml(v.Name)}</option>`).join('')}
+      </select></div>
     </div>
-    <div class="field-row" id="fundingRefRow" ${hasTarget ? '' : 'hidden'}>
-      <label id="fundingRefLabel">${FUNDING_SOURCE_LABELS[wo.FundingSource] || ''}</label>
-      <div id="fundingRefPicker"></div>
-    </div>`;
-}
-function wireFundingFields(root, fundingEntities, wo, getCurrentAsset) {
-  const sourceSelect = root.querySelector('#fundingSource');
-  const refRow = root.querySelector('#fundingRefRow');
-  const refLabel = root.querySelector('#fundingRefLabel');
-  const pickerEl = root.querySelector('#fundingRefPicker');
-  let picker = null;
 
-  function mountPicker(kind, initialEntity) {
-    picker = mountFundingCombobox(pickerEl, { kind, entities: fundingEntities[kind] || [], initialEntity });
-  }
-  if (sourceSelect.value !== 'operating_budget') {
-    const known = fundingEntities[sourceSelect.value]?.find((e) => e.Id === wo.FundingRefId);
-    const initial = known || (wo.FundingRefId ? { Id: wo.FundingRefId, Name: wo.FundingRefLabel } : null);
-    mountPicker(sourceSelect.value, initial);
-  }
-
-  sourceSelect.addEventListener('change', () => {
-    const source = sourceSelect.value;
-    if (source === 'operating_budget') { refRow.hidden = true; return; }
-    refRow.hidden = false;
-    refLabel.textContent = FUNDING_SOURCE_LABELS[source];
-    mountPicker(source, null);
-    // Cabin-holder auto-link: if the WO's asset already has a lodge-holder
-    // name on file, find (or create) the matching cabin-holder and select
-    // it automatically — the whole point being one less manual step.
-    if (source === 'cabin_holder') autoLinkCabinHolder();
-  });
-
-  async function autoLinkCabinHolder() {
-    const asset = getCurrentAsset() || wo.Asset;
-    const lodgeHolder = asset?.LodgeHolder?.trim();
-    if (!lodgeHolder) return;
-    const list = fundingEntities.cabin_holder || [];
-    let match = list.find((c) => c.Name.toLowerCase() === lodgeHolder.toLowerCase());
-    if (!match) {
-      try {
-        const { item } = await api('/api/pg/budget/cabin-holders', { method: 'POST', body: JSON.stringify({ name: lodgeHolder }) });
-        list.push(item);
-        match = item;
-        toast(`Linked cabin-holder "${lodgeHolder}" (created from this asset's records)`);
-      } catch (err) { toast(err.message); return; }
-    } else {
-      toast(`Linked cabin-holder "${match.Name}" (from this asset's records)`);
-    }
-    picker?.setSelected(match);
-  }
-
-  return { getPicker: () => picker };
+    <div style="margin-top:14px">
+      <h4 style="margin-bottom:6px">Photos</h4>
+      <div class="photo-grid">${(jl.Photos || []).map((p) => `
+        <div class="photo-thumb" style="width:56px;height:56px">
+          <img src="${p.Url}" alt="" />
+          <button type="button" class="photo-remove jl-delete-photo" data-id="${p.Id}">&times;</button>
+        </div>`).join('')}</div>
+      <button type="button" class="btn btn-secondary jl-add-photo-btn" style="padding:4px 8px;font-size:0.8rem;margin-top:6px">📷 Add Photo</button>
+      <input type="file" class="jl-photo-input" accept="image/*" capture="environment" multiple hidden />
+    </div>
+  </details>`;
 }
 
 async function renderWorkOrderDetail({ id }, container = app) {
   if (container === app) setChrome({ title: 'Work Order', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
-  const [detail, allVolunteers, allVendors, skillsRes, tplRes, campaignRes, cabinRes, otherRes] = await Promise.all([
+  const [detail, allVolunteers, allVendors, skillsRes, tplRes, campaignRes, cabinRes, otherRes, causesRes] = await Promise.all([
     api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'), api('/api/pg/skills'),
     api('/api/pg/checklist-templates'),
     api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
+    api('/api/pg/causes'),
   ]);
   const allSkills = skillsRes.skills.map((s) => s.Name);
   const checklistTemplates = tplRes.templates;
   const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
-  const { workOrder: wo, assetUpdates, volunteers, vendors, tasks, checklist, logEntries, crewSessions, photos } = detail;
+  const causesCatalog = causesRes.causes;
+  const { workOrder: wo, rollup, crewRoster, assetUpdates, jobLines, checklist, logEntries, crewSessions, photos } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
+  // Job-line pickers (assign-crew, crew-session attendee union) read the full
+  // roster off `state` rather than threading it through every helper — same
+  // trick the rest of this file uses for state.options.
+  state._allVolunteers = allVolunteers.volunteers;
+  state._allVendors = allVendors.vendors;
 
-  // Small (56px) thumbnails, unbounded count — the schema doesn't cap how
-  // many "solution" photos a task or WO can have; only the report/export
-  // picker later limits how many actually go on the page.
-  const taskPhotoThumbs = (taskId, taskPhotos = []) => `
-    ${taskPhotos.map((p) => `
-      <div class="photo-thumb" style="width:56px;height:56px">
-        <img src="${p.Url}" alt="" />
-        <button type="button" class="photo-remove delete-task-photo" data-id="${p.Id}">&times;</button>
-      </div>`).join('')}
-    <button type="button" class="btn btn-secondary add-task-photo-btn" data-task-id="${taskId}" style="padding:4px 8px;font-size:0.8rem">📷 Add Photo</button>
-    <input type="file" class="task-photo-input" data-task-id="${taskId}" accept="image/*" capture="environment" multiple hidden />`;
-
-  const taskRows = tasks.map((t) => `
-    <div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start">
-      <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
-        <input type="checkbox" class="task-toggle" data-id="${t.Id}" ${t.Done ? 'checked' : ''} />
-        <span style="${t.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(t.Description)}</span>
-      </label>
-      <button class="btn btn-secondary delete-task" data-id="${t.Id}" data-label="${escapeHtml(t.Description)}">Delete</button>
-      <div style="flex-basis:100%;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px">
-        ${taskPhotoThumbs(t.Id, t.Photos)}
-      </div>
-    </div>`).join('') || '<p class="muted">No tasks yet — add the scope of work below.</p>';
+  const jobLineRows = jobLines.map((jl) => jobLineCardHtml(jl, { fundingEntities, causesCatalog })).join('')
+    || '<p class="muted">No job lines yet — add the scope of work below.</p>';
 
   const woPhotoRows = (photos || []).map((p) => `
     <div class="photo-thumb">
@@ -4945,15 +5015,25 @@ async function renderWorkOrderDetail({ id }, container = app) {
       <button class="btn btn-secondary delete-crew-session" data-id="${s.Id}" style="align-self:center">Delete</button>
     </div>`).join('') || '<p class="muted">No sessions logged yet.</p>';
 
-  const assignedVolIds = new Set(volunteers.map((v) => v.Id));
-  const assignedVenIds = new Set(vendors.map((v) => v.Id));
-  const availableVols = allVolunteers.volunteers.filter((v) => !assignedVolIds.has(v.Id));
-  const availableVens = allVendors.vendors.filter((v) => !assignedVenIds.has(v.Id));
+
+  // Read-only rollup — hours/cost/funding/schedule now live on job lines
+  // (Phase 1); this is workOrderRollup() surfaced, never editable directly.
+  const rollupHtml = `
+    <div class="card">
+      <h4 style="margin-top:0">Rollup (from ${rollup.LineCount} job line${rollup.LineCount === 1 ? '' : 's'})</h4>
+      <p class="muted" style="margin:-4px 0 8px">
+        ${rollup.EstimatedCost ? `$${rollup.EstimatedCost.toLocaleString()} est.` : 'No cost estimated yet'}${rollup.ActualCost ? ` · $${rollup.ActualCost.toLocaleString()} actual` : ''}
+        · ${rollup.EstimatedHours || 0}h est.${rollup.ActualHours ? ` · ${rollup.ActualHours}h actual` : ''}
+      </p>
+      ${rollup.FundingBreakdown.length ? `<div class="muted" style="font-size:0.85rem">
+        ${rollup.FundingBreakdown.map((f) => `${FUNDING_SOURCE_LABELS[f.FundingSource] || f.FundingSource}${f.FundingRefLabel ? ` (${escapeHtml(f.FundingRefLabel)})` : ''}: $${f.Cost.toLocaleString()}`).join(' · ')}
+      </div>` : ''}
+      ${rollup.EarliestScheduledDate ? `<p class="muted" style="margin-bottom:0"><a href="#" id="viewOnCalendarLink">📅 Earliest scheduled line: ${formatDateNice(rollup.EarliestScheduledDate)}</a></p>` : ''}
+    </div>`;
 
   container.innerHTML = `
     <div class="card">
       <h3>${escapeHtml(wo.Title)}</h3>
-      ${wo['Scheduled Date'] ? `<p class="muted"><a href="#" id="viewOnCalendarLink">📅 View on Calendar (${new Date(wo['Scheduled Date']).toLocaleDateString('default', { month: 'long', year: 'numeric' })})</a></p>` : ''}
       <form id="woFieldsForm">
         <div class="field-row"><label>Asset</label><div id="woAssetPicker"></div></div>
         <div class="field-row"><label>Status</label>
@@ -4962,23 +5042,10 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <div class="field-row"><label>Priority</label>
           <select name="priority">${['Low', 'Medium', 'High', 'Urgent'].map((s) => `<option ${wo.Priority === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         </div>
-        <div class="field-row"><label>Responsible Party</label>
-          <div class="skill-chips">
-            <label class="skill-chip ${wo.ResponsibleSelf ? 'selected' : ''}" style="cursor:pointer"><input type="checkbox" name="responsibleSelf" style="margin-right:6px" ${wo.ResponsibleSelf ? 'checked' : ''} />Self</label>
-            <span class="pill ${volunteers.length ? 'good' : ''}" title="Set in Assigned Crew below">Volunteer${volunteers.length ? '' : ' (none assigned)'}</span>
-            <span class="pill ${vendors.length ? 'good' : ''}" title="Set in Assigned Crew below">Vendor${vendors.length ? '' : ' (none assigned)'}</span>
-          </div>
-        </div>
-        <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" value="${(wo['Scheduled Date'] || '').slice(0, 10)}" /></div>
         <div class="field-row"><label>Board Focus</label>
           <label class="skill-chip ${wo.BoardFocus ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="boardFocus" style="margin-right:6px" ${wo.BoardFocus ? 'checked' : ''} />Flag for board report</label>
         </div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(wo.Description || '')}</textarea></div>
-        <div class="field-row"><label>Estimated Hours</label><input name="estimatedHours" type="number" value="${wo['Estimated Hours'] ?? ''}" /></div>
-        <div class="field-row"><label>Actual Hours</label><input name="actualHours" type="number" value="${wo['Actual Hours'] ?? ''}" /></div>
-        <div class="field-row"><label>Estimated Cost</label><input name="estimatedCost" type="number" step="0.01" value="${wo['Estimated Cost'] ?? ''}" /></div>
-        <div class="field-row"><label>Actual Cost</label><input name="actualCost" type="number" step="0.01" value="${wo['Actual Cost'] ?? ''}" /></div>
-        ${fundingFieldsHtml(wo)}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       <div class="btn-row">
@@ -4987,6 +5054,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <button class="btn btn-secondary" id="duplicateWoBtn">Duplicate</button>
       </div>
     </div>
+
+    ${rollupHtml}
 
     <div class="card">
       <h3>Photos</h3>
@@ -4997,10 +5066,19 @@ async function renderWorkOrderDetail({ id }, container = app) {
     </div>
 
     <div class="card">
-      <h3>Tasks</h3>
-      <p class="muted">The scope of work — plain checklist items, not tied to any audit field. Each task can carry its own completion photos too.</p>
-      ${taskRows}
-      <div class="inline-add-row"><input class="new-task-input" placeholder="Add a task…" /><button type="button" class="btn btn-secondary" id="addTaskBtn">+</button></div>
+      <h3>Job Lines</h3>
+      <p class="muted">The unit of work — hours, cost, funding, responsibility, and scope all live on the line. A vendor on the roof, volunteers on the deck, one work order.</p>
+      ${jobLineRows}
+      <div class="card" style="margin-top:10px;background:transparent;border:1px dashed var(--border,#ccc)">
+        <h4 style="margin-top:0">+ Add Job Line</h4>
+        <form id="addJlForm">
+          <div class="field-row"><label>Title</label><input name="title" placeholder="e.g. Roof repair" required /></div>
+          <div class="field-row"><label>Responsibility</label>
+            <select name="responsibilityClass">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}">${v}</option>`).join('')}</select>
+          </div>
+          <button class="btn btn-primary" type="submit">Add Job Line</button>
+        </form>
+      </div>
     </div>
 
     <div class="card">
@@ -5023,7 +5101,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
       <p class="muted" style="margin-top:8px">Only for the rare case this WO should change a stable asset fact (e.g. Window Count after installing new windows) — most work orders don't need this.</p>
       ${fieldUpdateRows}
-      <form id="addJobLineForm" style="margin-top:10px">
+      <form id="addAssetUpdateForm" style="margin-top:10px">
         <div class="field-row"><label>Field</label><select name="targetField" required><option value="">— select —</option>${propertyFieldTitles.map((t) => `<option>${escapeHtml(t)}</option>`).join('')}</select></div>
         <div class="field-row"><label>New Value</label><input name="newValue" required /></div>
         <button class="btn btn-secondary" type="submit">Add Field Update</button>
@@ -5031,68 +5109,29 @@ async function renderWorkOrderDetail({ id }, container = app) {
     </details>
 
     <div class="card">
-      <h3>Assigned Crew</h3>
-      <h4 style="margin-bottom:6px">Volunteers</h4>
-      ${volunteers.map((v) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(v.Name)}</span><button class="btn btn-secondary unassign-vol" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('') || '<p class="muted">None assigned.</p>'}
-      <form id="assignVolForm" style="margin-top:8px">
-        <div class="field-row"><select name="volunteerId"><option value="">— add existing volunteer —</option>${availableVols.map((v) => `<option value="${v.Id}">${escapeHtml(v.Name)}</option>`).join('')}</select></div>
-        <button class="btn btn-secondary" type="submit">Assign</button>
-      </form>
-      <button type="button" class="btn btn-secondary" id="newVolToggle" style="margin-top:6px">+ New Volunteer</button>
-      <div id="newVolBox" hidden style="margin-top:10px">
-        <div class="field-row"><label>Name</label><input id="newVolName" required /></div>
-        <div class="field-row"><label>Phone</label><input id="newVolPhone" class="phone-input" type="tel" /></div>
-        <div class="field-row"><label>Skills</label>
-          <div class="skill-chips" id="newVolSkills">${skillChipsHtml(allSkills, [])}</div>
-          <div class="inline-add-row"><input class="new-skill-input" placeholder="Add a new skill…" /><button type="button" class="btn btn-secondary add-skill-btn">+</button></div>
-        </div>
-        <button type="button" class="btn btn-primary" id="newVolSave">Add & Assign</button>
-      </div>
-
-      <h4 style="margin:16px 0 6px">Vendors</h4>
-      ${vendors.map((v) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(v.Name)}</span><button class="btn btn-secondary unassign-ven" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('') || '<p class="muted">None assigned.</p>'}
-      <form id="assignVenForm" style="margin-top:8px">
-        <div class="field-row"><select name="vendorId"><option value="">— add existing vendor —</option>${availableVens.map((v) => `<option value="${v.Id}">${escapeHtml(v.Name)}</option>`).join('')}</select></div>
-        <button class="btn btn-secondary" type="submit">Assign</button>
-      </form>
-      <button type="button" class="btn btn-secondary" id="newVenToggle" style="margin-top:6px">+ New Vendor</button>
-      <div id="newVenBox" hidden style="margin-top:10px">
-        <div class="field-row"><label>Name</label><input id="newVenName" required /></div>
-        <div class="field-row"><label>Phone</label><input id="newVenPhone" class="phone-input" type="tel" /></div>
-        <div class="field-row"><label>Specialties</label>
-          <div class="skill-chips" id="newVenSkills">${skillChipsHtml(allSkills, [])}</div>
-          <div class="inline-add-row"><input class="new-skill-input" placeholder="Add a new specialty…" /><button type="button" class="btn btn-secondary add-skill-btn">+</button></div>
-        </div>
-        <button type="button" class="btn btn-primary" id="newVenSave">Add & Assign</button>
-      </div>
-    </div>
-
-    <div class="card">
       <h3>Crew Sessions</h3>
       <p class="muted">Attendance-based hours — who was here, and for how long, each time work happened on this job. Feeds the Hours report.</p>
       ${crewSessionRows}
-      ${(volunteers.length || vendors.length) ? `
+      ${(crewRoster.volunteers.length || crewRoster.vendors.length) ? `
       <form id="addCrewSessionForm" style="margin-top:10px">
         <div class="field-row"><label>Date</label><input name="sessionDate" type="date" value="${isoDate(new Date())}" required /></div>
         <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
+        <div class="field-row"><label>Job Line (optional)</label>
+          <select name="jobLineId"><option value="">— general WO time —</option>${jobLines.map((jl) => `<option value="${jl.Id}">${escapeHtml(jl.Title)}</option>`).join('')}</select>
+        </div>
         <div class="field-row"><label>Who was here?</label>
           <div class="skill-chips" id="sessionAttendeeChips">
-            ${volunteers.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="vol" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
-            ${vendors.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="ven" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
+            ${crewRoster.volunteers.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="vol" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
+            ${crewRoster.vendors.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="ven" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
           </div>
         </div>
         <div class="field-row"><label>Note (optional)</label><input name="note" placeholder="Anything worth noting" /></div>
         <button class="btn btn-primary" type="submit">Log Session</button>
-      </form>` : '<p class="muted">Assign crew above before logging a session.</p>'}
+      </form>` : '<p class="muted">Assign crew to a job line above before logging a session.</p>'}
     </div>`;
 
   const assetPicker = mountAssetCombobox(container.querySelector('#woAssetPicker'), { initialAsset: wo.Asset });
-  const fundingFieldsCtrl = wireFundingFields(container.querySelector('#woFieldsForm'), fundingEntities, wo, () => assetPicker.getSelected());
 
-  const selfCheckbox = container.querySelector('input[name="responsibleSelf"]');
-  selfCheckbox?.addEventListener('change', () => {
-    selfCheckbox.closest('.skill-chip').classList.toggle('selected', selfCheckbox.checked);
-  });
   const boardFocusCheckbox = container.querySelector('input[name="boardFocus"]');
   boardFocusCheckbox?.addEventListener('change', () => {
     boardFocusCheckbox.closest('.skill-chip').classList.toggle('selected', boardFocusCheckbox.checked);
@@ -5103,21 +5142,10 @@ async function renderWorkOrderDetail({ id }, container = app) {
     if (!await confirmDialog('Save changes to this work order?')) return;
     const fd = new FormData(e.target);
     const newAsset = assetPicker.getSelected();
-    const fundingSource = fd.get('fundingSource');
-    const fundingRefEntity = fundingSource === 'operating_budget' ? null : fundingFieldsCtrl.getPicker()?.getSelected();
-    const fundingRefId = fundingSource === 'operating_budget' ? '' : fundingRefEntity?.Id;
-    if (fundingSource !== 'operating_budget' && !fundingRefId) {
-      toast(`Choose a ${FUNDING_SOURCE_LABELS[fundingSource]} to link this to`); return;
-    }
     try {
       await api(`/api/pg/work-orders/${id}`, { method: 'PATCH', body: JSON.stringify({
         assetId: newAsset ? newAsset.Id : (wo.Asset ? wo.Asset.Id : ''),
         status: fd.get('status'), priority: fd.get('priority'), description: fd.get('description'),
-        scheduledDate: fd.get('scheduledDate') || '',
-        estimatedHours: fd.get('estimatedHours'), actualHours: fd.get('actualHours'),
-        estimatedCost: fd.get('estimatedCost'), actualCost: fd.get('actualCost'),
-        fundingSource, fundingRefId,
-        responsibleSelf: fd.has('responsibleSelf'),
         boardFocus: fd.has('boardFocus'),
       }) });
       toast('Work order updated');
@@ -5135,28 +5163,113 @@ async function renderWorkOrderDetail({ id }, container = app) {
 
   container.querySelector('#viewOnCalendarLink')?.addEventListener('click', (e) => {
     e.preventDefault();
-    const d = new Date(wo['Scheduled Date']);
+    const d = new Date(rollup.EarliestScheduledDate);
     go('calendar', { month: d.getMonth(), year: d.getFullYear(), fromWorkOrderId: id, fromWorkOrderTitle: wo.Title });
   });
 
-  container.querySelector('#addTaskBtn').addEventListener('click', async () => {
-    const input = container.querySelector('.new-task-input');
-    const description = input.value.trim();
-    if (!description) return;
+  container.querySelector('#addJlForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
     try {
-      await api(`/api/pg/work-orders/${id}/tasks`, { method: 'POST', body: JSON.stringify({ description }) });
+      await api(`/api/pg/work-orders/${id}/job-lines`, { method: 'POST', body: JSON.stringify({
+        title: fd.get('title'), responsibilityClass: fd.get('responsibilityClass'),
+      }) });
       renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message); }
   });
-  container.querySelectorAll('.task-toggle').forEach((cb) => cb.addEventListener('change', async () => {
-    try { await api(`/api/pg/work-order-tasks/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderWorkOrderDetail({ id }, container); }
-    catch (err) { toast(err.message); }
-  }));
-  container.querySelectorAll('.delete-task').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog(`Delete task "${btn.dataset.label}"?`)) return;
-    try { await api(`/api/pg/work-order-tasks/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
-    catch (err) { toast(err.message); }
-  }));
+
+  container.querySelectorAll('.jl-card').forEach((card) => {
+    const jlId = card.dataset.id;
+    const jl = jobLines.find((l) => String(l.Id) === jlId);
+
+    card.querySelector('.jl-done-toggle').addEventListener('change', async (e) => {
+      try { await api(`/api/pg/job-lines/${jlId}`, { method: 'PATCH', body: JSON.stringify({ done: e.target.checked }) }); renderWorkOrderDetail({ id }, container); }
+      catch (err) { toast(err.message); }
+    });
+
+    const fundingSourceSelect = card.querySelector('.jl-e-funding-source');
+    const fundingRefRow = card.querySelector('.jl-e-funding-ref-row');
+    fundingSourceSelect.addEventListener('change', () => {
+      const source = fundingSourceSelect.value;
+      if (source === 'operating_budget') { fundingRefRow.hidden = true; return; }
+      fundingRefRow.hidden = false;
+      fundingRefRow.querySelector('label').textContent = FUNDING_SOURCE_LABELS[source];
+      fundingRefRow.querySelector('select').innerHTML = (fundingEntities[source] || []).map((ent) => `<option value="${ent.Id}">${escapeHtml(ent.Name)}</option>`).join('');
+    });
+
+    card.querySelectorAll('.jl-e-cause').forEach((cb) => cb.addEventListener('change', () => {
+      cb.closest('.skill-chip').classList.toggle('selected', cb.checked);
+    }));
+
+    card.querySelector('.jl-edit-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const causeIds = [...card.querySelectorAll('.jl-e-cause:checked')].map((cb) => Number(cb.value));
+      try {
+        await api(`/api/pg/job-lines/${jlId}`, { method: 'PATCH', body: JSON.stringify({
+          title: card.querySelector('.jl-e-title').value.trim(),
+          responsibilityClass: card.querySelector('.jl-e-resp').value,
+          fundingSource: fundingSourceSelect.value,
+          fundingRefId: fundingRefRow.hidden ? '' : (fundingRefRow.querySelector('select').value || ''),
+          estimatedHours: card.querySelector('.jl-e-est-hours').value,
+          actualHours: card.querySelector('.jl-e-act-hours').value,
+          estimatedCost: card.querySelector('.jl-e-est-cost').value,
+          actualCost: card.querySelector('.jl-e-act-cost').value,
+          scheduledDate: card.querySelector('.jl-e-scheduled-date').value,
+          complaint: card.querySelector('.jl-e-complaint').value,
+          causeNote: card.querySelector('.jl-e-cause-note').value,
+          correction: card.querySelector('.jl-e-correction').value,
+          blockedReason: card.querySelector('.jl-e-blocked-reason').value,
+          blockedSince: card.querySelector('.jl-e-blocked-since').value,
+          causeIds,
+        }) });
+        toast('Job line saved');
+        renderWorkOrderDetail({ id }, container);
+      } catch (err) { toast(err.message); }
+    });
+    card.querySelector('.jl-delete-btn').addEventListener('click', async () => {
+      if (!await confirmDialog(`Delete job line "${card.querySelector('.jl-delete-btn').dataset.label}"? This removes its hours, cost, and crew assignments too.`)) return;
+      try { await api(`/api/pg/job-lines/${jlId}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
+      catch (err) { toast(err.message); }
+    });
+
+    card.querySelector('.jl-assign-picker').addEventListener('change', async (e) => {
+      const [kind, entId] = e.target.value.split(':');
+      if (!kind) return;
+      try {
+        if (kind === 'vol') await api(`/api/pg/job-lines/${jlId}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: Number(entId) }) });
+        else await api(`/api/pg/job-lines/${jlId}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: Number(entId) }) });
+        renderWorkOrderDetail({ id }, container);
+      } catch (err) { toast(err.message); }
+    });
+    card.querySelectorAll('.jl-unassign-vol').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!await confirmDialog(`Remove ${btn.dataset.name} from this line?`)) return;
+      await api(`/api/pg/job-lines/${jlId}/volunteers/${btn.dataset.id}`, { method: 'DELETE' });
+      renderWorkOrderDetail({ id }, container);
+    }));
+    card.querySelectorAll('.jl-unassign-ven').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!await confirmDialog(`Remove ${btn.dataset.name} from this line?`)) return;
+      await api(`/api/pg/job-lines/${jlId}/vendors/${btn.dataset.id}`, { method: 'DELETE' });
+      renderWorkOrderDetail({ id }, container);
+    }));
+
+    card.querySelector('.jl-add-photo-btn').addEventListener('click', () => card.querySelector('.jl-photo-input').click());
+    card.querySelector('.jl-photo-input').addEventListener('change', async (e) => {
+      const files = [...e.target.files];
+      if (!files.length) return;
+      try {
+        for (const file of files) {
+          const url = await uploadPhotoFile(file, 'job-lines', jlId);
+          await api(`/api/pg/job-lines/${jlId}/photos`, { method: 'POST', body: JSON.stringify({ photoUrl: url }) });
+        }
+        renderWorkOrderDetail({ id }, container);
+      } catch (err) { toast(err.message); }
+    });
+    card.querySelectorAll('.jl-delete-photo').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!await confirmDialog('Delete this photo?')) return;
+      try { await api(`/api/pg/job-line-photos/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
+      catch (err) { toast(err.message); }
+    }));
+  });
 
   container.querySelector('#addWoPhotoBtn')?.addEventListener('click', () => container.querySelector('#woPhotoInput').click());
   container.querySelector('#woPhotoInput')?.addEventListener('change', async (e) => {
@@ -5173,27 +5286,6 @@ async function renderWorkOrderDetail({ id }, container = app) {
   container.querySelectorAll('.delete-wo-photo').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog('Delete this photo?')) return;
     try { await api(`/api/pg/work-order-photos/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
-    catch (err) { toast(err.message); }
-  }));
-
-  container.querySelectorAll('.add-task-photo-btn').forEach((btn) => btn.addEventListener('click', () => {
-    container.querySelector(`.task-photo-input[data-task-id="${btn.dataset.taskId}"]`).click();
-  }));
-  container.querySelectorAll('.task-photo-input').forEach((input) => input.addEventListener('change', async (e) => {
-    const files = [...e.target.files];
-    if (!files.length) return;
-    const taskId = input.dataset.taskId;
-    try {
-      for (const file of files) {
-        const url = await uploadPhotoFile(file, 'work-order-tasks', taskId);
-        await api(`/api/pg/work-order-tasks/${taskId}/photos`, { method: 'POST', body: JSON.stringify({ photoUrl: url }) });
-      }
-      renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
-  }));
-  container.querySelectorAll('.delete-task-photo').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog('Delete this photo?')) return;
-    try { await api(`/api/pg/work-order-task-photos/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   }));
 
@@ -5223,7 +5315,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
     const chips = [...container.querySelectorAll('.crew-attendee-chip.selected')];
     try {
       await api('/api/pg/crew-sessions', { method: 'POST', body: JSON.stringify({
-        workOrderId: Number(id), sessionDate: fd.get('sessionDate'), hours: fd.get('hours') || undefined, note: fd.get('note') || undefined,
+        workOrderId: Number(id), jobLineId: fd.get('jobLineId') || undefined,
+        sessionDate: fd.get('sessionDate'), hours: fd.get('hours') || undefined, note: fd.get('note') || undefined,
         volunteerIds: chips.filter((c) => c.dataset.kind === 'vol').map((c) => Number(c.dataset.id)),
         vendorIds: chips.filter((c) => c.dataset.kind === 'ven').map((c) => Number(c.dataset.id)),
       }) });
@@ -5264,7 +5357,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
     } catch (err) { toast(err.message); }
   });
 
-  container.querySelector('#addJobLineForm').addEventListener('submit', async (e) => {
+  container.querySelector('#addAssetUpdateForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
@@ -5277,64 +5370,6 @@ async function renderWorkOrderDetail({ id }, container = app) {
     if (!await confirmDialog(`Delete the "${btn.dataset.label}" field update?`)) return;
     try { await api(`/api/pg/work-orders/${id}/asset-updates/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
-  }));
-
-  container.querySelector('#assignVolForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const volunteerId = new FormData(e.target).get('volunteerId');
-    if (!volunteerId) return;
-    await api(`/api/pg/work-orders/${id}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: Number(volunteerId) }) });
-    renderWorkOrderDetail({ id }, container);
-  });
-  container.querySelector('#assignVenForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const vendorId = new FormData(e.target).get('vendorId');
-    if (!vendorId) return;
-    await api(`/api/pg/work-orders/${id}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: Number(vendorId) }) });
-    renderWorkOrderDetail({ id }, container);
-  });
-
-  container.querySelector('#newVolToggle').addEventListener('click', () => openCrewAddBox('newVolBox', 'newVenBox'));
-  container.querySelector('#newVenToggle').addEventListener('click', () => openCrewAddBox('newVenBox', 'newVolBox'));
-  wireSkillChipToggle(container.querySelector('#newVolSkills'));
-  wireSkillChipToggle(container.querySelector('#newVenSkills'));
-  container.querySelectorAll('.add-skill-btn').forEach(wireAddSkillButton);
-  wirePhoneFormatting(container);
-  container.querySelector('#newVolSave').addEventListener('click', async () => {
-    const name = container.querySelector('#newVolName').value.trim();
-    if (!name) { toast('Name is required'); return; }
-    try {
-      const { volunteer } = await api('/api/pg/volunteers', { method: 'POST', body: JSON.stringify({
-        name, phone: container.querySelector('#newVolPhone').value.trim(),
-        skill: selectedSkillsOf(container.querySelector('#newVolSkills')),
-      }) });
-      await api(`/api/pg/work-orders/${id}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: volunteer.Id }) });
-      toast('Volunteer added and assigned');
-      renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
-  });
-  container.querySelector('#newVenSave').addEventListener('click', async () => {
-    const name = container.querySelector('#newVenName').value.trim();
-    if (!name) { toast('Name is required'); return; }
-    try {
-      const { vendor } = await api('/api/pg/vendors', { method: 'POST', body: JSON.stringify({
-        name, phone: container.querySelector('#newVenPhone').value.trim(),
-        specialty: selectedSkillsOf(container.querySelector('#newVenSkills')),
-      }) });
-      await api(`/api/pg/work-orders/${id}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: vendor.Id }) });
-      toast('Vendor added and assigned');
-      renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
-  });
-  container.querySelectorAll('.unassign-vol').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog(`Remove ${btn.dataset.name} from this work order?`)) return;
-    await api(`/api/pg/work-orders/${id}/volunteers/${btn.dataset.id}`, { method: 'DELETE' });
-    renderWorkOrderDetail({ id }, container);
-  }));
-  container.querySelectorAll('.unassign-ven').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog(`Remove ${btn.dataset.name} from this work order?`)) return;
-    await api(`/api/pg/work-orders/${id}/vendors/${btn.dataset.id}`, { method: 'DELETE' });
-    renderWorkOrderDetail({ id }, container);
   }));
 }
 
@@ -5352,33 +5387,6 @@ function wireSkillChipToggle(container) {
 }
 function selectedSkillsOf(container) {
   return [...container.querySelectorAll('.skill-chip.selected')].map((c) => c.dataset.skill);
-}
-
-// The "+ New Volunteer" / "+ New Vendor" inline boxes on WO Detail are mutually
-// exclusive — opening one while the other has unsaved text/skills prompts to
-// discard rather than silently leaving both open (a prior bug).
-function crewAddBoxHasData(boxId) {
-  const box = document.getElementById(boxId);
-  const hasText = [...box.querySelectorAll('input')].some((i) => i.value.trim());
-  const hasSkills = box.querySelectorAll('.skill-chip.selected').length > 0;
-  return hasText || hasSkills;
-}
-function resetCrewAddBox(boxId) {
-  const box = document.getElementById(boxId);
-  box.querySelectorAll('input').forEach((i) => { i.value = ''; });
-  box.querySelectorAll('.skill-chip.selected').forEach((c) => c.classList.remove('selected'));
-  box.hidden = true;
-}
-async function openCrewAddBox(openId, otherId) {
-  const otherBox = document.getElementById(otherId);
-  if (!otherBox.hidden) {
-    if (crewAddBoxHasData(otherId)) {
-      const label = otherId === 'newVolBox' ? 'volunteer' : 'vendor';
-      if (!await confirmDialog(`You have unsaved new-${label} info entered. Discard it and continue?`)) return;
-    }
-    resetCrewAddBox(otherId);
-  }
-  document.getElementById(openId).hidden = false;
 }
 
 // US phone auto-format as you type: 5551234567 -> (555) 123-4567.

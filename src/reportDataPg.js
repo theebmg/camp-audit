@@ -4,7 +4,7 @@
 // break the current one" rule. Reuses currentComponentState() from
 // components.js UNCHANGED, so "what counts as current" stays defined once,
 // regardless of which database it reads from.
-import { getAllComponentRowsWithAssetInfo, pool, getBoardFocusItems, historicalAvgActualCost } from './db.js';
+import { getAllComponentRowsWithAssetInfo, getBoardReportRawData, getBoardFocusItems, historicalAvgActualCost } from './db.js';
 import { currentComponentState } from './components.js';
 import { FUNDING_SOURCE_LABELS } from './reports.js';
 
@@ -75,49 +75,35 @@ export async function buildCapitalPlanPg({ componentType, condition } = {}) {
 // [periodStart, periodEnd]. Upcoming/overdue are relative to today rather
 // than periodEnd, since a board wants to see what's late right now even if
 // the reporting period nominally ended earlier.
+// Open-WO counts/funding totals are a live snapshot ("where things stand
+// right now"), grouped by job line since Phase 1 moved cost/funding there —
+// a WO with lines from two funding sources contributes to both totals, which
+// is correct: that WO's money really does come from two places.
+// "Completed This Period" sums each WO's lines' costs and lists every
+// funding source that touched it. "Upcoming"/"Overdue" list job lines, not
+// work orders — see getBoardReportRawData's comment for why.
 export async function buildBoardReportPg({ periodStart, periodEnd } = {}) {
   const todayStr = today();
   const start = periodStart || `${todayStr.slice(0, 7)}-01`;
   const end = periodEnd || todayStr;
 
-  const [openRes, completedRes, upcomingRes, overdueRes] = await Promise.all([
-    pool.query(`
-      SELECT status, priority, funding_source, COALESCE(actual_cost, estimated_cost, 0) AS cost
-      FROM work_orders WHERE status != 'Done'
-    `),
-    pool.query(`
-      SELECT w.id, w.title, w.date_completed, w.funding_source, COALESCE(w.actual_cost, w.estimated_cost, 0) AS cost,
-             a.name AS asset_name
-      FROM work_orders w LEFT JOIN assets a ON a.id = w.asset_id
-      WHERE w.status = 'Done' AND w.date_completed BETWEEN $1 AND $2
-      ORDER BY w.date_completed DESC
-    `, [start, end]),
-    pool.query(`
-      SELECT w.id, w.title, w.scheduled_date, w.priority, a.name AS asset_name
-      FROM work_orders w LEFT JOIN assets a ON a.id = w.asset_id
-      WHERE w.status != 'Done' AND w.scheduled_date >= $1
-      ORDER BY w.scheduled_date ASC
-    `, [todayStr]),
-    pool.query(`
-      SELECT w.id, w.title, w.scheduled_date, w.priority, a.name AS asset_name
-      FROM work_orders w LEFT JOIN assets a ON a.id = w.asset_id
-      WHERE w.status != 'Done' AND w.scheduled_date < $1
-      ORDER BY w.scheduled_date ASC
-    `, [todayStr]),
-  ]);
+  const { openStatusRows, openFundingRows, completedRows, upcomingRows, overdueRows } = await getBoardReportRawData({ periodStart: start, periodEnd: end, todayStr });
 
   const statusCounts = new Map();
   const priorityCounts = new Map();
-  const fundingTotals = new Map();
-  for (const r of openRes.rows) {
+  for (const r of openStatusRows) {
     statusCounts.set(r.status, (statusCounts.get(r.status) || 0) + 1);
     priorityCounts.set(r.priority, (priorityCounts.get(r.priority) || 0) + 1);
+  }
+  const fundingTotals = new Map();
+  for (const r of openFundingRows) {
     const key = r.funding_source || 'unspecified';
     fundingTotals.set(key, (fundingTotals.get(key) || 0) + Number(r.cost));
   }
 
   const rowShape = (r) => ({
-    id: r.id, title: r.title, scheduledDate: r.scheduled_date, priority: r.priority, assetName: r.asset_name,
+    id: r.job_line_id, workOrderId: r.work_order_id, title: r.wo_title, jobLineTitle: r.job_line_title,
+    scheduledDate: r.scheduled_date, priority: r.priority, assetName: r.asset_name,
   });
 
   return {
@@ -127,12 +113,13 @@ export async function buildBoardReportPg({ periodStart, periodEnd } = {}) {
     fundingSourceTotals: [...fundingTotals.entries()].map(([fundingSource, total]) => ({
       fundingSource, label: FUNDING_SOURCE_LABELS[fundingSource] || fundingSource, total,
     })),
-    completed: completedRes.rows.map((r) => ({
+    completed: completedRows.map((r) => ({
       id: r.id, title: r.title, dateCompleted: r.date_completed, assetName: r.asset_name,
-      cost: Number(r.cost), fundingSource: r.funding_source,
+      cost: Number(r.actual_cost ?? r.estimated_cost ?? 0),
+      fundingSource: (r.funding_sources || []).map((s) => FUNDING_SOURCE_LABELS[s] || s).join(', ') || null,
     })),
-    upcoming: upcomingRes.rows.map(rowShape),
-    overdue: overdueRes.rows.map(rowShape),
+    upcoming: upcomingRows.map(rowShape),
+    overdue: overdueRows.map(rowShape),
   };
 }
 

@@ -28,17 +28,20 @@ import {
   adminGetApplicabilityMatrix, adminSetApplicability,
   adminListSubAreas, adminCreateSubArea, adminDeleteSubArea,
   listWorkOrders, getWorkOrderDetail, createWorkOrder, updateWorkOrder, duplicateWorkOrder, getWorkOrderSummary,
+  workOrderRollup,
   listWorkOrderTemplates, createWorkOrderTemplate, updateWorkOrderTemplate, deleteWorkOrderTemplate,
   addAssetUpdateToWorkOrder, deleteAssetUpdate, completeWorkOrder,
-  assignVolunteer, unassignVolunteer, assignVendor, unassignVendor,
+  listJobLines, getJobLine, createJobLine, updateJobLine, deleteJobLine,
+  assignVolunteerToJobLine, unassignVolunteerFromJobLine, assignVendorToJobLine, unassignVendorFromJobLine,
+  listCauses, createCause, updateCause, deleteCause,
   listVolunteers, createVolunteer, updateVolunteer, removeVolunteer,
   listVendors, createVendor, updateVendor, removeVendor,
   listSkills, createSkill, searchAssetsLive, createAssetQuick,
-  listWorkOrderTasks, createWorkOrderTask, updateWorkOrderTask, deleteWorkOrderTask,
   listWorkOrderPhotos, createWorkOrderPhoto, deleteWorkOrderPhoto,
-  listWorkOrderTaskPhotosForWorkOrder, createWorkOrderTaskPhoto, deleteWorkOrderTaskPhoto,
+  listJobLinePhotosForWorkOrder, createJobLinePhoto, deleteJobLinePhoto,
   listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
+  listJobLinesScheduledInRange,
   generateDueWorkOrdersForRange,
   listChecklistTemplates, createChecklistTemplate, updateChecklistTemplate, deleteChecklistTemplate,
   getChecklistInstanceForWorkOrder, getChecklistInstanceForCalendarEvent,
@@ -732,16 +735,16 @@ router.get('/work-orders/:id', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    const [tasks, checklist, logEntries, crewSessions, photos, taskPhotosByTask] = await Promise.all([
-      listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id), listWorkOrderLogEntries(req.params.id),
-      listCrewSessionsForWorkOrder(req.params.id), listWorkOrderPhotos(req.params.id), listWorkOrderTaskPhotosForWorkOrder(req.params.id),
+    const [jobLines, checklist, logEntries, crewSessions, photos, linePhotosByLine] = await Promise.all([
+      listJobLines(req.params.id), getChecklistInstanceForWorkOrder(req.params.id), listWorkOrderLogEntries(req.params.id),
+      listCrewSessionsForWorkOrder(req.params.id), listWorkOrderPhotos(req.params.id), listJobLinePhotosForWorkOrder(req.params.id),
     ]);
-    for (const t of tasks) t.Photos = taskPhotosByTask.get(t.Id) || [];
-    res.json({ ...detail, tasks, checklist, logEntries, crewSessions, photos });
+    for (const jl of jobLines) jl.Photos = linePhotosByLine.get(jl.Id) || [];
+    res.json({ ...detail, jobLines, checklist, logEntries, crewSessions, photos });
   } catch (e) { next(e); }
 });
 
-// ---- Work Order / Task photos ("solution" photos — proof a job got done) ----
+// ---- Work Order / Job Line photos ("solution" photos — proof a job got done) ----
 
 router.post('/work-orders/:id/photos', async (req, res, next) => {
   try {
@@ -753,15 +756,15 @@ router.post('/work-orders/:id/photos', async (req, res, next) => {
 router.delete('/work-order-photos/:photoId', async (req, res, next) => {
   try { await deleteWorkOrderPhoto(req.params.photoId); res.json({ ok: true }); } catch (e) { next(e); }
 });
-router.post('/work-order-tasks/:taskId/photos', async (req, res, next) => {
+router.post('/job-lines/:jobLineId/photos', async (req, res, next) => {
   try {
     const { photoUrl } = req.body || {};
     if (!photoUrl) return res.status(400).json({ ok: false, error: 'photoUrl is required' });
-    res.json({ ok: true, photo: await createWorkOrderTaskPhoto(req.params.taskId, photoUrl) });
+    res.json({ ok: true, photo: await createJobLinePhoto(req.params.jobLineId, photoUrl) });
   } catch (e) { next(e); }
 });
-router.delete('/work-order-task-photos/:photoId', async (req, res, next) => {
-  try { await deleteWorkOrderTaskPhoto(req.params.photoId); res.json({ ok: true }); } catch (e) { next(e); }
+router.delete('/job-line-photos/:photoId', async (req, res, next) => {
+  try { await deleteJobLinePhoto(req.params.photoId); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 router.post('/work-orders/:id/log', async (req, res, next) => {
@@ -779,16 +782,17 @@ router.delete('/work-order-log/:id', async (req, res, next) => {
 });
 
 // ---- Crew Sessions — attendance-based hours, optionally tied to a Work
-// Order (workOrderId) or standalone (activity label instead) ----
+// Order (workOrderId) or standalone (activity label instead). jobLineId is
+// optional (1.5) — most sessions cover general WO work, not one line. ----
 
 router.post('/crew-sessions', async (req, res, next) => {
   try {
-    const { workOrderId, activity, sessionDate, hours, note, volunteerIds, vendorIds } = req.body || {};
+    const { workOrderId, jobLineId, activity, sessionDate, hours, note, volunteerIds, vendorIds } = req.body || {};
     if (!workOrderId && !(activity || '').trim()) {
       return res.status(400).json({ ok: false, error: 'A session needs either a Work Order or an activity label' });
     }
     const session = await createCrewSession({
-      workOrderId: workOrderId || null, activity: activity?.trim() || null,
+      workOrderId: workOrderId || null, jobLineId: jobLineId || null, activity: activity?.trim() || null,
       sessionDate: sessionDate || null, hours: hours ? Number(hours) : null, note: note?.trim() || null,
       volunteerIds: (volunteerIds || []).map(Number), vendorIds: (vendorIds || []).map(Number),
     });
@@ -803,32 +807,95 @@ router.get('/crew-hours/summary', async (req, res, next) => {
   try { res.json(await getCrewHoursSummary({ from: req.query.from || null, to: req.query.to || null })); } catch (e) { next(e); }
 });
 
-// ---- Work Order Tasks (free-text job lines — the default way to add work) ----
+// ---- Job Lines (the unit of work — Build Brief v2 Phase 1) ----
 
-router.post('/work-orders/:id/tasks', async (req, res, next) => {
+router.post('/work-orders/:id/job-lines', async (req, res, next) => {
   try {
-    const { description } = req.body || {};
-    if (!description || !description.trim()) return res.status(400).json({ ok: false, error: 'description is required' });
-    res.json({ ok: true, task: await createWorkOrderTask(req.params.id, description.trim()) });
+    const { title, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate } = req.body || {};
+    if (!title || !title.trim()) return res.status(400).json({ ok: false, error: 'title is required' });
+    res.json({
+      ok: true,
+      jobLine: await createJobLine(req.params.id, {
+        title: title.trim(), responsibilityClass, fundingSource,
+        fundingRefId: fundingRefId === '' || fundingRefId == null ? null : Number(fundingRefId),
+        estimatedHours: estimatedHours === '' || estimatedHours == null ? null : Number(estimatedHours),
+        estimatedCost: estimatedCost === '' || estimatedCost == null ? null : Number(estimatedCost),
+        scheduledDate: scheduledDate || null,
+      }),
+    });
   } catch (e) { next(e); }
 });
-router.patch('/work-order-tasks/:taskId', async (req, res, next) => {
+router.patch('/job-lines/:jobLineId', async (req, res, next) => {
   try {
-    const { description, done } = req.body || {};
-    const task = await updateWorkOrderTask(req.params.taskId, { description, done });
-    if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
-    res.json({ ok: true, task });
+    const body = req.body || {};
+    const fields = {};
+    if (body.title != null) fields.title = body.title;
+    if (body.done !== undefined) fields.done = !!body.done;
+    if (body.responsibilityClass != null) fields.responsibility_class = body.responsibilityClass;
+    if (body.fundingSource != null) fields.funding_source = body.fundingSource;
+    if (body.fundingRefId !== undefined) fields.funding_ref_id = body.fundingRefId === '' ? null : Number(body.fundingRefId);
+    if (body.estimatedHours !== undefined) fields.estimated_hours = body.estimatedHours === '' ? null : Number(body.estimatedHours);
+    if (body.actualHours !== undefined) fields.actual_hours = body.actualHours === '' ? null : Number(body.actualHours);
+    if (body.estimatedCost !== undefined) fields.estimated_cost = body.estimatedCost === '' ? null : Number(body.estimatedCost);
+    if (body.actualCost !== undefined) fields.actual_cost = body.actualCost === '' ? null : Number(body.actualCost);
+    if (body.scheduledDate !== undefined) fields.scheduled_date = body.scheduledDate;
+    if (body.complaint !== undefined) fields.complaint = body.complaint;
+    if (body.causeNote !== undefined) fields.cause_note = body.causeNote;
+    if (body.correction !== undefined) fields.correction = body.correction;
+    if (body.blockedReason !== undefined) fields.blocked_reason = body.blockedReason;
+    if (body.blockedSince !== undefined) fields.blocked_since = body.blockedSince;
+    if (body.completedDate !== undefined) fields.completed_date = body.completedDate;
+    if (body.causeIds !== undefined) fields.causeIds = (body.causeIds || []).map(Number);
+    const jobLine = await updateJobLine(req.params.jobLineId, fields);
+    if (!jobLine) return res.status(404).json({ ok: false, error: 'Job line not found' });
+    res.json({ ok: true, jobLine });
   } catch (e) { next(e); }
 });
-router.delete('/work-order-tasks/:taskId', async (req, res, next) => {
-  try { await deleteWorkOrderTask(req.params.taskId); res.json({ ok: true }); } catch (e) { next(e); }
+router.delete('/job-lines/:jobLineId', async (req, res, next) => {
+  try { await deleteJobLine(req.params.jobLineId); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.post('/job-lines/:jobLineId/volunteers', async (req, res, next) => {
+  try { res.json(await assignVolunteerToJobLine(req.params.jobLineId, req.body?.volunteerId)); } catch (e) { next(e); }
+});
+router.delete('/job-lines/:jobLineId/volunteers/:volunteerId', async (req, res, next) => {
+  try { res.json(await unassignVolunteerFromJobLine(req.params.jobLineId, req.params.volunteerId)); } catch (e) { next(e); }
+});
+router.post('/job-lines/:jobLineId/vendors', async (req, res, next) => {
+  try { res.json(await assignVendorToJobLine(req.params.jobLineId, req.body?.vendorId)); } catch (e) { next(e); }
+});
+router.delete('/job-lines/:jobLineId/vendors/:vendorId', async (req, res, next) => {
+  try { res.json(await unassignVendorFromJobLine(req.params.jobLineId, req.params.vendorId)); } catch (e) { next(e); }
+});
+
+// ---- Causes catalog (admin-editable — 1.6) ----
+router.get('/causes', async (req, res, next) => {
+  try { res.json({ causes: await listCauses({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/causes', async (req, res, next) => {
+  try {
+    const { name, sortOrder } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, cause: await createCause({ name: name.trim(), sortOrder }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/causes/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, active } = req.body || {};
+    const cause = await updateCause(req.params.id, { name, sortOrder, active });
+    if (!cause) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, cause });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/causes/:id', async (req, res, next) => {
+  try { await deleteCause(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 router.post('/work-orders', async (req, res, next) => {
   try {
-    const { title, assetId, locationId, priority, description, scheduledDate, responsibleSelf, assetUpdates, tasks } = req.body || {};
+    const { title, assetId, locationId, priority, description, scheduledDate, assetUpdates, jobLines } = req.body || {};
     if (!title) return res.status(400).json({ ok: false, error: 'title is required' });
-    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, responsibleSelf, assetUpdates, tasks });
+    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates, jobLines });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
@@ -852,14 +919,6 @@ router.patch('/work-orders/:id', async (req, res, next) => {
     if (body.assetId !== undefined) fields.asset_id = body.assetId === '' ? null : Number(body.assetId);
     if (body.dateReported !== undefined) fields.date_reported = body.dateReported;
     if (body.dateCompleted !== undefined) fields.date_completed = body.dateCompleted;
-    if (body.scheduledDate !== undefined) fields.scheduled_date = body.scheduledDate;
-    if (body.estimatedHours !== undefined) fields.estimated_hours = body.estimatedHours === '' ? null : Math.round(Number(body.estimatedHours));
-    if (body.actualHours !== undefined) fields.actual_hours = body.actualHours === '' ? null : Math.round(Number(body.actualHours));
-    if (body.estimatedCost !== undefined) fields.estimated_cost = body.estimatedCost === '' ? null : Number(body.estimatedCost);
-    if (body.actualCost !== undefined) fields.actual_cost = body.actualCost === '' ? null : Number(body.actualCost);
-    if (body.fundingSource != null) fields.funding_source = body.fundingSource;
-    if (body.fundingRefId !== undefined) fields.funding_ref_id = body.fundingRefId === '' ? null : Number(body.fundingRefId);
-    if (body.responsibleSelf !== undefined) fields.responsible_self = !!body.responsibleSelf;
     if (body.boardFocus !== undefined) fields.board_focus = !!body.boardFocus;
     const detail = await updateWorkOrder(req.params.id, fields);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
@@ -879,7 +938,7 @@ router.delete('/work-orders/:id/asset-updates/:auId', async (req, res, next) => 
   try {
     const result = await deleteAssetUpdate(req.params.auId);
     if (result.notFound) return res.status(404).json({ ok: false, error: 'Not found' });
-    if (result.alreadyApplied) return res.status(400).json({ ok: false, error: 'This job line was already applied to the asset' });
+    if (result.alreadyApplied) return res.status(400).json({ ok: false, error: 'This field update was already applied to the asset' });
     res.json({ ok: true });
   } catch (e) { next(e); }
 });
@@ -890,19 +949,6 @@ router.post('/work-orders/:id/complete', async (req, res, next) => {
     if (!result) return res.status(404).json({ ok: false, error: 'Work Order not found' });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
-});
-
-router.post('/work-orders/:id/volunteers', async (req, res, next) => {
-  try { res.json(await assignVolunteer(req.params.id, req.body?.volunteerId)); } catch (e) { next(e); }
-});
-router.delete('/work-orders/:id/volunteers/:volunteerId', async (req, res, next) => {
-  try { res.json(await unassignVolunteer(req.params.id, req.params.volunteerId)); } catch (e) { next(e); }
-});
-router.post('/work-orders/:id/vendors', async (req, res, next) => {
-  try { res.json(await assignVendor(req.params.id, req.body?.vendorId)); } catch (e) { next(e); }
-});
-router.delete('/work-orders/:id/vendors/:vendorId', async (req, res, next) => {
-  try { res.json(await unassignVendor(req.params.id, req.params.vendorId)); } catch (e) { next(e); }
 });
 
 router.get('/volunteers', async (req, res, next) => {
@@ -987,15 +1033,15 @@ router.get('/work-order-templates', async (req, res, next) => {
 });
 router.post('/work-order-templates', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds } = req.body || {};
+    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds }) });
+    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds }) });
   } catch (e) { next(e); }
 });
 router.patch('/work-order-templates/:id', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds } = req.body || {};
-    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, taskDefaults, jobLineDefaults, responsibleSelf, presetVolunteerIds, presetVendorIds });
+    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds } = req.body || {};
+    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds });
     if (!template) return res.status(404).json({ ok: false, error: 'Template not found' });
     res.json({ ok: true, template });
   } catch (e) { next(e); }
@@ -1014,6 +1060,15 @@ router.get('/calendar-events', async (req, res, next) => {
     res.json({ occurrences: await listCalendarEventOccurrences(from, to) });
   } catch (e) { next(e); }
 });
+// Job lines with a scheduled_date in range — what the calendar renders for
+// "work happening on this day" (1.4: a WO's lines can have divergent dates).
+router.get('/job-lines/scheduled', async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to (YYYY-MM-DD) are required' });
+    res.json({ jobLines: await listJobLinesScheduledInRange(from, to) });
+  } catch (e) { next(e); }
+});
 router.get('/calendar-events/:id', async (req, res, next) => {
   try {
     const event = await getCalendarEvent(req.params.id);
@@ -1024,9 +1079,9 @@ router.get('/calendar-events/:id', async (req, res, next) => {
 });
 router.post('/calendar-events', async (req, res, next) => {
   try {
-    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId, workOrderTemplateId } = req.body || {};
+    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId } = req.body || {};
     if (!title || !eventDate) return res.status(400).json({ ok: false, error: 'title and eventDate are required' });
-    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, workOrderTaskId, workOrderTemplateId }) });
+    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId }) });
   } catch (e) { next(e); }
 });
 router.patch('/calendar-events/:id', async (req, res, next) => {
@@ -1040,7 +1095,7 @@ router.patch('/calendar-events/:id', async (req, res, next) => {
     if (body.recurrenceInterval != null) fields.recurrence_interval = body.recurrenceInterval;
     if (body.recurrenceEndDate !== undefined) fields.recurrence_end_date = body.recurrenceEndDate;
     if (body.workOrderId !== undefined) fields.work_order_id = body.workOrderId === '' ? null : Number(body.workOrderId);
-    if (body.workOrderTaskId !== undefined) fields.work_order_task_id = body.workOrderTaskId === '' ? null : Number(body.workOrderTaskId);
+    if (body.jobLineId !== undefined) fields.job_line_id = body.jobLineId === '' ? null : Number(body.jobLineId);
     if (body.workOrderTemplateId !== undefined) fields.work_order_template_id = body.workOrderTemplateId === '' ? null : Number(body.workOrderTemplateId);
     const event = await updateCalendarEvent(req.params.id, fields);
     if (!event) return res.status(404).json({ ok: false, error: 'Event not found' });
@@ -1131,8 +1186,8 @@ router.get('/work-orders/:id/scope-pdf', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    const [tasks, checklist] = await Promise.all([
-      listWorkOrderTasks(req.params.id), getChecklistInstanceForWorkOrder(req.params.id),
+    const [jobLines, checklist] = await Promise.all([
+      listJobLines(req.params.id), getChecklistInstanceForWorkOrder(req.params.id),
     ]);
     let checklistSteps = null;
     if (checklist) {
@@ -1150,11 +1205,11 @@ router.get('/work-orders/:id/scope-pdf', async (req, res, next) => {
       assetName: w.Asset?.Name,
       locationName: w.Location?.Name,
       priority: w.Priority,
-      scheduledDate: w['Scheduled Date'],
+      scheduledDate: detail.rollup?.EarliestScheduledDate,
       description: w.Description,
-      tasks: tasks.filter((t) => !t.Done).map((t) => t.Description),
-      volunteers: (detail.volunteers || []).map((v) => v.Name),
-      vendors: (detail.vendors || []).map((v) => v.Name),
+      tasks: jobLines.filter((l) => !l.Done).map((l) => l.Title),
+      volunteers: (detail.crewRoster?.volunteers || []).map((v) => v.Name),
+      vendors: (detail.crewRoster?.vendors || []).map((v) => v.Name),
       checklistSteps,
     });
     res.setHeader('Content-Type', 'application/pdf');

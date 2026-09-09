@@ -1,3 +1,85 @@
+# Runbook: Job Lines (Build Brief v2, Phase 1)
+
+Phase 1 of `toClaudeCode/BUILD_BRIEF_v2_joblines_lifecycle_attachments.md` landed
+2026-09-09: `work_order_tasks` was renamed to **`job_lines`** and became the
+real unit of work — hours, cost, funding, responsibility, scheduling, and
+crew assignment all moved off `work_orders` onto it. Migrations 0030–0039
+(0037 pending — see below). Read this before touching work orders, job
+lines, calendar, budget, or reports code; the shape changed everywhere.
+
+## What moved, and where it lives now
+- `job_lines` (was `work_order_tasks`): `title` (was `description`),
+  `estimated_hours/actual_hours/estimated_cost/actual_cost`,
+  `funding_source/funding_ref_id`, `scheduled_date`, `responsibility_class`
+  (`self`/`volunteer`/`vendor`/`cabin_holder` — replaces the old
+  `work_orders.responsible_self` boolean), `complaint/cause_note/correction`,
+  `blocked_reason/blocked_since/completed_date`, `condition_finding_id`.
+- `job_line_volunteers`/`job_line_vendors` replace
+  `work_order_volunteers`/`work_order_vendors`. "Assigned crew" is a per-line
+  concept now — there is no WO-level crew list anymore. `getWorkOrderCrewRoster`
+  in db.js (union across a WO's lines) backs the crew-session attendee picker.
+- `work_orders` keeps only what's true of the whole job: asset/location/
+  priority/status/dates/description/board_focus. Its cost/hours/schedule are
+  **derived rollups, never stored** — `workOrderRollup(woId)` in db.js is the
+  single-WO version (with a per-funding-source breakdown); `listWorkOrders()`
+  and every list-shaped read path embed the `JOB_LINE_ROLLUP_SQL` subquery
+  instead of calling that function in a loop. **If you add a new place that
+  reads WO-level cost/hours/schedule, it must go through one of these two —
+  never re-add a column to `work_orders` for this.**
+- `causes` (admin-editable, seeded with "Unknown" first) + `job_line_causes`
+  is the multi-select a job line's Cause field reads. `cause_note` is
+  freetext and must **never** feed back into `causes` — no "add as new
+  option" anywhere, ever. Managed at Admin → Work Orders → Causes.
+- `crew_sessions.job_line_id` and `work_order_log_entries.job_line_id` are
+  both nullable — genuine WO-level time/notes still exist and shouldn't be
+  forced onto one line.
+- `calendar_events.job_line_id` (was `work_order_task_id`) and
+  `work_order_task_photos.job_line_id` (was `task_id`) were repointed/renamed
+  in migration 0038, not just retargeted — the columns are named for what
+  they reference now.
+- `work_order_templates.job_line_defaults` now holds partial job-line objects
+  (`{title, responsibilityClass}`), and the **old** `job_line_defaults`
+  (asset-update blueprints) was renamed to `asset_update_defaults`. Don't
+  confuse the two — this exact collision (two different things both called
+  "job line") is why the rename happened; see migration 0039's comment.
+- The Board report (`reportDataPg.js`'s `buildBoardReportPg`, fed by
+  `getBoardReportRawData` in db.js) and Reports v1's Work Orders export
+  (`getWorkOrdersReportRawData`) both now aggregate from `job_lines` — a WO's
+  funding/cost/hours can legitimately span more than one value.
+
+## Known gaps / follow-ups
+- **`work_order_log_entries.job_line_id` migration (0037) is unapplied.**
+  `work_order_log_entries` is owned by DB role `nocodb`, not `camp_app` (a
+  pre-existing ownership drift, not something this work introduced), and
+  `camp_app` has no privilege path to fix it. An operator with Postgres
+  superuser access needs to run, once, against the `camp` database:
+  `ALTER TABLE work_order_log_entries OWNER TO camp_app;` — then
+  `npm run migrate` picks up 0037 normally. Until then, work log entries
+  can't be attributed to a specific job line (WO-level notes still work
+  fine). **The same ownership drift affects 8 other tables** (`asset_photos`,
+  `asset_property_history`, `budget_settings`, `cabin_holders`,
+  `capital_campaign_projects`, `other_budget_categories`,
+  `report_favorites`, `users`) — none needed by Phase 1, but the next
+  migration that touches one of them will hit the same wall; worth fixing
+  all of them in one pass with the same `ALTER TABLE ... OWNER TO camp_app`
+  the next time a superuser is available.
+- `job_lines.status_id` (and the `job_line_statuses` table it references) is
+  Phase 2 work, not Phase 1 — see the brief's own 1.3/2.1 split. Job lines
+  currently have no status field at all beyond the boolean `done`.
+- Job-line-level responsibility assignment only captures the **class**
+  (self/volunteer/vendor/cabin-holder) at WO-creation time; picking the
+  *specific* volunteer/vendor happens afterward on the WO detail page, same
+  deferral the app already used pre-Phase-1 for `responsibleSelf`/crew.
+- The old WO-level funding combobox (search + inline "create new") was
+  retired — job lines pick funding refs from a plain `<select>`. Creating a
+  brand-new Capital Campaign Project / Cabin-Holder / Other category happens
+  on the Capital Plan page, which already has full CRUD for all three.
+- `duplicateWorkOrder` now actually copies job lines (title/responsibility/
+  funding/estimates, not actuals or crew) — previously its comment claimed
+  to but the code didn't.
+
+---
+
 # Runbook: Adding a New Asset Property
 
 *(e.g. "Window Type", "HVAC Type", "Flooring") — Camp Sychar CMMS on NocoDB*

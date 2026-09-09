@@ -41,15 +41,17 @@ export function buildAssetReportRows({ assets, propertyFields, eavByAsset, compo
   });
 }
 
+// responsibility_classes/funding_sources are now arrays — a WO can have
+// self+vendor lines, or lines against two different funding sources, at once
+// (the whole point of job lines carrying these instead of the work order).
+const RESPONSIBILITY_LABELS = { self: 'Self', volunteer: 'Volunteer', vendor: 'Vendor', cabin_holder: 'Cabin-Holder' };
 export function buildWorkOrderReportRows({ workOrders, volByWo, venByWo }) {
   return workOrders.map((w) => {
-    const parties = [];
-    if (w.responsible_self) parties.push('Self');
-    if (volByWo.get(w.id)?.length) parties.push('Volunteer');
-    if (venByWo.get(w.id)?.length) parties.push('Vendor');
+    const parties = (w.responsibility_classes || []).map((c) => RESPONSIBILITY_LABELS[c] || c);
+    const fundingLabels = (w.funding_sources || []).map((s) => FUNDING_SOURCE_LABELS[s] || s);
     return {
       Title: w.title, Status: w.status, Priority: w.priority,
-      'Funding Source': FUNDING_SOURCE_LABELS[w.funding_source] || w.funding_source || null,
+      'Funding Source': fundingLabels.join(', ') || null,
       Asset: w.asset_name, Location: w.location_name,
       'Scheduled Date': w.scheduled_date, 'Date Reported': w.date_reported, 'Date Completed': w.date_completed,
       'Estimated Cost': w.estimated_cost, 'Actual Cost': w.actual_cost,
@@ -136,7 +138,7 @@ export const WORK_ORDER_COLUMN_SPECS = [
   { key: 'Actual Cost', label: 'Actual Cost', group: 'Dates & Cost' },
   { key: 'Estimated Hours', label: 'Estimated Hours', group: 'Dates & Cost' },
   { key: 'Actual Hours', label: 'Actual Hours', group: 'Dates & Cost' },
-  { key: 'Responsible Party', label: 'Responsible Party', options: ['Self', 'Volunteer', 'Vendor'], group: 'Crew', default: true },
+  { key: 'Responsible Party', label: 'Responsible Party', options: ['Self', 'Volunteer', 'Vendor', 'Cabin-Holder'], group: 'Crew', default: true },
   { key: 'Volunteers', label: 'Volunteers', group: 'Crew' },
   { key: 'Vendors', label: 'Vendors', group: 'Crew' },
 ];
