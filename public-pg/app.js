@@ -295,16 +295,141 @@ async function api(path, opts = {}) {
   return body;
 }
 
-// Uploads one file to DigitalOcean Spaces via the backend, returns its URL.
-async function uploadPhotoFile(file, category, ownerId) {
+// ---------- Attachments (Build Brief v2 Phase 4) ----------
+// One shared system for every photo/document attach point in the app — WO
+// and job-line photos, asset reference photos, component-event photos,
+// finding photos, maintenance-request photos, asset-note photos. Capture is
+// zero-decision (snap and upload); role/classification/caption are set later
+// "at a desk" via the thumbnail's tap-to-edit panel, never prompted for at
+// capture time (see the brief's "Why" section).
+
+// Uploads one file directly onto an existing entity — upload + link in one
+// request. Use uploadAttachmentUnlinked instead when the entity doesn't
+// exist yet (a form that creates its parent row on submit).
+async function uploadAttachment(file, entityType, entityId, { roleId, classification, caption, category, ownerId } = {}) {
   const fd = new FormData();
-  fd.append('photo', file);
+  fd.append('file', file);
+  fd.append('entityType', entityType);
+  fd.append('entityId', String(entityId));
+  fd.append('category', category || entityType);
+  fd.append('ownerId', String(ownerId ?? entityId));
+  if (roleId) fd.append('roleId', String(roleId));
+  if (classification) fd.append('classification', classification);
+  if (caption) fd.append('caption', caption);
+  const res = await fetch('/api/pg/attachments', { method: 'POST', body: fd });
+  const body = await res.json();
+  if (!res.ok || body.ok === false) throw new Error(body.error || 'Upload failed');
+  return body.attachment;
+}
+
+// Uploads without linking — for the audit form and the public
+// maintenance-request portal, where photos are captured before the row they
+// belong to (a finding, a component event, the request itself) is created.
+// Returns the attachment id to submit alongside the rest of the form; the
+// server links it once the parent row exists.
+async function uploadAttachmentUnlinked(file, category, ownerId) {
+  const fd = new FormData();
+  fd.append('file', file);
   fd.append('category', category);
   fd.append('ownerId', String(ownerId));
-  const res = await fetch('/api/pg/upload', { method: 'POST', body: fd });
+  const res = await fetch('/api/pg/attachments', { method: 'POST', body: fd });
   const body = await res.json();
-  if (!res.ok || body.ok === false) throw new Error(body.error || 'Photo upload failed');
-  return body.url;
+  if (!res.ok || body.ok === false) throw new Error(body.error || 'Upload failed');
+  return body.attachment.Id;
+}
+
+function attachmentThumbHtml(a) {
+  if (a.Kind === 'image') {
+    return `<img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:84px;height:84px;object-fit:cover;border-radius:8px;display:block" />`;
+  }
+  const icon = a.Kind === 'document' ? '📄' : a.Kind === 'audio' ? '🎵' : '📎';
+  return `<div style="width:84px;height:84px;border-radius:8px;background:#f0f2fb;display:flex;align-items:center;justify-content:center;font-size:28px">${icon}</div>`;
+}
+
+// Renders a thumbnail grid + "+ Add" capture control into `container`, wired
+// to attach/detach/void/edit against (entityType, entityId). Re-renders
+// itself in place after any change — callers don't need to manage state.
+//   opts: { title, defaultRoleName, inheritedClassification, accept }
+async function renderAttachmentSection(entityType, entityId, container, opts = {}) {
+  const { title = 'Photos', defaultRoleName = null, inheritedClassification = null, accept = 'image/*,application/pdf' } = opts;
+  const roles = state.options.attachmentRoles || [];
+  const defaultRole = defaultRoleName ? roles.find((r) => r.Name === defaultRoleName) : null;
+  const { attachments } = await api(`/api/pg/attachments?entityType=${entityType}&entityId=${entityId}`);
+
+  const grid = attachments.length
+    ? `<div class="attach-grid" style="display:flex;flex-wrap:wrap;gap:8px">${attachments.map((a) => `
+        <div class="attach-thumb" data-link-id="${a.LinkId}" title="${escapeHtml(a.RoleName || '')}">${attachmentThumbHtml(a)}</div>`).join('')}</div>`
+    : '<p class="muted">None yet.</p>';
+
+  container.innerHTML = `
+    <h4 style="margin:14px 0 6px">${escapeHtml(title)}</h4>
+    ${grid}
+    <div class="btn-row" style="margin-top:8px">
+      <label class="btn btn-secondary" style="cursor:pointer;margin:0">
+        + Add
+        <input type="file" accept="${accept}" capture="environment" multiple style="display:none" class="attach-input" />
+      </label>
+    </div>
+    <div class="attach-edit-panel" hidden></div>`;
+
+  container.querySelector('.attach-input').addEventListener('change', async (e) => {
+    const files = [...e.target.files];
+    if (!files.length) return;
+    try {
+      for (const file of files) {
+        await uploadAttachment(file, entityType, entityId, { roleId: defaultRole?.Id, classification: inheritedClassification });
+      }
+      renderAttachmentSection(entityType, entityId, container, opts);
+    } catch (err) { toast(err.message); }
+  });
+
+  container.querySelectorAll('.attach-thumb').forEach((el) => el.addEventListener('click', () => {
+    const a = attachments.find((x) => String(x.LinkId) === el.dataset.linkId);
+    renderAttachmentEditPanel(a, roles, entityType, entityId, container, opts);
+  }));
+}
+
+function renderAttachmentEditPanel(a, roles, entityType, entityId, container, opts) {
+  const panel = container.querySelector('.attach-edit-panel');
+  const roleOptions = roles.map((r) => `<option value="${r.Id}" ${a.RoleId === r.Id ? 'selected' : ''}>${escapeHtml(r.Name)}</option>`).join('');
+  panel.hidden = false;
+  panel.innerHTML = `
+    <div class="card" style="margin-top:8px">
+      <a href="${escapeHtml(a.Url)}" target="_blank" rel="noopener">${a.Kind === 'image'
+        ? `<img src="${escapeHtml(a.Url)}" alt="" style="max-width:100%;border-radius:8px;display:block" />`
+        : `Open file (${escapeHtml(a.OriginalFilename || a.Kind)})`}</a>
+      <div class="field-row"><label>Role</label><select class="attach-role"><option value="">— unset —</option>${roleOptions}</select></div>
+      <div class="field-row"><label>Caption</label><input class="attach-caption" value="${escapeHtml(a.Caption || '')}" /></div>
+      <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="attach-include" ${a.IncludeInReport ? 'checked' : ''} /> Include in board report</label>
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary attach-save">Save</button>
+        <button type="button" class="btn btn-secondary attach-detach">Detach</button>
+        <button type="button" class="btn btn-secondary attach-void">Void</button>
+        <button type="button" class="btn btn-secondary attach-cancel">Close</button>
+      </div>
+    </div>`;
+  panel.querySelector('.attach-save').addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/attachment-links/${a.LinkId}`, { method: 'PATCH', body: JSON.stringify({
+        roleId: panel.querySelector('.attach-role').value || null,
+        caption: panel.querySelector('.attach-caption').value || null,
+        includeInReport: panel.querySelector('.attach-include').checked,
+      }) });
+      renderAttachmentSection(entityType, entityId, container, opts);
+    } catch (err) { toast(err.message); }
+  });
+  panel.querySelector('.attach-detach').addEventListener('click', async () => {
+    if (!await confirmDialog('Detach this file from here? The file itself is not deleted.')) return;
+    await api(`/api/pg/attachment-links/${a.LinkId}`, { method: 'DELETE' });
+    renderAttachmentSection(entityType, entityId, container, opts);
+  });
+  // One tap, no confirm — junk arrives via email in the inbox (Phase 5) and
+  // hesitation is the enemy. The file survives in Spaces either way.
+  panel.querySelector('.attach-void').addEventListener('click', async () => {
+    await api(`/api/pg/attachments/${a.Id}/void`, { method: 'POST' });
+    renderAttachmentSection(entityType, entityId, container, opts);
+  });
+  panel.querySelector('.attach-cancel').addEventListener('click', () => { panel.hidden = true; panel.innerHTML = ''; });
 }
 
 function setChrome({ title, showBack, showLogout }) {
@@ -480,6 +605,7 @@ async function render(view, params = {}) {
       adminCauses: () => renderAdminCauses(),
       adminWorkOrderStatuses: () => renderAdminWorkOrderStatuses(),
       adminJobLineStatuses: () => renderAdminJobLineStatuses(),
+      adminAttachmentRoles: () => renderAdminAttachmentRoles(),
       calendar: () => renderCalendar(params),
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
@@ -792,6 +918,7 @@ const ADMIN_LEAF_RENDERERS = {
   adminCauses: (params, container) => renderAdminCauses(container),
   adminWorkOrderStatuses: (params, container) => renderAdminWorkOrderStatuses(container),
   adminJobLineStatuses: (params, container) => renderAdminJobLineStatuses(container),
+  adminAttachmentRoles: (params, container) => renderAdminAttachmentRoles(container),
   adminChecklistTemplates: (params, container) => renderAdminChecklistTemplates(container),
   adminUsers: (params, container) => renderAdminUsers(container),
   activityLog: (params, container) => renderActivityLog(container),
@@ -1029,7 +1156,7 @@ async function renderAssetDetail({ id }, container = app) {
   const noteRows = notes.map((n) => `
     <div class="note-item ${n.resolved ? 'resolved' : ''}" data-id="${n.id}">
       <div>${escapeHtml(n.note)}</div>
-      ${n.photo_url ? `<a href="${escapeHtml(n.photo_url)}" target="_blank" rel="noopener"><img src="${escapeHtml(n.photo_url)}" alt="" style="max-width:120px;border-radius:8px;margin-top:6px;display:block" /></a>` : ''}
+      ${(n.attachments || []).length ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${n.attachments.map((a) => `<a href="${escapeHtml(a.Url)}" target="_blank" rel="noopener"><img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:60px;height:60px;object-fit:cover;border-radius:8px" /></a>`).join('')}</div>` : ''}
       <div class="muted">${new Date(n.created_at).toLocaleDateString()}${n.created_by ? ` · ${escapeHtml(n.created_by)}` : ''}
         <a href="#" class="resolve-note" data-id="${n.id}" data-next="${!n.resolved}">${n.resolved ? 'reopen' : 'mark resolved'}</a>
       </div>
@@ -1054,6 +1181,8 @@ async function renderAssetDetail({ id }, container = app) {
     </div>
 
     <div class="card"><h3>Components</h3>${componentRows}</div>
+
+    <div class="card" id="assetPhotosCard"></div>
 
     <div class="card"><h3>Work Orders (${workOrders.length})</h3>
       ${workOrders.map((w) => `<div class="list-item" data-wo-id="${w.Id}"><span>${escapeHtml(w.Title)}</span>${statusPillHtml(w.Status, w.StatusColor)}</div>`).join('') || '<p class="muted">None yet.</p>'}
@@ -1084,6 +1213,7 @@ async function renderAssetDetail({ id }, container = app) {
             <div class="field-row"><label>Why dismissed?</label><input class="finding-dismiss-note" /></div>
             <button type="button" class="btn btn-primary finding-dismiss-save" data-id="${f.Id}">Save</button>
           </div>` : ''}
+          <div class="card" id="findingPhotos-${f.Id}" style="flex-basis:100%;margin-top:8px"></div>
         </div>`;
       }).join('') || '<p class="muted">None yet.</p>'}
     </div>
@@ -1093,10 +1223,13 @@ async function renderAssetDetail({ id }, container = app) {
       <div id="noteList">${noteRows}</div>
       <form id="noteForm" style="margin-top:10px">
         <div class="field-row"><textarea name="note" placeholder="Quick note or follow-up for this asset…" required></textarea></div>
-        <div class="field-row"><label>Photo (optional)</label><input type="file" name="photo" accept="image/*" capture="environment" /></div>
+        <div class="field-row"><label>Photo (optional)</label><input type="file" name="photo" accept="image/*" capture="environment" multiple /></div>
         <button class="btn btn-secondary" type="submit">Add Note</button>
       </form>
     </div>`;
+
+  conditionFindings.forEach((f) => renderAttachmentSection('condition_finding', f.Id, container.querySelector(`#findingPhotos-${f.Id}`), { title: 'Photos', defaultRoleName: 'Evidence' }));
+  renderAttachmentSection('asset', id, container.querySelector('#assetPhotosCard'), { title: 'Reference Photos', defaultRoleName: 'Reference' });
 
   container.querySelector('#startAuditBtn').addEventListener('click', () => go('audit', { id }));
   container.querySelector('#viewHistoryBtn').addEventListener('click', () => go('assetHistory', { id }));
@@ -1116,11 +1249,11 @@ async function renderAssetDetail({ id }, container = app) {
     e.preventDefault();
     const fd = new FormData(e.target);
     const note = fd.get('note');
-    const file = fd.get('photo');
+    const files = fd.getAll('photo').filter((f) => f && f.size);
     try {
-      let photoUrl = null;
-      if (file && file.size) photoUrl = await uploadPhotoFile(file, 'notes', id);
-      await api(`/api/pg/assets/${id}/notes`, { method: 'POST', body: JSON.stringify({ note, photoUrl }) });
+      const attachmentIds = [];
+      for (const file of files) attachmentIds.push(await uploadAttachmentUnlinked(file, 'notes', id));
+      await api(`/api/pg/assets/${id}/notes`, { method: 'POST', body: JSON.stringify({ note, attachmentIds }) });
       toast('Note added');
       renderAssetDetail({ id }, container);
     } catch (err) { toast(err.message); }
@@ -1222,7 +1355,7 @@ async function renderAudit({ id }) {
           </div>
           <div class="field-row"><label>Material</label><input class="comp-material" /></div>
           <div class="field-row"><label>Notes</label><textarea class="comp-notes"></textarea></div>
-          <div class="field-row"><label>Photo (optional)</label><input type="file" class="comp-photo" accept="image/*" capture="environment" /></div>
+          <div class="field-row"><label>Photo (optional)</label><input type="file" class="comp-photo" accept="image/*" capture="environment" multiple /></div>
           <label class="flag-check"><input type="checkbox" class="comp-flag-toggle" /> 🚩 Flag for follow-up</label>
           <div class="flag-note-wrap" hidden><input type="text" class="comp-flag-note" placeholder="Optional note" /></div>
         </div>`).join('')}
@@ -1300,10 +1433,11 @@ async function renderAudit({ id }) {
       const notes = card.querySelector('.comp-notes').value;
       const flagged = !!card.querySelector('.comp-flag-toggle')?.checked;
       const flagNote = flagged ? (card.querySelector('.comp-flag-note')?.value.trim() || null) : null;
-      const photoFile = card.querySelector('.comp-photo')?.files?.[0];
-      if (!condition && !material && !notes && !flagged && !photoFile) continue; // skip untouched component cards
-      const photoUrl = photoFile && photoFile.size ? await uploadPhotoFile(photoFile, 'components', id) : null;
-      componentEvents.push({ componentType: card.dataset.component, eventType, condition, material, notes, flagged, flagNote, photoUrl });
+      const photoFiles = [...(card.querySelector('.comp-photo')?.files || [])].filter((f) => f && f.size);
+      if (!condition && !material && !notes && !flagged && !photoFiles.length) continue; // skip untouched component cards
+      const attachmentIds = [];
+      for (const file of photoFiles) attachmentIds.push(await uploadAttachmentUnlinked(file, 'components', id));
+      componentEvents.push({ componentType: card.dataset.component, eventType, condition, material, notes, flagged, flagNote, attachmentIds });
     }
 
     const severity = fd.get('findingSeverity');
@@ -1314,13 +1448,13 @@ async function renderAudit({ id }) {
     try {
       let finding = null;
       if (severity && description) {
-        const photoUrls = [];
-        for (const file of findingPhotos) photoUrls.push(await uploadPhotoFile(file, 'findings', id));
-        finding = { severity, description, photoUrls };
+        const attachmentIds = [];
+        for (const file of findingPhotos) attachmentIds.push(await uploadAttachmentUnlinked(file, 'findings', id));
+        finding = { severity, description, attachmentIds };
       }
-      const generalPhotos = [];
-      for (const file of generalPhotoFiles) generalPhotos.push(await uploadPhotoFile(file, 'asset-photos', id));
-      await api(`/api/pg/assets/${id}/audit`, { method: 'POST', body: JSON.stringify({ properties: propertiesOut, componentEvents, finding, generalPhotos }) });
+      const generalAttachmentIds = [];
+      for (const file of generalPhotoFiles) generalAttachmentIds.push(await uploadAttachmentUnlinked(file, 'asset-photos', id));
+      await api(`/api/pg/assets/${id}/audit`, { method: 'POST', body: JSON.stringify({ properties: propertiesOut, componentEvents, finding, generalAttachmentIds }) });
       toast('Audit submitted');
       state.stack.pop(); // drop this audit entry
       go('assetDetail', { id }, { replace: true });
@@ -1348,13 +1482,15 @@ async function renderAssetHistory({ id }) {
           <span class="pill ${conditionPillClass(h.Condition)}">${escapeHtml(h.Condition || '')}</span></div>
         <div class="muted">${escapeHtml(formatDateNice(h['Observed/Installed Date']))} · ${escapeHtml(h.Material || '')}</div>
         ${h.Notes ? `<div>${escapeHtml(h.Notes)}</div>` : ''}
-        ${h['Photo URL'] ? `<a href="${escapeHtml(h['Photo URL'])}" target="_blank" rel="noopener"><img src="${escapeHtml(h['Photo URL'])}" alt="" style="max-width:120px;border-radius:8px;margin-top:6px;display:block" /></a>` : ''}
+        <div id="compPhotos-${h.Id}" style="margin-top:6px"></div>
       </div>` : `
       <div class="card">
         <div><strong>${escapeHtml(h.Label)}</strong> changed</div>
         <div class="muted">${escapeHtml(h['Old Value'] ?? '—')} → <strong>${escapeHtml(h['New Value'] ?? '—')}</strong></div>
         <div class="muted">${new Date(h.ChangedAt).toLocaleString()}${h.ChangedBy ? ` · ${escapeHtml(h.ChangedBy)}` : ''}</div>
       </div>`).join('') : '<p class="muted">No history yet.</p>');
+
+  history.forEach((h) => renderAttachmentSection('asset_component', h.Id, app.querySelector(`#compPhotos-${h.Id}`), { title: 'Photos', defaultRoleName: 'Evidence', inheritedClassification: h['Component Type'] }));
 }
 
 // ---------- Interactive Map ----------
@@ -3262,6 +3398,7 @@ const ADMIN_CATEGORIES = {
       { view: 'adminCauses', icon: '🔍', label: 'Causes' },
       { view: 'adminWorkOrderStatuses', icon: '🚦', label: 'Work Order Statuses' },
       { view: 'adminJobLineStatuses', icon: '🚦', label: 'Job Line Statuses' },
+      { view: 'adminAttachmentRoles', icon: '📎', label: 'Attachment Roles' },
     ],
   },
   requests: {
@@ -4074,6 +4211,69 @@ async function renderAdminCauses(container = app) {
   });
 }
 
+// Build Brief v2 Phase 4 (§4.3): what an attachment IS relative to whatever
+// it's linked to — Before/After/Evidence/Quote/etc. "Default include in
+// report" pre-ticks the report checkbox for that role (still overridable per
+// link) — tagging something "After / Repair" is already saying "this is the
+// proof."
+async function renderAdminAttachmentRoles(container = app) {
+  if (container === app) setChrome({ title: 'Attachment Roles', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { roles } = await api('/api/pg/attachment-roles');
+
+  const rows = roles.map((r) => `
+    <div class="list-item" style="cursor:default">
+      <span>${escapeHtml(r.Name)}${r.DefaultIncludeInReport ? ' <span class="pill">in report by default</span>' : ''}${!r.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary role-toggle-report" data-id="${r.Id}" data-next="${!r.DefaultIncludeInReport}">${r.DefaultIncludeInReport ? 'Unset' : 'Set'} report default</button>
+        <button class="btn btn-secondary role-toggle-active" data-id="${r.Id}" data-active="${r.Active}">${r.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary role-delete" data-id="${r.Id}" data-name="${escapeHtml(r.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No attachment roles defined yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Attachment Roles</h3>
+      <p class="muted">What a photo or document IS relative to the record it's attached to — Before/After/Evidence/Quote/etc. Lives on the link, not the file, so the same photo can be "After / Repair" on a job line and "Reference" on the asset at once.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Role</h3>
+      <form id="addRoleForm">
+        <div class="field-row"><label>Name</label><input name="name" placeholder="e.g. Warranty" required /></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.role-toggle-report').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/attachment-roles/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ defaultIncludeInReport: btn.dataset.next === 'true' }) });
+      renderAdminAttachmentRoles(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.role-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/attachment-roles/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) });
+      renderAdminAttachmentRoles(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.role-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete role "${btn.dataset.name}"? Only possible if no attachment uses it — deactivate instead if it's in use.`)) return;
+    try {
+      await api(`/api/pg/admin/attachment-roles/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Role deleted');
+      renderAdminAttachmentRoles(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addRoleForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/attachment-roles', { method: 'POST', body: JSON.stringify({ name: fd.get('name') }) });
+      renderAdminAttachmentRoles(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
 async function renderAdminSubAreas(container = app) {
   if (container === app) setChrome({ title: 'Component Sub-Areas', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
@@ -4809,10 +5009,6 @@ async function renderRequestDetail({ id }, container = app) {
     api(`/api/pg/requests/${id}`), api(`/api/pg/requests/${id}/messages`),
   ]);
 
-  const photosHtml = request.Photos.length
-    ? `<div style="display:flex;flex-wrap:wrap;gap:8px">${request.Photos.map((p) => `<a href="${escapeHtml(p.Url)}" target="_blank" rel="noopener"><img src="${escapeHtml(p.Url)}" alt="" style="width:100px;height:100px;object-fit:cover;border-radius:8px" /></a>`).join('')}</div>`
-    : '<p class="muted">No photos attached.</p>';
-
   const customFieldsHtml = request.CustomFields.length
     ? request.CustomFields.map((f) => `<div class="list-item" style="cursor:default"><span>${escapeHtml(f.label)}</span><span>${escapeHtml(f.value)}</span></div>`).join('')
     : '';
@@ -4840,8 +5036,7 @@ async function renderRequestDetail({ id }, container = app) {
       <h4 style="margin:14px 0 6px">Description</h4>
       <p>${escapeHtml(request.Description || '—')}</p>
       ${customFieldsHtml ? `<h4 style="margin:14px 0 6px">Additional Details</h4>${customFieldsHtml}` : ''}
-      <h4 style="margin:14px 0 6px">Photos</h4>
-      ${photosHtml}
+      <div id="requestPhotosCard"></div>
     </div>
 
     <div class="card">
@@ -4877,6 +5072,8 @@ async function renderRequestDetail({ id }, container = app) {
         <button class="btn btn-primary" type="submit">Send Email</button>
       </form>
     </div>`;
+
+  renderAttachmentSection('maintenance_request', id, container.querySelector('#requestPhotosCard'), { title: 'Photos', defaultRoleName: 'Evidence' });
 
   mountAssetCombobox(container.querySelector('#assetPickerWrap'), {
     initialAsset: request.AssetId ? { Id: request.AssetId, Name: request.AssetName } : null,
@@ -5168,16 +5365,7 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }
       </select></div>
     </div>
 
-    <div style="margin-top:14px">
-      <h4 style="margin-bottom:6px">Photos</h4>
-      <div class="photo-grid">${(jl.Photos || []).map((p) => `
-        <div class="photo-thumb" style="width:56px;height:56px">
-          <img src="${p.Url}" alt="" />
-          <button type="button" class="photo-remove jl-delete-photo" data-id="${p.Id}">&times;</button>
-        </div>`).join('')}</div>
-      <button type="button" class="btn btn-secondary jl-add-photo-btn" style="padding:4px 8px;font-size:0.8rem;margin-top:6px">📷 Add Photo</button>
-      <input type="file" class="jl-photo-input" accept="image/*" capture="environment" multiple hidden />
-    </div>
+    <div style="margin-top:14px" id="jlPhotos-${jl.Id}"></div>
   </details>`;
 }
 
@@ -5194,7 +5382,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
   const checklistTemplates = tplRes.templates;
   const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
   const causesCatalog = causesRes.causes;
-  const { workOrder: wo, rollup, crewRoster, closeGate, assetUpdates, jobLines, checklist, logEntries, crewSessions, photos } = detail;
+  const { workOrder: wo, rollup, crewRoster, closeGate, assetUpdates, jobLines, checklist, logEntries, crewSessions } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
   // Job-line pickers (assign-crew, crew-session attendee union) read the full
   // roster off `state` rather than threading it through every helper — same
@@ -5204,12 +5392,6 @@ async function renderWorkOrderDetail({ id }, container = app) {
 
   const jobLineRows = jobLines.map((jl) => jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses })).join('')
     || '<p class="muted">No job lines yet — add the scope of work below.</p>';
-
-  const woPhotoRows = (photos || []).map((p) => `
-    <div class="photo-thumb">
-      <img src="${p.Url}" alt="${escapeHtml(p.Caption || '')}" />
-      <button type="button" class="photo-remove delete-wo-photo" data-id="${p.Id}">&times;</button>
-    </div>`).join('');
 
   const workOrderStatuses = state.options.workOrderStatuses; // admin-editable (2.2) — never hardcode this list
   const jobLineStatuses = state.options.jobLineStatuses; // admin-editable (2.1)
@@ -5303,11 +5485,9 @@ async function renderWorkOrderDetail({ id }, container = app) {
     ${rollupHtml}
 
     <div class="card">
-      <h3>Photos</h3>
-      <p class="muted">Finished-work photos for this job — "before/after/finished" shots, distinct from audit/condition photos. These are what a Reports export can attach.</p>
-      ${photos?.length ? `<div class="photo-grid">${woPhotoRows}</div>` : '<p class="muted">No photos yet.</p>'}
-      <input type="file" id="woPhotoInput" accept="image/*" capture="environment" multiple hidden />
-      <button type="button" class="btn btn-secondary" id="addWoPhotoBtn">+ Add Photo</button>
+      <h3>Documents</h3>
+      <p class="muted">Whole-job attachments not tied to one line — permits, invoices, warranty docs. Work photos belong on the job line they're proof of, below.</p>
+      <div id="woPhotosCard"></div>
     </div>
 
     <div class="card">
@@ -5512,42 +5692,10 @@ async function renderWorkOrderDetail({ id }, container = app) {
       renderWorkOrderDetail({ id }, container);
     }));
 
-    card.querySelector('.jl-add-photo-btn').addEventListener('click', () => card.querySelector('.jl-photo-input').click());
-    card.querySelector('.jl-photo-input').addEventListener('change', async (e) => {
-      const files = [...e.target.files];
-      if (!files.length) return;
-      try {
-        for (const file of files) {
-          const url = await uploadPhotoFile(file, 'job-lines', jlId);
-          await api(`/api/pg/job-lines/${jlId}/photos`, { method: 'POST', body: JSON.stringify({ photoUrl: url }) });
-        }
-        renderWorkOrderDetail({ id }, container);
-      } catch (err) { toast(err.message); }
-    });
-    card.querySelectorAll('.jl-delete-photo').forEach((btn) => btn.addEventListener('click', async () => {
-      if (!await confirmDialog('Delete this photo?')) return;
-      try { await api(`/api/pg/job-line-photos/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
-      catch (err) { toast(err.message); }
-    }));
+    renderAttachmentSection('job_line', jlId, card.querySelector(`#jlPhotos-${jlId}`), { title: 'Photos', defaultRoleName: 'During' });
   });
 
-  container.querySelector('#addWoPhotoBtn')?.addEventListener('click', () => container.querySelector('#woPhotoInput').click());
-  container.querySelector('#woPhotoInput')?.addEventListener('change', async (e) => {
-    const files = [...e.target.files];
-    if (!files.length) return;
-    try {
-      for (const file of files) {
-        const url = await uploadPhotoFile(file, 'work-orders', id);
-        await api(`/api/pg/work-orders/${id}/photos`, { method: 'POST', body: JSON.stringify({ photoUrl: url }) });
-      }
-      renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
-  });
-  container.querySelectorAll('.delete-wo-photo').forEach((btn) => btn.addEventListener('click', async () => {
-    if (!await confirmDialog('Delete this photo?')) return;
-    try { await api(`/api/pg/work-order-photos/${btn.dataset.id}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
-    catch (err) { toast(err.message); }
-  }));
+  renderAttachmentSection('work_order', id, container.querySelector('#woPhotosCard'), { title: 'Documents', defaultRoleName: 'Documentation', accept: 'image/*,application/pdf' });
 
   container.querySelector('#addLogEntryForm').addEventListener('submit', async (e) => {
     e.preventDefault();

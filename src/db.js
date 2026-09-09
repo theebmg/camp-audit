@@ -241,7 +241,6 @@ function componentRowToNocoShape(c) {
     'Est Replacement Year': c.est_replacement_year,
     'Est Replacement Cost': c.est_replacement_cost,
     Notes: c.notes,
-    'Photo URL': c.photo_url,
     Asset: { Id: c.asset_id, Name: c.asset_name },
     'Work Order': c.work_order_id ? { Id: c.work_order_id } : null,
   };
@@ -340,7 +339,7 @@ export async function getAssetHistory(assetId) {
 // Finding (which has its own explicit severity picker).
 const FLAG_DEFAULT_SEVERITY = '1 - Monitor';
 
-export async function submitAudit(assetId, { properties = {}, componentEvents = [], finding = null, generalPhotos = [] }) {
+export async function submitAudit(assetId, { properties = {}, componentEvents = [], finding = null, generalAttachmentIds = [] }) {
   const propertyFields = await getAssetPropertyFields();
   const byKey = new Map(propertyFields.map((f) => [f.fieldKey, f]));
   const [assetRowBefore, eavValuesBefore] = await Promise.all([getAssetRow(assetId), getAssetPropertyValuesEav(assetId)]);
@@ -415,12 +414,19 @@ export async function submitAudit(assetId, { properties = {}, componentEvents = 
       const observedDate = ev.observedDate || today;
       const { rows } = await client.query(
         `INSERT INTO asset_components (asset_id, component_type, sub_area, event_type, material, condition,
-           observed_installed_date, est_life_years, est_replacement_cost, notes, photo_url)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+           observed_installed_date, est_life_years, est_replacement_cost, notes)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
         [assetId, ev.componentType, ev.subArea || null, eventType, ev.material || null, condition,
-          observedDate, ev.estLifeYears ?? null, ev.estReplacementCost ?? null, ev.notes || null, ev.photoUrl || null]
+          observedDate, ev.estLifeYears ?? null, ev.estReplacementCost ?? null, ev.notes || null]
       );
       createdComponents.push(componentRowToNocoShape(rows[0]));
+      // Classification pre-fills from the component's own type — the one
+      // case in this phase where the guess is always right, since it's not a
+      // guess (§4.4: "attaching to a component event whose type is known
+      // pre-fills classification").
+      for (const attachmentId of ev.attachmentIds || []) {
+        await linkAttachment(attachmentId, { entityType: 'asset_component', entityId: rows[0].id, classification: ev.componentType }, client);
+      }
       if (ev.flagged) {
         const label = `${ev.componentType}${condition ? `: ${condition}` : ''}`;
         await client.query(
@@ -437,21 +443,19 @@ export async function submitAudit(assetId, { properties = {}, componentEvents = 
     if (finding && finding.description && finding.severity) {
       const { rows } = await client.query(
         `INSERT INTO condition_findings (asset_id, title, severity, description, recommended_repair,
-           estimated_hours, estimated_cost, status, date_identified, photo_urls, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'Open',$8,$9,$10) RETURNING *`,
+           estimated_hours, estimated_cost, status, date_identified, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'Open',$8,$9) RETURNING *`,
         [assetId, finding.title || `Finding on Asset #${assetId}`, finding.severity, finding.description,
-          finding.recommendedRepair || null, finding.estimatedHours ?? null, finding.estimatedCost ?? null, today,
-          finding.photoUrls || [], username]
+          finding.recommendedRepair || null, finding.estimatedHours ?? null, finding.estimatedCost ?? null, today, username]
       );
       createdFinding = rows[0];
+      for (const attachmentId of finding.attachmentIds || []) {
+        await linkAttachment(attachmentId, { entityType: 'condition_finding', entityId: createdFinding.id }, client);
+      }
     }
 
-    for (const url of generalPhotos) {
-      if (!url) continue;
-      await client.query(
-        `INSERT INTO asset_photos (asset_id, photo_url, created_by) VALUES ($1,$2,$3)`,
-        [assetId, url, username]
-      );
+    for (const attachmentId of generalAttachmentIds) {
+      await linkAttachment(attachmentId, { entityType: 'asset', entityId: assetId }, client);
     }
 
     await client.query('COMMIT');
@@ -640,20 +644,34 @@ export async function deleteReportFavorite(id) {
 
 export async function listAssetNotes(assetId) {
   const { rows } = await pool.query(
-    `SELECT id, note, photo_url, resolved, created_by, created_at FROM asset_notes
+    `SELECT id, note, resolved, created_by, created_at FROM asset_notes
      WHERE asset_id = $1 ORDER BY created_at DESC`,
     [assetId]
   );
-  return rows;
+  const attachments = await listAttachmentsForEntities('asset_note', rows.map((r) => r.id));
+  return rows.map((r) => ({ ...r, attachments: attachments.get(r.id) || [] }));
 }
 
-export async function createAssetNote(assetId, { note, photoUrl = null, createdBy = null }) {
-  const { rows } = await pool.query(
-    `INSERT INTO asset_notes (asset_id, note, photo_url, created_by) VALUES ($1,$2,$3,$4) RETURNING *`,
-    [assetId, note, photoUrl, createdBy]
-  );
-  await logActivity({ action: 'created', entityType: 'asset_note', entityId: rows[0].id, entityLabel: note, details: `On asset #${assetId}` });
-  return rows[0];
+export async function createAssetNote(assetId, { note, attachmentIds = [], createdBy = null }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO asset_notes (asset_id, note, created_by) VALUES ($1,$2,$3) RETURNING *`,
+      [assetId, note, createdBy]
+    );
+    for (const attachmentId of attachmentIds) {
+      await linkAttachment(attachmentId, { entityType: 'asset_note', entityId: rows[0].id }, client);
+    }
+    await client.query('COMMIT');
+    await logActivity({ action: 'created', entityType: 'asset_note', entityId: rows[0].id, entityLabel: note, details: `On asset #${assetId}` });
+    return rows[0];
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 export async function resolveAssetNote(noteId, resolved = true) {
@@ -2726,70 +2744,208 @@ async function getWorkOrderCrewRoster(woId) {
   return { volunteers: vol.rows.map((r) => ({ Id: r.id, Name: r.name })), vendors: ven.rows.map((r) => ({ Id: r.id, Name: r.name })) };
 }
 
-// ── Work Order / Task photos — "solution" photos (proof a job got done),
-//    distinct from every other photo locus in the schema (all audit/evidence:
-//    condition_findings = problem found, asset_photos/asset_components =
-//    asset reference/condition history, maintenance_request_photos = what the
-//    public reported). Storage here is uncapped by design — the report/export
-//    layer (reports.js + pdf.js) decides how many of these to show, not the
-//    schema. ────────────────────────────────────────────────────────────────
+// ── Attachments — the unified polymorphic attachment system (Build Brief v2
+//    Phase 4) that replaced nine separate per-locus photo columns/tables
+//    (work_order_photos, work_order_task_photos, asset_photos, and six
+//    others). One file, many links: `attachments` holds the object itself
+//    (url/thumb/metadata); `attachment_links` is the many-to-many join to
+//    whatever it's attached to — a roof photo can be the evidence on the
+//    finding, the before shot on the job line, and the reference image on
+//    the asset simultaneously, uploaded once. ──────────────────────────────
 
-export async function listWorkOrderPhotos(woId) {
-  const { rows } = await pool.query(
-    'SELECT id, photo_url, caption, sort_order, created_at FROM work_order_photos WHERE work_order_id = $1 ORDER BY sort_order, id',
-    [woId]
-  );
-  return rows.map((r) => ({ Id: r.id, Url: r.photo_url, Caption: r.caption, SortOrder: r.sort_order, CreatedAt: r.created_at }));
-}
-export async function createWorkOrderPhoto(woId, { photoUrl, caption }) {
-  const { rows: maxRows } = await pool.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM work_order_photos WHERE work_order_id = $1', [woId]);
-  const { rows } = await pool.query(
-    'INSERT INTO work_order_photos (work_order_id, photo_url, caption, sort_order, created_by) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-    [woId, photoUrl, caption || null, maxRows[0].next, currentUsername()]
-  );
-  await logActivity({ action: 'added photo to', entityType: 'work_order', entityId: Number(woId) });
-  return { Id: rows[0].id, Url: rows[0].photo_url, Caption: rows[0].caption, SortOrder: rows[0].sort_order, CreatedAt: rows[0].created_at };
-}
-export async function deleteWorkOrderPhoto(id) {
-  const { rows } = await pool.query('DELETE FROM work_order_photos WHERE id = $1 RETURNING work_order_id', [id]);
-  if (rows[0]) await logActivity({ action: 'removed photo from', entityType: 'work_order', entityId: rows[0].work_order_id });
-}
+const ATTACHMENT_ENTITY_TYPES = new Set(['asset', 'work_order', 'job_line', 'condition_finding', 'asset_component', 'maintenance_request', 'asset_note']);
 
-export async function listJobLinePhotos(jobLineId) {
-  const { rows } = await pool.query(
-    'SELECT id, photo_url, sort_order, created_at FROM work_order_task_photos WHERE job_line_id = $1 ORDER BY sort_order, id',
-    [jobLineId]
-  );
-  return rows.map((r) => ({ Id: r.id, Url: r.photo_url, SortOrder: r.sort_order, CreatedAt: r.created_at }));
+function attachmentRowShape(a) {
+  return {
+    Id: a.id, Url: a.url, ThumbUrl: a.thumb_url, Kind: a.kind, MimeType: a.mime_type,
+    FileSize: a.file_size, OriginalFilename: a.original_filename, Width: a.width, Height: a.height,
+    Caption: a.caption, Classification: a.classification, TakenAt: a.taken_at,
+    GpsLat: a.gps_lat, GpsLng: a.gps_lng, Source: a.source, TriageStatus: a.triage_status,
+    UploadedBy: a.uploaded_by, CreatedAt: a.created_at,
+  };
 }
-// Fetches photos for every line on a WO in one query, keyed by job_line_id —
-// the WO detail view lists photos per line without an N+1 round trip per line.
-export async function listJobLinePhotosForWorkOrder(woId) {
-  const { rows } = await pool.query(
-    `SELECT p.id, p.job_line_id, p.photo_url, p.sort_order, p.created_at FROM work_order_task_photos p
-     JOIN job_lines jl ON jl.id = p.job_line_id WHERE jl.work_order_id = $1 ORDER BY p.sort_order, p.id`,
-    [woId]
-  );
-  const byLine = new Map();
+function attachmentLinkRowShape(row) {
+  return {
+    ...attachmentRowShape(row),
+    LinkId: row.link_id, EntityType: row.entity_type, EntityId: row.entity_id,
+    RoleId: row.role_id, RoleName: row.role_name, IncludeInReport: row.include_in_report, SortOrder: row.sort_order,
+    VendorId: row.vendor_id, QuotedAmount: row.quoted_amount, QuoteDate: row.quote_date, IsSelectedQuote: row.is_selected_quote,
+  };
+}
+const ATTACHMENT_LINK_SELECT = `
+  SELECT al.id AS link_id, al.entity_type, al.entity_id, al.role_id, ar.name AS role_name,
+         al.include_in_report, al.sort_order, al.vendor_id, al.quoted_amount, al.quote_date, al.is_selected_quote,
+         a.id, a.url, a.thumb_url, a.kind, a.mime_type, a.file_size, a.original_filename, a.width, a.height,
+         a.caption, a.classification, a.taken_at, a.gps_lat, a.gps_lng, a.source, a.triage_status, a.uploaded_by, a.created_at
+  FROM attachment_links al
+  JOIN attachments a ON a.id = al.attachment_id
+  LEFT JOIN attachment_roles ar ON ar.id = al.role_id
+  WHERE a.deleted_at IS NULL`;
+
+export async function listAttachmentsForEntity(entityType, entityId) {
+  const { rows } = await pool.query(`${ATTACHMENT_LINK_SELECT} AND al.entity_type = $1 AND al.entity_id = $2 ORDER BY al.sort_order, al.id`, [entityType, entityId]);
+  return rows.map(attachmentLinkRowShape);
+}
+// Bulk variant for list-shaped pages (every job line on a WO) — one query
+// instead of one per row, same N+1-avoidance pattern used elsewhere in here.
+export async function listAttachmentsForEntities(entityType, entityIds) {
+  const byEntity = new Map();
+  if (!entityIds.length) return byEntity;
+  const { rows } = await pool.query(`${ATTACHMENT_LINK_SELECT} AND al.entity_type = $1 AND al.entity_id = ANY($2::int[]) ORDER BY al.sort_order, al.id`, [entityType, entityIds]);
   for (const r of rows) {
-    const list = byLine.get(r.job_line_id) || [];
-    list.push({ Id: r.id, Url: r.photo_url, SortOrder: r.sort_order, CreatedAt: r.created_at });
-    byLine.set(r.job_line_id, list);
+    const list = byEntity.get(r.entity_id) || [];
+    list.push(attachmentLinkRowShape(r));
+    byEntity.set(r.entity_id, list);
   }
-  return byLine;
+  return byEntity;
 }
-export async function createJobLinePhoto(jobLineId, photoUrl) {
-  const { rows: maxRows } = await pool.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM work_order_task_photos WHERE job_line_id = $1', [jobLineId]);
+
+async function resolveIncludeInReport(client, roleId, explicit) {
+  if (explicit !== null && explicit !== undefined) return explicit;
+  if (!roleId) return false;
+  const { rows } = await client.query('SELECT default_include_in_report FROM attachment_roles WHERE id = $1', [roleId]);
+  return rows[0]?.default_include_in_report ?? false;
+}
+
+// Creates the attachment row from a storage.js ingest result with NO link
+// yet. Needed because the audit form and the maintenance-request portal
+// upload photos before the row they belong to exists (a finding/component
+// event/request isn't created until the whole form submits) — the caller
+// links it afterward, inside the same transaction that creates the parent row.
+export async function createAttachment(meta, { source = 'upload', uploadedBy = null } = {}) {
   const { rows } = await pool.query(
-    'INSERT INTO work_order_task_photos (job_line_id, photo_url, sort_order, created_by) VALUES ($1,$2,$3,$4) RETURNING *',
-    [jobLineId, photoUrl, maxRows[0].next, currentUsername()]
+    `INSERT INTO attachments (url, thumb_url, kind, mime_type, file_size, original_filename, width, height, taken_at, gps_lat, gps_lng, source, uploaded_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+    [meta.url, meta.thumbUrl, meta.kind, meta.mimeType, meta.fileSize, meta.originalFilename, meta.width, meta.height,
+      meta.takenAt, meta.gpsLat, meta.gpsLng, source, uploadedBy]
   );
-  const lineRes = await pool.query('SELECT title, work_order_id FROM job_lines WHERE id = $1', [jobLineId]);
-  await logActivity({ action: 'added photo to', entityType: 'job_line', entityId: Number(jobLineId), entityLabel: lineRes.rows[0]?.title, details: `On Work Order #${lineRes.rows[0]?.work_order_id}` });
-  return { Id: rows[0].id, Url: rows[0].photo_url, SortOrder: rows[0].sort_order, CreatedAt: rows[0].created_at };
+  return attachmentRowShape(rows[0]);
 }
-export async function deleteJobLinePhoto(id) {
-  await pool.query('DELETE FROM work_order_task_photos WHERE id = $1', [id]);
+
+export async function linkAttachment(attachmentId, { entityType, entityId, roleId = null, classification = null, caption = null, includeInReport = null, sortOrder = 0, vendorId = null, quotedAmount = null, quoteDate = null, isSelectedQuote = false }, client = pool) {
+  if (!ATTACHMENT_ENTITY_TYPES.has(entityType)) { const e = new Error(`Unknown attachment entity type: ${entityType}`); e.status = 400; throw e; }
+  const include = await resolveIncludeInReport(client, roleId, includeInReport);
+  if (classification !== null || caption !== null) {
+    await client.query('UPDATE attachments SET classification = COALESCE($2, classification), caption = COALESCE($3, caption) WHERE id = $1', [attachmentId, classification, caption]);
+  }
+  const { rows } = await client.query(
+    `INSERT INTO attachment_links (attachment_id, entity_type, entity_id, role_id, include_in_report, sort_order, vendor_id, quoted_amount, quote_date, is_selected_quote)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+    [attachmentId, entityType, entityId, roleId, include, sortOrder, vendorId, quotedAmount, quoteDate, isSelectedQuote]
+  );
+  await logActivity({ action: 'attached', entityType, entityId: Number(entityId) });
+  return rows[0].id;
+}
+
+// The common case: upload + link in one step. Everything except the
+// "entity doesn't exist yet" flows above (which call createAttachment then
+// linkAttachment separately, inside their own transaction) goes through this.
+export async function createAndLinkAttachment(meta, link, opts) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const insertRes = await client.query(
+      `INSERT INTO attachments (url, thumb_url, kind, mime_type, file_size, original_filename, width, height, caption, classification, taken_at, gps_lat, gps_lng, source, uploaded_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+      [meta.url, meta.thumbUrl, meta.kind, meta.mimeType, meta.fileSize, meta.originalFilename, meta.width, meta.height,
+        link.caption || null, link.classification || null, meta.takenAt, meta.gpsLat, meta.gpsLng, opts?.source || 'upload', opts?.uploadedBy || null]
+    );
+    const attachment = insertRes.rows[0];
+    const linkId = await linkAttachment(attachment.id, { ...link, caption: null, classification: null }, client);
+    await client.query('COMMIT');
+    return { attachment: attachmentRowShape(attachment), linkId };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function updateAttachmentLink(linkId, { roleId, classification, caption, includeInReport, sortOrder, vendorId, quotedAmount, quoteDate, isSelectedQuote }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const linkRes = await client.query('SELECT attachment_id FROM attachment_links WHERE id = $1', [linkId]);
+    if (!linkRes.rows[0]) { await client.query('ROLLBACK'); return null; }
+    const attachmentId = linkRes.rows[0].attachment_id;
+    if (classification !== undefined || caption !== undefined) {
+      await client.query('UPDATE attachments SET classification = COALESCE($2, classification), caption = COALESCE($3, caption) WHERE id = $1', [attachmentId, classification ?? null, caption ?? null]);
+    }
+    const include = includeInReport !== undefined ? includeInReport : (roleId !== undefined ? await resolveIncludeInReport(client, roleId, null) : undefined);
+    await client.query(
+      `UPDATE attachment_links SET
+         role_id = COALESCE($2, role_id), include_in_report = COALESCE($3, include_in_report),
+         sort_order = COALESCE($4, sort_order), vendor_id = COALESCE($5, vendor_id),
+         quoted_amount = COALESCE($6, quoted_amount), quote_date = COALESCE($7, quote_date),
+         is_selected_quote = COALESCE($8, is_selected_quote)
+       WHERE id = $1`,
+      [linkId, roleId ?? null, include ?? null, sortOrder ?? null, vendorId ?? null, quotedAmount ?? null, quoteDate ?? null, isSelectedQuote ?? null]
+    );
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  const { rows } = await pool.query(`${ATTACHMENT_LINK_SELECT} AND al.id = $1`, [linkId]);
+  return rows[0] ? attachmentLinkRowShape(rows[0]) : null;
+}
+
+// Detach — the common, low-consequence action: removes one link. File and
+// attachment untouched, other links unaffected.
+export async function detachAttachment(linkId) {
+  const { rows } = await pool.query('DELETE FROM attachment_links WHERE id = $1 RETURNING entity_type, entity_id', [linkId]);
+  if (rows[0]) await logActivity({ action: 'detached attachment from', entityType: rows[0].entity_type, entityId: rows[0].entity_id });
+}
+
+// Void — soft delete. Fast, one-tap, no confirm dialog by design (junk mail
+// attachments are the case this exists for — hesitation is the enemy). File
+// in Spaces is untouched; hard delete is a separate, low-priority reaper
+// script this phase doesn't build.
+export async function voidAttachment(attachmentId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`DELETE FROM attachment_links WHERE attachment_id = $1`, [attachmentId]);
+    await client.query(`UPDATE attachments SET deleted_at = now(), triage_status = 'void' WHERE id = $1`, [attachmentId]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  await logActivity({ action: 'voided', entityType: 'attachment', entityId: Number(attachmentId) });
+}
+
+// ── Attachment roles (admin-editable, §4.3 — "what is this, relative to
+//    this record": Before/After/Evidence/Quote/etc. Lives on the link, not
+//    the file, since the same photo can be a different role on each entity
+//    it's attached to.) ─────────────────────────────────────────────────────
+export async function listAttachmentRoles({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(`SELECT id, name, sort_order, default_include_in_report, active FROM attachment_roles ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`);
+  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, DefaultIncludeInReport: r.default_include_in_report, Active: r.active }));
+}
+export async function createAttachmentRole({ name, sortOrder = 100, defaultIncludeInReport = false }) {
+  const { rows } = await pool.query('INSERT INTO attachment_roles (name, sort_order, default_include_in_report) VALUES ($1,$2,$3) RETURNING *', [name, sortOrder, defaultIncludeInReport]);
+  await logActivity({ action: 'created', entityType: 'attachment_role', entityId: rows[0].id, entityLabel: rows[0].name });
+  return { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, DefaultIncludeInReport: rows[0].default_include_in_report, Active: rows[0].active };
+}
+export async function updateAttachmentRole(id, { name, sortOrder, defaultIncludeInReport, active }) {
+  const { rows } = await pool.query(
+    'UPDATE attachment_roles SET name = COALESCE($2,name), sort_order = COALESCE($3,sort_order), default_include_in_report = COALESCE($4,default_include_in_report), active = COALESCE($5,active) WHERE id = $1 RETURNING *',
+    [id, name ?? null, sortOrder ?? null, defaultIncludeInReport ?? null, active ?? null]
+  );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'attachment_role', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] ? { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, DefaultIncludeInReport: rows[0].default_include_in_report, Active: rows[0].active } : null;
+}
+export async function deleteAttachmentRole(id) {
+  const inUse = await pool.query('SELECT count(*) FROM attachment_links WHERE role_id = $1', [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} attachment(s) still use this role — deactivate it instead of deleting`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM attachment_roles WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'attachment_role', entityId: Number(id), entityLabel: rows[0].name });
 }
 
 // ── Calendar Events — independent of Work Orders (optional link either way).
@@ -3349,7 +3505,7 @@ const REQUEST_CORE_COLUMNS = new Set(['requester_name', 'requester_email', 'requ
 // values: { [fieldKey]: string | string[] }. Unknown/inactive field keys are
 // silently ignored — validated against the LIVE active-field catalog, not
 // whatever the client happened to submit.
-export async function createMaintenanceRequest({ values = {}, photoUrls = [] }) {
+export async function createMaintenanceRequest({ values = {}, attachmentIds = [] }) {
   const fields = await getRequestFormFields();
   const missing = fields.filter((f) => f.required && !String(values[f.fieldKey] ?? '').trim());
   if (missing.length) {
@@ -3393,8 +3549,8 @@ export async function createMaintenanceRequest({ values = {}, photoUrls = [] }) 
         [request.id, e.fieldKey, e.value]
       );
     }
-    for (const url of photoUrls) {
-      await client.query(`INSERT INTO maintenance_request_photos (request_id, photo_url) VALUES ($1,$2)`, [request.id, url]);
+    for (const attachmentId of attachmentIds) {
+      await linkAttachment(attachmentId, { entityType: 'maintenance_request', entityId: request.id }, client);
     }
     await client.query('COMMIT');
     await logActivity({
@@ -3449,10 +3605,7 @@ export async function getMaintenanceRequestDetail(id) {
     fieldKey: v.field_key, label: fieldByKey.get(v.field_key)?.label || v.field_key, value: v.value,
   }));
 
-  const { rows: photoRows } = await pool.query(
-    `SELECT id, photo_url, created_at FROM maintenance_request_photos WHERE request_id = $1 ORDER BY id`, [id]
-  );
-  request.Photos = photoRows.map((p) => ({ Id: p.id, Url: p.photo_url, CreatedAt: p.created_at }));
+  request.Photos = await listAttachmentsForEntity('maintenance_request', id);
 
   return request;
 }

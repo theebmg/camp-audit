@@ -13,7 +13,7 @@ import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
 import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg } from '../reportDataPg.js';
 import { renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText, renderPlainEmailHtml } from '../reportRender.js';
-import { uploadPhoto } from '../storage.js';
+import { storeAttachment } from '../storage.js';
 import { renderChecklistPdf, renderWorkOrderScopePdf } from '../pdf.js';
 import { currentUsername, currentRole } from '../requestContext.js';
 import {
@@ -41,8 +41,9 @@ import {
   listVolunteers, createVolunteer, updateVolunteer, removeVolunteer,
   listVendors, createVendor, updateVendor, removeVendor,
   listSkills, createSkill, searchAssetsLive, createAssetQuick,
-  listWorkOrderPhotos, createWorkOrderPhoto, deleteWorkOrderPhoto,
-  listJobLinePhotosForWorkOrder, createJobLinePhoto, deleteJobLinePhoto,
+  listAttachmentsForEntity, listAttachmentsForEntities, createAttachment, createAndLinkAttachment,
+  updateAttachmentLink, detachAttachment, voidAttachment,
+  listAttachmentRoles, createAttachmentRole, updateAttachmentRole, deleteAttachmentRole,
   listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
   listJobLinesScheduledInRange,
@@ -75,22 +76,91 @@ import {
 } from '../reports.js';
 
 const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+// 25MB, not 15 — most mail servers reject above 25MB anyway (Phase 5 email
+// ingest), so the upload path matches that ceiling everywhere, not just here.
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-// Generic photo upload -> DigitalOcean Spaces, returns the URL to attach
-// wherever the caller needs it (a note, a finding, ...). category/ownerId are
-// just for readable object keys in the bucket, not access control.
-router.post('/upload', upload.single('photo'), async (req, res, next) => {
+// ---- Attachments (Build Brief v2 Phase 4) — replaces the old generic
+// /upload + nine per-locus photo tables. One route ingests (resize/thumb/
+// EXIF via storage.js) and, when entityType+entityId are given, links in the
+// same step. Omitting them uploads unlinked — the audit form and the public
+// maintenance-request portal need this because the row a photo belongs to
+// (a finding, a component event, the request itself) doesn't exist until the
+// whole form submits; the caller links it afterward, server-side. ----
+
+router.post('/attachments', upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
-    const url = await uploadPhoto(req.file.buffer, {
+    const meta = await storeAttachment(req.file.buffer, {
       filename: req.file.originalname,
       mimetype: req.file.mimetype,
       category: req.body.category || 'misc',
       ownerId: req.body.ownerId || 'unknown',
     });
-    res.json({ ok: true, url });
+    const { entityType, entityId, roleId, classification, caption } = req.body || {};
+    if (entityType && entityId) {
+      const { attachment, linkId } = await createAndLinkAttachment(meta,
+        { entityType, entityId: Number(entityId), roleId: roleId ? Number(roleId) : null, classification: classification || null, caption: caption || null },
+        { source: 'upload', uploadedBy: currentUsername() });
+      return res.json({ ok: true, attachment: { ...attachment, LinkId: linkId } });
+    }
+    const attachment = await createAttachment(meta, { source: 'upload', uploadedBy: currentUsername() });
+    res.json({ ok: true, attachment });
   } catch (e) { next(e); }
+});
+
+router.get('/attachments', async (req, res, next) => {
+  try {
+    const { entityType, entityId } = req.query;
+    if (!entityType || !entityId) return res.status(400).json({ ok: false, error: 'entityType and entityId are required' });
+    res.json({ attachments: await listAttachmentsForEntity(entityType, entityId) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/attachment-links/:linkId', async (req, res, next) => {
+  try {
+    const { roleId, classification, caption, includeInReport, sortOrder, vendorId, quotedAmount, quoteDate, isSelectedQuote } = req.body || {};
+    const updated = await updateAttachmentLink(req.params.linkId, {
+      roleId: roleId === undefined ? undefined : (roleId ? Number(roleId) : null),
+      classification, caption, includeInReport, sortOrder, vendorId: vendorId ? Number(vendorId) : undefined,
+      quotedAmount, quoteDate, isSelectedQuote,
+    });
+    if (!updated) return res.status(404).json({ ok: false, error: 'Attachment link not found' });
+    res.json({ ok: true, attachment: updated });
+  } catch (e) { next(e); }
+});
+
+// Detach — removes this one link only. Fast, no confirm expected client-side.
+router.delete('/attachment-links/:linkId', async (req, res, next) => {
+  try { await detachAttachment(req.params.linkId); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// Void — soft-deletes the file everywhere it's linked. One tap, no confirm —
+// see voidAttachment's comment in db.js for why.
+router.post('/attachments/:id/void', async (req, res, next) => {
+  try { await voidAttachment(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.get('/attachment-roles', async (req, res, next) => {
+  try { res.json({ roles: await listAttachmentRoles({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/attachment-roles', async (req, res, next) => {
+  try {
+    const { name, sortOrder } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, role: await createAttachmentRole({ name: name.trim(), sortOrder }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/attachment-roles/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, defaultIncludeInReport, active } = req.body || {};
+    const updated = await updateAttachmentRole(req.params.id, { name, sortOrder, defaultIncludeInReport, active });
+    if (!updated) return res.status(404).json({ ok: false, error: 'Role not found' });
+    res.json({ ok: true, role: updated });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/attachment-roles/:id', async (req, res, next) => {
+  try { await deleteAttachmentRole(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 // Condition Findings severity options — mirrors the live NocoDB Severity select.
@@ -144,9 +214,9 @@ router.get('/search', async (req, res, next) => {
 
 router.get('/options', async (req, res, next) => {
   try {
-    const [propertyFields, componentSchema, buildingTypes, workOrderStatuses, jobLineStatuses, displaySettings] = await Promise.all([
+    const [propertyFields, componentSchema, buildingTypes, workOrderStatuses, jobLineStatuses, displaySettings, attachmentRoles] = await Promise.all([
       getAssetPropertyFields(), getComponentTypeCatalog(), listBuildingTypes(),
-      listWorkOrderStatuses(), listJobLineStatuses(), getDisplaySettings(),
+      listWorkOrderStatuses(), listJobLineStatuses(), getDisplaySettings(), listAttachmentRoles(),
     ]);
     res.json({
       propertyFields,
@@ -156,6 +226,7 @@ router.get('/options', async (req, res, next) => {
       buildingTypes,
       workOrderStatuses, jobLineStatuses, displaySettings,
       findingSeverity: FINDING_SEVERITY_OPTIONS,
+      attachmentRoles,
       currentUser: { username: currentUsername(), role: currentRole() },
     });
   } catch (e) { next(e); }
@@ -296,9 +367,9 @@ router.get('/assets/:id/notes', async (req, res, next) => {
 
 router.post('/assets/:id/notes', async (req, res, next) => {
   try {
-    const { note, photoUrl } = req.body || {};
+    const { note, attachmentIds } = req.body || {};
     if (!note || !note.trim()) return res.status(400).json({ ok: false, error: 'note text is required' });
-    const created = await createAssetNote(req.params.id, { note: note.trim(), photoUrl: photoUrl || null, createdBy: req.session?.user || null });
+    const created = await createAssetNote(req.params.id, { note: note.trim(), attachmentIds: Array.isArray(attachmentIds) ? attachmentIds : [], createdBy: req.session?.user || null });
     res.json({ ok: true, note: created });
   } catch (e) { next(e); }
 });
@@ -379,8 +450,8 @@ router.get('/assets/:id/history', async (req, res, next) => {
 
 router.post('/assets/:id/audit', async (req, res, next) => {
   try {
-    const { properties = {}, componentEvents = [], finding = null, generalPhotos = [] } = req.body || {};
-    const result = await submitAudit(req.params.id, { properties, componentEvents, finding, generalPhotos });
+    const { properties = {}, componentEvents = [], finding = null, generalAttachmentIds = [] } = req.body || {};
+    const result = await submitAudit(req.params.id, { properties, componentEvents, finding, generalAttachmentIds });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
@@ -760,36 +831,14 @@ router.get('/work-orders/:id', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    const [jobLines, checklist, logEntries, crewSessions, photos, linePhotosByLine] = await Promise.all([
+    const [jobLines, checklist, logEntries, crewSessions, photos] = await Promise.all([
       listJobLines(req.params.id), getChecklistInstanceForWorkOrder(req.params.id), listWorkOrderLogEntries(req.params.id),
-      listCrewSessionsForWorkOrder(req.params.id), listWorkOrderPhotos(req.params.id), listJobLinePhotosForWorkOrder(req.params.id),
+      listCrewSessionsForWorkOrder(req.params.id), listAttachmentsForEntity('work_order', req.params.id),
     ]);
-    for (const jl of jobLines) jl.Photos = linePhotosByLine.get(jl.Id) || [];
+    const jobLineAttachments = await listAttachmentsForEntities('job_line', jobLines.map((jl) => jl.Id));
+    for (const jl of jobLines) jl.Photos = jobLineAttachments.get(jl.Id) || [];
     res.json({ ...detail, jobLines, checklist, logEntries, crewSessions, photos });
   } catch (e) { next(e); }
-});
-
-// ---- Work Order / Job Line photos ("solution" photos — proof a job got done) ----
-
-router.post('/work-orders/:id/photos', async (req, res, next) => {
-  try {
-    const { photoUrl, caption } = req.body || {};
-    if (!photoUrl) return res.status(400).json({ ok: false, error: 'photoUrl is required' });
-    res.json({ ok: true, photo: await createWorkOrderPhoto(req.params.id, { photoUrl, caption }) });
-  } catch (e) { next(e); }
-});
-router.delete('/work-order-photos/:photoId', async (req, res, next) => {
-  try { await deleteWorkOrderPhoto(req.params.photoId); res.json({ ok: true }); } catch (e) { next(e); }
-});
-router.post('/job-lines/:jobLineId/photos', async (req, res, next) => {
-  try {
-    const { photoUrl } = req.body || {};
-    if (!photoUrl) return res.status(400).json({ ok: false, error: 'photoUrl is required' });
-    res.json({ ok: true, photo: await createJobLinePhoto(req.params.jobLineId, photoUrl) });
-  } catch (e) { next(e); }
-});
-router.delete('/job-line-photos/:photoId', async (req, res, next) => {
-  try { await deleteJobLinePhoto(req.params.photoId); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 router.post('/work-orders/:id/log', async (req, res, next) => {

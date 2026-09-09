@@ -1,3 +1,101 @@
+# Runbook: Attachments (Build Brief v2, Phase 4)
+
+Phase 4 landed 2026-09-09. Migrations 0044–0047. Read this before touching
+any photo/document upload path anywhere in the app — every one of them now
+goes through the same system.
+
+## What changed
+- Nine separate photo loci (`assets.legacy_photos`, `asset_photos`,
+  `asset_components.photo_url`, `condition_findings.photo_urls`/
+  `legacy_photos`, `work_orders.legacy_photos`, `work_order_photos`,
+  `work_order_task_photos`, `maintenance_request_photos`,
+  `asset_notes.photo_url`) are gone, dropped in 0047 with no data migration
+  (all test data, per the brief). Three of the nine were already dead
+  (jsonb columns with no read/write path anywhere) — found during the sweep,
+  not previously documented.
+- Replaced by two tables (0046): `attachments` (the file + metadata: url,
+  thumb_url, kind, mime_type, dimensions, caption, classification, EXIF
+  taken_at/gps, triage_status, deleted_at) and `attachment_links` (the
+  many-to-many join: entity_type/entity_id, role_id, include_in_report,
+  sort_order, plus quote-only columns for Phase 6). One file can be linked to
+  several entities at once — e.g. a finding photo that's also the job line's
+  before-shot.
+- **Deviation from the brief as written**: §4.4 specifies a new
+  `component_types` table for photo classification. That table already
+  exists under a different name — `component_type_catalog` (migration
+  0002), which backs the live "Component Types" admin page and is the exact
+  vocabulary component_sub_areas/asset_components already use. Creating a
+  second table would have caused the exact drift §4.4 warns against, so
+  `attachments.classification` is a `text` FK straight to
+  `component_type_catalog(component_type)` instead of a new surrogate-id
+  table. No `component_types` table exists — don't add one.
+- `attachment_roles` (0045, admin-editable, Admin → Work Orders →
+  Attachment Roles) is what/why — Before/After/Evidence/Quote/etc.
+  `attachment_batches` (0044) exists as schema-only groundwork for Phase 5's
+  email ingest — nothing writes to it yet.
+- `src/storage.js` grew from one function (`uploadPhoto`) to
+  `storeAttachment()`: images are resized to a 2000px long edge at quality
+  82 with a 400px thumbnail generated alongside (both re-encoded to JPEG
+  regardless of source format), EXIF `DateTimeOriginal`/GPS are read from
+  the *original* buffer before resize strips it (via `exifr`), documents
+  pass through unresized with no thumbnail. New deps: `sharp`, `exifr`.
+- `src/db.js`: `listAttachmentsForEntity`/`listAttachmentsForEntities` (bulk,
+  N+1-safe) read; `createAttachment` (unlinked) + `linkAttachment` +
+  `createAndLinkAttachment` (the common upload+link-in-one-transaction path)
+  write; `updateAttachmentLink` edits role/classification/caption/
+  include-in-report/quote fields; `detachAttachment` removes one link;
+  `voidAttachment` soft-deletes everywhere at once (cascades link removal,
+  sets `deleted_at`+`triage_status='void'`, file untouched in Spaces — no
+  confirm dialog by design, see its comment). Admin CRUD for
+  `attachment_roles` mirrors `listCauses`/`createCause`/etc exactly.
+- `POST /api/pg/attachments` (multipart) is now the single ingest route for
+  everything, replacing the old generic `/api/pg/upload` plus five
+  locus-specific photo routes. Omitting `entityType`/`entityId` uploads
+  **unlinked** — required for the audit form and the public
+  maintenance-request portal, where the row a photo belongs to (a finding, a
+  component event, the request itself) doesn't exist yet at upload time;
+  `submitAudit`/`createAssetNote`/`createMaintenanceRequest` accept
+  `attachmentIds` and link them server-side, inside the same transaction
+  that creates the parent row. Max upload size is now 25MB everywhere
+  (brief §4.5), up from 15MB (8MB on the public portal).
+- Frontend: one shared widget, `renderAttachmentSection(entityType,
+  entityId, container, opts)` in `public-pg/app.js`, used everywhere a
+  photo/doc attaches to something — asset reference photos, per-finding
+  photos, per-component-event photos (history view), job-line photos, a new
+  WO-level "Documents" card (permits/invoices not tied to one line — work
+  photos still default to the job line per §4.2), maintenance-request
+  photos, asset-note photos. Capture is zero-decision (tap "+ Add", camera
+  opens, done); tapping an existing thumbnail opens an edit panel
+  (role/classification/caption/include-in-report/Detach/Void) — role and
+  classification are never prompted for at capture time, matching the
+  brief's "classification happens later at a desk." `state.options` (the
+  `/api/pg/options` bundle, loaded once at login) now carries
+  `attachmentRoles` so the widget never needs its own fetch for the roster.
+- Component-event attachments (`entity_type = 'asset_component'`) get their
+  `classification` pre-filled from the event's own `component_type` at
+  upload time — the one case where a guess is never wrong, since it isn't a
+  guess (§4.4).
+
+## Known gaps / follow-ups
+- Quote fields (`vendor_id`/`quoted_amount`/`quote_date`/`is_selected_quote`
+  on `attachment_links`) exist in the schema but have no UI yet — that's
+  explicitly Phase 6 work (§6.4) per the brief's own phase split; don't add
+  it early, the report-side consumption (Quote Comparison, "Quotes
+  received" count) needs to land at the same time.
+- Hard-delete reaper (purging `deleted_at`-older-than-30-days rows and their
+  Spaces objects) is not built — the brief marks it optional/low-priority.
+  Voided files currently sit in Spaces forever with no automated cleanup
+  (same as the pre-existing orphan risk from any DELETE that isn't a void).
+- `POST /api/pg/attachments` doesn't yet enforce the whitelist of valid
+  `entityType` values at the HTTP layer beyond what `linkAttachment` checks
+  server-side (400 on an unknown type) — fine functionally, just means a
+  bad request surfaces as a 500-shaped error path one layer lower than
+  ideal. Low priority.
+- EXIF GPS/`taken_at` extraction is wired and tested (`storeAttachment`
+  reads both from the original buffer before resize), but nothing in the UI
+  surfaces them yet — Phase 5's nearest-asset-from-GPS triage suggestion and
+  EXIF-clustering are what actually consume these columns.
+
 # Runbook: Findings Lifecycle (Build Brief v2, Phase 3)
 
 Phase 3 landed 2026-09-09, same session as Phases 1-2. Migration 0043.
@@ -152,21 +250,20 @@ lines, calendar, budget, or reports code; the shape changed everywhere.
   funding/cost/hours can legitimately span more than one value.
 
 ## Known gaps / follow-ups
-- **`work_order_log_entries.job_line_id` migration (0037) is unapplied.**
-  `work_order_log_entries` is owned by DB role `nocodb`, not `camp_app` (a
-  pre-existing ownership drift, not something this work introduced), and
-  `camp_app` has no privilege path to fix it. An operator with Postgres
-  superuser access needs to run, once, against the `camp` database:
-  `ALTER TABLE work_order_log_entries OWNER TO camp_app;` — then
-  `npm run migrate` picks up 0037 normally. Until then, work log entries
-  can't be attributed to a specific job line (WO-level notes still work
-  fine). **The same ownership drift affects 8 other tables** (`asset_photos`,
-  `asset_property_history`, `budget_settings`, `cabin_holders`,
-  `capital_campaign_projects`, `other_budget_categories`,
-  `report_favorites`, `users`) — none needed by Phase 1, but the next
-  migration that touches one of them will hit the same wall; worth fixing
-  all of them in one pass with the same `ALTER TABLE ... OWNER TO camp_app`
-  the next time a superuser is available.
+- ~~`work_order_log_entries.job_line_id` migration (0037) is unapplied~~ —
+  **resolved 2026-09-09.** Ownership drift fixed (`ALTER TABLE ... OWNER TO
+  camp_app` run as the `nocodb` superuser role against the `camp` database)
+  for all 10 affected tables — the 8 originally listed here plus
+  `activity_log` and `work_order_log_entries` itself, which the earlier
+  sweep undercounted. Migration 0037 is now applied. Job-line status-change
+  log entries can be tagged with `job_line_id` going forward.
+  **How to run migrations against this host:** the running `camp-audit`
+  container's image does not include `scripts/` or `migrations/` (see its
+  `Dockerfile` — only `src`/`public`/`public-pg` are copied), and
+  `nocodb-db` publishes no host port, so `npm run migrate` from the bare
+  host fails both for missing env and for DNS. Use a throwaway container on
+  the compose network instead:
+  `docker run --rm --network nocodb_default -v /root/camp-audit:/app:ro -w /app -e DATABASE_URL="$(grep DATABASE_URL /root/camp-audit/.env | cut -d= -f2-)" node:22-alpine node scripts/migrate.js`
 - `job_lines.status_id` (and the `job_line_statuses` table it references) is
   Phase 2 work, not Phase 1 — see the brief's own 1.3/2.1 split. Job lines
   currently have no status field at all beyond the boolean `done`.
