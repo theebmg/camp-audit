@@ -63,7 +63,7 @@ import {
   adminListRequestFields, adminCreateRequestField, adminUpdateRequestField,
   listMaintenanceRequests, getMaintenanceRequestDetail, updateMaintenanceRequestStatus,
   convertRequestToWorkOrder, linkRequestToAsset, listRequestMessages, createRequestMessage,
-  updateConditionFinding,
+  updateConditionFinding, deferFinding, dismissFinding, getFindingsSummary,
   listMapPins, setAssetMapLocation, listMapFeatures, createMapFeature, updateMapFeature, deleteMapFeature,
   listMapLayers, createMapLayer, updateMapLayer, deleteMapLayer,
 } from '../db.js';
@@ -348,6 +348,25 @@ router.patch('/condition-findings/:id', async (req, res, next) => {
     if (!finding) return res.status(404).json({ ok: false, error: 'Condition Finding not found' });
     res.json({ ok: true, finding });
   } catch (e) { next(e); }
+});
+router.post('/condition-findings/:id/defer', async (req, res, next) => {
+  try {
+    const { reason, revisitDate } = req.body || {};
+    const finding = await deferFinding(req.params.id, { reason, revisitDate });
+    if (!finding) return res.status(404).json({ ok: false, error: 'Condition Finding not found' });
+    res.json({ ok: true, finding });
+  } catch (e) { next(e); }
+});
+router.post('/condition-findings/:id/dismiss', async (req, res, next) => {
+  try {
+    const { note } = req.body || {};
+    const finding = await dismissFinding(req.params.id, { note });
+    if (!finding) return res.status(404).json({ ok: false, error: 'Condition Finding not found' });
+    res.json({ ok: true, finding });
+  } catch (e) { next(e); }
+});
+router.get('/findings-summary', async (req, res, next) => {
+  try { res.json(await getFindingsSummary()); } catch (e) { next(e); }
 });
 
 router.get('/assets/:id/history', async (req, res, next) => {

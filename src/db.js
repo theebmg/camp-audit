@@ -279,7 +279,11 @@ export async function getAssetDetail(assetId) {
        WHERE w.asset_id = $1 ORDER BY w.id DESC LIMIT 200`,
       [assetId]
     ),
-    pool.query(`SELECT id, title, severity, status, board_focus FROM condition_findings WHERE asset_id = $1 ORDER BY id DESC LIMIT 200`, [assetId]),
+    pool.query(
+      `SELECT id, title, severity, status, board_focus, deferred_reason, revisit_date, dismiss_note
+       FROM condition_findings WHERE asset_id = $1 ORDER BY id DESC LIMIT 200`,
+      [assetId]
+    ),
     getAssetPropertyValuesEav(assetId),
   ]);
   const asset = assetRowToNocoShape(assetRow);
@@ -295,7 +299,10 @@ export async function getAssetDetail(assetId) {
     componentRows, // callers pass this straight into components.js's currentComponentState/sortHistory
     componentSchema,
     workOrders: workOrders.rows.map((r) => ({ Id: r.id, Title: r.title, Status: r.status, StatusColor: r.status_color, Priority: r.priority })),
-    conditionFindings: findings.rows.map((r) => ({ Id: r.id, Title: r.title, Severity: r.severity, Status: r.status, BoardFocus: r.board_focus })),
+    conditionFindings: findings.rows.map((r) => ({
+      Id: r.id, Title: r.title, Severity: r.severity, Status: r.status, BoardFocus: r.board_focus,
+      DeferredReason: r.deferred_reason, RevisitDate: r.revisit_date, DismissNote: r.dismiss_note,
+    })),
   };
 }
 
@@ -1748,6 +1755,45 @@ export async function updateConditionFinding(id, { boardFocus }) {
   return { Id: rows[0].id, Title: rows[0].title, BoardFocus: rows[0].board_focus };
 }
 
+// Phase 3's two manual finding transitions — both require an explanation,
+// enforced here (not just in the UI), for the same "board credibility"
+// reason Deferred work orders do: reviewed_by/reviewed_at make the decision
+// attributable, same pattern as maintenance_requests.
+export async function deferFinding(id, { reason, revisitDate }) {
+  if (!reason?.trim() || !revisitDate) { const e = new Error('Deferring a finding requires a reason and a revisit date'); e.status = 400; throw e; }
+  const { rows } = await pool.query(
+    `UPDATE condition_findings SET status = 'Deferred', deferred_reason = $2, revisit_date = $3, reviewed_by = $4, reviewed_at = now() WHERE id = $1 RETURNING id, title`,
+    [id, reason.trim(), revisitDate, currentUsername()]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'deferred', entityType: 'condition_finding', entityId: rows[0].id, entityLabel: rows[0].title, details: reason.trim() });
+  return { Id: rows[0].id, Title: rows[0].title };
+}
+export async function dismissFinding(id, { note }) {
+  if (!note?.trim()) { const e = new Error('Dismissing a finding requires a note'); e.status = 400; throw e; }
+  const { rows } = await pool.query(
+    `UPDATE condition_findings SET status = 'Dismissed', dismiss_note = $2, reviewed_by = $3, reviewed_at = now() WHERE id = $1 RETURNING id, title`,
+    [id, note.trim(), currentUsername()]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'dismissed', entityType: 'condition_finding', entityId: rows[0].id, entityLabel: rows[0].title, details: note.trim() });
+  return { Id: rows[0].id, Title: rows[0].title };
+}
+
+// Dashboard signal (3): Open should trend to zero — every finding is
+// supposed to end up with a decision made on it, one way or another. The
+// second count is the data-quality check: findings nobody has even put on a
+// work order yet.
+export async function getFindingsSummary() {
+  const { rows } = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE status = 'Open') AS open_count,
+      COUNT(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM job_lines jl WHERE jl.condition_finding_id = condition_findings.id)) AS not_on_wo_count
+    FROM condition_findings
+  `);
+  return { OpenCount: Number(rows[0].open_count), NotOnAnyWorkOrderCount: Number(rows[0].not_on_wo_count) };
+}
+
 // Everything currently flagged board_focus, across both Work Orders and
 // Condition Findings — the Forward Focus report's raw material.
 export async function getBoardFocusItems() {
@@ -2216,9 +2262,9 @@ export async function listMapPins() {
       WHERE asset_id = a.id AND status = 'Open'
     ) cf ON true
     LEFT JOIN LATERAL (
-      SELECT bool_or(board_focus) AS any_focus
-      FROM work_orders
-      WHERE asset_id = a.id AND status NOT IN ('Completed', 'Cancelled')
+      SELECT bool_or(w.board_focus) AS any_focus
+      FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id
+      WHERE w.asset_id = a.id AND NOT ws.is_terminal
     ) wo ON true
     WHERE a.map_x IS NOT NULL AND a.map_y IS NOT NULL
     ORDER BY a.name
@@ -2270,9 +2316,9 @@ const MAP_FEATURE_SELECT = `
     WHERE asset_id = f.asset_id AND status = 'Open'
   ) cf ON true
   LEFT JOIN LATERAL (
-    SELECT bool_or(board_focus) AS any_focus
-    FROM work_orders
-    WHERE asset_id = f.asset_id AND status NOT IN ('Completed', 'Cancelled')
+    SELECT bool_or(w.board_focus) AS any_focus
+    FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id
+    WHERE w.asset_id = f.asset_id AND NOT ws.is_terminal
   ) wo ON true
 `;
 function formatMapFeatureRow(r) {
@@ -2467,16 +2513,38 @@ export async function getJobLine(id) {
 // 'Not Started' — status changes from there go through changeJobLineStatus.
 export async function createJobLine(woId, {
   title, responsibilityClass = 'self', fundingSource = 'operating_budget', fundingRefId = null,
-  estimatedHours = null, estimatedCost = null, scheduledDate = null,
+  estimatedHours = null, estimatedCost = null, scheduledDate = null, conditionFindingId = null,
 }) {
   const { rows: maxRows } = await pool.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM job_lines WHERE work_order_id = $1', [woId]);
   const { rows } = await pool.query(
-    `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, scheduled_date, status_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT id FROM job_line_statuses WHERE name = 'Not Started')) RETURNING *`,
-    [woId, title, maxRows[0].next, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate]
+    `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, scheduled_date, condition_finding_id, status_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,(SELECT id FROM job_line_statuses WHERE name = 'Not Started')) RETURNING *`,
+    [woId, title, maxRows[0].next, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate, conditionFindingId]
   );
+  if (conditionFindingId) await autoScheduleFindingIfLinked(pool, conditionFindingId);
   await logActivity({ action: 'created', entityType: 'job_line', entityId: rows[0].id, entityLabel: rows[0].title, details: `On Work Order #${woId}` });
   return hydrateJobLine(rows[0]);
+}
+
+// Phase 3 (3): a finding moves Open -> Scheduled the moment a job line links
+// to it — automatic, no note, because linking IS the decision (something is
+// now going to happen to it). Only fires from Open; a finding already
+// Resolved/Deferred/Dismissed doesn't get silently reopened by a later link.
+async function autoScheduleFindingIfLinked(queryable, findingId) {
+  await queryable.query(`UPDATE condition_findings SET status = 'Scheduled' WHERE id = $1 AND status = 'Open'`, [findingId]);
+}
+
+// Phase 3 (3): a finding moves to Resolved automatically the instant its
+// linked job line reaches a counts_as_work_performed status — no manual
+// step, no note (this isn't a "decision," it's a consequence of the work
+// itself being done). Fires regardless of the finding's current status,
+// matching the brief's table exactly ("Resolved — auto — when its job line
+// reaches a counts_as_work_performed status").
+async function autoResolveLinkedFinding(client, jobLineId) {
+  const { rows } = await client.query('SELECT condition_finding_id FROM job_lines WHERE id = $1', [jobLineId]);
+  const findingId = rows[0]?.condition_finding_id;
+  if (!findingId) return;
+  await client.query(`UPDATE condition_findings SET status = 'Resolved' WHERE id = $1`, [findingId]);
 }
 
 // Every job-line status transition writes a work_order_log_entries row
@@ -2511,6 +2579,7 @@ async function changeJobLineStatus(client, jobLineId, newStatusId, { statusNote 
     setCols.push('completed_date = CURRENT_DATE');
   }
   await client.query(`UPDATE job_lines SET ${setCols.join(', ')} WHERE id = $1`, vals);
+  if (newStatus.counts_as_work_performed) await autoResolveLinkedFinding(client, jobLineId);
   const noteText = statusNote?.trim()
     ? `Job line "${cur.title}" → ${newStatus.name}: ${statusNote.trim()}`
     : `Job line "${cur.title}" status: ${cur.old_name} → ${newStatus.name}`;
@@ -2524,6 +2593,7 @@ const JOB_LINE_UPDATE_COLUMNS = [
   'title', 'responsibility_class', 'funding_source', 'funding_ref_id',
   'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost', 'scheduled_date',
   'complaint', 'cause_note', 'correction', 'blocked_reason', 'blocked_since', 'completed_date',
+  'condition_finding_id',
 ];
 export async function updateJobLine(id, fields) {
   const setCols = []; const vals = []; let i = 1;
@@ -2544,6 +2614,9 @@ export async function updateJobLine(id, fields) {
     }
     if (fields.status_id != null) {
       await changeJobLineStatus(client, id, Number(fields.status_id), { statusNote: fields.statusNote });
+    }
+    if (fields.condition_finding_id) {
+      await autoScheduleFindingIfLinked(client, fields.condition_finding_id);
     }
     if (fields.causeIds !== undefined) {
       await client.query('DELETE FROM job_line_causes WHERE job_line_id = $1', [id]);

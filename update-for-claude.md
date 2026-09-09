@@ -1,3 +1,48 @@
+# Runbook: Findings Lifecycle (Build Brief v2, Phase 3)
+
+Phase 3 landed 2026-09-09, same session as Phases 1-2. Migration 0043.
+`condition_findings.status` stays a plain text column (not a table like
+work order/job line status) — the brief only asks for these five fixed
+values, not an admin-editable catalog, so a CHECK constraint is enough.
+
+## What changed
+- Lifecycle: `Open` (insert, unchanged) → `Scheduled` (auto, the instant a
+  job line's `condition_finding_id` points at it —
+  `autoScheduleFindingIfLinked` in db.js, called from both `createJobLine`
+  and `updateJobLine`) → `Resolved` (auto, the instant that job line reaches
+  a `counts_as_work_performed` status — `autoResolveLinkedFinding`, called
+  from `changeJobLineStatus`) or `Deferred`/`Dismissed` (manual, via
+  `deferFinding`/`dismissFinding`, both requiring an explanation enforced
+  server-side, both stamping `reviewed_by`/`reviewed_at`).
+- **`job_lines.condition_finding_id` has no UI to set it yet** — nothing in
+  Phases 1-3 creates a job line pre-linked to a finding. That's Phase 7
+  ("Create WO from findings"). The db.js plumbing (createJobLine accepts
+  `conditionFindingId`, updateJobLine accepts `condition_finding_id`) is
+  ready for it; there's just no button yet.
+- Asset Detail's Findings card (the only place findings are visible at all —
+  there's still no dedicated finding detail view) gained a status pill and
+  inline Defer/Dismiss mini-forms, and shows the deferred/dismiss reason
+  once decided.
+- Dashboard gained a Findings widget: Open count ("should trend to zero")
+  and count of findings not linked to any job line (the data-quality
+  signal) — `GET /api/pg/findings-summary`.
+- **Found and fixed a pre-existing bug while sweeping for Phase 2 fallout**:
+  `listMapPins`/`listMapFeatures` in db.js had raw SQL filtering work orders
+  by `status NOT IN ('Completed', 'Cancelled')` — those status names never
+  matched the app's real ones ('Done'/'Cancelled'), so the map's board-focus
+  aggregation was silently always-false even before this rework. Both now
+  join `work_order_statuses` and filter on `NOT is_terminal`.
+
+## Known gaps / follow-ups
+- No dedicated Findings report source in Reports v1 yet (only the Assets
+  report's "Flagged"/"Flagged Fields" columns, which only ever looked at
+  Open findings — untouched by this phase, still correct). The Deferred
+  Maintenance Backlog and "Open Findings Not On Any WO" named reports are
+  explicitly Phase 6 work; the columns this phase added
+  (`deferred_reason`/`revisit_date`/`dismiss_note`) are what Phase 6 reads.
+
+---
+
 # Runbook: Lifecycle & Status (Build Brief v2, Phase 2)
 
 Phase 2 landed 2026-09-09, same session as Phase 1. Migrations 0040–0042.

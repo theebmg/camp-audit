@@ -526,7 +526,7 @@ function renderLogin() {
   });
 }
 
-const DASHBOARD_WIDGET_DEFAULTS = { woOverview: true, calendar: true, activity: true };
+const DASHBOARD_WIDGET_DEFAULTS = { woOverview: true, calendar: true, activity: true, findings: true };
 function getDashboardWidgetPrefs() {
   try {
     const raw = localStorage.getItem('campAuditDashboardWidgets');
@@ -559,12 +559,27 @@ async function renderDashboard() {
   let selectedWeekDate = isoDate(today);
   const weekOccByDay = new Map();
 
-  const [woSummary, calRes, scheduledWoRes, activityRes] = await Promise.all([
+  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary] = await Promise.all([
     prefs.woOverview ? api('/api/pg/dashboard/wo-summary') : Promise.resolve(null),
     prefs.calendar ? api(`/api/pg/calendar-events?from=${isoDate(weekStart)}&to=${isoDate(weekEnd)}`) : Promise.resolve(null),
     prefs.calendar ? api('/api/pg/work-orders') : Promise.resolve(null),
     prefs.activity ? api(`/api/pg/activity-log?limit=12${isAdmin ? '' : `&username=${encodeURIComponent(currentUser.username || '')}`}`) : Promise.resolve(null),
+    prefs.findings ? api('/api/pg/findings-summary') : Promise.resolve(null),
   ]);
+
+  // Open should trend to zero (3) — every finding is meant to end up with a
+  // decision made on it. The second number is the data-quality check: things
+  // nobody has even put on a work order yet.
+  function findingsSummaryHtml() {
+    if (!findingsSummary) return '';
+    return `<div class="card">
+      <h3>Findings</h3>
+      <div class="summary-buckets">
+        <div class="bucket-tile clickable-tile" data-view="reports" style="cursor:pointer"><div class="n">${findingsSummary.OpenCount}</div><div class="muted">Open (trending to zero)</div></div>
+        <div class="bucket-tile"><div class="n">${findingsSummary.NotOnAnyWorkOrderCount}</div><div class="muted">Not on any Work Order</div></div>
+      </div>
+    </div>`;
+  }
 
   // colorClass is a fixed severity word (neutral/pop/warn/bad/good) for the
   // schedule buckets, which aren't admin-editable data; statusColor is a
@@ -683,10 +698,12 @@ async function renderDashboard() {
             <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="woOverview" ${prefs.woOverview ? 'checked' : ''} style="width:auto" /> Work Order overview</label>
             <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="calendar" ${prefs.calendar ? 'checked' : ''} style="width:auto" /> This week's calendar</label>
             <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="activity" ${prefs.activity ? 'checked' : ''} style="width:auto" /> Recent activity</label>
+            <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" class="widget-toggle" data-widget="findings" ${prefs.findings ? 'checked' : ''} style="width:auto" /> Findings</label>
           </div>
         </details>
       </div>
       ${woOverviewHtml()}
+      ${findingsSummaryHtml()}
       ${calendarStripHtml()}
       ${activityHtml()}
     `);
@@ -1043,14 +1060,32 @@ async function renderAssetDetail({ id }, container = app) {
     </div>
 
     <div class="card"><h3>Findings (${conditionFindings.length})</h3>
-      ${conditionFindings.map((f) => `
-        <div class="list-item" style="cursor:default">
+      ${conditionFindings.map((f) => {
+        const decided = f.Status === 'Deferred' || f.Status === 'Dismissed';
+        return `
+        <div class="list-item" style="cursor:default;flex-wrap:wrap">
           <span>${escapeHtml(f.Title || '')}</span>
-          <span style="display:flex;align-items:center;gap:8px">
+          <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             <span class="pill">${escapeHtml(f.Severity || '')}</span>
+            <span class="pill">${escapeHtml(f.Status || 'Open')}</span>
             <button type="button" class="btn btn-secondary toggle-board-focus" data-id="${f.Id}" data-next="${!f.BoardFocus}" style="padding:2px 8px;font-size:0.75rem;${f.BoardFocus ? 'background:#f0f2fb' : ''}">${f.BoardFocus ? '★ Board Focus' : '☆ Flag for Board'}</button>
+            ${!decided ? `<button type="button" class="btn btn-secondary finding-defer-toggle" data-id="${f.Id}" style="padding:2px 8px;font-size:0.75rem">Defer</button>
+            <button type="button" class="btn btn-secondary finding-dismiss-toggle" data-id="${f.Id}" style="padding:2px 8px;font-size:0.75rem">Dismiss</button>` : ''}
           </span>
-        </div>`).join('') || '<p class="muted">None yet.</p>'}
+          ${f.Status === 'Deferred' ? `<p class="muted" style="flex-basis:100%;margin:4px 0 0">Deferred: ${escapeHtml(f.DeferredReason || '')}${f.RevisitDate ? ` — revisit ${formatDateNice(f.RevisitDate)}` : ''}</p>` : ''}
+          ${f.Status === 'Dismissed' ? `<p class="muted" style="flex-basis:100%;margin:4px 0 0">Dismissed: ${escapeHtml(f.DismissNote || '')}</p>` : ''}
+          ${!decided ? `
+          <div class="finding-defer-box" data-id="${f.Id}" hidden style="flex-basis:100%;margin-top:6px">
+            <div class="field-row"><label>Reason</label><input class="finding-defer-reason" /></div>
+            <div class="field-row"><label>Revisit Date</label><input class="finding-defer-date" type="date" /></div>
+            <button type="button" class="btn btn-primary finding-defer-save" data-id="${f.Id}">Save</button>
+          </div>
+          <div class="finding-dismiss-box" data-id="${f.Id}" hidden style="flex-basis:100%;margin-top:6px">
+            <div class="field-row"><label>Why dismissed?</label><input class="finding-dismiss-note" /></div>
+            <button type="button" class="btn btn-primary finding-dismiss-save" data-id="${f.Id}">Save</button>
+          </div>` : ''}
+        </div>`;
+      }).join('') || '<p class="muted">None yet.</p>'}
     </div>
 
     <div class="card">
@@ -1098,6 +1133,30 @@ async function renderAssetDetail({ id }, container = app) {
   container.querySelectorAll('.toggle-board-focus').forEach((el) => el.addEventListener('click', async () => {
     await api(`/api/pg/condition-findings/${el.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ boardFocus: el.dataset.next === 'true' }) });
     renderAssetDetail({ id }, container);
+  }));
+  container.querySelectorAll('.finding-defer-toggle').forEach((el) => el.addEventListener('click', () => {
+    container.querySelector(`.finding-defer-box[data-id="${el.dataset.id}"]`).hidden = false;
+  }));
+  container.querySelectorAll('.finding-dismiss-toggle').forEach((el) => el.addEventListener('click', () => {
+    container.querySelector(`.finding-dismiss-box[data-id="${el.dataset.id}"]`).hidden = false;
+  }));
+  container.querySelectorAll('.finding-defer-save').forEach((btn) => btn.addEventListener('click', async () => {
+    const box = container.querySelector(`.finding-defer-box[data-id="${btn.dataset.id}"]`);
+    try {
+      await api(`/api/pg/condition-findings/${btn.dataset.id}/defer`, { method: 'POST', body: JSON.stringify({
+        reason: box.querySelector('.finding-defer-reason').value, revisitDate: box.querySelector('.finding-defer-date').value,
+      }) });
+      toast('Finding deferred');
+      renderAssetDetail({ id }, container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.finding-dismiss-save').forEach((btn) => btn.addEventListener('click', async () => {
+    const box = container.querySelector(`.finding-dismiss-box[data-id="${btn.dataset.id}"]`);
+    try {
+      await api(`/api/pg/condition-findings/${btn.dataset.id}/dismiss`, { method: 'POST', body: JSON.stringify({ note: box.querySelector('.finding-dismiss-note').value }) });
+      toast('Finding dismissed');
+      renderAssetDetail({ id }, container);
+    } catch (err) { toast(err.message); }
   }));
 }
 
