@@ -118,9 +118,14 @@ router.post('/', upload.any(), async (req, res) => {
     if (woMatch) targetWorkOrderId = await findWorkOrderIdByNumber(woMatch[1]);
 
     // content-id-map identifies inline/embedded parts (signature logos,
-    // tracking pixels referenced by cid: in an HTML body) by the attachment
-    // field name Mailgun gave them — same role mailparser's
-    // contentDisposition/related check played against raw MIME.
+    // tracking pixels, but ALSO a real photo — iOS Mail and the Gmail app
+    // both choose inline-vs-attached on their own with no user control, per
+    // Ben: "coming from an iPhone, it doesn't give me great control over
+    // what method it chooses"). So inline is tracked for the log line below
+    // only, never used to drop a file — isJunkImage's size check is what
+    // actually separates a tracking pixel/signature logo (near-universally
+    // under 200px) from a real photo (near-universally far larger), inline
+    // or not.
     let inlineFieldNames = new Set();
     try {
       const cidMap = JSON.parse(req.body['content-id-map'] || '{}');
@@ -128,7 +133,7 @@ router.post('/', upload.any(), async (req, res) => {
     } catch { /* absent or malformed — treat nothing as inline */ }
 
     const realFiles = (req.files || [])
-      .filter((f) => /^attachment-\d+$/.test(f.fieldname) && !inlineFieldNames.has(f.fieldname));
+      .filter((f) => /^attachment-\d+$/.test(f.fieldname));
 
     const uploaded = [];
     let junkFiltered = 0;
