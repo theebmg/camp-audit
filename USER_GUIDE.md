@@ -1,9 +1,8 @@
-# Camp Sychar Maintenance System — User Guide
+# Sychar Operations — User Guide
 
 This is a walkthrough of how to actually use the system day to day, written
 for the person doing the work — not a technical document. Open the app at
-**audit.fracturedrv.com/next** (bookmark that — the `/next` matters, see
-note at the bottom).
+**audit.fracturedrv.com**.
 
 Everything on the left-side menu (tap the ☰ icon on a phone) is one of the
 sections below.
@@ -148,9 +147,9 @@ picked. This is how "who did we shop and what did they quote" gets tracked.
 
 ## The Inbox
 
-Photos that arrive by email (once that's turned on) or that you upload
-directly without attaching them to anything specific land here, grouped by
-batch (one email = one batch).
+Photos that arrive by email (send to **photos@cmms.fracturedrv.com**) or
+that you upload directly without attaching them to anything specific land
+here, grouped by batch (one email = one batch).
 
 For each batch:
 1. Check the photos you want to act on (or tap a suggested "cluster" if
@@ -230,13 +229,3 @@ editable — no developer needed to add a new one. Under **Admin**:
   it was taken.
 - **Users** — who can log in and whether they're an admin.
 - **Activity Log** — a running record of everything anyone's done.
-
----
-
-## A note on the two web addresses
-
-- **audit.fracturedrv.com/next** — the current app (everything in this
-  guide). Bookmark this one.
-- **audit.fracturedrv.com** (no `/next`) — an older interface from before
-  this system moved to its current database. It still technically loads
-  but isn't where new work should happen.

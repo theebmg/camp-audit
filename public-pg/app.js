@@ -657,7 +657,7 @@ async function render(view, params = {}) {
 }
 
 function renderLogin() {
-  setChrome({ title: 'Camp Sychar Audit — Sign In', showBack: false, showLogout: false });
+  setChrome({ title: 'Sychar Operations — Sign In', showBack: false, showLogout: false });
   app.innerHTML = `
     <div class="card" style="max-width:360px;margin:40px auto">
       <h3>Sign In</h3>
@@ -1031,7 +1031,7 @@ async function renderLocations(container = app, { onOpenLocation } = {}) {
     // there regardless of the global table/cards preference.
     const mode = onOpenLocation ? 'cards' : getTableViewMode();
     const visible = typeFilter ? locations.filter((l) => l['Location Type'] === typeFilter) : locations;
-    const emptyMsg = typeFilter ? `No locations of type "${escapeHtml(typeFilter)}".` : 'No locations yet.';
+    const emptyMsg = typeFilter ? `No locations of type "${escapeHtml(typeFilter)}" — clear the filter to see all locations.` : 'No locations yet — tap + Add Location above to create the first one.';
     setApp(`
       <button class="btn btn-primary ${onOpenLocation ? '' : 'fab'}" id="addLocationBtn" title="Add Location">+ Add Location</button>
       ${onOpenLocation ? '' : tableViewToggleHtml(mode)}
@@ -1099,7 +1099,7 @@ async function renderAssetsInLocation({ id, name }, container = app, { onOpenAss
       <div class="list-item ${onOpenAsset && selectedAssetId === a.Id ? 'cal-strip-selected' : ''}" data-id="${a.Id}" data-name="${escapeHtml(a.Name)}">
         <span>🏚️ ${escapeHtml(a.Name)}</span>
         <span class="pill">${escapeHtml(a['Asset type'] || '')}</span>
-      </div>`).join('') : '<p class="muted">No assets in this location.</p>';
+      </div>`).join('') : '<p class="muted">No assets in this location yet — add one from the asset search box when starting an audit or creating a work order (type a new name and choose "Add new asset").</p>';
     container.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => {
       if (onOpenAsset) { selectedAssetId = Number(el.dataset.id); draw(); onOpenAsset(el.dataset.id); }
       else go('assetDetail', { id: el.dataset.id, name: el.dataset.name });
@@ -1190,7 +1190,7 @@ async function renderAssetDetail({ id }, container = app) {
       <div class="muted">${new Date(n.created_at).toLocaleDateString()}${n.created_by ? ` · ${escapeHtml(n.created_by)}` : ''}
         <a href="#" class="resolve-note" data-id="${n.id}" data-next="${!n.resolved}">${n.resolved ? 'reopen' : 'mark resolved'}</a>
       </div>
-    </div>`).join('') || '<p class="muted">No notes yet.</p>';
+    </div>`).join('') || '<p class="muted">No notes yet — add one below.</p>';
 
   container.innerHTML = `
     <div class="card">
@@ -2827,7 +2827,7 @@ async function renderNotes() {
       ${adding ? noteFormHtml(null) : ''}
       ${editingId ? noteFormHtml(notes.find((n) => n.id === editingId)) : ''}
       <div class="card">
-        ${visible.map(noteCardHtml).join('') || '<p class="muted">🗒️ No notes yet.</p>'}
+        ${visible.map(noteCardHtml).join('') || '<p class="muted">🗒️ No notes yet — tap + Add Note above to create one.</p>'}
       </div>
     `);
     wire();
@@ -2920,7 +2920,7 @@ async function renderInbox() {
   const { batches } = await api('/api/pg/inbox');
 
   if (!batches.length) {
-    app.innerHTML = `<div class="card"><h3>Inbox</h3><p class="muted">Nothing to triage. Photos land here from email (once configured) or the "Attach file" button — direct uploads on an asset/WO/job line skip the inbox entirely.</p></div>`;
+    app.innerHTML = `<div class="card"><h3>Inbox</h3><p class="muted">No photos waiting. Send photos to photos@cmms.fracturedrv.com, or use "Attach file" directly on an asset/work order/job line to skip the inbox entirely.</p></div>`;
     return;
   }
 
@@ -5462,7 +5462,7 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
         <span>WO ${escapeHtml(w.WoNumber || w.Id)} — ${escapeHtml(w.Title)}${w.IsBlocked ? ' 🚧' : ''}${splitChipHtml({ w, splitCount })}${bits.length ? `<div class="muted" style="font-weight:400">${bits.join(' · ')}</div>` : ''}${woProgressBarHtml(w)}</span>
         ${cols.status ? statusPillHtml(w.Status, w.StatusColor) : ''}
       </div>`;
-    }).join('') || `<p class="muted">${(statusFilter || scheduleFilter) ? 'Nothing matches this filter.' : 'No work orders yet.'}</p>`;
+    }).join('') || `<p class="muted">${(statusFilter || scheduleFilter) ? 'Nothing matches this filter.' : 'No work orders yet — tap + New Work Order above to create one.'}</p>`;
 
     const tableRows = displayList.map(({ w, indent, splitCount }) => {
       const days = daysSince(w['Date Reported']);
@@ -5500,7 +5500,7 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
         <div class="card" style="overflow-x:auto">
           <table class="report-table">
             <thead><tr><th>Title</th>${visibleCols.map((c) => `<th>${escapeHtml(c.label)}</th>`).join('')}</tr></thead>
-            <tbody>${tableRows || `<tr><td colspan="${visibleCols.length + 1}" class="muted">${filterLabel ? 'Nothing matches this filter.' : 'No work orders yet.'}</td></tr>`}</tbody>
+            <tbody>${tableRows || `<tr><td colspan="${visibleCols.length + 1}" class="muted">${filterLabel ? 'Nothing matches this filter.' : 'No work orders yet — tap + New Work Order above to create one.'}</td></tr>`}</tbody>
           </table>
         </div>` : cardRows}
     `, container);
@@ -5558,7 +5558,7 @@ async function renderRequests(params = {}, container = app) {
           ${r.Priority ? `<span class="pill">${escapeHtml(r.Priority)}</span>` : ''}
           <span class="pill ${requestStatusPillClass(r.Status)}">${escapeHtml(r.Status)}</span>
         </span>
-      </div>`).join('') || `<p class="muted">${statusFilter ? 'Nothing matches this filter.' : 'No requests yet.'}</p>`;
+      </div>`).join('') || `<p class="muted">${statusFilter ? 'Nothing matches this filter.' : 'No requests yet — they\'ll show up here once someone submits the form at /request.'}</p>`;
 
     setApp(`
       <div class="card">

@@ -3,18 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
-  <title>Camp Sychar Audit (Postgres preview)</title>
+  <title>Sychar Operations</title>
   <link rel="stylesheet" href="/style.css" />
   <style>
-    /* Small additions specific to this preview build — kept separate from the
+    /* Small additions specific to this page — kept separate from the
        shared style.css so the live app's stylesheet is never touched. */
     /* color-scheme (light vs dark, for native form-control legibility incl.
        the unstylable <select> dropdown popup) is now set per-theme-state in
        the shared style.css, alongside the Theme picker in the sidebar. */
-    .pg-banner {
-      background: var(--pop-soft); color: #7c2d12; font-size: 0.82rem; font-weight: 600;
-      padding: 8px 16px; text-align: center; border-bottom: 1px solid var(--border);
-    }
     .field-row { margin-bottom: 16px; }
     .field-row label { display: block; font-weight: 600; font-size: 0.9rem; margin-bottom: 6px; }
     .field-row select, .field-row input, .field-row textarea {
@@ -363,8 +359,8 @@
     .skill-chip.selected { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-dark); font-weight: 600; }
     /* Shared style.css's .toast hardcodes white text on a var(--text)
        background — in dark mode --text flips light, leaving white-on-white.
-       Override here (scoped to /next/ only, shared file untouched) with the
-       correctly-paired surface/text tokens, which invert together properly. */
+       Override here (scoped to this page only, shared file untouched) with
+       the correctly-paired surface/text tokens, which invert together properly. */
     .toast { background: var(--surface) !important; color: var(--text) !important; border: 1px solid var(--border); }
     /* .field-row's generic `input { width: 100% }` clashes with flex layouts
        like this one — force it back to auto so flex:1/flex:0 actually control
@@ -470,12 +466,11 @@
   </script>
 </head>
 <body>
-  <div class="pg-banner">🚧 Postgres migration preview — separate database from the main app, safe to click around</div>
   <div class="app-shell">
     <div class="sidebar-overlay" id="sidebarOverlay" hidden></div>
     <nav class="sidebar" id="sidebar">
       <div class="sidebar-header">
-        <span class="brand">🏕️ <span>Camp Sychar (pg)</span></span>
+        <span class="brand">🏕️ <span>Sychar Operations</span></span>
         <button id="closeSidebarBtn" class="icon-btn sidebar-close">&times;</button>
       </div>
       <div class="sidebar-nav" id="sidebarNav"></div>
@@ -490,7 +485,7 @@
       <header class="topbar">
         <button id="menuBtn" class="icon-btn menu-btn" hidden>&#9776;</button>
         <button id="backBtn" class="icon-btn" hidden>&larr;</button>
-        <h1 id="pageTitle">Camp Sychar Audit</h1>
+        <h1 id="pageTitle">Sychar Operations</h1>
       </header>
       <div class="global-search" id="globalSearchWrap" hidden>
         <input type="text" id="globalSearch" placeholder="Search locations & assets…" autocomplete="off" />
