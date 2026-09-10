@@ -131,13 +131,25 @@ router.post('/', upload.any(), async (req, res) => {
       .filter((f) => /^attachment-\d+$/.test(f.fieldname) && !inlineFieldNames.has(f.fieldname));
 
     const uploaded = [];
+    let junkFiltered = 0;
     for (const f of realFiles) {
-      if (f.mimetype?.startsWith('image/') && await isJunkImage(f.buffer)) continue;
+      if (f.mimetype?.startsWith('image/') && await isJunkImage(f.buffer)) { junkFiltered++; continue; }
       const meta = await storeAttachment(f.buffer, {
         filename: f.originalname || 'attachment', mimetype: f.mimetype, category: 'email', ownerId: `msg-${messageId.replace(/[^a-zA-Z0-9]/g, '')}`,
       });
       uploaded.push(meta);
     }
+
+    // Success-path visibility — this route otherwise only logs on throw, so
+    // a batch that lands with zero attachments (every file filtered as
+    // inline/junk, or Mailgun sending no files field at all) is silent and
+    // indistinguishable from "no photos were sent" without this.
+    console.log(
+      `mail-inbound: message ${messageId} — files=${(req.files || []).length} ` +
+      `fieldnames=[${(req.files || []).map((f) => f.fieldname).join(',')}] ` +
+      `inlineFieldnames=[${[...inlineFieldNames].join(',')}] ` +
+      `realFiles=${realFiles.length} junkFiltered=${junkFiltered} uploaded=${uploaded.length}`
+    );
 
     // Batch row is written last, together with the attachment rows, in one
     // transaction — see createMailInboundBatch's comment for why. If
