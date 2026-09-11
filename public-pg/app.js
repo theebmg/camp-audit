@@ -3187,6 +3187,15 @@ function categoryPickerOptionsHtml(categories, selectedId) {
   ).join('');
 }
 
+// .btn defaults to width:100% (it's meant to stack full-width, one per row —
+// see login/save/etc throughout the app). That's wrong for a button sharing
+// a row with other content: it fights the flex:1 text div for space instead
+// of sizing to its label, which is what made Void render huge and
+// overlapping. Fix: pull it out of the thumb+text row entirely into its own
+// .btn-row underneath (same "actions below content" shape every other card
+// in this app already uses) and size it with .btn-small so it isn't a giant
+// bar under a small card. Never competes for horizontal space, so there's
+// nothing narrow-screen-specific to add — it degrades the same way at any width.
 function expenseInboxCardHtml(e) {
   const thumb = (e.Attachments || [])[0];
   return `<div class="card expense-card" data-id="${e.Id}" style="cursor:pointer;border-left:4px solid #d98c00;margin-bottom:8px">
@@ -3197,7 +3206,9 @@ function expenseInboxCardHtml(e) {
         <div class="muted" style="font-size:0.85rem">${e.Amount != null ? `$${Number(e.Amount).toLocaleString()}` : 'amount unknown'}${e.PurchaseDate ? ` · ${formatDateNice(e.PurchaseDate)}` : ''}</div>
         ${e.SenderEmail ? `<div class="muted" style="font-size:0.8rem">${escapeHtml(e.SenderEmail)}</div>` : ''}
       </div>
-      <button type="button" class="btn btn-secondary expense-void-btn" data-id="${e.Id}">Void</button>
+    </div>
+    <div class="btn-row" style="margin-top:8px;justify-content:flex-end">
+      <button type="button" class="btn btn-secondary btn-small expense-void-btn" data-id="${e.Id}">Void</button>
     </div>
   </div>`;
 }
@@ -3229,7 +3240,7 @@ async function renderExpenses() {
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
         <h3 style="margin:0">Expenses</h3>
-        <button class="btn btn-primary" id="addExpenseBtn">+ Add Expense</button>
+        <button class="btn btn-primary" id="addExpenseBtn" style="width:auto;margin-top:0">+ Add Expense</button>
       </div>
       <p class="muted">Camp debit card spending — Ben's own record, separate from what he emails the treasurer directly. Receipts forward to receipts@cmms.fracturedrv.com.</p>
     </div>
