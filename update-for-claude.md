@@ -1,3 +1,39 @@
+# Follow-up: Mailgun free-tier route consolidation (same day as Build Brief v3)
+
+Ben's Mailgun account is on the free tier, which allows only one inbound
+route — so the two-dedicated-routes design in Part 2 below (`photos@` at
+`/api/pg/mail-inbound`, `receipts@` at `/api/pg/receipt-inbound`) can't
+actually be configured as written. Fix: `POST /api/pg/mail-dispatch`
+(`src/routes/mail-dispatch.js`), mounted the same pre-auth way as the other
+two. It verifies the signature and checks Message-Id idempotency exactly
+ONCE, then reads the parsed/lowercased `recipient` field and calls straight
+into `ingestPhotoMail`/`ingestReceiptMail` — both newly `export`ed out of
+`mail-inbound.js`/`receipt-inbound.js`'s route handlers (their own standalone
+routes are otherwise unchanged and still fully functional with their own
+signature/idempotency checks, so nothing broke mid-cutover). An unrecognized
+recipient always returns 200 (logged as "unrouted recipient", never
+processed) — never a 5xx, which would make Mailgun retry it forever.
+
+Smoke-tested with real signed requests against the live endpoint: `photos@`
+with a display-name-wrapped recipient ("Camp Photos <photos@...>"),
+`RECEIPTS@` in mixed case with a zero-attachment forwarded confirmation
+(receipts routinely have no attachment — a pure text order confirmation),
+an unrouted address (200, not processed), and a same-Message-Id retry
+(correctly no-opped, no duplicate row — verified by count in the DB, not
+just the response).
+
+**Ben still needs to point Mailgun's one inbound route at
+`https://audit.fracturedrv.com/api/pg/mail-dispatch`** (recipient pattern
+covering both `photos@cmms.fracturedrv.com` and
+`receipts@cmms.fracturedrv.com` — Mailgun's free tier matches by pattern,
+not a fixed single address, so one route with a wildcard or "catch all on
+this domain" rule pointed at mail-dispatch covers both). The two old
+dedicated routes were never actually created (blocked by the same free-tier
+limit that prompted this fix), so there's nothing to remove on Mailgun's
+side — just the one route to add.
+
+---
+
 # Runbook: Expense Tracking & Funds (Build Brief v3, Parts 1–5, done in full in one session)
 
 `toClaudeCode/` doesn't have this brief's file yet (it was given inline, not
@@ -157,10 +193,10 @@ block, same as before.
   funds are tracked on the Expenses page instead, which was the brief's
   intent (funds are Ben's personal accountability, not part of the capital
   plan the board sees).
-- Ben still needs to add the Mailgun route for `receipts@cmms.fracturedrv.com`
-  → `https://audit.fracturedrv.com/api/pg/receipt-inbound` (same pattern as
-  the existing `photos@` route) — this was flagged to him as the one manual
-  step outside this session's reach.
+- Superseded same-day by the Mailgun free-tier route consolidation at the
+  top of this file: there is no separate `receipts@` route to add. Both
+  addresses now go through the single `/api/pg/mail-dispatch` route — see
+  that entry for what Ben actually needs to configure.
 - Frontend UI (Part 3) was built and exercised only through the API it
   calls — no visual/click-through verification, since the Chrome extension
   isn't connected in this environment. Worth a manual pass before relying
