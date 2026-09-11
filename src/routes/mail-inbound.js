@@ -18,7 +18,7 @@ import express from 'express';
 import { findAttachmentBatchByMessageId, findWorkOrderIdByNumber, createMailInboundBatch } from '../db.js';
 import { storeAttachment } from '../storage.js';
 import {
-  mailUpload, isJunkImage, verifySignature, extractHeader, extractEmailAddress, extractInlineFieldNames,
+  mailUpload, isJunkImage, verifySignatureDetailed, extractHeader, extractEmailAddress, extractInlineFieldNames, logInboundHit,
 } from '../mailIngestShared.js';
 
 const router = express.Router();
@@ -97,7 +97,10 @@ export async function ingestPhotoMail(req, messageId) {
 
 router.post('/', mailUpload.any(), async (req, res) => {
   try {
-    if (!verifySignature(req.body || {})) {
+    logInboundHit('mail-inbound', req);
+    const sig = verifySignatureDetailed(req.body || {});
+    if (!sig.ok) {
+      console.log(`mail-inbound: signature rejected — ${sig.reason}`);
       return res.status(401).json({ ok: false, error: 'Invalid or stale signature' });
     }
 
@@ -108,7 +111,10 @@ router.post('/', mailUpload.any(), async (req, res) => {
     }
 
     const messageId = extractHeader(req.body, 'Message-Id');
-    if (!messageId) return res.json({ ok: true }); // can't dedupe without one — drop rather than risk reprocessing forever, same as the IMAP version
+    if (!messageId) {
+      console.log('mail-inbound: no extractable Message-Id — 200, not processed (can\'t dedupe without one)');
+      return res.json({ ok: true }); // drop rather than risk reprocessing forever, same as the IMAP version
+    }
 
     // Idempotency: Mailgun retries any non-2xx, so seeing the same
     // Message-Id again is normal operation. Check BEFORE doing any storage

@@ -16,7 +16,7 @@
 // no session. The signature check below is what stands in for auth.
 import express from 'express';
 import { findAttachmentBatchByMessageId } from '../db.js';
-import { mailUpload, verifySignature, extractHeader, extractEmailAddress } from '../mailIngestShared.js';
+import { mailUpload, verifySignatureDetailed, extractHeader, extractEmailAddress, logInboundHit } from '../mailIngestShared.js';
 import { ingestPhotoMail } from './mail-inbound.js';
 import { ingestReceiptMail } from './receipt-inbound.js';
 
@@ -37,12 +37,18 @@ const ROUTES = {
 
 router.post('/', mailUpload.any(), async (req, res) => {
   try {
-    if (!verifySignature(req.body || {})) {
+    logInboundHit('mail-dispatch', req);
+    const sig = verifySignatureDetailed(req.body || {});
+    if (!sig.ok) {
+      console.log(`mail-dispatch: signature rejected — ${sig.reason}`);
       return res.status(401).json({ ok: false, error: 'Invalid or stale signature' });
     }
 
     const messageId = extractHeader(req.body, 'Message-Id');
-    if (!messageId) return res.json({ ok: true }); // can't dedupe without one — drop rather than risk reprocessing forever, same as both ingest paths
+    if (!messageId) {
+      console.log('mail-dispatch: no extractable Message-Id — 200, not processed (can\'t dedupe without one)');
+      return res.json({ ok: true }); // can't dedupe without one — drop rather than risk reprocessing forever, same as both ingest paths
+    }
 
     // Idempotency lives here now, once, ahead of the fan-out — see this
     // file's header comment. Both ingestPhotoMail/ingestReceiptMail's own
