@@ -16,7 +16,7 @@
 // no session. The signature check below is what stands in for auth.
 import express from 'express';
 import { findAttachmentBatchByMessageId } from '../db.js';
-import { mailUpload, verifySignatureDetailed, extractHeader, extractEmailAddress, logInboundHit } from '../mailIngestShared.js';
+import { mailParsers, verifySignatureDetailed, extractHeader, extractEmailAddress, logInboundHit } from '../mailIngestShared.js';
 import { ingestPhotoMail } from './mail-inbound.js';
 import { ingestReceiptMail } from './receipt-inbound.js';
 
@@ -35,7 +35,7 @@ const ROUTES = {
   'receipts@cmms.fracturedrv.com': ingestReceiptMail,
 };
 
-router.post('/', mailUpload.any(), async (req, res) => {
+router.post('/', mailParsers, async (req, res) => {
   try {
     logInboundHit('mail-dispatch', req);
     const sig = verifySignatureDetailed(req.body || {});

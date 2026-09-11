@@ -18,7 +18,7 @@ import express from 'express';
 import { findAttachmentBatchByMessageId, findWorkOrderIdByNumber, createMailInboundBatch } from '../db.js';
 import { storeAttachment } from '../storage.js';
 import {
-  mailUpload, isJunkImage, verifySignatureDetailed, extractHeader, extractEmailAddress, extractInlineFieldNames, logInboundHit,
+  mailParsers, isJunkImage, verifySignatureDetailed, extractHeader, extractEmailAddress, extractInlineFieldNames, logInboundHit,
 } from '../mailIngestShared.js';
 
 const router = express.Router();
@@ -95,7 +95,7 @@ export async function ingestPhotoMail(req, messageId) {
   return { ok: true, batchId, attachmentCount: uploaded.length };
 }
 
-router.post('/', mailUpload.any(), async (req, res) => {
+router.post('/', mailParsers, async (req, res) => {
   try {
     logInboundHit('mail-inbound', req);
     const sig = verifySignatureDetailed(req.body || {});

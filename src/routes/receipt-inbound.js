@@ -23,7 +23,7 @@ import { findAttachmentBatchByMessageId, createReceiptInboundBatch } from '../db
 import { storeAttachment } from '../storage.js';
 import { parseReceiptEmail } from '../expenseParsing.js';
 import {
-  mailUpload, isJunkImage, verifySignatureDetailed, extractHeader, extractEmailAddress, extractInlineFieldNames, logInboundHit,
+  mailParsers, isJunkImage, verifySignatureDetailed, extractHeader, extractEmailAddress, extractInlineFieldNames, logInboundHit,
 } from '../mailIngestShared.js';
 
 const router = express.Router();
@@ -74,7 +74,7 @@ export async function ingestReceiptMail(req, messageId) {
   return { ok: true, ...result, attachmentCount: uploaded.length };
 }
 
-router.post('/', mailUpload.any(), async (req, res) => {
+router.post('/', mailParsers, async (req, res) => {
   try {
     logInboundHit('receipt-inbound', req);
     const sig = verifySignatureDetailed(req.body || {});

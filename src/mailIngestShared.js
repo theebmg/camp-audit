@@ -3,6 +3,7 @@
 // the header/address/junk-image helpers every route needs identically.
 // Build Brief v3 Part 2: factored out of mail-inbound.js so two routes never
 // drift on the security-critical bits (signature check, replay window).
+import express from 'express';
 import multer from 'multer';
 import crypto from 'crypto';
 import sharp from 'sharp';
@@ -28,6 +29,29 @@ export const mailUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024, files: 25, fieldSize: 25 * 1024 * 1024 },
 });
+
+// Root cause of the "text-only forwarded receipt gets a silent 401" bug:
+// Mailgun does NOT always POST multipart/form-data. A message with at least
+// one real attachment part comes through multipart (mailUpload above parses
+// it fine) — but a message with nothing to attach (a forwarded Amazon/
+// vendor confirmation with only text, or only an inline logo the junk
+// filter drops) apparently comes through as plain
+// application/x-www-form-urlencoded instead. multer only recognizes
+// multipart/form-data; given anything else it silently calls next() without
+// touching req.body at all, so req.body came back completely empty —
+// missing timestamp/token/signature wasn't a rejected signature, it was a
+// body that was never parsed in the first place. Confirmed live: caught a
+// real failing delivery with logInboundHit and saw
+// content-type="application/x-www-form-urlencoded".
+//
+// Fix: run express.urlencoded() ahead of mailUpload in the chain. Each
+// body-parser middleware checks Content-Type before touching req.body and
+// calls next() immediately on a mismatch, so the two stack safely — whichever
+// one matches the actual request runs, the other is a no-op. Use
+// `mailParsers` (both, in order) as the route's body-parsing middleware
+// instead of mailUpload.any() alone.
+const urlencodedParser = express.urlencoded({ extended: true, limit: '25mb' });
+export const mailParsers = [urlencodedParser, mailUpload.any()];
 
 // Drops signature logos and tracking pixels — anything under ~200px on both
 // edges. Void handles whatever slips through. Deliberately a SIZE check
@@ -91,6 +115,7 @@ export function logInboundHit(routeLabel, req) {
   const b = req.body || {};
   console.log(
     `${routeLabel}: inbound POST — recipient="${b.recipient || ''}" ` +
+    `content-type="${req.headers['content-type'] || '?'}" content-encoding="${req.headers['content-encoding'] || 'none'}" ` +
     `content-length=${req.headers['content-length'] || '?'} ` +
     `hasTimestamp=${!!b.timestamp} hasToken=${!!b.token} hasSignature=${!!b.signature} ` +
     `fieldKeys=[${Object.keys(b).join(',')}] fileFields=[${(req.files || []).map((f) => f.fieldname).join(',')}]`
