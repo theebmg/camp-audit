@@ -486,6 +486,7 @@ const NAV_ITEMS = [
   { icon: '🗒️', label: 'Notes', view: 'notes' },
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
   { icon: '📥', label: 'Inbox', view: 'inbox' },
+  { icon: '💵', label: 'Expenses', view: 'expenses' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
   { icon: '👷', label: 'Crew', view: 'crew' },
@@ -608,6 +609,10 @@ async function render(view, params = {}) {
       map: () => renderMap(),
       notes: () => renderNotes(),
       inbox: () => renderInbox(),
+      expenses: () => renderExpenses(params),
+      expenseDetail: () => renderExpenseDetail(params),
+      adminFunds: () => renderAdminFunds(),
+      adminExpenseCategories: () => renderAdminExpenseCategories(),
       createWoFromFindings: () => renderCreateWoFromFindings(params),
       assetsInLocation: () => renderAssetsInLocation(params),
       assetDetail: () => renderAssetDetail(params),
@@ -711,14 +716,36 @@ async function renderDashboard() {
   let selectedWeekDate = isoDate(today);
   const weekOccByDay = new Map();
 
-  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary, inboxRes] = await Promise.all([
+  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary, inboxRes, expenseInboxRes, fundBalancesRes] = await Promise.all([
     prefs.woOverview ? api('/api/pg/dashboard/wo-summary') : Promise.resolve(null),
     prefs.calendar ? api(`/api/pg/calendar-events?from=${isoDate(weekStart)}&to=${isoDate(weekEnd)}`) : Promise.resolve(null),
     prefs.calendar ? api('/api/pg/work-orders') : Promise.resolve(null),
     prefs.activity ? api(`/api/pg/activity-log?limit=12${isAdmin ? '' : `&username=${encodeURIComponent(currentUser.username || '')}`}`) : Promise.resolve(null),
     prefs.findings ? api('/api/pg/findings-summary') : Promise.resolve(null),
     api('/api/pg/inbox/count'),
+    api('/api/pg/expenses/inbox/count'),
+    api('/api/pg/funds/balances'),
   ]);
+
+  // Build Brief v3 §3.4 — per active fund, "$X of $Y remaining · N days
+  // left." Over-spend renders in a warning color with the overage shown;
+  // nothing is ever blocked, this is a reference line only.
+  function fundBalancesHtml() {
+    const activeFunds = (fundBalancesRes.funds || []).filter((f) => f.Active);
+    if (!activeFunds.length) return '';
+    return `<div class="card">
+      <h3>Funds</h3>
+      <div class="summary-buckets">
+        ${activeFunds.map((f) => {
+          const over = f.OverBudget;
+          return `<div class="bucket-tile clickable-tile" data-view="expenses" style="cursor:pointer${over ? ';border-color:#c0392b66;background:#c0392b1a' : ''}">
+            <div class="n" style="${over ? 'color:#c0392b' : ''}">${over ? `+$${Math.abs(f.Remaining).toLocaleString()}` : `$${f.Remaining.toLocaleString()}`}</div>
+            <div class="muted">${escapeHtml(f.Name)}${over ? ' over' : ' left'}${f.DaysLeft != null && f.DaysLeft >= 0 ? ` · ${f.DaysLeft}d` : ''}</div>
+          </div>`;
+        }).join('')}
+      </div>
+    </div>`;
+  }
 
   // Open should trend to zero (3) — every finding is meant to end up with a
   // decision made on it. The second number is the data-quality check: things
@@ -845,6 +872,7 @@ async function renderDashboard() {
           <div class="list-item" data-view="maintenanceLog" style="flex:1;min-width:140px">📋 Maintenance Log</div>
           <div class="list-item" data-view="capitalPlan" style="flex:1;min-width:140px">💰 Capital Plan</div>
           <div class="list-item" data-view="inbox" style="flex:1;min-width:140px${inboxRes.count > 0 ? ';font-weight:600' : ''}">📥 Inbox${inboxRes.count > 0 ? ` <span class="pill">${inboxRes.count}</span>` : ''}</div>
+          <div class="list-item" data-view="expenses" style="flex:1;min-width:140px${expenseInboxRes.count > 0 ? ';font-weight:600' : ''}">💵 Expenses${expenseInboxRes.count > 0 ? ` <span class="pill">${expenseInboxRes.count}</span>` : ''}</div>
         </div>
         <details style="margin-top:10px">
           <summary class="muted" style="cursor:pointer">Customize dashboard</summary>
@@ -856,6 +884,7 @@ async function renderDashboard() {
           </div>
         </details>
       </div>
+      ${fundBalancesHtml()}
       ${woOverviewHtml()}
       ${findingsSummaryHtml()}
       ${calendarStripHtml()}
@@ -3122,6 +3151,221 @@ function wireInboxBatch(batch) {
   }));
 }
 
+// ── Expenses (Build Brief v3 Part 3) — a separate nav item from the photo
+// Inbox on purpose ("photos and receipts must be visually distinct; they get
+// triaged differently and mixing them will cause mistakes" — brief §3.1). A
+// receipt needs vendor/amount/date/category/fund; a photo needs role/
+// classification. Two lists, two triage screens, no shared card markup. ────
+
+function expenseParsedBadge(e) {
+  if (!e || e.Source !== 'email' || !e.ParsedConfidence || e.ParsedConfidence === 'none') return '';
+  const label = e.ParsedConfidence === 'parsed' ? 'Parsed from email — confirm' : 'Partially parsed — confirm';
+  return ` <span class="pill">${label}</span>`;
+}
+function fundPickerOptionsHtml(funds, selectedId) {
+  return '<option value="">— none —</option>' + (funds || []).map((f) =>
+    `<option value="${f.Id}" ${f.Id === selectedId ? 'selected' : ''}>${escapeHtml(f.Name)}${f.Expired ? ' (expired)' : ''}${f.Active === false ? ' (inactive)' : ''}</option>`
+  ).join('');
+}
+function categoryPickerOptionsHtml(categories, selectedId) {
+  return '<option value="">— none —</option>' + (categories || []).map((c) =>
+    `<option value="${c.Id}" ${c.Id === selectedId ? 'selected' : ''}>${escapeHtml(c.Name)}</option>`
+  ).join('');
+}
+
+function expenseInboxCardHtml(e) {
+  const thumb = (e.Attachments || [])[0];
+  return `<div class="card expense-card" data-id="${e.Id}" style="cursor:pointer;border-left:4px solid #d98c00;margin-bottom:8px">
+    <div style="display:flex;gap:10px;align-items:flex-start">
+      ${thumb ? attachmentThumbHtml(thumb) : '<div style="width:84px;height:84px;border-radius:8px;background:#fff3e0;display:flex;align-items:center;justify-content:center;font-size:28px;flex-shrink:0">🧾</div>'}
+      <div style="flex:1;min-width:0">
+        <strong>${escapeHtml(e.Vendor || e.Subject || '(unidentified receipt)')}</strong>${expenseParsedBadge(e)}
+        <div class="muted" style="font-size:0.85rem">${e.Amount != null ? `$${Number(e.Amount).toLocaleString()}` : 'amount unknown'}${e.PurchaseDate ? ` · ${formatDateNice(e.PurchaseDate)}` : ''}</div>
+        ${e.SenderEmail ? `<div class="muted" style="font-size:0.8rem">${escapeHtml(e.SenderEmail)}</div>` : ''}
+      </div>
+      <button type="button" class="btn btn-secondary expense-void-btn" data-id="${e.Id}">Void</button>
+    </div>
+  </div>`;
+}
+
+async function renderExpenses() {
+  setChrome({ title: 'Expenses', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const [{ expenses: inbox }, { funds: fundBalances }, { expenses: recent }] = await Promise.all([
+    api('/api/pg/expenses/inbox'),
+    api('/api/pg/funds/balances'),
+    api('/api/pg/expenses'),
+  ]);
+
+  function fundTileHtml(f) {
+    const over = f.OverBudget;
+    const pct = f.Amount > 0 ? Math.min(100, Math.round((f.Spent / f.Amount) * 100)) : 0;
+    const color = over ? '#c0392b' : '#2e8b57';
+    return `<div class="card" style="border-left:4px solid ${color}">
+      <strong>${escapeHtml(f.Name)}</strong>
+      <p style="margin:4px 0${over ? ';color:' + color + ';font-weight:600' : ''}">
+        ${over ? `$${Math.abs(f.Remaining).toLocaleString()} OVER the $${f.Amount.toLocaleString()} line` : `$${f.Spent.toLocaleString()} of $${f.Amount.toLocaleString()} remaining: $${f.Remaining.toLocaleString()}`}
+        ${f.DaysLeft != null ? ` · ${f.DaysLeft >= 0 ? `${f.DaysLeft} days left` : 'ended'}` : ''}
+      </p>
+      <div style="background:#e5e5ea;border-radius:4px;height:6px;overflow:hidden"><div style="width:${pct}%;height:100%;background:${color}"></div></div>
+    </div>`;
+  }
+
+  app.innerHTML = `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <h3 style="margin:0">Expenses</h3>
+        <button class="btn btn-primary" id="addExpenseBtn">+ Add Expense</button>
+      </div>
+      <p class="muted">Camp debit card spending — Ben's own record, separate from what he emails the treasurer directly. Receipts forward to receipts@cmms.fracturedrv.com.</p>
+    </div>
+    ${fundBalances.filter((f) => f.Active).map(fundTileHtml).join('')}
+    <div class="card"><h3>Receipt Inbox${inbox.length ? ` <span class="pill">${inbox.length}</span>` : ''}</h3>
+      ${!inbox.length ? '<p class="muted">Nothing waiting.</p>' : ''}
+      <div id="expenseInboxList"></div>
+    </div>
+    <div class="card"><h3>Recent Expenses</h3>
+      <div id="expenseRecentList"></div>
+      <p class="muted" style="margin-top:8px"><a href="#" id="viewExpenseReportLink">See all, with filters, in Reports →</a></p>
+    </div>`;
+
+  const inboxListEl = document.getElementById('expenseInboxList');
+  inboxListEl.innerHTML = inbox.map(expenseInboxCardHtml).join('');
+  inboxListEl.querySelectorAll('.expense-card').forEach((el) => el.addEventListener('click', (evt) => {
+    if (evt.target.closest('button')) return;
+    go('expenseDetail', { id: el.dataset.id });
+  }));
+  inboxListEl.querySelectorAll('.expense-void-btn').forEach((btn) => btn.addEventListener('click', async (evt) => {
+    evt.stopPropagation();
+    try { await api(`/api/pg/expenses/${btn.dataset.id}/void`, { method: 'POST' }); toast('Voided'); renderExpenses(); }
+    catch (err) { toast(err.message); }
+  }));
+
+  const recentListEl = document.getElementById('expenseRecentList');
+  recentListEl.innerHTML = recent.slice(0, 15).map((e) => `
+    <div class="list-item" data-id="${e.Id}">
+      <span>${escapeHtml(e.Vendor || '(no vendor)')}${e.CategoryName ? ` · ${escapeHtml(e.CategoryName)}` : ''}</span>
+      <span class="muted">${e.Amount != null ? `$${Number(e.Amount).toLocaleString()}` : '—'}${e.PurchaseDate ? ` · ${formatDateNice(e.PurchaseDate)}` : ''}</span>
+    </div>`).join('') || '<p class="muted">No expenses yet.</p>';
+  recentListEl.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => go('expenseDetail', { id: el.dataset.id })));
+
+  document.getElementById('viewExpenseReportLink').addEventListener('click', (e) => { e.preventDefault(); go('reports', { entity: 'expenses' }); });
+  document.getElementById('addExpenseBtn').addEventListener('click', () => go('expenseDetail', {}));
+}
+
+// Create/edit/triage — one form for all three (brief §3.2: "Add expense"
+// opens the same form with empty fields). A manual "Add" POSTs immediately
+// (triage_status='triaged' from the start — there's nothing to triage about
+// an entry Ben is typing himself) then lands here again in edit mode so a
+// receipt photo can still be attached. An inbox row PATCHes, which flips
+// triage_status from 'inbox' to 'triaged' as a side effect of any save.
+async function renderExpenseDetail({ id } = {}) {
+  setChrome({ title: id ? 'Edit Expense' : 'Add Expense', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const expense = id ? (await api(`/api/pg/expenses/${id}`)).expense : null;
+  if (id && !expense) { app.innerHTML = '<div class="card"><p class="muted">Expense not found.</p></div>'; return; }
+  const funds = state.options.funds || [];
+  const expenseCategories = state.options.expenseCategories || [];
+
+  app.innerHTML = `
+    <div class="card">
+      <h3>${id ? 'Edit Expense' : 'Add Expense'}</h3>
+      ${expense?.Subject ? `<p class="muted">From email: "${escapeHtml(expense.Subject)}"${expense.SenderEmail ? ` — ${escapeHtml(expense.SenderEmail)}` : ''}</p>` : ''}
+      ${id ? '<div id="expenseReceiptSection"></div>' : '<p class="muted">You can attach a receipt photo once this is saved.</p>'}
+      <form id="expenseForm" style="margin-top:12px">
+        <div class="field-row"><label>Vendor${expenseParsedBadge(expense)}</label><input name="vendor" value="${escapeHtml(expense?.Vendor || '')}" placeholder="e.g. Ace Hardware" /></div>
+        <div class="field-row"><label>Amount</label><input name="amount" type="number" step="0.01" min="0" value="${expense?.Amount ?? ''}" /></div>
+        <div class="field-row"><label>Purchase Date</label><input name="purchaseDate" type="date" value="${(expense?.PurchaseDate || '').slice(0, 10)}" /></div>
+        <div class="field-row"><label>Tax Amount</label><input name="taxAmount" type="number" step="0.01" min="0" value="${expense?.TaxAmount ?? ''}" /></div>
+        <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0">
+          <input type="checkbox" name="taxChargedInError" ${expense?.TaxChargedInError ? 'checked' : ''} style="width:auto" />
+          Tax charged in error (camp is tax-exempt — flags this for the quarterly recovery list)
+        </label>
+        <div class="field-row"><label>Category</label><select name="categoryId">${categoryPickerOptionsHtml(expenseCategories, expense?.CategoryId)}</select></div>
+        <div class="field-row"><label>Fund</label><select name="fundId">${fundPickerOptionsHtml(funds, expense?.FundId)}</select>
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">A reference line, not a cap — going over always saves, it just shows as a warning on the Expenses page.</p>
+        </div>
+        <div class="field-row"><label>Work Order (optional)</label><select id="expenseWoPicker"><option value="">— none —</option></select></div>
+        <div class="field-row" id="expenseLineRow" hidden><label>Job Line (optional)</label><select id="expenseLinePicker"><option value="">— none —</option></select>
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">Picking a line funded by a fund defaults Fund above, if you haven't already chosen one yourself.</p>
+        </div>
+        <div class="field-row"><label>Asset (optional)</label><div class="asset-picker" id="expenseAssetPicker"></div></div>
+        <div class="field-row"><label>Notes</label><textarea name="notes">${escapeHtml(expense?.Notes || '')}</textarea></div>
+        <div class="btn-row">
+          <button class="btn btn-primary" type="submit">Save</button>
+          ${id ? '<button type="button" class="btn btn-secondary" id="voidExpenseBtn">Void</button>' : ''}
+        </div>
+      </form>
+    </div>`;
+
+  if (id) {
+    renderAttachmentSection('expense', id, document.getElementById('expenseReceiptSection'), {
+      title: 'Receipt', defaultRoleName: 'Receipt', accept: 'image/*,application/pdf',
+    });
+  }
+
+  let selectedAsset = expense?.AssetId ? { Id: expense.AssetId, Name: expense.AssetName } : null;
+  mountAssetCombobox(document.getElementById('expenseAssetPicker'), {
+    initialAsset: selectedAsset, onSelect: (a) => { selectedAsset = a; },
+  });
+
+  const form = document.getElementById('expenseForm');
+  const woPicker = document.getElementById('expenseWoPicker');
+  const lineRow = document.getElementById('expenseLineRow');
+  const linePicker = document.getElementById('expenseLinePicker');
+
+  const { workOrders } = await api('/api/pg/work-orders');
+  woPicker.innerHTML = '<option value="">— none —</option>' + workOrders.map((w) =>
+    `<option value="${w.Id}" ${w.Id === expense?.WorkOrderId ? 'selected' : ''}>${escapeHtml(w.Title)}${w.WoNumber ? ` (WO ${w.WoNumber})` : ''}</option>`
+  ).join('');
+
+  async function loadJobLinesFor(woId, selectedLineId) {
+    if (!woId) { lineRow.hidden = true; linePicker.innerHTML = '<option value="">— none —</option>'; return; }
+    const wo = await api(`/api/pg/work-orders/${woId}`);
+    lineRow.hidden = false;
+    linePicker.innerHTML = '<option value="">— none —</option>' + (wo.jobLines || []).map((jl) =>
+      `<option value="${jl.Id}" ${jl.Id === selectedLineId ? 'selected' : ''}>${escapeHtml(jl.Title)}</option>`
+    ).join('');
+  }
+  if (expense?.WorkOrderId) await loadJobLinesFor(expense.WorkOrderId, expense.JobLineId);
+  woPicker.addEventListener('change', () => loadJobLinesFor(woPicker.value ? Number(woPicker.value) : null, null));
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const payload = {
+      vendor: fd.get('vendor') || null,
+      amount: fd.get('amount') || null,
+      purchaseDate: fd.get('purchaseDate') || null,
+      taxAmount: fd.get('taxAmount') || null,
+      taxChargedInError: fd.has('taxChargedInError'),
+      categoryId: fd.get('categoryId') || null,
+      fundId: fd.get('fundId') || null,
+      jobLineId: linePicker.value || null,
+      workOrderId: woPicker.value || null,
+      assetId: selectedAsset?.Id || null,
+      notes: fd.get('notes') || null,
+    };
+    try {
+      if (id) {
+        await api(`/api/pg/expenses/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+        toast('Expense saved');
+        go('expenses', {}, { replace: true });
+      } else {
+        const { expense: created } = await api('/api/pg/expenses', { method: 'POST', body: JSON.stringify(payload) });
+        toast('Expense added — attach a receipt below if you have one');
+        go('expenseDetail', { id: created.Id }, { replace: true });
+      }
+    } catch (err) { toast(err.message); }
+  });
+
+  document.getElementById('voidExpenseBtn')?.addEventListener('click', async () => {
+    if (!await confirmDialog('Void this expense? The receipt file (if any) is untouched and this can be undone from the expense.')) return;
+    try { await api(`/api/pg/expenses/${id}/void`, { method: 'POST' }); toast('Voided'); go('expenses', {}, { replace: true }); }
+    catch (err) { toast(err.message); }
+  });
+}
+
 async function renderMaintenanceLog() {
   setChrome({ title: 'Maintenance Log', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
@@ -3171,6 +3415,7 @@ const REPORT_ENTITIES = [
   { key: 'findings', label: 'Findings' },
   { key: 'workOrderLog', label: 'Progress Log' },
   { key: 'crewSessions', label: 'Crew Sessions' },
+  { key: 'expenses', label: 'Expenses' },
 ];
 
 // One-click canned filter combinations for the most common "which report do
@@ -3809,6 +4054,13 @@ const ADMIN_CATEGORIES = {
       { view: 'adminWorkOrderStatuses', icon: '🚦', label: 'Work Order Statuses' },
       { view: 'adminJobLineStatuses', icon: '🚦', label: 'Job Line Statuses' },
       { view: 'adminAttachmentRoles', icon: '📎', label: 'Attachment Roles' },
+    ],
+  },
+  expenses: {
+    icon: '💵', title: 'Expenses & Funds', description: 'Funds Ben is accountable for, and what an expense can be categorized as',
+    items: [
+      { view: 'adminFunds', icon: '💰', label: 'Funds' },
+      { view: 'adminExpenseCategories', icon: '🏷️', label: 'Expense Categories' },
     ],
   },
   requests: {
@@ -4647,6 +4899,169 @@ async function renderAdminJobLineStatuses(container = app) {
         countsAsWorkPerformed: fd.has('countsAsWorkPerformed'), requiresNote: fd.has('requiresNote'), noteLabel: fd.get('noteLabel') || null,
       }) });
       renderAdminJobLineStatuses(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+// Build Brief v3 Part 1/3 — same freetext-never-promoted admin CRUD pattern
+// as Causes below, for what kind of thing an expense was.
+async function renderAdminExpenseCategories(container = app) {
+  if (container === app) setChrome({ title: 'Expense Categories', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { categories } = await api('/api/pg/expense-categories');
+
+  const rows = categories.map((c) => `
+    <div class="list-item" style="cursor:default">
+      <span>${escapeHtml(c.Name)}${!c.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary ec-toggle-active" data-id="${c.Id}" data-active="${c.Active}">${c.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary ec-delete" data-id="${c.Id}" data-name="${escapeHtml(c.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No expense categories defined yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Expense Categories</h3>
+      <p class="muted">What kind of thing an expense was — independent of which fund it came from. Freetext never gets promoted into this list; adding one here is the only way it becomes selectable.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Category</h3>
+      <form id="addExpenseCategoryForm">
+        <div class="field-row"><label>Name</label><input name="name" placeholder="e.g. Materials" required /></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.ec-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/expense-categories/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) });
+      renderAdminExpenseCategories(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelectorAll('.ec-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete category "${btn.dataset.name}"? Only possible if no expense uses it — deactivate instead if it's in use.`)) return;
+    try {
+      await api(`/api/pg/admin/expense-categories/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Category deleted');
+      renderAdminExpenseCategories(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addExpenseCategoryForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/expense-categories', { method: 'POST', body: JSON.stringify({ name: fd.get('name') }) });
+      renderAdminExpenseCategories(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+// Build Brief v3 Part 1/3 — funds are money with a ceiling Ben is personally
+// accountable for, not a general ledger (the operating budget stays a label
+// with no balance tracked). More fields than a plain name-only catalog, so
+// this gets its own inline edit form rather than mirroring Causes exactly.
+async function renderAdminFunds(container = app) {
+  if (container === app) setChrome({ title: 'Funds', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { funds } = await api('/api/pg/funds');
+
+  const fundRowHtml = (f) => `
+    <div class="card fund-row" data-id="${f.Id}">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <strong style="flex:1">${escapeHtml(f.Name)}</strong>
+        ${!f.Active ? '<span class="pill">inactive</span>' : ''}
+        ${f.Expired ? '<span class="pill">expired</span>' : ''}
+        <button type="button" class="btn btn-secondary fund-edit-toggle">Edit</button>
+      </div>
+      <p class="muted" style="margin:4px 0 0">$${Number(f.Amount).toLocaleString()}${f.EndDate ? ` through ${formatDateNice(f.EndDate)}` : ''}${f.AuthorizedBy ? ` · authorized by ${escapeHtml(f.AuthorizedBy)}` : ''}</p>
+      <form class="fund-edit-form" hidden style="margin-top:10px">
+        <div class="field-row"><label>Name</label><input class="f-name" value="${escapeHtml(f.Name)}" required /></div>
+        <div class="field-row"><label>Amount</label><input class="f-amount" type="number" step="0.01" min="0" value="${f.Amount}" required /></div>
+        <div class="field-row"><label>Start Date</label><input class="f-start" type="date" value="${(f.StartDate || '').slice(0, 10)}" /></div>
+        <div class="field-row"><label>End Date</label><input class="f-end" type="date" value="${(f.EndDate || '').slice(0, 10)}" />
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">Past this date the fund drops out of the default picker but stays selectable for backdated entry.</p>
+        </div>
+        <div class="field-row"><label>Authorized By</label><input class="f-authorized" value="${escapeHtml(f.AuthorizedBy || '')}" /></div>
+        <div class="field-row"><label>Notes</label><textarea class="f-notes">${escapeHtml(f.Notes || '')}</textarea></div>
+        <div class="btn-row">
+          <button class="btn btn-primary fund-save" type="submit">Save</button>
+          <button class="btn btn-secondary fund-toggle-active" type="button" data-active="${f.Active}">${f.Active ? 'Deactivate' : 'Reactivate'}</button>
+          <button class="btn btn-secondary fund-delete" type="button" data-name="${escapeHtml(f.Name)}">Delete</button>
+        </div>
+      </form>
+    </div>`;
+
+  container.innerHTML = `
+    <div class="card"><h3>Funds</h3>
+      <p class="muted">Money with a ceiling Ben is personally accountable for — a reference line, not an enforcement mechanism. Spending past Amount always warns, never blocks. The camp's operating budget is NOT a fund; it stays a label with no balance tracked here.</p>
+    </div>
+    ${funds.map(fundRowHtml).join('') || '<p class="muted">No funds defined yet.</p>'}
+    <div class="card">
+      <h3>Add Fund</h3>
+      <form id="addFundForm">
+        <div class="field-row"><label>Name</label><input name="name" placeholder="e.g. Discretionary Audit Fund" required /></div>
+        <div class="field-row"><label>Amount</label><input name="amount" type="number" step="0.01" min="0" required /></div>
+        <div class="field-row"><label>Start Date</label><input name="startDate" type="date" /></div>
+        <div class="field-row"><label>End Date</label><input name="endDate" type="date" /></div>
+        <div class="field-row"><label>Authorized By</label><input name="authorizedBy" placeholder="e.g. Camp Sychar board" /></div>
+        <div class="field-row"><label>Notes</label><textarea name="notes"></textarea></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  container.querySelectorAll('.fund-row').forEach((row) => {
+    const id = row.dataset.id;
+    const form = row.querySelector('.fund-edit-form');
+    row.querySelector('.fund-edit-toggle').addEventListener('click', () => { form.hidden = !form.hidden; });
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await api(`/api/pg/admin/funds/${id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            name: form.querySelector('.f-name').value.trim(),
+            amount: Number(form.querySelector('.f-amount').value),
+            startDate: form.querySelector('.f-start').value || null,
+            endDate: form.querySelector('.f-end').value || null,
+            authorizedBy: form.querySelector('.f-authorized').value || null,
+            notes: form.querySelector('.f-notes').value || null,
+          }),
+        });
+        toast('Fund saved');
+        renderAdminFunds(container);
+      } catch (err) { toast(err.message); }
+    });
+    form.querySelector('.fund-toggle-active').addEventListener('click', async () => {
+      const btn = form.querySelector('.fund-toggle-active');
+      try {
+        await api(`/api/pg/admin/funds/${id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) });
+        renderAdminFunds(container);
+      } catch (err) { toast(err.message); }
+    });
+    form.querySelector('.fund-delete').addEventListener('click', async () => {
+      const btn = form.querySelector('.fund-delete');
+      if (!await confirmDialog(`Delete fund "${btn.dataset.name}"? Only possible if no expense or job line uses it — deactivate instead if it's in use.`)) return;
+      try {
+        await api(`/api/pg/admin/funds/${id}`, { method: 'DELETE' });
+        toast('Fund deleted');
+        renderAdminFunds(container);
+      } catch (err) { toast(err.message); }
+    });
+  });
+
+  container.querySelector('#addFundForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/funds', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: fd.get('name'), amount: Number(fd.get('amount')), startDate: fd.get('startDate') || null,
+          endDate: fd.get('endDate') || null, authorizedBy: fd.get('authorizedBy') || null, notes: fd.get('notes') || null,
+        }),
+      });
+      toast('Fund added');
+      renderAdminFunds(container);
     } catch (err) { toast(err.message); }
   });
 }
@@ -5707,11 +6122,12 @@ const RESPONSIBILITY_CLASS_LABELS = { self: 'Self', volunteer: 'Volunteer', vend
 // zero-decision, classify later" principle the brief opens with.
 async function renderNewWorkOrder({ assetId, assetName }) {
   setChrome({ title: 'New Work Order', showBack: true, showLogout: true });
-  const [{ templates }, campaignRes, cabinRes, otherRes] = await Promise.all([
+  const [{ templates }, campaignRes, cabinRes, otherRes, fundsRes] = await Promise.all([
     api('/api/pg/work-order-templates'),
     api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
+    api('/api/pg/funds'),
   ]);
-  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
+  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items, fund: fundsRes.funds };
   const fieldTitles = state.options.propertyFields.map((f) => f.title);
 
   const fundingRefOptionsHtml = (source, selectedId) =>
@@ -5855,8 +6271,9 @@ async function renderNewWorkOrder({ assetId, assetName }) {
   });
 }
 
+// 'fund' added Build Brief v3 Part 1 (see migration 0053's header comment).
 const FUNDING_SOURCE_LABELS = {
-  operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other',
+  operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other', fund: 'Fund',
 };
 // The old WO-level funding combobox (search/inline-create) was retired with
 // Phase 1 — funding now lives per-line via a plain <select> populated from
@@ -5915,7 +6332,9 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }
       <div class="field-row"><label>Estimated Hours</label><input class="jl-e-est-hours" type="number" min="0" value="${jl.EstimatedHours ?? ''}" /></div>
       <div class="field-row"><label>Actual Hours</label><input class="jl-e-act-hours" type="number" min="0" value="${jl.ActualHours ?? ''}" /></div>
       <div class="field-row"><label>Estimated Cost</label><input class="jl-e-est-cost" type="number" step="0.01" min="0" value="${jl.EstimatedCost ?? ''}" /></div>
-      <div class="field-row"><label>Actual Cost</label><input class="jl-e-act-cost" type="number" step="0.01" min="0" value="${jl.ActualCost ?? ''}" /></div>
+      <div class="field-row"><label>Actual Cost</label><input class="jl-e-act-cost" type="number" step="0.01" min="0" value="${jl.ActualCost ?? ''}" />
+        ${jl.LinkedExpenseCount ? `<p class="muted" style="margin-top:2px;font-size:0.8rem">+ $${jl.LinkedExpenseTotal.toLocaleString()} from ${jl.LinkedExpenseCount} linked expense${jl.LinkedExpenseCount === 1 ? '' : 's'} — this field is the manual/no-receipt amount only; totals elsewhere include both.</p>` : '<p class="muted" style="margin-top:2px;font-size:0.8rem">For costs with no receipt (invoice paid directly, donated materials). Link an expense instead when there is one.</p>'}
+      </div>
       <div class="field-row"><label>Scheduled Date</label><input class="jl-e-scheduled-date" type="date" value="${(jl.ScheduledDate || '').slice(0, 10)}" /></div>
       <div class="field-row"><label>Complaint</label><textarea class="jl-e-complaint" placeholder="What's wrong?">${escapeHtml(jl.Complaint || '')}</textarea></div>
       <div class="field-row"><label>Cause</label>
@@ -5950,15 +6369,15 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }
 async function renderWorkOrderDetail({ id }, container = app) {
   if (container === app) setChrome({ title: 'Work Order', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
-  const [detail, allVolunteers, allVendors, skillsRes, tplRes, campaignRes, cabinRes, otherRes, causesRes] = await Promise.all([
+  const [detail, allVolunteers, allVendors, skillsRes, tplRes, campaignRes, cabinRes, otherRes, causesRes, fundsRes] = await Promise.all([
     api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'), api('/api/pg/skills'),
     api('/api/pg/checklist-templates'),
     api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
-    api('/api/pg/causes'),
+    api('/api/pg/causes'), api('/api/pg/funds'),
   ]);
   const allSkills = skillsRes.skills.map((s) => s.Name);
   const checklistTemplates = tplRes.templates;
-  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items };
+  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items, fund: fundsRes.funds };
   const causesCatalog = causesRes.causes;
   const { workOrder: wo, rollup, crewRoster, closeGate, assetUpdates, jobLines, checklist, logEntries, crewSessions } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);

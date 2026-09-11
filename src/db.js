@@ -563,6 +563,28 @@ const JOB_LINE_SESSION_HOURS_SQL = `
   GROUP BY job_line_id
 `;
 
+// Build Brief v3 Part 5: actual_cost becomes a rollup of linked expenses,
+// exactly as actual_hours rolls up crew_sessions above — same pre-aggregate-
+// before-joining shape, for the same fan-out reason (a line can have several
+// expenses). Manual override stays available: jl.actual_cost is still a
+// plain hand-typed column (for a vendor invoice paid directly, donated
+// materials valued, anything with no receipt), and this only ADDS linked
+// expense totals on top — never replaces it. Every call site below joins
+// this alongside JOB_LINE_SESSION_HOURS_SQL wherever a line's actual cost is
+// presented as a rollup/total; the job-line EDIT FORM's Actual Cost input
+// deliberately stays on the raw column (jobLineRowShape/hydrateJobLine) —
+// same reasoning as the Actual Hours input, see its comment.
+const JOB_LINE_EXPENSE_COST_SQL = `
+  SELECT job_line_id, SUM(amount) AS expense_cost
+  FROM expenses WHERE job_line_id IS NOT NULL AND amount IS NOT NULL AND triage_status != 'void' AND deleted_at IS NULL
+  GROUP BY job_line_id
+`;
+// NULL only when there's truly nothing recorded either way, so an
+// untouched line still reads as "—" instead of a misleading $0 — same
+// null-preservation the raw column already had before this rollup existed.
+const JOB_LINE_ACTUAL_COST_EXPR = `(CASE WHEN jl.actual_cost IS NULL AND ec.expense_cost IS NULL THEN NULL
+    ELSE COALESCE(jl.actual_cost,0) + COALESCE(ec.expense_cost,0) END)`;
+
 // Shared rollup subquery: every work order's job lines summed into one row
 // (hours/cost totals, line count, earliest scheduled date, distinct
 // responsibility classes present). Embedded via LEFT JOIN everywhere a list
@@ -589,12 +611,13 @@ const JOB_LINE_ROLLUP_SQL = `
       COALESCE(SUM(jl.estimated_hours), 0) AS estimated_hours,
       COALESCE(SUM(jl.actual_hours), 0) + COALESCE(SUM(lh.session_hours), 0) AS actual_hours,
       COALESCE(SUM(jl.estimated_cost), 0) AS estimated_cost,
-      COALESCE(SUM(jl.actual_cost), 0) AS actual_cost,
+      COALESCE(SUM(jl.actual_cost), 0) + COALESCE(SUM(ec.expense_cost), 0) AS actual_cost,
       MIN(jl.scheduled_date) AS earliest_scheduled_date,
       COALESCE(ARRAY_AGG(DISTINCT jl.responsibility_class), '{}') AS responsibility_classes,
       COALESCE(ARRAY_AGG(DISTINCT jl.funding_source), '{}') AS funding_sources
     FROM job_lines jl
     LEFT JOIN (${JOB_LINE_SESSION_HOURS_SQL}) lh ON lh.job_line_id = jl.id
+    LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
     GROUP BY jl.work_order_id
   ) jl_agg
   LEFT JOIN (
@@ -657,7 +680,7 @@ export async function getJobLinesReportRawData() {
   const { rows } = await pool.query(`
     SELECT jl.id, jl.title, jl.complaint, jl.correction, jl.responsibility_class, jl.funding_source,
            jl.estimated_hours, COALESCE(jl.actual_hours, 0) + COALESCE(lh.session_hours, 0) AS actual_hours,
-           jl.estimated_cost, jl.actual_cost, jl.scheduled_date, jl.completed_date,
+           jl.estimated_cost, ${JOB_LINE_ACTUAL_COST_EXPR} AS actual_cost, jl.scheduled_date, jl.completed_date,
            jls.name AS status, jls.counts_as_work_performed,
            w.id AS work_order_id, w.wo_number, w.title AS wo_title,
            a.name AS asset_name, l.name AS location_name, pr.name AS project_name,
@@ -670,6 +693,7 @@ export async function getJobLinesReportRawData() {
     LEFT JOIN locations l ON l.id = w.location_id
     LEFT JOIN projects pr ON pr.id = w.project_id
     LEFT JOIN (${JOB_LINE_SESSION_HOURS_SQL}) lh ON lh.job_line_id = jl.id
+    LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
     ORDER BY jl.id DESC`
   );
   const [causeRows, volRows, venRows] = await Promise.all([
@@ -741,7 +765,7 @@ async function getReportImagesForJobLines(jobLineIds, jobLineToWoMap, cap) {
 // the big multi-line jobs are legitimately still open.
 export async function getWorkPerformedRawData({ from, to }) {
   const { rows } = await pool.query(
-    `SELECT jl.id, jl.title, jl.correction, jl.completed_date, jl.actual_cost, jl.estimated_cost,
+    `SELECT jl.id, jl.title, jl.correction, jl.completed_date, ${JOB_LINE_ACTUAL_COST_EXPR} AS actual_cost, jl.estimated_cost,
             COALESCE(jl.actual_hours, 0) + COALESCE(lh.session_hours, 0) AS actual_hours,
             w.id AS work_order_id, w.wo_number, w.title AS wo_title,
             a.name AS asset_name, COALESCE(l.name, al.name) AS location_name
@@ -752,6 +776,7 @@ export async function getWorkPerformedRawData({ from, to }) {
      LEFT JOIN locations l ON l.id = w.location_id
      LEFT JOIN locations al ON al.id = a.location_id
      LEFT JOIN (${JOB_LINE_SESSION_HOURS_SQL}) lh ON lh.job_line_id = jl.id
+     LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
      WHERE jls.counts_as_work_performed AND jl.completed_date BETWEEN $1 AND $2
      ORDER BY COALESCE(l.name, al.name) NULLS LAST, w.id, jl.sort_order`,
     [from, to]
@@ -1211,10 +1236,11 @@ export async function getBudgetOverview() {
   // line, not work order, is the point of Phase 1: one WO can have lines
   // against three different funding sources.
   const opRes = await pool.query(`
-    SELECT jl.id, ws.name AS status, ws.is_terminal, COALESCE(jl.actual_cost, jl.estimated_cost, 0) AS cost
+    SELECT jl.id, ws.name AS status, ws.is_terminal, COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0) AS cost
     FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
     JOIN work_order_statuses ws ON ws.id = w.status_id
-    WHERE jl.funding_source = 'operating_budget' AND COALESCE(jl.actual_cost, jl.estimated_cost, 0) > 0
+    LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+    WHERE jl.funding_source = 'operating_budget' AND COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0) > 0
   `);
   const pendingOpCost = opRes.rows.filter((r) => !r.is_terminal).reduce((s, r) => s + Number(r.cost), 0);
   const totalOpCost = opRes.rows.reduce((s, r) => s + Number(r.cost), 0);
@@ -1223,9 +1249,10 @@ export async function getBudgetOverview() {
     const lineRes = await pool.query(
       `SELECT jl.id AS job_line_id, jl.title AS job_line_title, jl.funding_ref_id,
               w.id AS work_order_id, w.title AS wo_title, ws.name AS status,
-              COALESCE(jl.actual_cost, jl.estimated_cost, 0) AS cost
+              COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0) AS cost
        FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
        JOIN work_order_statuses ws ON ws.id = w.status_id
+       LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
        WHERE jl.funding_source = $1`,
       [fundingSource]
     );
@@ -1331,10 +1358,12 @@ const JOB_LINE_STATUS_BREAKDOWN_SQL = `
     SUM(t.est_cost) AS total_est_cost,
     SUM(CASE WHEN s.counts_as_work_performed THEN t.line_count ELSE 0 END) AS performed_lines
   FROM (
-    SELECT work_order_id, status_id, COUNT(*) AS line_count,
-           SUM(COALESCE(actual_cost, estimated_cost, 0)) AS cost,
-           SUM(COALESCE(estimated_cost, 0)) AS est_cost
-    FROM job_lines GROUP BY work_order_id, status_id
+    SELECT jl.work_order_id, jl.status_id, COUNT(*) AS line_count,
+           SUM(COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0)) AS cost,
+           SUM(COALESCE(jl.estimated_cost, 0)) AS est_cost
+    FROM job_lines jl
+    LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+    GROUP BY jl.work_order_id, jl.status_id
   ) t
   JOIN job_line_statuses s ON s.id = t.status_id
   GROUP BY t.work_order_id
@@ -1404,12 +1433,13 @@ export async function workOrderRollup(woId) {
             COALESCE(SUM(jl.estimated_hours), 0) AS estimated_hours,
             COALESCE(SUM(jl.actual_hours), 0) + COALESCE(SUM(lh.session_hours), 0) AS actual_hours_from_lines,
             COALESCE(SUM(jl.estimated_cost), 0) AS estimated_cost,
-            COALESCE(SUM(jl.actual_cost), 0) AS actual_cost,
+            COALESCE(SUM(jl.actual_cost), 0) + COALESCE(SUM(ec.expense_cost), 0) AS actual_cost,
             MIN(jl.scheduled_date) AS earliest_scheduled_date,
             MAX(jl.scheduled_date) AS latest_scheduled_date,
             COALESCE(ARRAY_AGG(DISTINCT jl.responsibility_class), '{}') AS responsibility_classes
      FROM job_lines jl
      LEFT JOIN (${JOB_LINE_SESSION_HOURS_SQL}) lh ON lh.job_line_id = jl.id
+     LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
      WHERE jl.work_order_id = $1`,
     [woId]
   );
@@ -1423,8 +1453,10 @@ export async function workOrderRollup(woId) {
   );
   const actualHours = Number(r.actual_hours_from_lines) + Number(unattrRows[0].hours);
   const fundingRes = await pool.query(
-    `SELECT funding_source, funding_ref_id, SUM(COALESCE(actual_cost, estimated_cost, 0)) AS cost
-     FROM job_lines WHERE work_order_id = $1 GROUP BY funding_source, funding_ref_id`,
+    `SELECT jl.funding_source, jl.funding_ref_id, SUM(COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0)) AS cost
+     FROM job_lines jl
+     LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+     WHERE jl.work_order_id = $1 GROUP BY jl.funding_source, jl.funding_ref_id`,
     [woId]
   );
   const fundingBreakdown = await Promise.all(fundingRes.rows.map(async (fr) => ({
@@ -2165,8 +2197,11 @@ export async function historicalAvgActualCost(templateId) {
      JOIN calendar_events e ON e.id = g.calendar_event_id
      JOIN work_orders w ON w.id = g.work_order_id
      JOIN (
-       SELECT work_order_id, SUM(actual_cost) AS total_actual_cost
-       FROM job_lines WHERE actual_cost IS NOT NULL GROUP BY work_order_id
+       SELECT jl.work_order_id, SUM(COALESCE(jl.actual_cost,0) + COALESCE(ec.expense_cost,0)) AS total_actual_cost
+       FROM job_lines jl
+       LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+       WHERE jl.actual_cost IS NOT NULL OR ec.expense_cost IS NOT NULL
+       GROUP BY jl.work_order_id
      ) wo_actual ON wo_actual.work_order_id = w.id
      JOIN work_order_statuses ws ON ws.id = w.status_id
      WHERE e.work_order_template_id = $1 AND ws.name = 'Done'`,
@@ -2194,9 +2229,10 @@ export async function getBoardReportRawData({ periodStart, periodEnd, todayStr }
     // separate query, one row per line, so a WO split across two funding
     // sources contributes to both totals correctly.
     pool.query(`
-      SELECT jl.funding_source, COALESCE(jl.actual_cost, jl.estimated_cost, 0) AS cost
+      SELECT jl.funding_source, COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0) AS cost
       FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
       JOIN work_order_statuses ws ON ws.id = w.status_id
+      LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
       WHERE NOT ws.is_terminal
     `),
     pool.query(`
@@ -2816,11 +2852,16 @@ function jobLineRowShape(r) {
 // bare columns.
 async function hydrateJobLine(row) {
   const shaped = jobLineRowShape(row);
-  const [fundingRefLabel, statusRows, causes, assignees] = await Promise.all([
+  const [fundingRefLabel, statusRows, causes, assignees, expenseAgg] = await Promise.all([
     getFundingRefLabel(row.funding_source, row.funding_ref_id),
     pool.query('SELECT name, color, is_terminal, counts_as_work_performed, requires_note, note_label FROM job_line_statuses WHERE id = $1', [row.status_id]),
     pool.query(`SELECT c.id, c.name FROM job_line_causes jlc JOIN causes c ON c.id = jlc.cause_id WHERE jlc.job_line_id = $1 ORDER BY c.sort_order, c.name`, [row.id]),
     getJobLineAssignees(row.id),
+    // Build Brief v3 Part 5: the Actual Cost INPUT stays the raw manual
+    // column (jobLineRowShape above) — same as Actual Hours — but the edit
+    // form still needs to show what's linked, so it's surfaced separately
+    // here rather than folded into ActualCost itself.
+    pool.query(`SELECT count(*) AS n, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE job_line_id = $1 AND amount IS NOT NULL AND triage_status != 'void' AND deleted_at IS NULL`, [row.id]),
   ]);
   const s = statusRows.rows[0] || {};
   return {
@@ -2828,6 +2869,7 @@ async function hydrateJobLine(row) {
     StatusName: s.name, StatusColor: s.color, StatusIsTerminal: s.is_terminal,
     StatusCountsAsWorkPerformed: s.counts_as_work_performed,
     Causes: causes.rows.map((c) => ({ Id: c.id, Name: c.name })), ...assignees,
+    LinkedExpenseCount: Number(expenseAgg.rows[0].n), LinkedExpenseTotal: Number(expenseAgg.rows[0].total),
   };
 }
 

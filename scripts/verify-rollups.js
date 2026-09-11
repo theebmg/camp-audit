@@ -18,6 +18,7 @@ import {
   deleteCapitalCampaignProject, createCabinHolder, deleteCabinHolder, createCrewSession,
   deleteCrewSession, splitWorkOrder, getWorkOrderFamily, workOrderCloseGate,
   getJobLinesReportRawData, deleteJobLine,
+  createExpense, voidExpense, getJobLine,
 } from '../src/db.js';
 import { buildWorkPerformedReportPg } from '../src/reportDataPg.js';
 
@@ -30,7 +31,7 @@ function assert(name, actual, expected, { tolerance = 0.001 } = {}) {
 }
 
 const TEST_PREFIX = 'TEST verify-rollups';
-const created = { workOrderIds: [], jobLineIds: [], crewSessionIds: [], capitalProjectId: null, cabinHolderId: null };
+const created = { workOrderIds: [], jobLineIds: [], crewSessionIds: [], capitalProjectId: null, cabinHolderId: null, expenseIds: [] };
 
 async function main() {
   const statuses = await listJobLineStatuses();
@@ -167,6 +168,45 @@ async function main() {
   const rowD = (await listWorkOrders()).find((w) => w.Id === woId);
   assert('D: cost-weighted progress excludes Deck\'s 2000 (0/10000 now — only Roof estimated remains, Roof already counted)', rowD.PercentCompleteCost, 8000 / 10000);
 
+  // ── Scenario E — Build Brief v3 Part 5: actual_cost rolls up expenses ──
+  // Roof (still on the parent WO, woId) already has a manual actual_cost of
+  // 8750 with no expenses linked — an expense on top must ADD, never
+  // replace, exactly like Scenario B proved for crew-session hours.
+  const roofExpense = await createExpense({ vendor: `${TEST_PREFIX} Ace Hardware`, amount: 100, jobLineId: roof.Id });
+  created.expenseIds.push(roofExpense.Id);
+
+  let rollupE = await workOrderRollup(woId);
+  assert('E: manual actual_cost + linked expense adds, not replaces (8750+100)', rollupE.ActualCost, 10650 + 100);
+
+  const roofLineAfterExpense = await getJobLine(roof.Id);
+  assert('E: job-line edit form Actual Cost INPUT stays the raw manual value (8750, not 8850)', roofLineAfterExpense.ActualCost, 8750);
+  assert('E: job-line edit form surfaces the linked total separately (100 from 1 expense)', roofLineAfterExpense.LinkedExpenseTotal, 100);
+  assert('E: linked expense count', roofLineAfterExpense.LinkedExpenseCount, 1);
+
+  // Windows (moved to the child WO in Scenario C) has NO manual actual_cost
+  // at all (NULL) — an expense-only line must still roll up correctly, and
+  // must not show as a misleading $0 anywhere it was previously NULL.
+  const { jobLines: reportRowsBeforeWindowsExpense } = await getJobLinesReportRawData();
+  const windowsRowBefore = reportRowsBeforeWindowsExpense.find((l) => l.id === windows.Id);
+  assert('E: Windows actual_cost reads NULL before any expense (not a misleading $0)', windowsRowBefore.actual_cost === null, true);
+
+  const windowsExpense = await createExpense({ vendor: `${TEST_PREFIX} Lowes`, amount: 250, jobLineId: windows.Id });
+  created.expenseIds.push(windowsExpense.Id);
+
+  const childRollupE = await workOrderRollup(childId);
+  assert('E: expense-only line (no manual actual_cost) rolls up on the child WO (0+250)', childRollupE.ActualCost, 250);
+
+  const { jobLines: reportRowsAfterWindowsExpense } = await getJobLinesReportRawData();
+  const windowsRowAfter = reportRowsAfterWindowsExpense.find((l) => l.id === windows.Id);
+  assert('E: Windows actual_cost now reflects the expense in the job-lines report', Number(windowsRowAfter.actual_cost), 250);
+
+  // Void must exclude it from every rollup, exactly like void already does
+  // for attachments/other expenses — the file/record stays, the number
+  // doesn't count anymore.
+  await voidExpense(roofExpense.Id);
+  const rollupAfterVoid = await workOrderRollup(woId);
+  assert('E: voided expense drops out of the rollup (back to 10650)', rollupAfterVoid.ActualCost, 10650);
+
   console.log('\n=== verify-rollups results ===\n');
   const nameWidth = Math.max(...results.map((r) => r.name.length));
   for (const r of results) {
@@ -179,6 +219,9 @@ async function main() {
 
 async function cleanup() {
   try {
+    if (created.expenseIds.length) {
+      await pool.query('DELETE FROM expenses WHERE id = ANY($1::int[])', [created.expenseIds]).catch(() => {});
+    }
     if (created.crewSessionIds.length) {
       for (const id of created.crewSessionIds) await deleteCrewSession(id).catch(() => {});
     }
