@@ -10,6 +10,7 @@ import pgApiRouter from './routes/pg-api.js';
 import requestPortalRouter from './routes/request-portal.js';
 import mailInboundRouter from './routes/mail-inbound.js';
 import receiptInboundRouter from './routes/receipt-inbound.js';
+import mailDispatchRouter from './routes/mail-dispatch.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -72,10 +73,17 @@ app.get('/health', async (req, res) => {
 // otherwise intercept '/api/pg/mail-inbound/*' and reject it with
 // requireAuth before this router ever saw the request.
 app.use('/api/pg/mail-inbound', mailInboundRouter);
-// Second Mailgun route for emailed receipts (Build Brief v3 Part 2) — same
-// public/pre-auth mounting reason as mail-inbound above. Ben's Mailgun route
-// for receipts@cmms.fracturedrv.com points at this exact path.
+// Second ingest path, for emailed receipts (Build Brief v3 Part 2) — same
+// public/pre-auth mounting reason as mail-inbound above.
 app.use('/api/pg/receipt-inbound', receiptInboundRouter);
+// Single Mailgun route for BOTH addresses (Build Brief v3, free-tier
+// consolidation — Mailgun's free plan allows only one inbound route). Ben's
+// Mailgun route for both photos@cmms.fracturedrv.com and
+// receipts@cmms.fracturedrv.com points here; mail-inbound/receipt-inbound
+// above stay mounted and fully functional as direct endpoints (their own
+// signature/idempotency checks intact) so nothing broke mid-cutover, but
+// nothing points Mailgun at them anymore once this route is live.
+app.use('/api/pg/mail-dispatch', mailDispatchRouter);
 // Postgres-backed parallel API (migration in progress) — additive, does not
 // replace /api. See toClaudeCode/camp-cmms-postgres-migration-brief.md.
 app.use('/api/pg', requireAuth, pgApiRouter);

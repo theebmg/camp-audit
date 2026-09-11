@@ -6,9 +6,14 @@
 // parsing left to do on our side — that's the entire point of the move away
 // from IMAP+mailparser.
 //
-// Public route (mounted before the authenticated /api/pg catch-all in
-// server.js, same pattern as request-portal.js) — Mailgun is the caller,
-// there's no session. The signature check below is what stands in for auth.
+// Build Brief v3 (Mailgun free-tier consolidation): Mailgun's free plan
+// allows only one inbound route, so both photos@ and receipts@ now arrive
+// through mail-dispatch.js, which verifies the signature and checks
+// idempotency ONCE and then calls ingestPhotoMail directly (exported below)
+// — no second HTTP round trip. This file's own POST / route stays wired up
+// and fully functional (signature + idempotency of its own) so nothing
+// breaks mid-cutover or if a route ever points here directly again; it just
+// delegates the actual processing to the same exported function.
 import express from 'express';
 import { findAttachmentBatchByMessageId, findWorkOrderIdByNumber, createMailInboundBatch } from '../db.js';
 import { storeAttachment } from '../storage.js';
@@ -23,6 +28,72 @@ const router = express.Router();
 // entirely — the touchless case of sending the after photo for the job
 // you're standing in front of.
 const WO_SUBJECT_RE = /\bWO\s*(\d+(?:-\d+)?)\b/i;
+
+// The actual ingest — everything after signature verification and the
+// Message-Id idempotency check, both of which the caller (this file's own
+// route, or mail-dispatch.js) has already done before calling this.
+// Returns the response payload; never sends a response itself, so it's
+// equally callable from a direct route or a dispatcher.
+export async function ingestPhotoMail(req, messageId) {
+  const subject = req.body.subject || '(no subject)';
+  const bodyText = req.body['body-plain'] || null;
+  const senderEmail = extractEmailAddress(req.body.sender || req.body.from);
+  const receivedAt = req.body.timestamp ? new Date(Number(req.body.timestamp) * 1000) : new Date();
+  const spfResult = req.body['X-Mailgun-Spf'] || extractHeader(req.body, 'X-Mailgun-Spf');
+  const dkimResult = req.body['X-Mailgun-Dkim-Check-Result'] || extractHeader(req.body, 'X-Mailgun-Dkim-Check-Result');
+
+  let targetWorkOrderId = null;
+  const woMatch = subject.match(WO_SUBJECT_RE);
+  if (woMatch) targetWorkOrderId = await findWorkOrderIdByNumber(woMatch[1]);
+
+  // content-id-map identifies inline/embedded parts (signature logos,
+  // tracking pixels, but ALSO a real photo — iOS Mail and the Gmail app
+  // both choose inline-vs-attached on their own with no user control, per
+  // Ben: "coming from an iPhone, it doesn't give me great control over
+  // what method it chooses"). So inline is tracked for the log line below
+  // only, never used to drop a file — isJunkImage's size check is what
+  // actually separates a tracking pixel/signature logo (near-universally
+  // under 200px) from a real photo (near-universally far larger), inline
+  // or not.
+  const inlineFieldNames = extractInlineFieldNames(req.body);
+
+  const realFiles = (req.files || [])
+    .filter((f) => /^attachment-\d+$/.test(f.fieldname));
+
+  const uploaded = [];
+  let junkFiltered = 0;
+  for (const f of realFiles) {
+    if (f.mimetype?.startsWith('image/') && await isJunkImage(f.buffer)) { junkFiltered++; continue; }
+    const meta = await storeAttachment(f.buffer, {
+      filename: f.originalname || 'attachment', mimetype: f.mimetype, category: 'email', ownerId: `msg-${messageId.replace(/[^a-zA-Z0-9]/g, '')}`,
+    });
+    uploaded.push(meta);
+  }
+
+  // Success-path visibility — this route otherwise only logs on throw, so
+  // a batch that lands with zero attachments (every file filtered as
+  // inline/junk, or Mailgun sending no files field at all) is silent and
+  // indistinguishable from "no photos were sent" without this.
+  console.log(
+    `mail-inbound: message ${messageId} — files=${(req.files || []).length} ` +
+    `fieldnames=[${(req.files || []).map((f) => f.fieldname).join(',')}] ` +
+    `inlineFieldnames=[${[...inlineFieldNames].join(',')}] ` +
+    `realFiles=${realFiles.length} junkFiltered=${junkFiltered} uploaded=${uploaded.length}`
+  );
+
+  // Batch row is written last, together with the attachment rows, in one
+  // transaction — see createMailInboundBatch's comment for why. If
+  // anything above this point throws, no batch row exists yet and
+  // Mailgun's retry starts clean instead of being blocked by the UNIQUE
+  // constraint on a half-ingested batch.
+  const batchId = await createMailInboundBatch({
+    subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult,
+    attachments: uploaded, targetWorkOrderId,
+  });
+  if (batchId === null) return { ok: true }; // raced with another retry — already created, nothing to do
+
+  return { ok: true, batchId, attachmentCount: uploaded.length };
+}
 
 router.post('/', mailUpload.any(), async (req, res) => {
   try {
@@ -48,64 +119,8 @@ router.post('/', mailUpload.any(), async (req, res) => {
       return res.json({ ok: true });
     }
 
-    const subject = req.body.subject || '(no subject)';
-    const bodyText = req.body['body-plain'] || null;
-    const senderEmail = extractEmailAddress(req.body.sender || req.body.from);
-    const receivedAt = req.body.timestamp ? new Date(Number(req.body.timestamp) * 1000) : new Date();
-    const spfResult = req.body['X-Mailgun-Spf'] || extractHeader(req.body, 'X-Mailgun-Spf');
-    const dkimResult = req.body['X-Mailgun-Dkim-Check-Result'] || extractHeader(req.body, 'X-Mailgun-Dkim-Check-Result');
-
-    let targetWorkOrderId = null;
-    const woMatch = subject.match(WO_SUBJECT_RE);
-    if (woMatch) targetWorkOrderId = await findWorkOrderIdByNumber(woMatch[1]);
-
-    // content-id-map identifies inline/embedded parts (signature logos,
-    // tracking pixels, but ALSO a real photo — iOS Mail and the Gmail app
-    // both choose inline-vs-attached on their own with no user control, per
-    // Ben: "coming from an iPhone, it doesn't give me great control over
-    // what method it chooses"). So inline is tracked for the log line below
-    // only, never used to drop a file — isJunkImage's size check is what
-    // actually separates a tracking pixel/signature logo (near-universally
-    // under 200px) from a real photo (near-universally far larger), inline
-    // or not.
-    const inlineFieldNames = extractInlineFieldNames(req.body);
-
-    const realFiles = (req.files || [])
-      .filter((f) => /^attachment-\d+$/.test(f.fieldname));
-
-    const uploaded = [];
-    let junkFiltered = 0;
-    for (const f of realFiles) {
-      if (f.mimetype?.startsWith('image/') && await isJunkImage(f.buffer)) { junkFiltered++; continue; }
-      const meta = await storeAttachment(f.buffer, {
-        filename: f.originalname || 'attachment', mimetype: f.mimetype, category: 'email', ownerId: `msg-${messageId.replace(/[^a-zA-Z0-9]/g, '')}`,
-      });
-      uploaded.push(meta);
-    }
-
-    // Success-path visibility — this route otherwise only logs on throw, so
-    // a batch that lands with zero attachments (every file filtered as
-    // inline/junk, or Mailgun sending no files field at all) is silent and
-    // indistinguishable from "no photos were sent" without this.
-    console.log(
-      `mail-inbound: message ${messageId} — files=${(req.files || []).length} ` +
-      `fieldnames=[${(req.files || []).map((f) => f.fieldname).join(',')}] ` +
-      `inlineFieldnames=[${[...inlineFieldNames].join(',')}] ` +
-      `realFiles=${realFiles.length} junkFiltered=${junkFiltered} uploaded=${uploaded.length}`
-    );
-
-    // Batch row is written last, together with the attachment rows, in one
-    // transaction — see createMailInboundBatch's comment for why. If
-    // anything above this point throws, no batch row exists yet and
-    // Mailgun's retry starts clean instead of being blocked by the UNIQUE
-    // constraint on a half-ingested batch.
-    const batchId = await createMailInboundBatch({
-      subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult,
-      attachments: uploaded, targetWorkOrderId,
-    });
-    if (batchId === null) return res.json({ ok: true }); // raced with another retry — already created, nothing to do
-
-    res.json({ ok: true, batchId, attachmentCount: uploaded.length });
+    const result = await ingestPhotoMail(req, messageId);
+    res.json(result);
   } catch (e) {
     // 5xx so Mailgun retries — a storage failure or transient DB error here
     // must not silently drop the message.

@@ -5,9 +5,14 @@
 // inbox row (pre-filled by expenseParsing.js) instead of a batch of unlinked
 // attachments.
 //
-// Public route (mounted before the authenticated /api/pg catch-all in
-// server.js, same pattern as mail-inbound.js) — Mailgun is the caller,
-// there's no session. The signature check below is what stands in for auth.
+// Build Brief v3 (Mailgun free-tier consolidation): Mailgun's free plan
+// allows only one inbound route, so both photos@ and receipts@ now arrive
+// through mail-dispatch.js, which verifies the signature and checks
+// idempotency ONCE and then calls ingestReceiptMail directly (exported
+// below) — no second HTTP round trip. This file's own POST / route stays
+// wired up and fully functional (signature + idempotency of its own) so
+// nothing breaks mid-cutover or if a route ever points here directly again;
+// it just delegates the actual processing to the same exported function.
 //
 // Do NOT filter inline-marked attachments here (see mailIngestShared.js's
 // isJunkImage comment) — receipts are, if anything, MORE likely than photos
@@ -22,6 +27,52 @@ import {
 } from '../mailIngestShared.js';
 
 const router = express.Router();
+
+// The actual ingest — everything after signature verification and the
+// Message-Id idempotency check, both of which the caller (this file's own
+// route, or mail-dispatch.js) has already done before calling this.
+// Returns the response payload; never sends a response itself.
+export async function ingestReceiptMail(req, messageId) {
+  const subject = req.body.subject || '(no subject)';
+  const bodyText = req.body['body-plain'] || null;
+  const senderEmail = extractEmailAddress(req.body.sender || req.body.from);
+  const receivedAt = req.body.timestamp ? new Date(Number(req.body.timestamp) * 1000) : new Date();
+  const spfResult = req.body['X-Mailgun-Spf'] || extractHeader(req.body, 'X-Mailgun-Spf');
+  const dkimResult = req.body['X-Mailgun-Dkim-Check-Result'] || extractHeader(req.body, 'X-Mailgun-Dkim-Check-Result');
+
+  const parsed = parseReceiptEmail({ subject, bodyText, senderEmail });
+
+  const inlineFieldNames = extractInlineFieldNames(req.body);
+  const realFiles = (req.files || []).filter((f) => /^attachment-\d+$/.test(f.fieldname));
+
+  const uploaded = [];
+  let junkFiltered = 0;
+  for (const f of realFiles) {
+    if (f.mimetype?.startsWith('image/') && await isJunkImage(f.buffer)) { junkFiltered++; continue; }
+    const meta = await storeAttachment(f.buffer, {
+      filename: f.originalname || 'receipt', mimetype: f.mimetype, category: 'receipt', ownerId: `msg-${messageId.replace(/[^a-zA-Z0-9]/g, '')}`,
+    });
+    uploaded.push(meta);
+  }
+
+  // Success-path visibility — see mail-inbound.js's identical comment. A
+  // receipt with zero attachments (a pure forwarded confirmation email) is
+  // routine, not a failure, but should still be visible in the logs.
+  console.log(
+    `receipt-inbound: message ${messageId} — files=${(req.files || []).length} ` +
+    `fieldnames=[${(req.files || []).map((f) => f.fieldname).join(',')}] ` +
+    `inlineFieldnames=[${[...inlineFieldNames].join(',')}] ` +
+    `realFiles=${realFiles.length} junkFiltered=${junkFiltered} uploaded=${uploaded.length} ` +
+    `parsed=${JSON.stringify(parsed)}`
+  );
+
+  const result = await createReceiptInboundBatch({
+    subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments: uploaded, parsed,
+  });
+  if (result === null) return { ok: true }; // raced with another retry — already created, nothing to do
+
+  return { ok: true, ...result, attachmentCount: uploaded.length };
+}
 
 router.post('/', mailUpload.any(), async (req, res) => {
   try {
@@ -46,45 +97,8 @@ router.post('/', mailUpload.any(), async (req, res) => {
       return res.json({ ok: true });
     }
 
-    const subject = req.body.subject || '(no subject)';
-    const bodyText = req.body['body-plain'] || null;
-    const senderEmail = extractEmailAddress(req.body.sender || req.body.from);
-    const receivedAt = req.body.timestamp ? new Date(Number(req.body.timestamp) * 1000) : new Date();
-    const spfResult = req.body['X-Mailgun-Spf'] || extractHeader(req.body, 'X-Mailgun-Spf');
-    const dkimResult = req.body['X-Mailgun-Dkim-Check-Result'] || extractHeader(req.body, 'X-Mailgun-Dkim-Check-Result');
-
-    const parsed = parseReceiptEmail({ subject, bodyText, senderEmail });
-
-    const inlineFieldNames = extractInlineFieldNames(req.body);
-    const realFiles = (req.files || []).filter((f) => /^attachment-\d+$/.test(f.fieldname));
-
-    const uploaded = [];
-    let junkFiltered = 0;
-    for (const f of realFiles) {
-      if (f.mimetype?.startsWith('image/') && await isJunkImage(f.buffer)) { junkFiltered++; continue; }
-      const meta = await storeAttachment(f.buffer, {
-        filename: f.originalname || 'receipt', mimetype: f.mimetype, category: 'receipt', ownerId: `msg-${messageId.replace(/[^a-zA-Z0-9]/g, '')}`,
-      });
-      uploaded.push(meta);
-    }
-
-    // Success-path visibility — see mail-inbound.js's identical comment. A
-    // receipt with zero attachments (a pure forwarded confirmation email) is
-    // routine, not a failure, but should still be visible in the logs.
-    console.log(
-      `receipt-inbound: message ${messageId} — files=${(req.files || []).length} ` +
-      `fieldnames=[${(req.files || []).map((f) => f.fieldname).join(',')}] ` +
-      `inlineFieldnames=[${[...inlineFieldNames].join(',')}] ` +
-      `realFiles=${realFiles.length} junkFiltered=${junkFiltered} uploaded=${uploaded.length} ` +
-      `parsed=${JSON.stringify(parsed)}`
-    );
-
-    const result = await createReceiptInboundBatch({
-      subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments: uploaded, parsed,
-    });
-    if (result === null) return res.json({ ok: true }); // raced with another retry — already created, nothing to do
-
-    res.json({ ok: true, ...result, attachmentCount: uploaded.length });
+    const result = await ingestReceiptMail(req, messageId);
+    res.json(result);
   } catch (e) {
     // 5xx so Mailgun retries — a storage failure or transient DB error here
     // must not silently drop the message.
