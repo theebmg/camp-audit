@@ -462,7 +462,21 @@ function setChrome({ title, showBack, showLogout }) {
 }
 
 function go(view, params, opts = {}) {
-  if (!opts.replace) state.stack.push({ view, params });
+  // opts.reset: jumping to a top-level section (sidebar nav, a dashboard
+  // quick-link, an admin tool list) starts a fresh breadcrumb trail rather
+  // than extending whatever drill-down path was already on the stack —
+  // otherwise switching between nav items, or re-clicking the one you're
+  // already on, just keeps appending forever (bug: breadcrumb bar growing
+  // unbounded, eventually off-screen, from ordinary nav clicks).
+  if (opts.reset) state.stack = [];
+  if (!opts.replace) {
+    const top = state.stack[state.stack.length - 1];
+    // Belt-and-suspenders dedup: even a plain repeat of the exact same
+    // view+params (clicking the same tab twice, or a stray double-click)
+    // never pushes a second identical entry.
+    const isDuplicate = top && top.view === view && JSON.stringify(top.params) === JSON.stringify(params);
+    if (!isDuplicate) state.stack.push({ view, params });
+  }
   render(view, params);
 }
 function goBack() {
@@ -503,7 +517,7 @@ function renderSidebar(activeView) {
       <span class="nav-icon">${item.icon}</span><span>${item.label}</span>
     </button>`).join('');
   sidebarNavEl.querySelectorAll('.nav-item').forEach((btn) => {
-    btn.addEventListener('click', () => { closeSidebar(); go(btn.dataset.view, {}); });
+    btn.addEventListener('click', () => { closeSidebar(); go(btn.dataset.view, {}, { reset: true }); });
   });
   sidebarUserEl.textContent = state.user ? `Signed in as ${state.user}` : '';
 }
@@ -890,7 +904,7 @@ async function renderDashboard() {
       ${calendarStripHtml()}
       ${activityHtml()}
     `);
-    app.querySelectorAll('[data-view]').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {})));
+    app.querySelectorAll('[data-view]').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, {}, { reset: true })));
     app.querySelectorAll('.wo-filter-tile').forEach((el) => el.addEventListener('click', () => go('workOrders', JSON.parse(el.dataset.filter))));
 
     function wireWeekSummaryLinks(root) {
