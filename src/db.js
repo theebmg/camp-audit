@@ -3520,12 +3520,18 @@ function expenseRowToApi(r) {
     Notes: r.notes, TriageStatus: r.triage_status, Source: r.source, ParsedConfidence: r.parsed_confidence,
     CreatedBy: r.created_by, CreatedAt: r.created_at,
     Subject: r.batch_subject || null, SenderEmail: r.batch_sender_email || null, ReceivedAt: r.batch_received_at || null,
+    BodyText: r.batch_body_text || null,
   };
 }
+// batch_body_text is the whole point of the join for a triage screen: an
+// expense parsed from email arrives with nothing but suggested values — the
+// only way to actually confirm "is $55.64 right" without leaving the app is
+// to show the source email it came from, not just the parsed-out fields.
 const EXPENSE_SELECT = `
   SELECT e.*, ec.name AS category_name, f.name AS fund_name,
          jl.title AS job_line_title, wo.title AS work_order_title, a.name AS asset_name,
-         b.subject AS batch_subject, b.sender_email AS batch_sender_email, b.received_at AS batch_received_at
+         b.subject AS batch_subject, b.sender_email AS batch_sender_email, b.received_at AS batch_received_at,
+         b.body_text AS batch_body_text
   FROM expenses e
   LEFT JOIN expense_categories ec ON ec.id = e.category_id
   LEFT JOIN funds f ON f.id = e.fund_id

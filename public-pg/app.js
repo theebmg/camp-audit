@@ -3267,6 +3267,27 @@ async function renderExpenses() {
   document.getElementById('addExpenseBtn').addEventListener('click', () => go('expenseDetail', {}));
 }
 
+// The source email itself — subject/sender/date plus the full body text, so
+// confirming a parsed amount/vendor/date never requires leaving the app to
+// go check a phone's mail client or dig up the original Amazon order. Open
+// by default: this is the primary thing being confirmed on a triage screen,
+// not a detail to dig for. Plain-text body only (body-html isn't stored —
+// see receipt-inbound.js), rendered with white-space:pre-wrap so quoted
+// receipt formatting/line breaks stay readable.
+function originalEmailHtml(expense) {
+  return `<details class="card" open style="margin:10px 0;background:var(--card-bg,#f7f7fa)">
+    <summary style="cursor:pointer;font-weight:600">
+      Original Email${expense.Subject ? `: ${escapeHtml(expense.Subject)}` : ''}
+    </summary>
+    <p class="muted" style="margin:6px 0 2px">
+      ${expense.SenderEmail ? `From ${escapeHtml(expense.SenderEmail)}` : ''}${expense.ReceivedAt ? `${expense.SenderEmail ? ' · ' : ''}${new Date(expense.ReceivedAt).toLocaleString()}` : ''}
+    </p>
+    ${expense.BodyText
+      ? `<pre style="white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:0.9rem;max-height:320px;overflow-y:auto;margin:8px 0 0;padding:10px;background:var(--bg,#fff);border-radius:8px;border:1px solid var(--border,#ddd)">${escapeHtml(expense.BodyText)}</pre>`
+      : '<p class="muted">No body text captured for this message.</p>'}
+  </details>`;
+}
+
 // Create/edit/triage — one form for all three (brief §3.2: "Add expense"
 // opens the same form with empty fields). A manual "Add" POSTs immediately
 // (triage_status='triaged' from the start — there's nothing to triage about
@@ -3284,7 +3305,7 @@ async function renderExpenseDetail({ id } = {}) {
   app.innerHTML = `
     <div class="card">
       <h3>${id ? 'Edit Expense' : 'Add Expense'}</h3>
-      ${expense?.Subject ? `<p class="muted">From email: "${escapeHtml(expense.Subject)}"${expense.SenderEmail ? ` — ${escapeHtml(expense.SenderEmail)}` : ''}</p>` : ''}
+      ${expense?.Source === 'email' && (expense.Subject || expense.BodyText) ? originalEmailHtml(expense) : ''}
       ${id ? '<div id="expenseReceiptSection"></div>' : '<p class="muted">You can attach a receipt photo once this is saved.</p>'}
       <form id="expenseForm" style="margin-top:12px">
         <div class="field-row"><label>Vendor${expenseParsedBadge(expense)}</label><input name="vendor" value="${escapeHtml(expense?.Vendor || '')}" placeholder="e.g. Ace Hardware" /></div>
