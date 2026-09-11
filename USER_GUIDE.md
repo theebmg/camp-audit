@@ -79,11 +79,18 @@ From an asset's page, tap **New Work Order**. Give it a title, then tap
 on the same cabin are two lines on one work order, not two work orders.
 For each line, set:
 - **Responsibility** — Self, Volunteer, Vendor, or Cabin-Holder
-- **Funding source** — Operating Budget, Capital Campaign, Cabin-Holder, or
-  Other (and which specific campaign/holder/category)
+- **Funding source** — Operating Budget, Capital Campaign, Cabin-Holder,
+  Fund, or Other (and which specific campaign/holder/fund/category)
 - **Estimated hours/cost**, and a scheduled date (defaults to the work
   order's date, but you can move one line independently — the vendor comes
   Tuesday, the volunteers come Saturday)
+
+**Actual Cost** on a job line is two things added together: whatever you
+type into the field directly (for a vendor invoice paid straight by camp, or
+anything else with no receipt), plus the total of any Expenses linked to
+that line (see **Expenses** below) — the edit form shows both so you can
+see which is which. Linking an expense to a line that's funded by a Fund
+also defaults that expense's Fund for you.
 
 ### Working a job line
 Open the work order, tap a job line to expand it. You can:
@@ -171,14 +178,55 @@ straight to that job.
 
 ---
 
+## Expenses
+
+Ben's own record of what he spends on the camp debit card — not a
+replacement for camp accounting. He still separately emails every receipt
+to the treasurer, same as always; this is just so he can see what a
+purchase went to and how much of a fund is left.
+
+**Receipts by email.** Forward or send a receipt to
+**receipts@cmms.fracturedrv.com** — Amazon order confirmations, Home Depot/
+Lowe's emailed receipts, anything. It lands in the Expenses inbox with
+vendor, amount, and date pre-filled where the email could be parsed (marked
+"Parsed from email — confirm"), plus the receipt image or PDF attached.
+Nothing is ever saved from a parsed guess — you always confirm or correct
+it before it counts.
+
+**Triage a receipt:** open it from the inbox, check/fix Vendor, Amount,
+Date, Tax Amount (and tick "charged in error" if sales tax was charged by
+mistake — camp is tax-exempt), pick a Category and a Fund, optionally
+attach it to a work order/job line/asset, then Save. **Void** if it's junk
+(a newsletter, a shipping notice with no purchase) — one tap, no confirm,
+the email itself is untouched and this can be undone.
+
+**Add an expense manually** — the **+ Add Expense** button opens the same
+form with everything blank, for a paper receipt you photograph later or a
+purchase with no receipt at all.
+
+**Funds** are money with a ceiling Ben is personally accountable for — right
+now, the board's $5,000 Discretionary Audit Fund through the end of 2026.
+The Expenses page and the Dashboard both show **$X of $Y remaining**. Going
+over is expected and always allowed — the number just turns red as a
+heads-up, it never blocks a save. The camp's regular operating budget is
+**not** a fund; that stays with the treasurer.
+
+**Linking to a job line** defaults the Fund automatically if that line is
+funded from a fund — pick a different one, or none, any time.
+
+---
+
 ## Reports
 
 Menu → **Reports**. Along the top:
 
 - **Data Explorer** — pick Assets, Work Orders, Job Lines, Findings,
-  Progress Log, or Crew Sessions, filter and sort however you want, export
-  to CSV. Save a filter combination as a favorite if you run the same view
-  often.
+  Progress Log, Crew Sessions, or Expenses, filter and sort however you
+  want, export to CSV. Save a filter combination as a favorite if you run
+  the same view often. For Expenses, filtering to one Fund is the board
+  hand-off document; filtering Tax Charged In Error is the quarterly
+  recovery list; leaving Fund or Category blank finds anything still
+  unclassified.
 - **Board Report** — a snapshot for a board meeting: open work orders by
   status/priority, outstanding cost by funding source, what got done this
   period, what's overdue, what's upcoming. Preview it, then send by email.
@@ -217,6 +265,10 @@ editable — no developer needed to add a new one. Under **Admin**:
   colors, and which ones are "terminal" (no longer block anything).
 - **Causes** — the dropdown for "why did this happen." Add new ones here;
   never let people type a new one into a freetext box.
+- **Funds** — the pools of money Ben is accountable for, with a name,
+  amount, and (optional) end date. **Expense Categories** — what kind of
+  thing an expense was (Materials, Tools, Fuel, ...); same "never
+  promoted from freetext" rule as Causes.
 - **Attachment Roles** — the "what kind of photo is this" list.
 - **Job Line Templates** — the suggested titles/defaults used by "Create
   Work Order from Findings" (e.g., "Roof repair — {asset}").

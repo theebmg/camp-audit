@@ -1,3 +1,173 @@
+# Runbook: Expense Tracking & Funds (Build Brief v3, Parts 1–5, done in full in one session)
+
+`toClaudeCode/` doesn't have this brief's file yet (it was given inline, not
+as a file) — call it Build Brief v3 if you're looking for it later. Migrations
+0053–0054. All five parts built and smoke-tested live in one session; Ben
+said to run every part rather than stopping after Part 1 as originally
+planned, and confirmed v2.1 Part 2's rollup verification (below) was already
+done, which is what the brief made Part 5 conditional on.
+
+## What this is
+Ben buys things for camp on a **camp debit card**. This tracks what he
+spent, on what, against which of a small number of funds he's personally
+accountable for — his own record, not a replacement for camp accounting (he
+still separately emails every receipt to the treasurer). Same "email it in,
+sort it later" mechanism as the photo inbox: a second Mailgun route, a
+second inbox, deliberately kept visually and functionally separate from
+photos (mixing them was flagged in the brief as a real risk of mistriage).
+
+## The one real conflict with what was already built
+Flagged to Ben before writing the schema, per his instruction: migration
+0031 constrains `job_lines.funding_source` to `('operating_budget',
+'capital_campaign','cabin_holder','other')`, and `funding_ref_id` is a
+soft, app-validated pointer into whichever of `capital_campaign_projects` /
+`cabin_holders` / `other_budget_categories` matches. The brief's §3.3 fund
+inheritance ("default fund_id from that line's funding_ref_id if the line's
+funding_source is a fund") presupposes a fifth `funding_source` value,
+`'fund'`, that didn't exist. Resolution: migration 0053 widens the CHECK
+constraint to add it (job_lines only — work_orders dropped these columns in
+0031 and never got them back), wired through `getFundingRefLabel` and the
+job-line funding pickers in app.js exactly like the other three. Migration
+0054 is the same widening for `job_line_templates.default_funding_source`,
+caught only once the template admin form started offering "Fund" in a
+dropdown backed by the now-5-value `FUNDING_SOURCE_LABELS`.
+
+## Part 1 — Schema
+`funds` (seeded: Discretionary Audit Fund, $5,000, through 2026-12-31,
+"Camp Sychar board"), `expense_categories` (seeded: Materials/Tools/Fuel/
+Contractor/Permit/Supplies/Other), `expenses`. A `Receipt` attachment role
+was added — receipts are attachments through the existing system
+(`attachment_links.entity_type = 'expense'`), no second file store.
+`ATTACHMENT_ENTITY_TYPES` in db.js needed `'expense'` added to its
+whitelist — missed on the first pass, caught by the end-to-end signed-
+webhook smoke test below (not by code review), which is exactly the kind
+of silent gap that whitelist exists to prevent for every *other* entity
+type.
+
+## Part 2 — Email intake (receipts@cmms.fracturedrv.com → /api/pg/receipt-inbound)
+`src/mailIngestShared.js` is new — signature verification, the replay
+guard, and the multer upload config were factored out of `mail-inbound.js`
+so this route and the photo route share one implementation instead of
+drifting (the brief's explicit instruction). `src/routes/receipt-inbound.js`
+mirrors `mail-inbound.js`'s shape exactly: same idempotency guard on
+Message-Id, same "batch row written last" transaction ordering, same
+5xx-on-failure so Mailgun retries, same refusal to filter inline-marked
+attachments (receipts are if anything more likely to arrive inline than
+photos — iOS Mail/Gmail choose this on their own). PDFs are handled as
+`kind = 'document'`, no resize.
+
+`src/expenseParsing.js` — body-text regex for Amazon, Home Depot, Lowe's,
+plus a generic currency+date fallback. Sets `parsed_confidence` ('parsed' /
+'partial' / 'none'); the triage screen always shows editable fields with
+parsed values pre-filled and marked, nothing auto-commits. No OCR/vision
+pipeline — out of scope per the brief, photos of paper receipts get manual
+entry for now.
+
+Smoke-tested with real signed HMAC-SHA256 requests against the live
+endpoint (not just code review): Amazon confirmation with a real image
+attachment (parsed vendor/amount/date all correct, `confidence: 'parsed'`),
+a retry with the same Message-Id (correctly no-opped, no duplicate), a
+Home Depot receipt with a PDF attachment (correctly stored as
+`kind='document'`, `mime_type='application/pdf'`).
+
+## Part 3/4 — Inbox, triage, admin, reports
+New **Expenses** nav item (not a tab inside the photo Inbox — kept as a
+fully separate view per the brief's visual-distinctness requirement).
+Inbox cards, triage/edit/manual-add form (one form for all three — a
+manual "Add" POSTs immediately since there's nothing to triage about an
+entry Ben typed himself, then lands back in edit mode so a receipt photo
+can still be attached), void/undo. Fund balance tiles on both the Expenses
+page and the Dashboard (`getFundBalances` in db.js). Admin CRUD for Funds
+and Expense Categories (`renderAdminFunds`/`renderAdminExpenseCategories`
+in app.js, same in-use-guard-on-delete pattern as Causes/Attachment Roles).
+
+'Expenses' registered as a Data Explorer report source (`EXPENSE_COLUMN_
+SPECS`/`buildExpenseReportRows` in reports.js) rather than four bespoke
+report builders — the brief's four named reports (Fund Breakdown, Spend by
+Category, Spend by Vendor, Tax Charged in Error, Unclassified) are all just
+filtered/sorted views of the same source, which the explorer's existing
+filter/sort/CSV machinery already does.
+
+Bug caught during the fund-inheritance smoke test, fixed before it shipped:
+`updateExpense`'s first draft used `COALESCE($n, column)`/`value ?? null`
+throughout, which meant a PATCH touching only one field (e.g. clearing
+Category during triage) would silently null out every other nullable
+field (Fund, Job Line, Work Order, Asset) not present in that request.
+Rewritten to the same dynamic-column-builder pattern `updateJobLine`
+already uses — only columns actually present in the request body are
+touched; verified live with a PATCH sending only `{categoryId: null}`
+against a fund-linked expense and confirming Fund/Vendor/Amount all
+survived untouched.
+
+Fund inheritance (§3.3) verified live both directions: an expense created
+with `jobLineId` set and no `fundId` correctly inherited the line's fund;
+an explicit `fundId: null` on the same line correctly overrode it to no
+fund.
+
+## Part 5 — Job line cost rollup (done last, as instructed)
+Before starting: confirmed via `git log` that Build Brief v2.1 Part 2's
+rollup verification — the prerequisite this part was made conditional on —
+was already committed (`a5600da`), despite this brief's own text saying it
+was "still outstanding." Stale line in the brief, not a real blocker.
+
+`actual_cost` is now manual entry (the hand-typed column) **plus**
+`SUM(linked non-void expenses)` — exactly mirroring how `actual_hours`
+already rolls up `crew_sessions` (same pre-aggregate-before-joining shape,
+for the same fan-out reason). New `JOB_LINE_EXPENSE_COST_SQL` /
+`JOB_LINE_ACTUAL_COST_EXPR` in db.js, applied at every site that presents a
+line's actual cost as a rollup/total — deliberately not just the one or
+two the brief's own wording focused on, because leaving some sites rolled
+up and others not would have recreated exactly the "a bug in either one
+looks like a bug in the other" risk the brief itself warned about:
+`JOB_LINE_ROLLUP_SQL` (WO list, dashboard, board report), `workOrderRollup`
+(WO detail page, both its main total and the per-funding-source
+breakdown), `JOB_LINE_STATUS_BREAKDOWN_SQL` (WO list per-status cost),
+`getJobLinesReportRawData`, `getWorkPerformedRawData`, `getBudgetOverview`
+(Capital Plan), `getBoardReportRawData`'s open-funding totals, and
+`historicalAvgActualCost` (PM cost projections).
+
+**The job-line edit form's Actual Cost `<input>` is deliberately untouched**
+— same reasoning v2.1 Part 2 already established for Actual Hours: it
+shows/edits only the hand-typed value, never a blended total, so re-saving
+the form can never double-count a linked expense into itself. The form now
+shows a hint line underneath instead ("+ $X from N linked expenses") so the
+distinction is visible, not just correct under the hood.
+
+Verified by extending `scripts/verify-rollups.js` with a Scenario E (9 new
+assertions) rather than writing a separate one-off check, run against the
+live database:
+```
+docker cp scripts/verify-rollups.js camp-audit:/app/scripts/verify-rollups.js
+docker exec camp-audit node scripts/verify-rollups.js
+```
+39/39 passed, including all 30 pre-existing Phase 1 assertions (no
+regression). Scenario E specifically proves: manual actual_cost + a linked
+expense adds rather than replaces; an expense-only line (no manual
+actual_cost ever entered, reads NULL not a misleading $0) still rolls up
+correctly once one is linked; a voided expense drops back out of the
+rollup; and the edit-form input stays exactly the raw manual value
+throughout. The script cleans up everything it creates in a `finally`
+block, same as before.
+
+## Known gaps / follow-ups
+- No OCR/vision pipeline for photographed paper receipts (explicitly out of
+  scope for this pass — "phase two," per the brief).
+- The Capital Plan page's Operating/Capital Campaign/Cabin-Holder/Other
+  breakdown (`getBudgetOverview`) does not add a fourth "Fund" grouping —
+  funds are tracked on the Expenses page instead, which was the brief's
+  intent (funds are Ben's personal accountability, not part of the capital
+  plan the board sees).
+- Ben still needs to add the Mailgun route for `receipts@cmms.fracturedrv.com`
+  → `https://audit.fracturedrv.com/api/pg/receipt-inbound` (same pattern as
+  the existing `photos@` route) — this was flagged to him as the one manual
+  step outside this session's reach.
+- Frontend UI (Part 3) was built and exercised only through the API it
+  calls — no visual/click-through verification, since the Chrome extension
+  isn't connected in this environment. Worth a manual pass before relying
+  on it in the field.
+
+---
+
 # Housekeeping pass: app renamed to "Sychar Operations," scaffolding removed (2026-09-10)
 
 Copy/naming only, no functional changes. Context: the app had accumulated
