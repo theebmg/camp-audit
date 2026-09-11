@@ -9,6 +9,7 @@ import { requestContext } from './requestContext.js';
 import pgApiRouter from './routes/pg-api.js';
 import requestPortalRouter from './routes/request-portal.js';
 import mailInboundRouter from './routes/mail-inbound.js';
+import receiptInboundRouter from './routes/receipt-inbound.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -71,6 +72,10 @@ app.get('/health', async (req, res) => {
 // otherwise intercept '/api/pg/mail-inbound/*' and reject it with
 // requireAuth before this router ever saw the request.
 app.use('/api/pg/mail-inbound', mailInboundRouter);
+// Second Mailgun route for emailed receipts (Build Brief v3 Part 2) — same
+// public/pre-auth mounting reason as mail-inbound above. Ben's Mailgun route
+// for receipts@cmms.fracturedrv.com points at this exact path.
+app.use('/api/pg/receipt-inbound', receiptInboundRouter);
 // Postgres-backed parallel API (migration in progress) — additive, does not
 // replace /api. See toClaudeCode/camp-cmms-postgres-migration-brief.md.
 app.use('/api/pg', requireAuth, pgApiRouter);

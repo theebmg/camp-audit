@@ -1494,10 +1494,12 @@ export async function workOrderCloseGate(woId) {
 }
 
 // funding_ref_id points at a different table depending on funding_source
-// (no real FK possible across three target tables — see migration 0016).
+// (no real FK possible across four target tables — see migration 0016).
+// 'fund' (Build Brief v3 Part 1) added funds.id as a fifth target, wired in
+// the same soft, app-validated way as the other three.
 async function getFundingRefLabel(fundingSource, fundingRefId) {
   if (!fundingRefId) return null;
-  const table = { capital_campaign: 'capital_campaign_projects', cabin_holder: 'cabin_holders', other: 'other_budget_categories' }[fundingSource];
+  const table = { capital_campaign: 'capital_campaign_projects', cabin_holder: 'cabin_holders', other: 'other_budget_categories', fund: 'funds' }[fundingSource];
   if (!table) return null;
   const { rows } = await pool.query(`SELECT name FROM ${table} WHERE id = $1`, [fundingRefId]);
   return rows[0]?.name || null;
@@ -3067,7 +3069,7 @@ async function getWorkOrderCrewRoster(woId) {
 //    finding, the before shot on the job line, and the reference image on
 //    the asset simultaneously, uploaded once. ──────────────────────────────
 
-const ATTACHMENT_ENTITY_TYPES = new Set(['asset', 'work_order', 'job_line', 'condition_finding', 'asset_component', 'maintenance_request', 'asset_note']);
+const ATTACHMENT_ENTITY_TYPES = new Set(['asset', 'work_order', 'job_line', 'condition_finding', 'asset_component', 'maintenance_request', 'asset_note', 'expense']);
 
 function attachmentRowShape(a) {
   return {
@@ -3318,6 +3320,317 @@ export async function createMailInboundBatch({ subject, bodyText, senderEmail, m
   } finally {
     client.release();
   }
+}
+
+// ── Receipt-inbound ingest (Build Brief v3 Part 2) — the second Mailgun
+//    route (routes/receipt-inbound.js). Mirrors createMailInboundBatch's
+//    transaction shape exactly (batch row written last, together with its
+//    attachments, for the same retry-safety reason), but the row that lands
+//    in the inbox is an `expenses` row — pre-filled from expenseParsing.js —
+//    not a set of unlinked attachments. Every receipt attachment gets linked
+//    to that expense immediately (role 'Receipt'); there's no WO-subject-
+//    shortcut equivalent here, receipts don't skip triage. ─────────────────
+export async function createReceiptInboundBatch({ subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments, parsed }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO attachment_batches (source, subject, body_text, sender_email, message_id, received_at, spf_result, dkim_result)
+       VALUES ('email',$1,$2,$3,$4,$5,$6,$7) ON CONFLICT (message_id) DO NOTHING RETURNING id`,
+      [subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult]
+    );
+    if (!rows[0]) { await client.query('ROLLBACK'); return null; }
+    const batchId = rows[0].id;
+
+    const expenseRes = await client.query(
+      `INSERT INTO expenses (vendor, amount, purchase_date, triage_status, batch_id, source, parsed_confidence)
+       VALUES ($1,$2,$3,'inbox',$4,'email',$5) RETURNING id`,
+      [parsed?.vendor || null, parsed?.amount ?? null, parsed?.purchaseDate || null, batchId, parsed?.confidence || 'none']
+    );
+    const expenseId = expenseRes.rows[0].id;
+
+    const roleRes = await client.query(`SELECT id FROM attachment_roles WHERE name = 'Receipt'`);
+    const receiptRoleId = roleRes.rows[0]?.id || null;
+
+    for (const meta of attachments) {
+      const insertRes = await client.query(
+        `INSERT INTO attachments (url, thumb_url, kind, mime_type, file_size, original_filename, width, height, taken_at, gps_lat, gps_lng, source, batch_id, triage_status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'email',$12,'triaged') RETURNING id`,
+        [meta.url, meta.thumbUrl, meta.kind, meta.mimeType, meta.fileSize, meta.originalFilename, meta.width, meta.height,
+          meta.takenAt, meta.gpsLat, meta.gpsLng, batchId]
+      );
+      await linkAttachment(insertRes.rows[0].id, { entityType: 'expense', entityId: expenseId, roleId: receiptRoleId }, client);
+    }
+    await client.query('COMMIT');
+    return { batchId, expenseId };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// ── Funds (Build Brief v3 Part 1, §1.1) — money with a ceiling Ben is
+//    personally accountable for, NOT a general ledger. amount is a reference
+//    line: spending past it warns (getFundBalances) and is always allowed,
+//    never blocked. Expired funds (past end_date) drop out of the default
+//    picker (activeOnly) but stay selectable for backdated entry. ──────────
+export async function listFunds({ activeOnly = false } = {}) {
+  const { rows } = await pool.query(
+    `SELECT * FROM funds ${activeOnly ? "WHERE active AND (end_date IS NULL OR end_date >= current_date)" : ''} ORDER BY active DESC, end_date DESC NULLS LAST, name`
+  );
+  return rows.map((r) => ({
+    Id: r.id, Name: r.name, Amount: Number(r.amount), StartDate: r.start_date, EndDate: r.end_date,
+    AuthorizedBy: r.authorized_by, Notes: r.notes, Active: r.active,
+    Expired: !!(r.end_date && new Date(r.end_date) < new Date(new Date().toISOString().slice(0, 10))),
+  }));
+}
+export async function createFund({ name, amount, startDate, endDate, authorizedBy, notes }) {
+  const { rows } = await pool.query(
+    `INSERT INTO funds (name, amount, start_date, end_date, authorized_by, notes) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+    [name, amount, startDate || null, endDate || null, authorizedBy || null, notes || null]
+  );
+  await logActivity({ action: 'created', entityType: 'fund', entityId: rows[0].id, entityLabel: name });
+  return (await listFunds()).find((f) => f.Id === rows[0].id);
+}
+export async function updateFund(id, { name, amount, startDate, endDate, authorizedBy, notes, active }) {
+  const { rows } = await pool.query(
+    `UPDATE funds SET name = COALESCE($2,name), amount = COALESCE($3,amount), start_date = COALESCE($4,start_date),
+       end_date = COALESCE($5,end_date), authorized_by = COALESCE($6,authorized_by), notes = COALESCE($7,notes), active = COALESCE($8,active)
+     WHERE id = $1 RETURNING id, name`,
+    [id, name ?? null, amount ?? null, startDate ?? null, endDate ?? null, authorizedBy ?? null, notes ?? null, active ?? null]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'updated', entityType: 'fund', entityId: rows[0].id, entityLabel: rows[0].name });
+  return (await listFunds()).find((f) => f.Id === rows[0].id);
+}
+export async function deleteFund(id) {
+  const inUse = await pool.query(
+    `SELECT (SELECT count(*) FROM job_lines WHERE funding_source = 'fund' AND funding_ref_id = $1)
+          + (SELECT count(*) FROM expenses WHERE fund_id = $1) AS count`,
+    [id]
+  );
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} record(s) still use this fund — deactivate it instead of deleting`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM funds WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'fund', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+// Dashboard fund tile (§3.4) — "$X of $Y remaining · N days left". Spent =
+// sum of non-void expenses with that fund_id; over-spend is a positive
+// Overage number the frontend renders in a warning color, never blocked.
+export async function getFundBalances() {
+  const funds = await listFunds();
+  const { rows: spentRows } = await pool.query(
+    `SELECT fund_id, COALESCE(SUM(amount), 0) AS spent FROM expenses WHERE fund_id IS NOT NULL AND triage_status != 'void' AND deleted_at IS NULL GROUP BY fund_id`
+  );
+  const spentByFund = new Map(spentRows.map((r) => [r.fund_id, Number(r.spent)]));
+  const today = new Date();
+  return funds.map((f) => {
+    const spent = spentByFund.get(f.Id) || 0;
+    const remaining = f.Amount - spent;
+    const daysLeft = f.EndDate ? Math.ceil((new Date(f.EndDate) - today) / 86400000) : null;
+    return { ...f, Spent: spent, Remaining: remaining, OverBudget: remaining < 0, DaysLeft: daysLeft };
+  });
+}
+
+// ── Expense categories (Build Brief v3 Part 1, §1.2) — admin-editable,
+//    same freetext-never-promoted rule as `causes`. ─────────────────────────
+export async function listExpenseCategories({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(`SELECT id, name, sort_order, active FROM expense_categories ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`);
+  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Active: r.active }));
+}
+export async function createExpenseCategory({ name, sortOrder = 100 }) {
+  const { rows } = await pool.query('INSERT INTO expense_categories (name, sort_order) VALUES ($1,$2) RETURNING *', [name, sortOrder]);
+  await logActivity({ action: 'created', entityType: 'expense_category', entityId: rows[0].id, entityLabel: rows[0].name });
+  return { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, Active: rows[0].active };
+}
+export async function updateExpenseCategory(id, { name, sortOrder, active }) {
+  const { rows } = await pool.query(
+    'UPDATE expense_categories SET name = COALESCE($2,name), sort_order = COALESCE($3,sort_order), active = COALESCE($4,active) WHERE id = $1 RETURNING *',
+    [id, name ?? null, sortOrder ?? null, active ?? null]
+  );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'expense_category', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] ? { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, Active: rows[0].active } : null;
+}
+export async function deleteExpenseCategory(id) {
+  const inUse = await pool.query('SELECT count(*) FROM expenses WHERE category_id = $1', [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} expense(s) still use this category — deactivate it instead of deleting`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM expense_categories WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'expense_category', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+// ── Expenses (Build Brief v3 Part 1/3) — camp-debit-card spending. Nearly
+//    everything is nullable on the row itself; triage is where an inbox
+//    expense gets completed. Void is soft (triage_status='void'), same
+//    one-tap/undo pattern as attachment void — junk (spam receipts, a
+//    forwarded email with no purchase) will arrive here same as the photo
+//    inbox. ────────────────────────────────────────────────────────────────
+function expenseRowToApi(r) {
+  return {
+    Id: r.id, Vendor: r.vendor, Amount: r.amount != null ? Number(r.amount) : null, PurchaseDate: r.purchase_date,
+    TaxAmount: r.tax_amount != null ? Number(r.tax_amount) : null, TaxChargedInError: r.tax_charged_in_error,
+    CategoryId: r.category_id, CategoryName: r.category_name || null,
+    FundId: r.fund_id, FundName: r.fund_name || null,
+    JobLineId: r.job_line_id, JobLineTitle: r.job_line_title || null,
+    WorkOrderId: r.work_order_id, WorkOrderTitle: r.work_order_title || null,
+    AssetId: r.asset_id, AssetName: r.asset_name || null,
+    Notes: r.notes, TriageStatus: r.triage_status, Source: r.source, ParsedConfidence: r.parsed_confidence,
+    CreatedBy: r.created_by, CreatedAt: r.created_at,
+    Subject: r.batch_subject || null, SenderEmail: r.batch_sender_email || null, ReceivedAt: r.batch_received_at || null,
+  };
+}
+const EXPENSE_SELECT = `
+  SELECT e.*, ec.name AS category_name, f.name AS fund_name,
+         jl.title AS job_line_title, wo.title AS work_order_title, a.name AS asset_name,
+         b.subject AS batch_subject, b.sender_email AS batch_sender_email, b.received_at AS batch_received_at
+  FROM expenses e
+  LEFT JOIN expense_categories ec ON ec.id = e.category_id
+  LEFT JOIN funds f ON f.id = e.fund_id
+  LEFT JOIN job_lines jl ON jl.id = e.job_line_id
+  LEFT JOIN work_orders wo ON wo.id = e.work_order_id
+  LEFT JOIN assets a ON a.id = e.asset_id
+  LEFT JOIN attachment_batches b ON b.id = e.batch_id`;
+
+export async function listExpenseInbox() {
+  const { rows } = await pool.query(`${EXPENSE_SELECT} WHERE e.triage_status = 'inbox' AND e.deleted_at IS NULL ORDER BY e.created_at DESC`);
+  const expenses = rows.map(expenseRowToApi);
+  if (!expenses.length) return expenses;
+  const { rows: attRows } = await pool.query(
+    `SELECT al.entity_id, a.id, a.url, a.thumb_url, a.kind, a.original_filename
+     FROM attachment_links al JOIN attachments a ON a.id = al.attachment_id
+     WHERE al.entity_type = 'expense' AND al.entity_id = ANY($1::int[]) AND a.deleted_at IS NULL`,
+    [expenses.map((e) => e.Id)]
+  );
+  const byExpense = new Map();
+  for (const r of attRows) {
+    if (!byExpense.has(r.entity_id)) byExpense.set(r.entity_id, []);
+    byExpense.get(r.entity_id).push({ Id: r.id, Url: r.url, ThumbUrl: r.thumb_url, Kind: r.kind, OriginalFilename: r.original_filename });
+  }
+  for (const e of expenses) e.Attachments = byExpense.get(e.Id) || [];
+  return expenses;
+}
+
+// Dashboard badge (§3.1) — same role as getInboxCount for photos.
+export async function getExpenseInboxCount() {
+  const { rows } = await pool.query(`SELECT count(*) FROM expenses WHERE triage_status = 'inbox' AND deleted_at IS NULL`);
+  return Number(rows[0].count);
+}
+
+export async function listExpenses({ fundId, categoryId, vendor, jobLineId, workOrderId, assetId, dateFrom, dateTo, taxChargedInError, unclassified } = {}) {
+  const clauses = [`e.triage_status != 'void'`, 'e.deleted_at IS NULL'];
+  const params = [];
+  const add = (clause, val) => { params.push(val); clauses.push(clause.replace('$N', `$${params.length}`)); };
+  if (fundId) add('e.fund_id = $N', Number(fundId));
+  if (categoryId) add('e.category_id = $N', Number(categoryId));
+  if (vendor) add('e.vendor ILIKE $N', `%${vendor}%`);
+  if (jobLineId) add('e.job_line_id = $N', Number(jobLineId));
+  if (workOrderId) add('e.work_order_id = $N', Number(workOrderId));
+  if (assetId) add('e.asset_id = $N', Number(assetId));
+  if (dateFrom) add('e.purchase_date >= $N', dateFrom);
+  if (dateTo) add('e.purchase_date <= $N', dateTo);
+  if (taxChargedInError) clauses.push('e.tax_charged_in_error = true');
+  if (unclassified) clauses.push('(e.fund_id IS NULL OR e.category_id IS NULL)');
+  const { rows } = await pool.query(`${EXPENSE_SELECT} WHERE ${clauses.join(' AND ')} ORDER BY e.purchase_date DESC NULLS LAST, e.created_at DESC`, params);
+  return rows.map(expenseRowToApi);
+}
+
+export async function getExpense(id) {
+  const { rows } = await pool.query(`${EXPENSE_SELECT} WHERE e.id = $1`, [id]);
+  return rows[0] ? expenseRowToApi(rows[0]) : null;
+}
+
+// Fund inheritance (§3.3) — when a job line is given, and the caller hasn't
+// explicitly chosen a fund, default fund_id from that line's funding_ref_id
+// IF the line's funding_source is 'fund'. Overridable: an explicit fundId
+// (including explicit null, i.e. "no fund") always wins over inheritance.
+// Returns undefined when nothing about funding was touched at all, so the
+// caller (updateExpense's dynamic column builder) can tell "leave alone"
+// apart from "set to null."
+async function inheritedFundId(jobLineId, fundId) {
+  if (fundId !== undefined) return fundId;
+  if (!jobLineId) return jobLineId === undefined ? undefined : null;
+  const { rows } = await pool.query(`SELECT funding_source, funding_ref_id FROM job_lines WHERE id = $1`, [jobLineId]);
+  const jl = rows[0];
+  return (jl && jl.funding_source === 'fund') ? jl.funding_ref_id : null;
+}
+
+export async function createExpense({
+  vendor, amount, purchaseDate, taxAmount, taxChargedInError, categoryId, fundId, jobLineId, workOrderId, assetId, notes, createdBy,
+}) {
+  const resolvedFundId = await inheritedFundId(jobLineId, fundId);
+  const { rows } = await pool.query(
+    `INSERT INTO expenses (vendor, amount, purchase_date, tax_amount, tax_charged_in_error, category_id, fund_id, job_line_id, work_order_id, asset_id, notes, triage_status, source, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'triaged','manual',$12) RETURNING id`,
+    [vendor || null, amount ?? null, purchaseDate || null, taxAmount ?? null, !!taxChargedInError, categoryId || null,
+      resolvedFundId ?? null, jobLineId || null, workOrderId || null, assetId || null, notes || null, createdBy || null]
+  );
+  await logActivity({ action: 'created', entityType: 'expense', entityId: rows[0].id, entityLabel: vendor || 'Expense' });
+  return getExpense(rows[0].id);
+}
+
+const EXPENSE_UPDATE_COLUMNS = {
+  vendor: 'vendor', amount: 'amount', purchaseDate: 'purchase_date', taxAmount: 'tax_amount',
+  taxChargedInError: 'tax_charged_in_error', categoryId: 'category_id', jobLineId: 'job_line_id',
+  workOrderId: 'work_order_id', assetId: 'asset_id', notes: 'notes',
+};
+// Triage/edit — same row for "complete an inbox row" and "edit an existing
+// expense," same as attachment triage. Moves triage_status to 'triaged' on
+// any save from the inbox unless the caller explicitly voids instead. Only
+// touches columns actually present in `fields` (undefined = leave alone,
+// null = explicitly clear) — same convention as updateJobLine, needed here
+// because several of these fields (category/job line/fund) must be
+// independently clearable without a full-form resubmit wiping the rest.
+export async function updateExpense(id, fields) {
+  const setCols = []; const vals = []; let i = 2;
+  for (const [key, col] of Object.entries(EXPENSE_UPDATE_COLUMNS)) {
+    if (fields[key] === undefined) continue;
+    setCols.push(`${col} = $${i++}`);
+    vals.push(fields[key]);
+  }
+  const resolvedFundId = await inheritedFundId(fields.jobLineId, fields.fundId);
+  if (resolvedFundId !== undefined) { setCols.push(`fund_id = $${i++}`); vals.push(resolvedFundId); }
+  if (!setCols.length) return getExpense(id);
+  setCols.push(`triage_status = CASE WHEN triage_status = 'inbox' THEN 'triaged' ELSE triage_status END`);
+  const { rows } = await pool.query(
+    `UPDATE expenses SET ${setCols.join(', ')} WHERE id = $1 AND deleted_at IS NULL RETURNING id, vendor`,
+    [id, ...vals]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'updated', entityType: 'expense', entityId: rows[0].id, entityLabel: rows[0].vendor || 'Expense' });
+  return getExpense(id);
+}
+
+// Void — one tap, no confirm, same reasoning as voidAttachment: junk
+// (a spam email, a forwarded newsletter) will land in the inbox, and asking
+// for a confirm on every one of those is friction with no upside. File
+// itself is untouched; this only flips triage_status.
+export async function voidExpense(id) {
+  const { rows } = await pool.query(`UPDATE expenses SET triage_status = 'void' WHERE id = $1 AND deleted_at IS NULL RETURNING id, vendor`, [id]);
+  if (rows[0]) await logActivity({ action: 'voided', entityType: 'expense', entityId: rows[0].id, entityLabel: rows[0].vendor || 'Expense' });
+}
+export async function unvoidExpense(id) {
+  const { rows } = await pool.query(`UPDATE expenses SET triage_status = 'triaged' WHERE id = $1 AND triage_status = 'void' RETURNING id, vendor`, [id]);
+  if (rows[0]) await logActivity({ action: 'unvoided', entityType: 'expense', entityId: rows[0].id, entityLabel: rows[0].vendor || 'Expense' });
+}
+
+export async function getExpensesReportRawData() {
+  const { rows } = await pool.query(`
+    SELECT e.*, ec.name AS category_name, f.name AS fund_name,
+           jl.title AS job_line_title, wo.title AS work_order_title, wo.wo_number,
+           a.name AS asset_name, l.name AS location_name,
+           (SELECT count(*) FROM attachment_links al WHERE al.entity_type = 'expense' AND al.entity_id = e.id) AS receipt_count
+    FROM expenses e
+    LEFT JOIN expense_categories ec ON ec.id = e.category_id
+    LEFT JOIN funds f ON f.id = e.fund_id
+    LEFT JOIN job_lines jl ON jl.id = e.job_line_id
+    LEFT JOIN work_orders wo ON wo.id = e.work_order_id
+    LEFT JOIN assets a ON a.id = e.asset_id
+    LEFT JOIN locations l ON l.id = a.location_id
+    WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+    ORDER BY e.purchase_date DESC NULLS LAST, e.created_at DESC`
+  );
+  return { expenses: rows };
 }
 
 // ── Triage inbox (Build Brief v2 Phase 5, §5.3) — batches with at least one

@@ -10,21 +10,13 @@
 // server.js, same pattern as request-portal.js) — Mailgun is the caller,
 // there's no session. The signature check below is what stands in for auth.
 import express from 'express';
-import multer from 'multer';
-import crypto from 'crypto';
-import sharp from 'sharp';
 import { findAttachmentBatchByMessageId, findWorkOrderIdByNumber, createMailInboundBatch } from '../db.js';
 import { storeAttachment } from '../storage.js';
+import {
+  mailUpload, isJunkImage, verifySignature, extractHeader, extractEmailAddress, extractInlineFieldNames,
+} from '../mailIngestShared.js';
 
 const router = express.Router();
-
-// Mailgun's timestamp/token/signature fields arrive as regular multipart form
-// fields alongside the attachment files, not as headers — there's no way to
-// verify the signature before the body is parsed, so multer's own limits
-// (not the signature check) are the first line of defense against abuse of
-// this public endpoint. 25MB matches the app-wide per-file ceiling (§4.5);
-// 25 files matches Mailgun's own per-message attachment cap.
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024, files: 25 } });
 
 // Subject shortcut (§5.2, unchanged from the IMAP implementation): "WO 1000"
 // or "WO 1000-2" attaches straight to that work order and skips the inbox
@@ -32,57 +24,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 
 // you're standing in front of.
 const WO_SUBJECT_RE = /\bWO\s*(\d+(?:-\d+)?)\b/i;
 
-// Drops signature logos and tracking pixels — anything under ~200px on both
-// edges. Void handles whatever slips through.
-const MIN_IMAGE_EDGE = 200;
-const REPLAY_WINDOW_SECONDS = 5 * 60;
-
-async function isJunkImage(buffer) {
-  try {
-    const meta = await sharp(buffer).metadata();
-    return (meta.width || 0) < MIN_IMAGE_EDGE && (meta.height || 0) < MIN_IMAGE_EDGE;
-  } catch {
-    return false; // undecodable isn't this filter's call to make — let it through, void handles it
-  }
-}
-
-function verifySignature(body) {
-  const { timestamp, token, signature } = body;
-  if (!timestamp || !token || !signature) return false;
-  const key = process.env.MAILGUN_SIGNING_KEY;
-  if (!key) return false;
-  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
-  if (!Number.isFinite(age) || age > REPLAY_WINDOW_SECONDS) return false; // replay guard
-  const expected = crypto.createHmac('sha256', key).update(timestamp + token).digest('hex');
-  const a = Buffer.from(expected, 'utf8');
-  const b = Buffer.from(String(signature), 'utf8');
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-// Mailgun's parsed-message payload doesn't always carry a dedicated
-// "Message-Id" field — fall back to message-headers (a JSON array of
-// [name, value] pairs) so a mail server that only puts it in the raw
-// headers still gets a usable dedupe key. Without one we can't dedupe at
-// all, so a message with neither is dropped (see below), same call the old
-// IMAP ingest made.
-function extractHeader(body, name) {
-  if (body[name]) return body[name];
-  try {
-    const headers = JSON.parse(body['message-headers'] || '[]');
-    const hit = headers.find(([k]) => k?.toLowerCase() === name.toLowerCase());
-    return hit?.[1] || null;
-  } catch {
-    return null;
-  }
-}
-
-function extractEmailAddress(raw) {
-  if (!raw) return null;
-  const match = raw.match(/[^\s<@]+@[^\s>]+/);
-  return match ? match[0] : raw;
-}
-
-router.post('/', upload.any(), async (req, res) => {
+router.post('/', mailUpload.any(), async (req, res) => {
   try {
     if (!verifySignature(req.body || {})) {
       return res.status(401).json({ ok: false, error: 'Invalid or stale signature' });
@@ -126,11 +68,7 @@ router.post('/', upload.any(), async (req, res) => {
     // actually separates a tracking pixel/signature logo (near-universally
     // under 200px) from a real photo (near-universally far larger), inline
     // or not.
-    let inlineFieldNames = new Set();
-    try {
-      const cidMap = JSON.parse(req.body['content-id-map'] || '{}');
-      inlineFieldNames = new Set(Object.values(cidMap));
-    } catch { /* absent or malformed — treat nothing as inline */ }
+    const inlineFieldNames = extractInlineFieldNames(req.body);
 
     const realFiles = (req.files || [])
       .filter((f) => /^attachment-\d+$/.test(f.fieldname));

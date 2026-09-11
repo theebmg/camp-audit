@@ -14,8 +14,10 @@ import { currentComponentState } from './components.js';
 // neither is an admin-editable table (see the brief: funding_source stays a
 // CHECK enum, priority was never part of this rework).
 export const WO_PRIORITY_OPTIONS = ['Low', 'Medium', 'High', 'Urgent'];
+// 'fund' added Build Brief v3 Part 1 — see migration 0053's header comment
+// for why job_lines.funding_source needed a fifth value.
 export const FUNDING_SOURCE_LABELS = {
-  operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other',
+  operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other', fund: 'Fund',
 };
 
 export function buildAssetReportRows({ assets, propertyFields, eavByAsset, componentRowsByAsset, flagsByAsset }, componentTypeOptions) {
@@ -235,6 +237,46 @@ export const WORK_ORDER_LOG_COLUMN_SPECS = [
   { key: 'Hours', label: 'Hours', group: 'Progress Log' },
   { key: 'Note', label: 'Note', group: 'Progress Log', default: true },
   { key: 'Logged By', label: 'Logged By', group: 'Progress Log' },
+];
+
+// Expenses report source (Build Brief v3 Part 4) — covers all four named
+// reports the brief asks for as filtered views of one source, rather than
+// four bespoke report builders: "Fund Breakdown" = filter Fund; "Spend by
+// Category"/"Spend by Vendor" = filter or sort on those columns; "Tax
+// Charged in Error" = filter that column true; "Unclassified Expenses" =
+// Fund and/or Category left blank. The explorer's existing filter/sort/CSV
+// machinery already does all of this — no separate report needed.
+export function buildExpenseReportRows({ expenses }) {
+  return expenses.map((e) => ({
+    Vendor: e.vendor, Amount: e.amount != null ? Number(e.amount) : null, 'Purchase Date': e.purchase_date,
+    Category: e.category_name, Fund: e.fund_name,
+    'Tax Amount': e.tax_amount != null ? Number(e.tax_amount) : null,
+    'Tax Charged In Error': e.tax_charged_in_error ? 'Yes' : 'No',
+    'Job Line': e.job_line_title, 'Work Order': e.work_order_title, 'WO Number': e.wo_number,
+    Asset: e.asset_name, Location: e.location_name,
+    Receipts: Number(e.receipt_count || 0), Source: e.source === 'email' ? 'Email' : 'Manual',
+    Notes: e.notes,
+    _id: e.id,
+    _entity: 'expense',
+  }));
+}
+
+export const EXPENSE_COLUMN_SPECS = [
+  { key: 'Vendor', label: 'Vendor', group: 'Expense Info', default: true },
+  { key: 'Amount', label: 'Amount', group: 'Expense Info', default: true },
+  { key: 'Purchase Date', label: 'Purchase Date', group: 'Expense Info', type: 'date', default: true },
+  { key: 'Category', label: 'Category', group: 'Expense Info', default: true },
+  { key: 'Fund', label: 'Fund', group: 'Expense Info', default: true },
+  { key: 'Tax Amount', label: 'Tax Amount', group: 'Tax' },
+  { key: 'Tax Charged In Error', label: 'Tax Charged In Error', options: ['Yes', 'No'], group: 'Tax', default: true },
+  { key: 'Job Line', label: 'Job Line', group: 'Linked To' },
+  { key: 'Work Order', label: 'Work Order', group: 'Linked To' },
+  { key: 'WO Number', label: 'WO Number', group: 'Linked To' },
+  { key: 'Asset', label: 'Asset', group: 'Linked To' },
+  { key: 'Location', label: 'Location', group: 'Linked To' },
+  { key: 'Receipts', label: 'Receipts', group: 'Expense Info' },
+  { key: 'Source', label: 'Source', options: ['Email', 'Manual'], group: 'Expense Info' },
+  { key: 'Notes', label: 'Notes', group: 'Expense Info' },
 ];
 
 // A column is either "fixed" (a known options list), "distinct" (derived

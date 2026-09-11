@@ -72,12 +72,17 @@ import {
   listMapCalibrationPoints, createMapCalibrationPoint, deleteMapCalibrationPoint, nearestAssetsToGps,
   listJobLineTemplates, createJobLineTemplate, updateJobLineTemplate, deleteJobLineTemplate,
   getOpenFindingsForWoCreation, createWorkOrderFromFindings,
+  listFunds, createFund, updateFund, deleteFund, getFundBalances,
+  listExpenseCategories, createExpenseCategory, updateExpenseCategory, deleteExpenseCategory,
+  listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
+  getExpensesReportRawData,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import {
   buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows, buildCrewSessionReportRows,
   buildJobLineReportRows, JOB_LINE_COLUMN_SPECS, buildFindingReportRows, FINDING_COLUMN_SPECS,
   assetColumnSpecs, WORK_ORDER_COLUMN_SPECS, WORK_ORDER_LOG_COLUMN_SPECS, CREW_SESSION_COLUMN_SPECS,
+  buildExpenseReportRows, EXPENSE_COLUMN_SPECS,
   columnDefsFromRows, applyReportFilters, rowsToCsv, canonicalFiltersKey,
 } from '../reports.js';
 
@@ -217,6 +222,135 @@ router.post('/inbox/void', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---- Funds (Build Brief v3 Part 1/3) — money with a ceiling Ben is
+// personally accountable for. Admin-editable, same in-use-guard-on-delete
+// pattern as causes/attachment roles. ----
+
+router.get('/funds', async (req, res, next) => {
+  try { res.json({ funds: await listFunds({ activeOnly: req.query.activeOnly === 'true' }) }); } catch (e) { next(e); }
+});
+router.get('/funds/balances', async (req, res, next) => {
+  try { res.json({ funds: await getFundBalances() }); } catch (e) { next(e); }
+});
+router.post('/admin/funds', async (req, res, next) => {
+  try {
+    const { name, amount, startDate, endDate, authorizedBy, notes } = req.body || {};
+    if (!name?.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    if (amount == null || Number.isNaN(Number(amount))) return res.status(400).json({ ok: false, error: 'Amount is required' });
+    res.json({ ok: true, fund: await createFund({ name: name.trim(), amount: Number(amount), startDate, endDate, authorizedBy, notes }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/funds/:id', async (req, res, next) => {
+  try {
+    const { name, amount, startDate, endDate, authorizedBy, notes, active } = req.body || {};
+    const fund = await updateFund(req.params.id, { name, amount: amount != null ? Number(amount) : undefined, startDate, endDate, authorizedBy, notes, active });
+    if (!fund) return res.status(404).json({ ok: false, error: 'Fund not found' });
+    res.json({ ok: true, fund });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/funds/:id', async (req, res, next) => {
+  try { await deleteFund(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Expense categories (Build Brief v3 Part 1, §1.2) — admin-editable,
+// freetext never promoted into this list, same rule as causes. ----
+
+router.get('/expense-categories', async (req, res, next) => {
+  try { res.json({ categories: await listExpenseCategories({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/expense-categories', async (req, res, next) => {
+  try {
+    const { name, sortOrder } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, category: await createExpenseCategory({ name: name.trim(), sortOrder }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/expense-categories/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, active } = req.body || {};
+    const category = await updateExpenseCategory(req.params.id, { name, sortOrder, active });
+    if (!category) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, category });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/expense-categories/:id', async (req, res, next) => {
+  try { await deleteExpenseCategory(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// ---- Expenses (Build Brief v3 Part 1/3) — camp debit card spending.
+// Inbox mirrors the photo inbox's triage/void pattern; "Add expense" (manual
+// entry) and triage share the same create/update functions since a manual
+// entry is just an expense that skips triage_status='inbox' entirely. ----
+
+router.get('/expenses/inbox', async (req, res, next) => {
+  try { res.json({ expenses: await listExpenseInbox() }); } catch (e) { next(e); }
+});
+router.get('/expenses/inbox/count', async (req, res, next) => {
+  try { res.json({ count: await getExpenseInboxCount() }); } catch (e) { next(e); }
+});
+router.get('/expenses', async (req, res, next) => {
+  try {
+    const { fundId, categoryId, vendor, jobLineId, workOrderId, assetId, dateFrom, dateTo, taxChargedInError, unclassified } = req.query;
+    res.json({
+      expenses: await listExpenses({
+        fundId, categoryId, vendor, jobLineId, workOrderId, assetId, dateFrom, dateTo,
+        taxChargedInError: taxChargedInError === 'true', unclassified: unclassified === 'true',
+      }),
+    });
+  } catch (e) { next(e); }
+});
+router.get('/expenses/:id', async (req, res, next) => {
+  try {
+    const expense = await getExpense(req.params.id);
+    if (!expense) return res.status(404).json({ ok: false, error: 'Expense not found' });
+    res.json({ expense });
+  } catch (e) { next(e); }
+});
+router.post('/expenses', async (req, res, next) => {
+  try {
+    const { vendor, amount, purchaseDate, taxAmount, taxChargedInError, categoryId, fundId, jobLineId, workOrderId, assetId, notes } = req.body || {};
+    const expense = await createExpense({
+      vendor, amount: amount != null ? Number(amount) : null, purchaseDate, taxAmount: taxAmount != null ? Number(taxAmount) : null,
+      taxChargedInError, categoryId: categoryId ? Number(categoryId) : null,
+      fundId: fundId === undefined ? undefined : (fundId ? Number(fundId) : null),
+      jobLineId: jobLineId ? Number(jobLineId) : null, workOrderId: workOrderId ? Number(workOrderId) : null,
+      assetId: assetId ? Number(assetId) : null, notes, createdBy: currentUsername(),
+    });
+    res.json({ ok: true, expense });
+  } catch (e) { next(e); }
+});
+// Only a key actually present in the body reaches updateExpense — a field
+// simply absent from the request must leave that column untouched (see
+// updateExpense's comment); `null` is how the frontend explicitly clears a
+// nullable field (e.g. unlinking the job line).
+function numOrNull(v) { return v === '' || v == null ? null : Number(v); }
+router.patch('/expenses/:id', async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const fields = {};
+    if ('vendor' in body) fields.vendor = body.vendor || null;
+    if ('amount' in body) fields.amount = numOrNull(body.amount);
+    if ('purchaseDate' in body) fields.purchaseDate = body.purchaseDate || null;
+    if ('taxAmount' in body) fields.taxAmount = numOrNull(body.taxAmount);
+    if ('taxChargedInError' in body) fields.taxChargedInError = !!body.taxChargedInError;
+    if ('categoryId' in body) fields.categoryId = numOrNull(body.categoryId);
+    if ('fundId' in body) fields.fundId = numOrNull(body.fundId);
+    if ('jobLineId' in body) fields.jobLineId = numOrNull(body.jobLineId);
+    if ('workOrderId' in body) fields.workOrderId = numOrNull(body.workOrderId);
+    if ('assetId' in body) fields.assetId = numOrNull(body.assetId);
+    if ('notes' in body) fields.notes = body.notes || null;
+    const expense = await updateExpense(req.params.id, fields);
+    if (!expense) return res.status(404).json({ ok: false, error: 'Expense not found' });
+    res.json({ ok: true, expense });
+  } catch (e) { next(e); }
+});
+router.post('/expenses/:id/void', async (req, res, next) => {
+  try { await voidExpense(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+router.post('/expenses/:id/unvoid', async (req, res, next) => {
+  try { await unvoidExpense(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
 // ---- Work order splitting + family (Build Brief v2 Phase 5, §5.4) ----
 
 router.post('/work-orders/:id/split', async (req, res, next) => {
@@ -301,9 +435,10 @@ router.get('/search', async (req, res, next) => {
 
 router.get('/options', async (req, res, next) => {
   try {
-    const [propertyFields, componentSchema, buildingTypes, workOrderStatuses, jobLineStatuses, displaySettings, attachmentRoles] = await Promise.all([
+    const [propertyFields, componentSchema, buildingTypes, workOrderStatuses, jobLineStatuses, displaySettings, attachmentRoles, funds, expenseCategories] = await Promise.all([
       getAssetPropertyFields(), getComponentTypeCatalog(), listBuildingTypes(),
       listWorkOrderStatuses(), listJobLineStatuses(), getDisplaySettings(), listAttachmentRoles(),
+      listFunds(), listExpenseCategories({ includeInactive: currentRole() === 'admin' }),
     ]);
     res.json({
       propertyFields,
@@ -314,6 +449,7 @@ router.get('/options', async (req, res, next) => {
       workOrderStatuses, jobLineStatuses, displaySettings,
       findingSeverity: FINDING_SEVERITY_OPTIONS,
       attachmentRoles,
+      funds, expenseCategories,
       currentUser: { username: currentUsername(), role: currentRole() },
     });
   } catch (e) { next(e); }
@@ -619,6 +755,10 @@ async function getReportRowsAndSpecs(entity) {
   if (entity === 'findings') {
     const raw = await getFindingsReportRawData();
     return { rows: buildFindingReportRows(raw), specs: FINDING_COLUMN_SPECS };
+  }
+  if (entity === 'expenses') {
+    const raw = await getExpensesReportRawData();
+    return { rows: buildExpenseReportRows(raw), specs: EXPENSE_COLUMN_SPECS };
   }
   return null;
 }
