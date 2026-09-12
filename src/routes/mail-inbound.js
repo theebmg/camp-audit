@@ -37,6 +37,7 @@ const WO_SUBJECT_RE = /\bWO\s*(\d+(?:-\d+)?)\b/i;
 export async function ingestPhotoMail(req, messageId) {
   const subject = req.body.subject || '(no subject)';
   const bodyText = req.body['body-plain'] || null;
+  const bodyHtml = req.body['body-html'] || null;
   const senderEmail = extractEmailAddress(req.body.sender || req.body.from);
   const receivedAt = req.body.timestamp ? new Date(Number(req.body.timestamp) * 1000) : new Date();
   const spfResult = req.body['X-Mailgun-Spf'] || extractHeader(req.body, 'X-Mailgun-Spf');
@@ -87,7 +88,7 @@ export async function ingestPhotoMail(req, messageId) {
   // Mailgun's retry starts clean instead of being blocked by the UNIQUE
   // constraint on a half-ingested batch.
   const batchId = await createMailInboundBatch({
-    subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult,
+    subject, bodyText, bodyHtml, senderEmail, messageId, receivedAt, spfResult, dkimResult,
     attachments: uploaded, targetWorkOrderId,
   });
   if (batchId === null) return { ok: true }; // raced with another retry — already created, nothing to do

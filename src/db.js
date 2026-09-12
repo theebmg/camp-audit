@@ -3331,14 +3331,14 @@ export async function findWorkOrderIdByNumber(woNumber) {
 // failed attempt leaves no batch row at all, so Mailgun's retry starts clean.
 // Returns null (not an error) if the batch already exists — the caller's
 // idempotency case, not a failure.
-export async function createMailInboundBatch({ subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments, targetWorkOrderId }) {
+export async function createMailInboundBatch({ subject, bodyText, bodyHtml, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments, targetWorkOrderId }) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO attachment_batches (source, subject, body_text, sender_email, message_id, received_at, spf_result, dkim_result)
-       VALUES ('email',$1,$2,$3,$4,$5,$6,$7) ON CONFLICT (message_id) DO NOTHING RETURNING id`,
-      [subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult]
+      `INSERT INTO attachment_batches (source, subject, body_text, body_html, sender_email, message_id, received_at, spf_result, dkim_result)
+       VALUES ('email',$1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (message_id) DO NOTHING RETURNING id`,
+      [subject, bodyText, bodyHtml, senderEmail, messageId, receivedAt, spfResult, dkimResult]
     );
     if (!rows[0]) { await client.query('ROLLBACK'); return null; }
     const batchId = rows[0].id;
@@ -3372,14 +3372,14 @@ export async function createMailInboundBatch({ subject, bodyText, senderEmail, m
 //    not a set of unlinked attachments. Every receipt attachment gets linked
 //    to that expense immediately (role 'Receipt'); there's no WO-subject-
 //    shortcut equivalent here, receipts don't skip triage. ─────────────────
-export async function createReceiptInboundBatch({ subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments, parsed }) {
+export async function createReceiptInboundBatch({ subject, bodyText, bodyHtml, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments, parsed }) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO attachment_batches (source, subject, body_text, sender_email, message_id, received_at, spf_result, dkim_result)
-       VALUES ('email',$1,$2,$3,$4,$5,$6,$7) ON CONFLICT (message_id) DO NOTHING RETURNING id`,
-      [subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult]
+      `INSERT INTO attachment_batches (source, subject, body_text, body_html, sender_email, message_id, received_at, spf_result, dkim_result)
+       VALUES ('email',$1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (message_id) DO NOTHING RETURNING id`,
+      [subject, bodyText, bodyHtml, senderEmail, messageId, receivedAt, spfResult, dkimResult]
     );
     if (!rows[0]) { await client.query('ROLLBACK'); return null; }
     const batchId = rows[0].id;
@@ -3520,18 +3520,22 @@ function expenseRowToApi(r) {
     Notes: r.notes, TriageStatus: r.triage_status, Source: r.source, ParsedConfidence: r.parsed_confidence,
     CreatedBy: r.created_by, CreatedAt: r.created_at,
     Subject: r.batch_subject || null, SenderEmail: r.batch_sender_email || null, ReceivedAt: r.batch_received_at || null,
-    BodyText: r.batch_body_text || null,
+    BodyText: r.batch_body_text || null, BodyHtml: r.batch_body_html || null,
   };
 }
-// batch_body_text is the whole point of the join for a triage screen: an
-// expense parsed from email arrives with nothing but suggested values — the
-// only way to actually confirm "is $55.64 right" without leaving the app is
-// to show the source email it came from, not just the parsed-out fields.
+// batch_body_text/batch_body_html is the whole point of the join for a
+// triage screen: an expense parsed from email arrives with nothing but
+// suggested values — the only way to actually confirm "is $55.64 right"
+// without leaving the app is to show the source email it came from, not
+// just the parsed-out fields. HTML is what vendor receipt emails are
+// actually designed to look like (see 0055's migration comment on why
+// plain-text alone is unreliable); plain text stays available as a
+// fallback toggle in the UI.
 const EXPENSE_SELECT = `
   SELECT e.*, ec.name AS category_name, f.name AS fund_name,
          jl.title AS job_line_title, wo.title AS work_order_title, a.name AS asset_name,
          b.subject AS batch_subject, b.sender_email AS batch_sender_email, b.received_at AS batch_received_at,
-         b.body_text AS batch_body_text
+         b.body_text AS batch_body_text, b.body_html AS batch_body_html
   FROM expenses e
   LEFT JOIN expense_categories ec ON ec.id = e.category_id
   LEFT JOIN funds f ON f.id = e.fund_id
@@ -3565,7 +3569,22 @@ export async function getExpenseInboxCount() {
   return Number(rows[0].count);
 }
 
-export async function listExpenses({ fundId, categoryId, vendor, jobLineId, workOrderId, assetId, dateFrom, dateTo, taxChargedInError, unclassified } = {}) {
+// sortBy/limit/offset are for the Expenses page's "All Expenses" list (Ben's
+// request, 2026-09-12, §3) — a plain "what have I entered" browse, distinct
+// from the Reports data explorer (grouping/export/charts stay Reports-only,
+// on purpose). Only passing `limit` switches the query into paginated mode
+// (adds a companion COUNT(*) so the frontend knows whether "Load more" has
+// anything left) — every existing caller (Recent Expenses, Reports raw data
+// via getExpensesReportRawData) calls this with no limit and keeps getting
+// the plain array it always got, unpaginated, most-recent-first.
+const EXPENSE_SORT_COLUMNS = {
+  date: 'e.purchase_date',
+  amount: 'e.amount',
+};
+export async function listExpenses({
+  fundId, categoryId, vendor, jobLineId, workOrderId, assetId, dateFrom, dateTo, taxChargedInError, unclassified,
+  sortBy = 'date', sortDir = 'desc', limit, offset = 0,
+} = {}) {
   const clauses = [`e.triage_status != 'void'`, 'e.deleted_at IS NULL'];
   const params = [];
   const add = (clause, val) => { params.push(val); clauses.push(clause.replace('$N', `$${params.length}`)); };
@@ -3579,8 +3598,18 @@ export async function listExpenses({ fundId, categoryId, vendor, jobLineId, work
   if (dateTo) add('e.purchase_date <= $N', dateTo);
   if (taxChargedInError) clauses.push('e.tax_charged_in_error = true');
   if (unclassified) clauses.push('(e.fund_id IS NULL OR e.category_id IS NULL)');
-  const { rows } = await pool.query(`${EXPENSE_SELECT} WHERE ${clauses.join(' AND ')} ORDER BY e.purchase_date DESC NULLS LAST, e.created_at DESC`, params);
-  return rows.map(expenseRowToApi);
+  const where = clauses.join(' AND ');
+
+  const sortCol = EXPENSE_SORT_COLUMNS[sortBy] || EXPENSE_SORT_COLUMNS.date;
+  const dir = sortDir === 'asc' ? 'ASC' : 'DESC';
+  let sql = `${EXPENSE_SELECT} WHERE ${where} ORDER BY ${sortCol} ${dir} NULLS LAST, e.created_at ${dir}`;
+  if (limit) { params.push(Number(limit)); sql += ` LIMIT $${params.length}`; params.push(Number(offset)); sql += ` OFFSET $${params.length}`; }
+  const { rows } = await pool.query(sql, params);
+  const expenses = rows.map(expenseRowToApi);
+  if (!limit) return expenses;
+
+  const { rows: countRows } = await pool.query(`SELECT count(*) FROM expenses e WHERE ${where}`, params.slice(0, params.length - 2));
+  return { expenses, total: Number(countRows[0].count) };
 }
 
 export async function getExpense(id) {

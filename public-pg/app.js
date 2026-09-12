@@ -3213,8 +3213,33 @@ function expenseInboxCardHtml(e) {
   </div>`;
 }
 
-async function renderExpenses() {
+// Overview (funds + receipt inbox + a Recent Expenses taste) is the page
+// Ben already knows and likes — kept exactly as-is, not replaced. "All
+// Expenses" is a second tab next to it: the full list, searchable/
+// filterable/sortable, for "what have I entered" — deliberately simpler
+// than the Reports data explorer (no grouping/export/charts, see
+// renderAllExpensesTab's comment), which stays reachable via the "See all,
+// with filters, in Reports" link either tab keeps in place.
+const EXPENSE_TABS = [{ key: 'overview', label: 'Overview' }, { key: 'all', label: 'All Expenses' }];
+function expenseTabsHtml(tab) {
+  return `<div class="card">
+    <div class="view-toggle">
+      ${EXPENSE_TABS.map((t) => `<button type="button" class="view-toggle-btn expenses-tab-btn ${tab === t.key ? 'active' : ''}" data-tab="${t.key}">${escapeHtml(t.label)}</button>`).join('')}
+    </div>
+  </div>`;
+}
+function wireExpenseTabs(container = app) {
+  container.querySelectorAll('.expenses-tab-btn').forEach((btn) => btn.addEventListener('click', () => {
+    if (btn.classList.contains('active')) return;
+    go('expenses', { tab: btn.dataset.tab }, { replace: true });
+  }));
+}
+
+async function renderExpenses(params = {}) {
+  const tab = EXPENSE_TABS.some((t) => t.key === params.tab) ? params.tab : 'overview';
   setChrome({ title: 'Expenses', showBack: false, showLogout: true });
+  if (tab === 'all') return renderAllExpensesTab();
+
   app.innerHTML = LOADING_HTML;
   const [{ expenses: inbox }, { funds: fundBalances }, { expenses: recent }] = await Promise.all([
     api('/api/pg/expenses/inbox'),
@@ -3244,6 +3269,7 @@ async function renderExpenses() {
       </div>
       <p class="muted">Camp debit card spending — Ben's own record, separate from what he emails the treasurer directly. Receipts forward to receipts@cmms.fracturedrv.com.</p>
     </div>
+    ${expenseTabsHtml(tab)}
     ${fundBalances.filter((f) => f.Active).map(fundTileHtml).join('')}
     <div class="card"><h3>Receipt Inbox${inbox.length ? ` <span class="pill">${inbox.length}</span>` : ''}</h3>
       ${!inbox.length ? '<p class="muted">Nothing waiting.</p>' : ''}
@@ -3276,27 +3302,236 @@ async function renderExpenses() {
 
   document.getElementById('viewExpenseReportLink').addEventListener('click', (e) => { e.preventDefault(); go('reports', { entity: 'expenses' }); });
   document.getElementById('addExpenseBtn').addEventListener('click', () => go('expenseDetail', {}));
+  wireExpenseTabs();
 }
 
-// The source email itself — subject/sender/date plus the full body text, so
+// "All Expenses" — the full list, plain and browsable: search by vendor,
+// filter by fund/category, sort by date or amount, click a row to edit.
+// Deliberately NOT the Reports data explorer — no grouping, no export, no
+// charts, no saved favorites; this answers "what have I entered," the
+// explorer answers "what does my spending look like." Server-side search/
+// filter/sort/pagination (listExpenses in db.js) rather than fetching
+// everything client-side, so this stays fast as the expense count grows.
+const ALL_EXPENSES_PAGE_SIZE = 50;
+async function renderAllExpensesTab() {
+  app.innerHTML = LOADING_HTML;
+  const funds = state.options.funds || [];
+  const expenseCategories = state.options.expenseCategories || [];
+
+  app.innerHTML = `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <h3 style="margin:0">Expenses</h3>
+        <button class="btn btn-primary" id="addExpenseBtn" style="width:auto;margin-top:0">+ Add Expense</button>
+      </div>
+    </div>
+    ${expenseTabsHtml('all')}
+    <div class="card">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
+        <div class="field-row" style="flex:2;min-width:160px;margin:0"><label>Search vendor</label><input type="text" id="allExpSearch" placeholder="e.g. Amazon" /></div>
+        <div class="field-row" style="flex:1;min-width:140px;margin:0"><label>Fund</label><select id="allExpFund">
+          <option value="">All funds</option>
+          ${funds.map((f) => `<option value="${f.Id}">${escapeHtml(f.Name)}</option>`).join('')}
+        </select></div>
+        <div class="field-row" style="flex:1;min-width:140px;margin:0"><label>Category</label><select id="allExpCategory">
+          <option value="">All categories</option>
+          ${expenseCategories.map((c) => `<option value="${c.Id}">${escapeHtml(c.Name)}</option>`).join('')}
+        </select></div>
+        <div class="field-row" style="flex:1;min-width:160px;margin:0"><label>Sort</label>
+          <select id="allExpSort">
+            <option value="date:desc">Date (newest first)</option>
+            <option value="date:asc">Date (oldest first)</option>
+            <option value="amount:desc">Amount (high to low)</option>
+            <option value="amount:asc">Amount (low to high)</option>
+          </select>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="report-table">
+          <thead><tr>
+            <th>Date</th>
+            <th>Vendor</th>
+            <th>Category</th>
+            <th>Fund</th>
+            <th style="text-align:right">Amount</th>
+          </tr></thead>
+          <tbody id="allExpTableBody"></tbody>
+        </table>
+      </div>
+      <p class="muted" id="allExpEmpty" hidden style="margin:10px 0">No expenses match these filters.</p>
+      <div class="btn-row" style="margin-top:10px">
+        <button type="button" class="btn btn-secondary" id="allExpLoadMore" style="width:auto" hidden>Load more</button>
+      </div>
+      <p class="muted" id="allExpCount" style="margin-top:6px;font-size:0.85rem"></p>
+      <p class="muted" style="margin-top:8px"><a href="#" id="viewExpenseReportLink">See all, with filters, in Reports →</a></p>
+    </div>`;
+
+  document.getElementById('addExpenseBtn').addEventListener('click', () => go('expenseDetail', {}));
+  document.getElementById('viewExpenseReportLink').addEventListener('click', (e) => { e.preventDefault(); go('reports', { entity: 'expenses' }); });
+  wireExpenseTabs();
+
+  const tbody = document.getElementById('allExpTableBody');
+  const emptyMsg = document.getElementById('allExpEmpty');
+  const loadMoreBtn = document.getElementById('allExpLoadMore');
+  const countLabel = document.getElementById('allExpCount');
+  const searchInput = document.getElementById('allExpSearch');
+  const fundSelect = document.getElementById('allExpFund');
+  const categorySelect = document.getElementById('allExpCategory');
+  const sortSelect = document.getElementById('allExpSort');
+
+  let offset = 0;
+  let total = 0;
+  let loaded = 0;
+  let requestSeq = 0; // guards against a slow earlier fetch clobbering a newer filter change
+
+  function rowHtml(e) {
+    return `<tr class="all-exp-row clickable-row" data-id="${e.Id}">
+      <td>${e.PurchaseDate ? formatDateNice(e.PurchaseDate) : '—'}</td>
+      <td>${escapeHtml(e.Vendor || '(no vendor)')}</td>
+      <td>${escapeHtml(e.CategoryName || '—')}</td>
+      <td>${escapeHtml(e.FundName || '—')}</td>
+      <td style="text-align:right">${e.Amount != null ? `$${Number(e.Amount).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—'}</td>
+    </tr>`;
+  }
+
+  async function loadPage({ reset }) {
+    const seq = ++requestSeq;
+    if (reset) { offset = 0; tbody.innerHTML = ''; loaded = 0; }
+    const [sortBy, sortDir] = sortSelect.value.split(':');
+    const qs = new URLSearchParams({
+      sortBy, sortDir, limit: String(ALL_EXPENSES_PAGE_SIZE), offset: String(offset),
+    });
+    if (searchInput.value.trim()) qs.set('vendor', searchInput.value.trim());
+    if (fundSelect.value) qs.set('fundId', fundSelect.value);
+    if (categorySelect.value) qs.set('categoryId', categorySelect.value);
+
+    const { expenses, total: newTotal } = await api(`/api/pg/expenses?${qs.toString()}`);
+    if (seq !== requestSeq) return; // a newer request already landed
+
+    total = newTotal;
+    tbody.insertAdjacentHTML('beforeend', expenses.map(rowHtml).join(''));
+    tbody.querySelectorAll('.all-exp-row').forEach((tr) => {
+      if (tr.dataset.wired) return;
+      tr.dataset.wired = '1';
+      tr.addEventListener('click', () => go('expenseDetail', { id: tr.dataset.id }));
+    });
+    offset += expenses.length;
+    loaded += expenses.length;
+
+    emptyMsg.hidden = loaded !== 0;
+    loadMoreBtn.hidden = loaded >= total;
+    countLabel.textContent = total ? `Showing ${loaded} of ${total}` : '';
+  }
+
+  let searchTimer;
+  searchInput.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => loadPage({ reset: true }), 300);
+  });
+  fundSelect.addEventListener('change', () => loadPage({ reset: true }));
+  categorySelect.addEventListener('change', () => loadPage({ reset: true }));
+  sortSelect.addEventListener('change', () => loadPage({ reset: true }));
+  loadMoreBtn.addEventListener('click', () => loadPage({ reset: false }));
+
+  await loadPage({ reset: true });
+}
+
+// Blanks remote images (and CSS background-image urls) in a vendor email's
+// HTML before it ever reaches the iframe, so a tracking pixel never even
+// attempts the network request just because the details panel was open —
+// the sandboxed iframe (sandbox attribute, no scripts/no same-origin/no
+// forms — see originalEmailHtml) is the real security boundary, this is
+// belt-and-suspenders for privacy, not for safety. Runs via DOMParser
+// (never innerHTML on the live document) so the vendor markup is parsed
+// inert the whole time; <script> is stripped outright regardless of the
+// images toggle since the sandbox already blocks it and there's no reason
+// to ship it into the iframe at all.
+function sanitizeEmailHtml(html, { showImages }) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('script').forEach((el) => el.remove());
+  if (!showImages) {
+    doc.querySelectorAll('img').forEach((img) => {
+      const src = img.getAttribute('src');
+      if (src) img.setAttribute('data-blocked-src', src);
+      img.removeAttribute('src');
+      img.removeAttribute('srcset');
+    });
+    doc.querySelectorAll('[style]').forEach((el) => {
+      const style = el.getAttribute('style') || '';
+      if (/url\(/i.test(style)) el.setAttribute('style', style.replace(/url\([^)]*\)/gi, 'none'));
+    });
+  }
+  return `<!DOCTYPE html>${doc.documentElement.outerHTML}`;
+}
+
+// The source email itself — subject/sender/date plus the full body, so
 // confirming a parsed amount/vendor/date never requires leaving the app to
 // go check a phone's mail client or dig up the original Amazon order. Open
 // by default: this is the primary thing being confirmed on a triage screen,
-// not a detail to dig for. Plain-text body only (body-html isn't stored —
-// see receipt-inbound.js), rendered with white-space:pre-wrap so quoted
-// receipt formatting/line breaks stay readable.
+// not a detail to dig for.
+//
+// HTML is the default view when Mailgun sent one (body-html, stored since
+// migration 0055) — vendor receipt emails are designed for HTML rendering
+// and the plain-text alternate part is frequently mangled (see
+// expenseParsing.js's CURRENCY_RE comment: Amazon drops decimal points out
+// of prices in its plain-text part). Rendered in a sandboxed iframe with an
+// empty `sandbox` attribute — no scripts, no same-origin, no forms, nothing
+// — with remote images blocked by default (vendor emails carry tracking
+// pixels) behind a "Load images" toggle. Plain text stays one click away as
+// a fallback for messages where the HTML looks broken or wasn't captured.
+// The actual <iframe>/<pre> content is filled in by initOriginalEmailViewer
+// after this markup is in the DOM (srcdoc needs JS, not an HTML string).
 function originalEmailHtml(expense) {
-  return `<details class="card" open style="margin:10px 0;background:var(--card-bg,#f7f7fa)">
-    <summary style="cursor:pointer;font-weight:600">
-      Original Email${expense.Subject ? `: ${escapeHtml(expense.Subject)}` : ''}
-    </summary>
-    <p class="muted" style="margin:6px 0 2px">
+  const hasHtml = !!expense.BodyHtml;
+  const hasText = !!expense.BodyText;
+  const metaHtml = `<p class="muted" style="margin:6px 0 2px">
       ${expense.SenderEmail ? `From ${escapeHtml(expense.SenderEmail)}` : ''}${expense.ReceivedAt ? `${expense.SenderEmail ? ' · ' : ''}${new Date(expense.ReceivedAt).toLocaleString()}` : ''}
-    </p>
-    ${expense.BodyText
-      ? `<pre style="white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:0.9rem;max-height:320px;overflow-y:auto;margin:8px 0 0;padding:10px;background:var(--bg,#fff);border-radius:8px;border:1px solid var(--border,#ddd)">${escapeHtml(expense.BodyText)}</pre>`
-      : '<p class="muted">No body text captured for this message.</p>'}
+    </p>`;
+  if (!hasHtml && !hasText) {
+    return `<details class="card" open style="margin:10px 0;background:var(--card-bg,#f7f7fa)">
+      <summary style="cursor:pointer;font-weight:600">Original Email${expense.Subject ? `: ${escapeHtml(expense.Subject)}` : ''}</summary>
+      ${metaHtml}
+      <p class="muted">No body captured for this message.</p>
+    </details>`;
+  }
+  return `<details class="card" open style="margin:10px 0;background:var(--card-bg,#f7f7fa)">
+    <summary style="cursor:pointer;font-weight:600">Original Email${expense.Subject ? `: ${escapeHtml(expense.Subject)}` : ''}</summary>
+    ${metaHtml}
+    <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin:4px 0 8px;font-size:0.85rem">
+      ${hasHtml ? `<label style="display:flex;align-items:center;gap:5px;font-weight:400;cursor:pointer"><input type="checkbox" id="emailViewPlainToggle" style="width:auto" /> View as plain text</label>` : ''}
+      ${hasHtml ? `<label id="emailLoadImagesRow" style="display:flex;align-items:center;gap:5px;font-weight:400;cursor:pointer"><input type="checkbox" id="emailLoadImagesToggle" style="width:auto" /> Load images (vendor emails often carry tracking pixels)</label>` : ''}
+    </div>
+    <iframe id="emailHtmlFrame" sandbox="" title="Original email" ${hasHtml ? '' : 'hidden'} style="width:100%;min-height:320px;border:1px solid var(--border,#ddd);border-radius:8px;background:#fff"></iframe>
+    <pre id="emailPlainText" ${hasHtml ? 'hidden' : ''} style="white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:0.9rem;max-height:320px;overflow-y:auto;margin:8px 0 0;padding:10px;background:var(--bg,#fff);border-radius:8px;border:1px solid var(--border,#ddd)">${escapeHtml(expense.BodyText || '(no plain-text body captured)')}</pre>
   </details>`;
+}
+
+// Wires up the toggles for the panel originalEmailHtml() just rendered —
+// separate from that function because an iframe's content has to be set via
+// srcdoc in JS, never inlined as an HTML string (that's exactly the
+// unsanitized-string-into-markup pattern the sandboxed iframe + DOMParser
+// sanitizer above both exist to avoid).
+function initOriginalEmailViewer(expense) {
+  const frame = document.getElementById('emailHtmlFrame');
+  if (!frame) return; // neither BodyHtml nor BodyText — nothing interactive to wire up
+  const plainToggle = document.getElementById('emailViewPlainToggle');
+  const imagesToggle = document.getElementById('emailLoadImagesToggle');
+  const imagesRow = document.getElementById('emailLoadImagesRow');
+  const plainPre = document.getElementById('emailPlainText');
+
+  function renderFrame() {
+    if (expense.BodyHtml) frame.srcdoc = sanitizeEmailHtml(expense.BodyHtml, { showImages: !!imagesToggle?.checked });
+  }
+  function applyMode() {
+    const showPlain = !!plainToggle?.checked;
+    frame.hidden = showPlain || !expense.BodyHtml;
+    plainPre.hidden = !showPlain && !!expense.BodyHtml;
+    if (imagesRow) imagesRow.hidden = showPlain;
+  }
+  renderFrame();
+  applyMode();
+  plainToggle?.addEventListener('change', applyMode);
+  imagesToggle?.addEventListener('change', renderFrame);
 }
 
 // Create/edit/triage — one form for all three (brief §3.2: "Add expense"
@@ -3316,7 +3551,7 @@ async function renderExpenseDetail({ id } = {}) {
   app.innerHTML = `
     <div class="card">
       <h3>${id ? 'Edit Expense' : 'Add Expense'}</h3>
-      ${expense?.Source === 'email' && (expense.Subject || expense.BodyText) ? originalEmailHtml(expense) : ''}
+      ${expense?.Source === 'email' && (expense.Subject || expense.BodyText || expense.BodyHtml) ? originalEmailHtml(expense) : ''}
       ${id ? '<div id="expenseReceiptSection"></div>' : '<p class="muted">You can attach a receipt photo once this is saved.</p>'}
       <form id="expenseForm" style="margin-top:12px">
         <div class="field-row"><label>Vendor${expenseParsedBadge(expense)}</label><input name="vendor" value="${escapeHtml(expense?.Vendor || '')}" placeholder="e.g. Ace Hardware" /></div>
@@ -3349,6 +3584,7 @@ async function renderExpenseDetail({ id } = {}) {
       title: 'Receipt', defaultRoleName: 'Receipt', accept: 'image/*,application/pdf',
     });
   }
+  if (expense?.Source === 'email' && (expense.Subject || expense.BodyText || expense.BodyHtml)) initOriginalEmailViewer(expense);
 
   let selectedAsset = expense?.AssetId ? { Id: expense.AssetId, Name: expense.AssetName } : null;
   mountAssetCombobox(document.getElementById('expenseAssetPicker'), {

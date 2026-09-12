@@ -1,6 +1,7 @@
 // Checklist PDF export. Portability boundary: the only module that knows
 // about pdfkit — callers just get a Buffer back.
 import PDFDocument from 'pdfkit';
+import { convert as htmlToText } from 'html-to-text';
 
 export function renderChecklistPdf({ checklistName, contextLabel, steps }) {
   return new Promise((resolve, reject) => {
@@ -99,6 +100,46 @@ export function renderWorkOrderScopePdf({ title, assetName, locationName, priori
     }
 
     doc.fontSize(9).font('Helvetica').fillColor('#777').text(`Generated ${new Date().toLocaleString()}`);
+
+    doc.end();
+  });
+}
+
+// Receipts-by-email fallback (Ben's request, 2026-09-12, §2b): a forwarded
+// vendor confirmation with no image attachment IS the receipt — nothing to
+// photograph, the email itself is the proof of purchase. pdfkit has no HTML
+// renderer (no DOM/CSS layout engine), so this doesn't attempt a visual
+// reproduction of the source email; it extracts the email's actual text
+// content (via html-to-text, which understands table/paragraph/link
+// structure well enough to keep line-item lists and totals readable — far
+// better than a naive tag-strip regex) and lays it out the same way
+// renderChecklistPdf/renderWorkOrderScopePdf already do. Falls back to the
+// stored plain-text body when there's no HTML part at all.
+export function renderEmailReceiptPdf({ subject, senderEmail, receivedAt, bodyHtml, bodyText }) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 50 });
+    const chunks = [];
+    doc.on('data', (c) => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    doc.fontSize(10).font('Helvetica-Bold').fillColor('#777').text('RECEIPT EMAIL');
+    doc.fillColor('#000').fontSize(16).font('Helvetica-Bold').moveDown(0.15).text(subject || '(no subject)');
+    const metaBits = [senderEmail, receivedAt ? new Date(receivedAt).toLocaleString() : null].filter(Boolean);
+    if (metaBits.length) doc.fontSize(10).font('Helvetica').fillColor('#555').moveDown(0.2).text(metaBits.join('  ·  '));
+    doc.fillColor('#000').moveDown(1);
+
+    const text = bodyHtml
+      ? htmlToText(bodyHtml, {
+          wordwrap: 100,
+          selectors: [
+            { selector: 'img', format: 'skip' }, // tracking pixels/logos add nothing as text
+            { selector: 'a', options: { ignoreHref: true } },
+          ],
+        })
+      : (bodyText || '(no body captured for this message)');
+
+    doc.fontSize(10).font('Helvetica').text(text.trim(), { width: 495 });
 
     doc.end();
   });

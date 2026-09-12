@@ -22,6 +22,7 @@ import express from 'express';
 import { findAttachmentBatchByMessageId, createReceiptInboundBatch } from '../db.js';
 import { storeAttachment } from '../storage.js';
 import { parseReceiptEmail } from '../expenseParsing.js';
+import { renderEmailReceiptPdf } from '../pdf.js';
 import {
   mailParsers, isJunkImage, verifySignatureDetailed, extractHeader, extractEmailAddress, extractInlineFieldNames, logInboundHit,
 } from '../mailIngestShared.js';
@@ -35,6 +36,7 @@ const router = express.Router();
 export async function ingestReceiptMail(req, messageId) {
   const subject = req.body.subject || '(no subject)';
   const bodyText = req.body['body-plain'] || null;
+  const bodyHtml = req.body['body-html'] || null;
   const senderEmail = extractEmailAddress(req.body.sender || req.body.from);
   const receivedAt = req.body.timestamp ? new Date(Number(req.body.timestamp) * 1000) : new Date();
   const spfResult = req.body['X-Mailgun-Spf'] || extractHeader(req.body, 'X-Mailgun-Spf');
@@ -55,19 +57,38 @@ export async function ingestReceiptMail(req, messageId) {
     uploaded.push(meta);
   }
 
+  // Forwarded-email-as-receipt (§2 of Ben's expenses request, 2026-09-12): a
+  // forwarded vendor confirmation with no image attachment IS the receipt —
+  // the email itself is the proof of purchase. Render it to a PDF (existing
+  // pdfkit tooling, same as the checklist/scope-of-work exports) and attach
+  // that instead, so triage always has *something* to show as the receipt
+  // rather than nothing. Only when zero real images came through — a message
+  // with a photo attached keeps the photo as the receipt, full stop, even if
+  // the body also has HTML worth keeping (it's stored on the batch either
+  // way for the email viewer).
+  let pdfMeta = null;
+  if (uploaded.length === 0 && (bodyHtml || bodyText)) {
+    const pdfBuffer = await renderEmailReceiptPdf({ subject, senderEmail, receivedAt, bodyHtml, bodyText });
+    pdfMeta = await storeAttachment(pdfBuffer, {
+      filename: 'receipt-email.pdf', mimetype: 'application/pdf', category: 'receipt', ownerId: `msg-${messageId.replace(/[^a-zA-Z0-9]/g, '')}`,
+    });
+    uploaded.push(pdfMeta);
+  }
+
   // Success-path visibility — see mail-inbound.js's identical comment. A
-  // receipt with zero attachments (a pure forwarded confirmation email) is
-  // routine, not a failure, but should still be visible in the logs.
+  // receipt with zero image attachments (a pure forwarded confirmation
+  // email) is routine, not a failure, but should still be visible in the
+  // logs — including whether the HTML-to-PDF fallback fired.
   console.log(
     `receipt-inbound: message ${messageId} — files=${(req.files || []).length} ` +
     `fieldnames=[${(req.files || []).map((f) => f.fieldname).join(',')}] ` +
     `inlineFieldnames=[${[...inlineFieldNames].join(',')}] ` +
     `realFiles=${realFiles.length} junkFiltered=${junkFiltered} uploaded=${uploaded.length} ` +
-    `parsed=${JSON.stringify(parsed)}`
+    `pdfFallback=${!!pdfMeta} parsed=${JSON.stringify(parsed)}`
   );
 
   const result = await createReceiptInboundBatch({
-    subject, bodyText, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments: uploaded, parsed,
+    subject, bodyText, bodyHtml, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments: uploaded, parsed,
   });
   if (result === null) return { ok: true }; // raced with another retry — already created, nothing to do
 

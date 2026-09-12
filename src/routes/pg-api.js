@@ -290,13 +290,19 @@ router.get('/expenses/inbox/count', async (req, res, next) => {
 });
 router.get('/expenses', async (req, res, next) => {
   try {
-    const { fundId, categoryId, vendor, jobLineId, workOrderId, assetId, dateFrom, dateTo, taxChargedInError, unclassified } = req.query;
-    res.json({
-      expenses: await listExpenses({
-        fundId, categoryId, vendor, jobLineId, workOrderId, assetId, dateFrom, dateTo,
-        taxChargedInError: taxChargedInError === 'true', unclassified: unclassified === 'true',
-      }),
+    const {
+      fundId, categoryId, vendor, jobLineId, workOrderId, assetId, dateFrom, dateTo, taxChargedInError, unclassified,
+      sortBy, sortDir, limit, offset,
+    } = req.query;
+    const result = await listExpenses({
+      fundId, categoryId, vendor, jobLineId, workOrderId, assetId, dateFrom, dateTo,
+      taxChargedInError: taxChargedInError === 'true', unclassified: unclassified === 'true',
+      sortBy, sortDir, limit: limit ? Number(limit) : undefined, offset: offset ? Number(offset) : 0,
     });
+    // listExpenses returns a plain array when unpaginated (limit omitted —
+    // Recent Expenses/Reports keep working unchanged) and {expenses,total}
+    // once `limit` is passed (the All Expenses tab's paginated mode).
+    res.json(Array.isArray(result) ? { expenses: result } : { expenses: result.expenses, total: result.total });
   } catch (e) { next(e); }
 });
 router.get('/expenses/:id', async (req, res, next) => {
