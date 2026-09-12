@@ -19,11 +19,11 @@ const globalSearchResults = document.getElementById('globalSearchResults');
 
 const state = { user: null, options: null, stack: [] };
 
-function toast(msg) {
+function toast(msg, ms = 2500) {
   toastEl.textContent = msg;
   toastEl.hidden = false;
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => { toastEl.hidden = true; }, 2500);
+  toast._t = setTimeout(() => { toastEl.hidden = true; }, ms);
 }
 
 // Postgres date/timestamp columns arrive as raw ISO strings (e.g.
@@ -1440,6 +1440,125 @@ async function renderAuditPicker() {
   });
 }
 
+// Audit-draft persistence (B4 fix, 2026-09-12): the walkthrough form used to
+// live only in JS memory — a dropped connection, an accidental nav-away, or
+// a reload lost everything typed. Keyed per asset (not one global slot) so
+// two buildings in progress never collide. File objects genuinely cannot
+// survive localStorage or a reload (the platform won't let a file input be
+// repopulated programmatically, for security reasons) — so a draft restores
+// every typed/selected field, but staged photos can only be restored as a
+// filename list the user is told to re-add, not as the files themselves.
+function auditDraftKey(assetId) { return `campAuditDraft:${assetId}`; }
+
+function saveAuditDraft(assetId, assetName) {
+  try {
+    localStorage.setItem(auditDraftKey(assetId), JSON.stringify({ assetName, savedAt: Date.now(), ...collectAuditDraftState() }));
+  } catch { /* storage unavailable/full — draft silently doesn't persist, not fatal */ }
+}
+function loadAuditDraft(assetId) {
+  try { const raw = localStorage.getItem(auditDraftKey(assetId)); return raw ? JSON.parse(raw) : null; }
+  catch { return null; }
+}
+function clearAuditDraft(assetId) {
+  try { localStorage.removeItem(auditDraftKey(assetId)); } catch { /* nothing to clean up */ }
+}
+
+// Mirrors the shape the submit handler already builds (properties keyed by
+// fieldKey -> {value,flagged,flagNote}) so applying a draft back and reading
+// it for real submission share the same structure.
+function collectAuditDraftState() {
+  const properties = {};
+  document.querySelectorAll('#auditForm [name^="prop_"]').forEach((el) => {
+    const key = el.name.slice(5);
+    const flagged = !!document.querySelector(`.flag-toggle[data-flag-for="${key}"]`)?.checked;
+    const flagNote = document.querySelector(`.flag-note[data-flag-note-for="${key}"]`)?.value || '';
+    properties[key] = { value: el.value, flagged, flagNote };
+  });
+
+  const componentEvents = [];
+  document.querySelectorAll('#componentPromptBlock [data-component]').forEach((card) => {
+    componentEvents.push({
+      componentType: card.dataset.component,
+      eventType: card.querySelector('.comp-event')?.value || '',
+      condition: card.querySelector('.comp-condition')?.value || '',
+      material: card.querySelector('.comp-material')?.value || '',
+      notes: card.querySelector('.comp-notes')?.value || '',
+      flagged: !!card.querySelector('.comp-flag-toggle')?.checked,
+      flagNote: card.querySelector('.comp-flag-note')?.value || '',
+      stagedPhotoNames: [...(card.querySelector('.comp-photo')?.files || [])].map((f) => f.name),
+    });
+  });
+
+  return {
+    properties,
+    componentEvents,
+    findingSeverity: document.querySelector('[name="findingSeverity"]')?.value || '',
+    findingDescription: document.querySelector('[name="findingDescription"]')?.value || '',
+    findingStagedPhotoNames: [...(document.querySelector('[name="findingPhoto"]')?.files || [])].map((f) => f.name),
+    generalStagedPhotoNames: [...(document.querySelector('[name="generalPhotos"]')?.files || [])].map((f) => f.name),
+  };
+}
+
+// Whether a draft has anything in it worth prompting to resume, or worth
+// confirming before discarding — an untouched form (every component card at
+// its default "Inspected"/blank state, nothing flagged, nothing typed)
+// shouldn't trigger a resume prompt or a discard confirmation.
+function auditDraftHasContent(d) {
+  if (!d) return false;
+  if (Object.values(d.properties || {}).some((e) => e?.value || e?.flagged)) return true;
+  if ((d.componentEvents || []).some((ev) => ev.condition || ev.material || ev.notes || ev.flagged || ev.stagedPhotoNames?.length)) return true;
+  if (d.findingSeverity || d.findingDescription) return true;
+  if (d.generalStagedPhotoNames?.length || d.findingStagedPhotoNames?.length) return true;
+  return false;
+}
+
+function applyAuditDraft(draft) {
+  Object.entries(draft.properties || {}).forEach(([key, entry]) => {
+    const el = document.querySelector(`#auditForm [name="prop_${key}"]`);
+    if (el && entry.value) el.value = entry.value;
+    if (entry.flagged) {
+      const cb = document.querySelector(`.flag-toggle[data-flag-for="${key}"]`);
+      if (cb) cb.checked = true;
+      const noteEl = document.querySelector(`.flag-note[data-flag-note-for="${key}"]`);
+      if (noteEl && entry.flagNote) noteEl.value = entry.flagNote;
+    }
+  });
+  (draft.componentEvents || []).forEach((ev) => {
+    const card = document.querySelector(`#componentPromptBlock [data-component="${CSS.escape(ev.componentType)}"]`);
+    if (!card) return;
+    if (ev.eventType) card.querySelector('.comp-event').value = ev.eventType;
+    if (ev.condition) card.querySelector('.comp-condition').value = ev.condition;
+    if (ev.material) card.querySelector('.comp-material').value = ev.material;
+    if (ev.notes) card.querySelector('.comp-notes').value = ev.notes;
+    if (ev.flagged) {
+      const cb = card.querySelector('.comp-flag-toggle');
+      if (cb) cb.checked = true;
+      const noteEl = card.querySelector('.comp-flag-note');
+      if (noteEl && ev.flagNote) noteEl.value = ev.flagNote;
+    }
+  });
+  if (draft.findingSeverity) { const el = document.querySelector('[name="findingSeverity"]'); if (el) el.value = draft.findingSeverity; }
+  if (draft.findingDescription) { const el = document.querySelector('[name="findingDescription"]'); if (el) el.value = draft.findingDescription; }
+
+  // Flag-toggle checkboxes and conditional-reveal selects were set via
+  // .checked/.value directly, which fires no 'change' event — re-dispatch so
+  // the flag-note-wrap visibility and the property-dependency reveals (incl.
+  // the component-prompt block itself) recompute against the restored state.
+  document.querySelectorAll('#auditForm .flag-toggle, #auditForm .comp-flag-toggle').forEach((cb) => cb.dispatchEvent(new Event('change')));
+  document.querySelectorAll('#auditForm select[name^="prop_"]').forEach((el) => el.dispatchEvent(new Event('change')));
+
+  const staged = [
+    ...(draft.generalStagedPhotoNames || []),
+    ...(draft.findingStagedPhotoNames || []),
+    ...(draft.componentEvents || []).flatMap((ev) => ev.stagedPhotoNames || []),
+  ];
+  if (staged.length) {
+    toast(`Restored your answers. ${staged.length} staged photo${staged.length === 1 ? '' : 's'} couldn't survive the reload (${staged.join(', ')}) — please re-add them.`, 8000);
+  } else {
+    toast('Resumed your in-progress audit.');
+  }
+}
+
 async function renderAudit({ id }) {
   setChrome({ title: 'Audit', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
@@ -1539,7 +1658,45 @@ async function renderAudit({ id }) {
     });
   });
 
-  document.getElementById('cancelAuditBtn').addEventListener('click', goBack);
+  // Resume-or-discard: check for a draft from an earlier interrupted attempt
+  // at this SAME asset before wiring autosave, so applying it doesn't count
+  // as new user input. An empty/untouched draft (e.g. one saved the instant
+  // the page loaded, before anything was typed) is discarded silently —
+  // nothing to ask about.
+  const existingDraft = loadAuditDraft(id);
+  if (auditDraftHasContent(existingDraft)) {
+    const when = new Date(existingDraft.savedAt).toLocaleString();
+    const resume = await confirmDialog(
+      `Resume in-progress audit for "${asset.Name}"? You have unsaved answers from ${when}.`,
+      { confirmLabel: 'Resume', cancelLabel: 'Discard', danger: false }
+    );
+    if (resume) applyAuditDraft(existingDraft);
+    else clearAuditDraft(id);
+  } else if (existingDraft) {
+    clearAuditDraft(id); // stale empty draft — clean it up rather than leave it
+  }
+
+  // Autosave — debounced so a fast typist doesn't write to localStorage on
+  // every keystroke. Wired after the resume/discard decision above so
+  // restoring a draft doesn't immediately re-save over itself mid-decision.
+  let draftSaveTimer;
+  document.getElementById('auditForm').addEventListener('input', () => {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(() => saveAuditDraft(id, asset.Name), 400);
+  });
+  document.getElementById('auditForm').addEventListener('change', () => {
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(() => saveAuditDraft(id, asset.Name), 400);
+  });
+
+  document.getElementById('cancelAuditBtn').addEventListener('click', async () => {
+    if (auditDraftHasContent(collectAuditDraftState())) {
+      const discard = await confirmDialog('Discard this in-progress audit? Your answers and staged photos will be lost.', { confirmLabel: 'Discard', cancelLabel: 'Keep editing' });
+      if (!discard) return;
+    }
+    clearAuditDraft(id);
+    goBack();
+  });
   document.getElementById('auditForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -1582,6 +1739,7 @@ async function renderAudit({ id }) {
       const generalAttachmentIds = [];
       for (const file of generalPhotoFiles) generalAttachmentIds.push(await uploadAttachmentUnlinked(file, 'asset-photos', id));
       await api(`/api/pg/assets/${id}/audit`, { method: 'POST', body: JSON.stringify({ properties: propertiesOut, componentEvents, finding, generalAttachmentIds }) });
+      clearAuditDraft(id);
       toast('Audit submitted');
       state.stack.pop(); // drop this audit entry
       go('assetDetail', { id }, { replace: true });
