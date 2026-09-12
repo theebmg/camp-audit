@@ -3180,6 +3180,43 @@ export async function createAttachment(meta, { source = 'upload', uploadedBy = n
   return attachmentRowShape(rows[0]);
 }
 
+// Orphaned-upload cleanup (scripts/cleanup-orphaned-uploads.js, 2026-09-12):
+// createAttachment above is the ONLY code path that ever produces an
+// unlinked 'upload'-sourced row — every legitimate caller (the audit form,
+// asset notes, the maintenance-request portal) links it within seconds, in
+// the same transaction that creates the parent row it belongs to. So
+// `source = 'upload' AND zero attachment_links rows` occurring past a
+// generous age cutoff is an unambiguous signature for "the form that would
+// have linked this was abandoned" (a dropped connection, a closed tab, a
+// reload before submit) — never a normal in-flight upload, never anything
+// from the email inbox (source='email', a deliberately-unlinked-for-now
+// state that IS legitimate and must never be swept here).
+export async function findOrphanedUploadAttachments({ olderThanHours = 48 } = {}) {
+  const { rows } = await pool.query(
+    `SELECT a.id, a.url, a.thumb_url, a.original_filename, a.created_at
+     FROM attachments a
+     WHERE a.source = 'upload' AND a.deleted_at IS NULL
+       AND a.created_at < now() - ($1 || ' hours')::interval
+       AND NOT EXISTS (SELECT 1 FROM attachment_links al WHERE al.attachment_id = a.id)
+     ORDER BY a.created_at`,
+    [olderThanHours]
+  );
+  return rows.map((r) => ({ Id: r.id, Url: r.url, ThumbUrl: r.thumb_url, OriginalFilename: r.original_filename, CreatedAt: r.created_at }));
+}
+
+// Hard delete — the DB half of cleanup; the caller (the cleanup script)
+// deletes the matching Spaces objects first via storage.js, then calls this
+// with the same id list. No soft-delete/void step here: these rows were
+// never visible to anyone (zero links, never triaged) and Part A's "storage
+// is pennies, no reaper" stance is specifically about NOT hard-deleting
+// deliberately-voided content — this is the opposite case, rows nobody ever
+// saw and nothing will ever reference.
+export async function deleteAttachmentsByIds(ids) {
+  if (!ids.length) return 0;
+  const { rowCount } = await pool.query(`DELETE FROM attachments WHERE id = ANY($1::int[])`, [ids]);
+  return rowCount;
+}
+
 export async function linkAttachment(attachmentId, { entityType, entityId, roleId = null, classification = null, caption = null, includeInReport = null, sortOrder = 0, vendorId = null, quotedAmount = null, quoteDate = null, isSelectedQuote = false }, client = pool) {
   if (!ATTACHMENT_ENTITY_TYPES.has(entityType)) { const e = new Error(`Unknown attachment entity type: ${entityType}`); e.status = 400; throw e; }
   const include = await resolveIncludeInReport(client, roleId, includeInReport);
