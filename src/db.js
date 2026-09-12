@@ -3777,6 +3777,31 @@ export async function getInboxCount() {
   return Number(rows[0].count);
 }
 
+// Backup status (B6 fix, 2026-09-12): "last successful backup" and "did the
+// most recent run fail" are deliberately two different questions — a run
+// can fail tonight while last night's backup is still fine, and the
+// dashboard should say so precisely rather than just "backups: bad."
+// Staleness is measured off the last SUCCESS, not the last attempt, since a
+// string of failures with an old-but-real backup underneath is a different
+// (also-bad, but differently bad) situation than never having backed up at
+// all — LastSuccessAt being null covers that second case on its own.
+export async function getBackupStatus() {
+  const [{ rows: latestRows }, { rows: lastOkRows }] = await Promise.all([
+    pool.query(`SELECT * FROM backup_runs ORDER BY finished_at DESC LIMIT 1`),
+    pool.query(`SELECT * FROM backup_runs WHERE status = 'ok' ORDER BY finished_at DESC LIMIT 1`),
+  ]);
+  const latest = latestRows[0] || null;
+  const lastOk = lastOkRows[0] || null;
+  const hoursSinceSuccess = lastOk ? (Date.now() - new Date(lastOk.finished_at).getTime()) / 3600000 : null;
+  return {
+    LastRunFailed: latest?.status === 'failed',
+    LatestDetail: latest?.detail || null,
+    LatestFinishedAt: latest?.finished_at || null,
+    LastSuccessAt: lastOk?.finished_at || null,
+    Stale: hoursSinceSuccess == null || hoursSinceSuccess > 48,
+  };
+}
+
 // Fuzzy asset-name match for a batch's subject/body (§5.2) — plain word
 // overlap, not a real search index. Never auto-assigns; the inbox surfaces
 // the top matches as tappable suggestions only. A silent wrong match

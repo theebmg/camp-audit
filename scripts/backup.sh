@@ -1,5 +1,7 @@
 #!/bin/bash
-# Nightly backup of the `camp` Postgres database (Build Brief v2.1 Part 3).
+# Nightly backup of the `camp` Postgres database (Build Brief v2.1 Part 3;
+# status-recording and the tee/redirect fix below are from the 2026-09-12
+# pre-live audit's B6 finding).
 #
 # This formalizes what an ad hoc host script (camp-backup.sh, outside this
 # repo) was already doing nightly since 2026-08-28 — local pg_dump, gzip, an
@@ -28,7 +30,6 @@
 set -euo pipefail
 
 BACKUP_DIR="${BACKUP_DIR:-$HOME/backups}"
-LOG_FILE="${BACKUP_LOG_FILE:-$BACKUP_DIR/backup.log}"
 RETENTION_DAYS=30
 DB_CONTAINER="${DB_CONTAINER:-nocodb-db}"
 DB_USER="${DB_USER:-camp_app}"
@@ -38,8 +39,35 @@ RCLONE_REMOTE="${RCLONE_REMOTE:-dropbox:Sychar CMMS Backup}"
 mkdir -p "$BACKUP_DIR"
 STAMP=$(date +%Y-%m-%d-%H%M)
 FILE="$BACKUP_DIR/sychar-$STAMP.dump.gz"
+START_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
-log() { echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') $1" | tee -a "$LOG_FILE"; }
+# Every log() call used to pipe through `tee -a "$LOG_FILE"` while the
+# crontab entry ALSO redirected the whole script's stdout to that same file
+# (`>> backup.log 2>&1`) — tee's own file-write plus its stdout passthrough
+# (which cron's redirect then appended too) doubled every line under cron,
+# though not when run by hand with no redirect — exactly the pattern the
+# audit found (every cron-triggered line duplicated from 2026-09-10 on,
+# the two manual test runs on 2026-09-09 weren't). Fix: log() only writes to
+# stdout now; the crontab redirect is the ONE place persistence happens.
+log() { echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') $1"; }
+
+# Records one row in `backup_runs` per run — db.js's getBackupStatus reads
+# it for the dashboard warning (2026-09-12 pre-live audit, B6). Same
+# trust-auth path already used for pg_dump below, no new credentials.
+# Failing to record a status row is logged but never fails the backup
+# itself: a missed dashboard update is a much smaller problem than treating
+# a real, successful backup as a failure. Piped over stdin (`-i`, a heredoc)
+# rather than `-c`: psql's `:'var'` interpolation is only applied to script
+# input (stdin/-f), NOT to a -c argument, in this psql version — confirmed
+# by hand before landing this, `-c` silently sent the literal text `:'var'`
+# to the server as a syntax error.
+record_backup_run() {
+  local status="$1" detail="$2"
+  docker exec -i "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 \
+    -v started="$START_TIME" -v status="$status" -v detail="$detail" >/dev/null 2>&1 <<'SQL' || log "WARNING failed to record backup_runs status row (non-fatal)"
+INSERT INTO backup_runs (started_at, finished_at, status, detail) VALUES (:'started', now(), :'status', :'detail');
+SQL
+}
 
 # Custom format (-Fc), not plain SQL: lets a restore target one table with
 # pg_restore instead of always replaying the whole dump, and supports
@@ -52,6 +80,7 @@ if docker exec "$DB_CONTAINER" pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc | gzip > 
 else
   log "FAILED pg_dump/gzip for $FILE"
   rm -f "$FILE"
+  record_backup_run failed "pg_dump/gzip failed for $(basename "$FILE")"
   exit 1
 fi
 
@@ -70,11 +99,16 @@ find "$BACKUP_DIR" -maxdepth 1 \( -name 'sychar-*.dump.gz' -o -name 'camp_*.sql.
 if command -v rclone >/dev/null 2>&1 && rclone listremotes 2>/dev/null | grep -q '^dropbox:'; then
   if rclone copy "$FILE" "$RCLONE_REMOTE/"; then
     log "OK copied to Dropbox: $RCLONE_REMOTE/$(basename "$FILE")"
+    BACKUP_DETAIL="local + Dropbox ($(du -h "$FILE" | cut -f1))"
   else
     log "FAILED Dropbox upload for $FILE — local copy is still safe, but the off-box copy is missing until this is fixed"
+    record_backup_run failed "Dropbox upload failed for $(basename "$FILE") — local copy is safe"
     exit 1
   fi
-  rclone delete --min-age "${RETENTION_DAYS}d" "$RCLONE_REMOTE/" 2>&1 | tee -a "$LOG_FILE" || true
+  rclone delete --min-age "${RETENTION_DAYS}d" "$RCLONE_REMOTE/" 2>&1 || true
 else
   log "WARNING skipping off-box copy — rclone 'dropbox' remote not configured on this host"
+  BACKUP_DETAIL="local only — Dropbox not configured ($(du -h "$FILE" | cut -f1))"
 fi
+
+record_backup_run ok "$BACKUP_DETAIL"

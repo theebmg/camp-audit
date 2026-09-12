@@ -67,7 +67,7 @@ import {
   updateConditionFinding, deferFinding, dismissFinding, getFindingsSummary,
   listMapPins, setAssetMapLocation, listMapFeatures, createMapFeature, updateMapFeature, deleteMapFeature,
   listMapLayers, createMapLayer, updateMapLayer, deleteMapLayer,
-  listInboxBatches, getInboxCount, suggestAssetsForText, triageAttachToEntity, triageCreateWorkOrder, triageCreateFinding, voidAttachments,
+  listInboxBatches, getInboxCount, getBackupStatus, suggestAssetsForText, triageAttachToEntity, triageCreateWorkOrder, triageCreateFinding, voidAttachments,
   splitWorkOrder, getWorkOrderFamily,
   listMapCalibrationPoints, createMapCalibrationPoint, deleteMapCalibrationPoint, nearestAssetsToGps,
   listJobLineTemplates, createJobLineTemplate, updateJobLineTemplate, deleteJobLineTemplate,
@@ -181,6 +181,9 @@ router.get('/inbox', async (req, res, next) => {
 });
 router.get('/inbox/count', async (req, res, next) => {
   try { res.json({ count: await getInboxCount() }); } catch (e) { next(e); }
+});
+router.get('/backup-status', async (req, res, next) => {
+  try { res.json(await getBackupStatus()); } catch (e) { next(e); }
 });
 router.get('/inbox/suggest-assets', async (req, res, next) => {
   try {

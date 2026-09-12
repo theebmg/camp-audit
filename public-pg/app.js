@@ -766,7 +766,7 @@ async function renderDashboard() {
   let selectedWeekDate = isoDate(today);
   const weekOccByDay = new Map();
 
-  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary, inboxRes, expenseInboxRes, fundBalancesRes] = await Promise.all([
+  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary, inboxRes, expenseInboxRes, fundBalancesRes, backupStatus] = await Promise.all([
     prefs.woOverview ? api('/api/pg/dashboard/wo-summary') : Promise.resolve(null),
     prefs.calendar ? api(`/api/pg/calendar-events?from=${isoDate(weekStart)}&to=${isoDate(weekEnd)}`) : Promise.resolve(null),
     prefs.calendar ? api('/api/pg/work-orders') : Promise.resolve(null),
@@ -775,6 +775,7 @@ async function renderDashboard() {
     api('/api/pg/inbox/count'),
     api('/api/pg/expenses/inbox/count'),
     api('/api/pg/funds/balances'),
+    api('/api/pg/backup-status').catch(() => null), // never let a backup-status hiccup block the rest of the dashboard from loading
   ]);
 
   // Build Brief v3 §3.4 — per active fund, "$X of $Y remaining · N days
@@ -912,6 +913,27 @@ async function renderDashboard() {
     </div>`;
   }
 
+  // "Last successful backup" and "did the most recent run fail" are shown
+  // separately (B6 fix, 2026-09-12) — a run can fail tonight while last
+  // night's backup is still perfectly fine, and collapsing that into one
+  // bad/good signal would hide which situation you're actually in. Quiet
+  // (a plain line, no card chrome) when healthy; a warning card, same
+  // treatment as an over-budget fund, when the last run failed or the last
+  // success is more than 48 hours old.
+  function backupStatusHtml() {
+    if (!backupStatus) return ''; // request failed — don't let a broken status check itself cry wolf
+    const { LastRunFailed, LatestDetail, LastSuccessAt, Stale } = backupStatus;
+    const bad = LastRunFailed || Stale;
+    const whenText = LastSuccessAt ? new Date(LastSuccessAt).toLocaleString() : 'never';
+    if (!bad) return `<p class="muted" style="margin:-4px 0 0">💾 Last backup: ${escapeHtml(whenText)}</p>`;
+    return `<div class="card" style="border-left:4px solid #c0392b;background:#c0392b0d">
+      <h3 style="color:#c0392b">⚠️ Backup needs attention</h3>
+      <p class="muted" style="margin-top:-4px">Last successful backup: ${escapeHtml(whenText)}</p>
+      ${LastRunFailed ? `<p style="margin-top:6px">Most recent run failed${LatestDetail ? `: ${escapeHtml(LatestDetail)}` : ''}.</p>` : ''}
+      ${!LastRunFailed && Stale ? `<p style="margin-top:6px">No successful backup in over 48 hours.</p>` : ''}
+    </div>`;
+  }
+
   function draw() {
     setApp(`
       <div class="card">
@@ -934,6 +956,7 @@ async function renderDashboard() {
           </div>
         </details>
       </div>
+      ${backupStatusHtml()}
       ${fundBalancesHtml()}
       ${woOverviewHtml()}
       ${findingsSummaryHtml()}
