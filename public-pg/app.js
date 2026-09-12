@@ -338,6 +338,42 @@ async function uploadAttachmentUnlinked(file, category, ownerId) {
   return body.attachment.Id;
 }
 
+// A stable-enough identity for "is this the same File I already uploaded" —
+// File objects don't carry a real id, but name+size+lastModified collide
+// only in practice-never cases for camera photos. Scoped by section (e.g.
+// "component:Roof" vs "finding") so the same filename in two different
+// sections is never treated as the same upload.
+function fileIdentity(sectionKey, file) {
+  return `${sectionKey}::${file.name}::${file.size}::${file.lastModified}`;
+}
+
+// Uploads whichever of `files` don't already have a recorded success in
+// `tracker` (B4 fix #2, 2026-09-12) — a per-file try/catch means one bad
+// upload no longer aborts the rest of the batch, and a file that already
+// has a recorded attachmentId is never re-uploaded, so calling this again
+// after a partial failure (the caller's "retry") only touches the files
+// that actually failed last time. `tracker` is a Map the caller owns and
+// keeps alive across submit attempts within the same page load — that's
+// what makes retry-without-duplication possible; it does not survive a
+// reload (see the audit-draft comment for why that's a separate, harder
+// problem for the File objects themselves).
+async function uploadSectionResumable(files, category, ownerId, sectionKey, tracker) {
+  const attachmentIds = [];
+  const failures = [];
+  for (const file of files) {
+    const key = fileIdentity(sectionKey, file);
+    if (tracker.has(key)) { attachmentIds.push(tracker.get(key)); continue; }
+    try {
+      const attachmentId = await uploadAttachmentUnlinked(file, category, ownerId);
+      tracker.set(key, attachmentId);
+      attachmentIds.push(attachmentId);
+    } catch (err) {
+      failures.push({ name: file.name, error: err.message });
+    }
+  }
+  return { attachmentIds, failures };
+}
+
 function attachmentThumbHtml(a) {
   if (a.Kind === 'image') {
     return `<img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:84px;height:84px;object-fit:cover;border-radius:8px;display:block" />`;
@@ -1627,8 +1663,9 @@ async function renderAudit({ id }) {
           <div class="field-row"><label>Description</label><textarea name="findingDescription"></textarea></div>
           <div class="field-row"><label>Photo (optional)</label><input type="file" name="findingPhoto" accept="image/*" capture="environment" multiple /></div>
         </div>
+        <div class="card" id="auditUploadStatus" hidden style="border-left:4px solid #c0392b;background:#c0392b0d"></div>
         <div class="btn-row">
-          <button class="btn btn-primary" type="submit">Submit Audit</button>
+          <button class="btn btn-primary" type="submit" id="auditSubmitBtn">Submit Audit</button>
           <button class="btn btn-secondary" type="button" id="cancelAuditBtn">Cancel</button>
         </div>
       </form>
@@ -1697,6 +1734,28 @@ async function renderAudit({ id }) {
     clearAuditDraft(id);
     goBack();
   });
+
+  // uploadTracker lives for the lifetime of this render — survives repeated
+  // submit clicks within the same page load (a failed submit followed by
+  // clicking Submit again, i.e. "retry") but not a reload, same scope as the
+  // File objects it's keyed against (see uploadSectionResumable's comment).
+  const uploadTracker = new Map();
+  const uploadStatusEl = document.getElementById('auditUploadStatus');
+  const submitBtn = document.getElementById('auditSubmitBtn');
+  function showUploadFailures(failureLines, succeededSoFar) {
+    uploadStatusEl.hidden = false;
+    uploadStatusEl.innerHTML = `
+      <strong>${failureLines.length} photo${failureLines.length === 1 ? '' : 's'} failed to upload:</strong>
+      <ul style="margin:6px 0 0;padding-left:20px">${failureLines.map((l) => `<li>${escapeHtml(l)}</li>`).join('')}</ul>
+      <p class="muted" style="margin-top:8px">${succeededSoFar} photo${succeededSoFar === 1 ? '' : 's'} already uploaded successfully and won't be re-sent. Everything else on this form is unaffected — fix your connection if needed, then tap Retry.</p>`;
+    submitBtn.textContent = `Retry failed uploads (${failureLines.length})`;
+  }
+  function clearUploadFailures() {
+    uploadStatusEl.hidden = true;
+    uploadStatusEl.innerHTML = '';
+    submitBtn.textContent = 'Submit Audit';
+  }
+
   document.getElementById('auditForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -1709,7 +1768,10 @@ async function renderAudit({ id }) {
       propertiesOut[f.fieldKey] = { value: v, flagged, flagNote };
     });
 
-    const componentEvents = [];
+    // Gather what's touched first, upload second — deciding which component
+    // cards even count never depends on whether their photos happen to
+    // upload cleanly.
+    const touchedCards = [];
     for (const card of document.querySelectorAll('#componentPromptBlock [data-component]')) {
       const condition = card.querySelector('.comp-condition').value;
       const eventType = card.querySelector('.comp-event').value;
@@ -1719,31 +1781,49 @@ async function renderAudit({ id }) {
       const flagNote = flagged ? (card.querySelector('.comp-flag-note')?.value.trim() || null) : null;
       const photoFiles = [...(card.querySelector('.comp-photo')?.files || [])].filter((f) => f && f.size);
       if (!condition && !material && !notes && !flagged && !photoFiles.length) continue; // skip untouched component cards
-      const attachmentIds = [];
-      for (const file of photoFiles) attachmentIds.push(await uploadAttachmentUnlinked(file, 'components', id));
-      componentEvents.push({ componentType: card.dataset.component, eventType, condition, material, notes, flagged, flagNote, attachmentIds });
+      touchedCards.push({ componentType: card.dataset.component, eventType, condition, material, notes, flagged, flagNote, photoFiles });
     }
 
     const severity = fd.get('findingSeverity');
     const description = fd.get('findingDescription');
+    const wantsFinding = !!(severity && description);
     const findingPhotos = fd.getAll('findingPhoto').filter((f) => f && f.size);
     const generalPhotoFiles = fd.getAll('generalPhotos').filter((f) => f && f.size);
 
+    submitBtn.disabled = true;
     try {
+      // Upload phase — every section attempted, failures collected rather
+      // than thrown, so one bad file never blocks the rest of the batch and
+      // never discards the ones that already succeeded (uploadTracker).
+      const failureLines = [];
+      const componentEvents = [];
+      for (const c of touchedCards) {
+        const { attachmentIds, failures } = await uploadSectionResumable(c.photoFiles, 'components', id, `component:${c.componentType}`, uploadTracker);
+        failures.forEach((f) => failureLines.push(`${c.componentType} — ${f.name}`));
+        componentEvents.push({ componentType: c.componentType, eventType: c.eventType, condition: c.condition, material: c.material, notes: c.notes, flagged: c.flagged, flagNote: c.flagNote, attachmentIds });
+      }
       let finding = null;
-      if (severity && description) {
-        const attachmentIds = [];
-        for (const file of findingPhotos) attachmentIds.push(await uploadAttachmentUnlinked(file, 'findings', id));
+      if (wantsFinding) {
+        const { attachmentIds, failures } = await uploadSectionResumable(findingPhotos, 'findings', id, 'finding', uploadTracker);
+        failures.forEach((f) => failureLines.push(`Finding photo — ${f.name}`));
         finding = { severity, description, attachmentIds };
       }
-      const generalAttachmentIds = [];
-      for (const file of generalPhotoFiles) generalAttachmentIds.push(await uploadAttachmentUnlinked(file, 'asset-photos', id));
+      const { attachmentIds: generalAttachmentIds, failures: generalFailures } = await uploadSectionResumable(generalPhotoFiles, 'asset-photos', id, 'general', uploadTracker);
+      generalFailures.forEach((f) => failureLines.push(`General photo — ${f.name}`));
+
+      if (failureLines.length) {
+        showUploadFailures(failureLines, uploadTracker.size);
+        return; // nothing submitted yet — successful uploads are kept in uploadTracker for the next attempt
+      }
+      clearUploadFailures();
+
       await api(`/api/pg/assets/${id}/audit`, { method: 'POST', body: JSON.stringify({ properties: propertiesOut, componentEvents, finding, generalAttachmentIds }) });
       clearAuditDraft(id);
       toast('Audit submitted');
       state.stack.pop(); // drop this audit entry
       go('assetDetail', { id }, { replace: true });
     } catch (err) { toast(err.message); }
+    finally { submitBtn.disabled = false; }
   });
 }
 
