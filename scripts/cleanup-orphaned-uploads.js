@@ -71,16 +71,17 @@ async function main() {
   for (const [key, group] of groups) {
     const n = group.length;
     const plural = n === 1 ? '' : 's';
+    const was = n === 1 ? 'was' : 'were';
     let subject, note;
     if (key === 'unknown') {
       subject = 'Recovered from an abandoned upload';
-      note = `${n} photo${plural} were uploaded but never attached to anything, and the form that would have linked them was abandoned. Routed here automatically 48h+ after upload.`;
+      note = `${n} photo${plural} ${was} uploaded but never attached to anything, and the form that would have linked them was abandoned. Routed here automatically 48h+ after upload.`;
     } else {
       const [category, ownerIdStr] = key.split(':');
       const assetId = Number(ownerIdStr);
       const assetName = assetNames.get(assetId) || `asset #${assetId} (asset since deleted)`;
       subject = `Recovered from an abandoned audit — ${assetName}`;
-      note = `${n} photo${plural} (${ASSET_CATEGORY_LABELS[category]}) were uploaded during an audit walkthrough for "${assetName}" but the walkthrough was never submitted. Routed here automatically 48h+ after upload.`;
+      note = `${n} photo${plural} (${ASSET_CATEGORY_LABELS[category]}) ${was} uploaded during an audit walkthrough for "${assetName}" but the walkthrough was never submitted. Routed here automatically 48h+ after upload.`;
     }
     await createInboxBatchForAttachments({ subject, note, attachmentIds: group.map((a) => a.Id) });
     batchCount += 1;
