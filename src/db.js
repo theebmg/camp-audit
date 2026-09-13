@@ -3204,17 +3204,44 @@ export async function findOrphanedUploadAttachments({ olderThanHours = 48 } = {}
   return rows.map((r) => ({ Id: r.id, Url: r.url, ThumbUrl: r.thumb_url, OriginalFilename: r.original_filename, CreatedAt: r.created_at }));
 }
 
-// Hard delete — the DB half of cleanup; the caller (the cleanup script)
-// deletes the matching Spaces objects first via storage.js, then calls this
-// with the same id list. No soft-delete/void step here: these rows were
-// never visible to anyone (zero links, never triaged) and Part A's "storage
-// is pennies, no reaper" stance is specifically about NOT hard-deleting
-// deliberately-voided content — this is the opposite case, rows nobody ever
-// saw and nothing will ever reference.
-export async function deleteAttachmentsByIds(ids) {
-  if (!ids.length) return 0;
-  const { rowCount } = await pool.query(`DELETE FROM attachments WHERE id = ANY($1::int[])`, [ids]);
-  return rowCount;
+// Routes orphaned uploads into the triage inbox instead of deleting them
+// (2026-09-13, superseding the hard-delete this originally shipped with):
+// an orphaned audit photo was taken standing in a building, and re-shooting
+// it means driving back out there, so silently destroying the file is the
+// wrong default for something this expensive to replace. An unlinked upload
+// past the age floor is functionally the same as a photo emailed in with no
+// job attached yet — Part A's "storage is pennies, no reaper" stance already
+// covers not second-guessing that kind of thing — so it gets the same
+// treatment: one attachment_batches row (source='upload') so it renders on
+// the same inbox screen, with the same actions, as anything Mailgun delivers.
+export async function createInboxBatchForAttachments({ subject, note, attachmentIds }) {
+  if (!attachmentIds.length) return null;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO attachment_batches (source, subject, note, received_at) VALUES ('upload', $1, $2, now()) RETURNING id`,
+      [subject, note]
+    );
+    const batchId = rows[0].id;
+    await client.query(`UPDATE attachments SET batch_id = $1, triage_status = 'inbox' WHERE id = ANY($2::int[])`, [batchId, attachmentIds]);
+    await client.query('COMMIT');
+    return batchId;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Best-effort asset-name lookup for the cleanup job's inbox subject lines —
+// looked up in bulk rather than per-orphan since a night's worth of orphans
+// commonly share an asset.
+export async function getAssetNamesByIds(ids) {
+  if (!ids.length) return new Map();
+  const { rows } = await pool.query('SELECT id, name FROM assets WHERE id = ANY($1::int[])', [ids]);
+  return new Map(rows.map((r) => [r.id, r.name]));
 }
 
 export async function linkAttachment(attachmentId, { entityType, entityId, roleId = null, classification = null, caption = null, includeInReport = null, sortOrder = 0, vendorId = null, quotedAmount = null, quoteDate = null, isSelectedQuote = false }, client = pool) {
@@ -3756,7 +3783,7 @@ export async function getExpensesReportRawData() {
 
 export async function listInboxBatches() {
   const { rows } = await pool.query(`
-    SELECT b.id, b.subject, b.body_text, b.sender_email, b.received_at,
+    SELECT b.id, b.subject, b.body_text, b.sender_email, b.received_at, b.note,
            json_agg(json_build_object(
              'Id', a.id, 'Url', a.url, 'ThumbUrl', a.thumb_url, 'Kind', a.kind,
              'Width', a.width, 'Height', a.height, 'TakenAt', a.taken_at,
@@ -3767,7 +3794,7 @@ export async function listInboxBatches() {
     GROUP BY b.id
     ORDER BY b.received_at DESC`
   );
-  return rows.map((r) => ({ Id: r.id, Subject: r.subject, BodyText: r.body_text, SenderEmail: r.sender_email, ReceivedAt: r.received_at, Attachments: r.attachments }));
+  return rows.map((r) => ({ Id: r.id, Subject: r.subject, BodyText: r.body_text, SenderEmail: r.sender_email, ReceivedAt: r.received_at, Note: r.note, Attachments: r.attachments }));
 }
 
 // Dashboard badge (§5.3) — "the failure mode is a junk drawer of 400

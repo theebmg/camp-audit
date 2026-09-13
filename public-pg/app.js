@@ -3234,6 +3234,7 @@ async function renderInbox() {
     <div class="card inbox-batch" data-batch-id="${b.Id}">
       <h3>${escapeHtml(b.Subject || '(no subject)')}</h3>
       <p class="muted">${b.SenderEmail ? escapeHtml(b.SenderEmail) + ' · ' : ''}${new Date(b.ReceivedAt).toLocaleString()} · ${b.Attachments.length} photo${b.Attachments.length === 1 ? '' : 's'}</p>
+      ${b.Note ? `<p class="muted" style="font-size:0.85rem">${escapeHtml(b.Note)}</p>` : ''}
       ${clusters.length ? `<div class="btn-row" style="margin-bottom:8px">${clusters.map((c, i) => `<button type="button" class="btn btn-secondary cluster-select" data-ids="${c.map((a) => a.Id).join(',')}">Select cluster ${i + 1} (${c.length}, ~${Math.round((new Date(c[c.length - 1].TakenAt) - new Date(c[0].TakenAt)) / 60000)}min)</button>`).join('')}</div>` : ''}
       <div class="attach-grid" style="display:flex;flex-wrap:wrap;gap:8px">
         ${b.Attachments.map((a) => `
@@ -7218,6 +7219,15 @@ async function renderWorkOrderDetail({ id }, container = app) {
 
     card.querySelector('.jl-edit-form').addEventListener('submit', async (e) => {
       e.preventDefault();
+      const newActualCost = card.querySelector('.jl-e-act-cost').value;
+      const origActualCost = jl.ActualCost != null ? String(jl.ActualCost) : '';
+      if (jl.LinkedExpenseCount && newActualCost.trim() !== '' && newActualCost !== origActualCost) {
+        const ok = await confirmDialog(
+          `This line already has ${jl.LinkedExpenseCount} linked expense${jl.LinkedExpenseCount === 1 ? '' : 's'} totaling $${jl.LinkedExpenseTotal.toLocaleString()} — manual cost is added on top, not instead. Continue?`,
+          { confirmLabel: 'Continue', danger: false },
+        );
+        if (!ok) return;
+      }
       const causeIds = [...card.querySelectorAll('.jl-e-cause:checked')].map((cb) => Number(cb.value));
       try {
         await api(`/api/pg/job-lines/${jlId}`, { method: 'PATCH', body: JSON.stringify({

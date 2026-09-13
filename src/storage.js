@@ -9,7 +9,7 @@
 // the S3 call — resize, thumbnail, and EXIF extraction are part of turning an
 // uploaded buffer into a storable attachment, and nothing else in the
 // codebase may know these details either.
-import { S3Client, PutObjectCommand, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import crypto from 'crypto';
 import sharp from 'sharp';
 import exifr from 'exifr';
@@ -76,24 +76,18 @@ function keyFromUrl(url) {
   return url.startsWith(prefix) ? url.slice(prefix.length) : null;
 }
 
-// Deletes a batch of objects by their public URLs (both url and thumb_url
-// for however many attachments are being purged) — used by the orphaned-
-// upload cleanup job (scripts/cleanup-orphaned-uploads.js). S3's
-// DeleteObjects caps at 1000 keys per request, comfortably above anything
-// this job will ever see in one run. Silently skips any url that doesn't
-// match this bucket's own URL shape (defensive — never sends a malformed or
-// foreign key to a delete call).
-export async function deleteObjectsByUrls(urls) {
-  const keys = [...new Set(urls.filter(Boolean).map(keyFromUrl).filter(Boolean))];
-  if (!keys.length) return { deleted: 0 };
-  for (let i = 0; i < keys.length; i += 1000) {
-    const batch = keys.slice(i, i + 1000);
-    await s3.send(new DeleteObjectsCommand({
-      Bucket: bucket,
-      Delete: { Objects: batch.map((Key) => ({ Key })), Quiet: true },
-    }));
-  }
-  return { deleted: keys.length };
+// Recovers the (category, ownerId) a stored url was uploaded under — the
+// exact inverse of keyFor's `category/ownerId/filename` layout. Used by the
+// orphaned-upload cleanup job (scripts/cleanup-orphaned-uploads.js) to
+// recover which asset an abandoned audit/notes upload belonged to, so the
+// photo can be routed into the triage inbox with real context instead of a
+// bare "unknown source." Returns null for anything that doesn't match this
+// bucket's own URL shape.
+export function parseCategoryOwnerFromUrl(url) {
+  const key = keyFromUrl(url);
+  if (!key) return null;
+  const [category, ownerId] = key.split('/');
+  return category && ownerId ? { category, ownerId } : null;
 }
 
 // Reads EXIF from the ORIGINAL buffer, before any resize strips it.
