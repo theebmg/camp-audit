@@ -15,7 +15,7 @@
 // breaks mid-cutover or if a route ever points here directly again; it just
 // delegates the actual processing to the same exported function.
 import express from 'express';
-import { findAttachmentBatchByMessageId, findWorkOrderIdByNumber, createMailInboundBatch } from '../db.js';
+import { findAttachmentBatchByMessageId, findWorkOrderIdByNumber, createMailInboundBatch, recordSystemHealthSuccess } from '../db.js';
 import { storeAttachment } from '../storage.js';
 import {
   mailParsers, isJunkImage, verifySignatureDetailed, extractHeader, extractEmailAddress, extractInlineFieldNames, logInboundHit,
@@ -91,8 +91,15 @@ export async function ingestPhotoMail(req, messageId) {
     subject, bodyText, bodyHtml, senderEmail, messageId, receivedAt, spfResult, dkimResult,
     attachments: uploaded, targetWorkOrderId,
   });
-  if (batchId === null) return { ok: true }; // raced with another retry — already created, nothing to do
+  // System health (Build Brief v4 Part 2): a batch landing at all — new or a
+  // duplicate retry of one already ingested — means the ingest path itself
+  // is working, which is the only thing this signal is meant to answer.
+  if (batchId === null) {
+    await recordSystemHealthSuccess('mail_ingest', 'duplicate retry — already ingested');
+    return { ok: true }; // raced with another retry — already created, nothing to do
+  }
 
+  await recordSystemHealthSuccess('mail_ingest', `photo batch #${batchId}, ${uploaded.length} photo(s)`);
   return { ok: true, batchId, attachmentCount: uploaded.length };
 }
 

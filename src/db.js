@@ -3804,29 +3804,57 @@ export async function getInboxCount() {
   return Number(rows[0].count);
 }
 
-// Backup status (B6 fix, 2026-09-12): "last successful backup" and "did the
-// most recent run fail" are deliberately two different questions — a run
-// can fail tonight while last night's backup is still fine, and the
-// dashboard should say so precisely rather than just "backups: bad."
-// Staleness is measured off the last SUCCESS, not the last attempt, since a
-// string of failures with an old-but-real backup underneath is a different
-// (also-bad, but differently bad) situation than never having backed up at
-// all — LastSuccessAt being null covers that second case on its own.
-export async function getBackupStatus() {
-  const [{ rows: latestRows }, { rows: lastOkRows }] = await Promise.all([
-    pool.query(`SELECT * FROM backup_runs ORDER BY finished_at DESC LIMIT 1`),
-    pool.query(`SELECT * FROM backup_runs WHERE status = 'ok' ORDER BY finished_at DESC LIMIT 1`),
-  ]);
-  const latest = latestRows[0] || null;
-  const lastOk = lastOkRows[0] || null;
-  const hoursSinceSuccess = lastOk ? (Date.now() - new Date(lastOk.finished_at).getTime()) / 3600000 : null;
-  return {
-    LastRunFailed: latest?.status === 'failed',
-    LatestDetail: latest?.detail || null,
-    LatestFinishedAt: latest?.finished_at || null,
-    LastSuccessAt: lastOk?.finished_at || null,
-    Stale: hoursSinceSuccess == null || hoursSinceSuccess > 48,
-  };
+// ── System health (Build Brief v4 Part 2) — one shared table so backups,
+//    calendar sync, and mail ingest (and whatever integration comes after
+//    those) all report through the same mechanism instead of each growing
+//    its own bespoke status table the way backup_runs originally did.
+//    backup_runs itself stays as the detailed per-run log (started/finished/
+//    detail for every single run) — this table is only ever the current
+//    at-a-glance read per subsystem, one row each, overwritten in place.
+//
+//    last_success and last_failure are tracked separately (never collapsed
+//    into one "last run" field) for the same reason the old backup-specific
+//    status check already got right: a failure tonight must not erase that
+//    last night succeeded. ─────────────────────────────────────────────────
+
+// Only a subsystem with a genuine expected cadence gets judged for
+// staleness. Backups are the one instance of that today (B6's original
+// >48h threshold, carried over unchanged). Mail ingest deliberately has no
+// cadence — "no mail for a week is normal" (Build Brief v4 §2.2) — and must
+// never be flagged by this; gcal_sync isn't given a cadence here either
+// until Part 1's sync worker actually exists and its own failure signal
+// (repeated failure / dead token) makes a separate staleness check
+// unnecessary for it.
+const STALE_AFTER_HOURS = { backup: 48 };
+
+export async function getSystemHealth() {
+  const { rows } = await pool.query('SELECT * FROM system_health ORDER BY subsystem');
+  return rows.map((r) => {
+    const staleAfterHours = STALE_AFTER_HOURS[r.subsystem];
+    const hoursSinceSuccess = r.last_success ? (Date.now() - new Date(r.last_success).getTime()) / 3600000 : null;
+    const stale = staleAfterHours != null && (hoursSinceSuccess == null || hoursSinceSuccess > staleAfterHours);
+    return {
+      Subsystem: r.subsystem, LastSuccess: r.last_success, LastFailure: r.last_failure,
+      LastMessage: r.last_message, State: r.state, UpdatedAt: r.updated_at, Stale: stale,
+    };
+  });
+}
+
+// The two write paths every subsystem funnels through. Kept as plain
+// UPDATEs (not upserts) — the three subsystem rows are seeded by migration
+// 0057, so a typo'd subsystem name here is a bug worth surfacing as "zero
+// rows updated" rather than silently creating a fourth row nothing reads.
+export async function recordSystemHealthSuccess(subsystem, message = null) {
+  await pool.query(
+    `UPDATE system_health SET last_success = now(), last_message = $2, state = 'ok', updated_at = now() WHERE subsystem = $1`,
+    [subsystem, message]
+  );
+}
+export async function recordSystemHealthFailure(subsystem, message = null) {
+  await pool.query(
+    `UPDATE system_health SET last_failure = now(), last_message = $2, state = 'failed', updated_at = now() WHERE subsystem = $1`,
+    [subsystem, message]
+  );
 }
 
 // Fuzzy asset-name match for a batch's subject/body (§5.2) — plain word

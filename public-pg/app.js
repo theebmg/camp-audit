@@ -751,6 +751,8 @@ function isoDate(d) {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+const SUBSYSTEM_LABELS = { backup: 'Backup', gcal_sync: 'Calendar sync', mail_ingest: 'Mail ingest' };
+
 async function renderDashboard() {
   setChrome({ title: 'Dashboard', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
@@ -766,7 +768,7 @@ async function renderDashboard() {
   let selectedWeekDate = isoDate(today);
   const weekOccByDay = new Map();
 
-  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary, inboxRes, expenseInboxRes, fundBalancesRes, backupStatus] = await Promise.all([
+  const [woSummary, calRes, scheduledWoRes, activityRes, findingsSummary, inboxRes, expenseInboxRes, fundBalancesRes, systemHealthRes] = await Promise.all([
     prefs.woOverview ? api('/api/pg/dashboard/wo-summary') : Promise.resolve(null),
     prefs.calendar ? api(`/api/pg/calendar-events?from=${isoDate(weekStart)}&to=${isoDate(weekEnd)}`) : Promise.resolve(null),
     prefs.calendar ? api('/api/pg/work-orders') : Promise.resolve(null),
@@ -775,7 +777,7 @@ async function renderDashboard() {
     api('/api/pg/inbox/count'),
     api('/api/pg/expenses/inbox/count'),
     api('/api/pg/funds/balances'),
-    api('/api/pg/backup-status').catch(() => null), // never let a backup-status hiccup block the rest of the dashboard from loading
+    api('/api/pg/system-health').catch(() => null), // never let a health-check hiccup block the rest of the dashboard from loading
   ]);
 
   // Build Brief v3 §3.4 — per active fund, "$X of $Y remaining · N days
@@ -913,25 +915,43 @@ async function renderDashboard() {
     </div>`;
   }
 
-  // "Last successful backup" and "did the most recent run fail" are shown
-  // separately (B6 fix, 2026-09-12) — a run can fail tonight while last
-  // night's backup is still perfectly fine, and collapsing that into one
-  // bad/good signal would hide which situation you're actually in. Quiet
-  // (a plain line, no card chrome) when healthy; a warning card, same
-  // treatment as an over-budget fund, when the last run failed or the last
-  // success is more than 48 hours old.
-  function backupStatusHtml() {
-    if (!backupStatus) return ''; // request failed — don't let a broken status check itself cry wolf
-    const { LastRunFailed, LatestDetail, LastSuccessAt, Stale } = backupStatus;
-    const bad = LastRunFailed || Stale;
-    const whenText = LastSuccessAt ? new Date(LastSuccessAt).toLocaleString() : 'never';
-    if (!bad) return `<p class="muted" style="margin:-4px 0 0">💾 Last backup: ${escapeHtml(whenText)}</p>`;
-    return `<div class="card" style="border-left:4px solid #c0392b;background:#c0392b0d">
-      <h3 style="color:#c0392b">⚠️ Backup needs attention</h3>
-      <p class="muted" style="margin-top:-4px">Last successful backup: ${escapeHtml(whenText)}</p>
-      ${LastRunFailed ? `<p style="margin-top:6px">Most recent run failed${LatestDetail ? `: ${escapeHtml(LatestDetail)}` : ''}.</p>` : ''}
-      ${!LastRunFailed && Stale ? `<p style="margin-top:6px">No successful backup in over 48 hours.</p>` : ''}
-    </div>`;
+  // System health (Build Brief v4 Part 2, generalizing the B6 backup-only
+  // check, 2026-09-12): "last success" and "did the most recent attempt
+  // fail" are shown separately for every subsystem — a run can fail tonight
+  // while last night's was still fine, and collapsing that into one
+  // bad/good signal would hide which situation you're actually in.
+  //
+  // Backup keeps its own quiet line (no card chrome) when healthy — it's
+  // the one subsystem with a "last success" timestamp worth showing even
+  // when nothing is wrong. Any subsystem actually reporting `failed` (gcal
+  // sync, mail ingest, backup, or whatever gets added after those) gets the
+  // same warning-card treatment automatically — no per-integration
+  // dashboard work needed when the other two start reporting for real.
+  function systemHealthHtml() {
+    if (!systemHealthRes) return ''; // request failed — don't let a broken health check itself cry wolf
+    const subsystems = systemHealthRes.subsystems || [];
+    const backup = subsystems.find((s) => s.Subsystem === 'backup');
+    const others = subsystems.filter((s) => s.Subsystem !== 'backup' && s.State === 'failed');
+
+    let html = '';
+    if (backup) {
+      const bad = backup.State === 'failed' || backup.Stale;
+      const whenText = backup.LastSuccess ? new Date(backup.LastSuccess).toLocaleString() : 'never';
+      html += !bad
+        ? `<p class="muted" style="margin:-4px 0 0">💾 Last backup: ${escapeHtml(whenText)}</p>`
+        : `<div class="card" style="border-left:4px solid #c0392b;background:#c0392b0d">
+            <h3 style="color:#c0392b">⚠️ Backup needs attention</h3>
+            <p class="muted" style="margin-top:-4px">Last successful backup: ${escapeHtml(whenText)}</p>
+            ${backup.State === 'failed' ? `<p style="margin-top:6px">Most recent run failed${backup.LastMessage ? `: ${escapeHtml(backup.LastMessage)}` : ''}.</p>` : ''}
+            ${backup.State !== 'failed' && backup.Stale ? `<p style="margin-top:6px">No successful backup in over 48 hours.</p>` : ''}
+          </div>`;
+    }
+    html += others.map((s) => `
+      <div class="card" style="border-left:4px solid #c0392b;background:#c0392b0d">
+        <h3 style="color:#c0392b">⚠️ ${escapeHtml(SUBSYSTEM_LABELS[s.Subsystem] || s.Subsystem)} needs attention</h3>
+        ${s.LastMessage ? `<p style="margin-top:-4px">${escapeHtml(s.LastMessage)}</p>` : ''}
+      </div>`).join('');
+    return html;
   }
 
   function draw() {
@@ -956,7 +976,7 @@ async function renderDashboard() {
           </div>
         </details>
       </div>
-      ${backupStatusHtml()}
+      ${systemHealthHtml()}
       ${fundBalancesHtml()}
       ${woOverviewHtml()}
       ${findingsSummaryHtml()}

@@ -19,7 +19,7 @@
 // to arrive inline (iOS Mail/Gmail choose this on their own), and PDFs
 // (non-image, no resize) are a common shape for emailed receipts.
 import express from 'express';
-import { findAttachmentBatchByMessageId, createReceiptInboundBatch } from '../db.js';
+import { findAttachmentBatchByMessageId, createReceiptInboundBatch, recordSystemHealthSuccess } from '../db.js';
 import { storeAttachment } from '../storage.js';
 import { parseReceiptEmail } from '../expenseParsing.js';
 import { renderEmailReceiptPdf } from '../pdf.js';
@@ -90,8 +90,15 @@ export async function ingestReceiptMail(req, messageId) {
   const result = await createReceiptInboundBatch({
     subject, bodyText, bodyHtml, senderEmail, messageId, receivedAt, spfResult, dkimResult, attachments: uploaded, parsed,
   });
-  if (result === null) return { ok: true }; // raced with another retry — already created, nothing to do
+  // System health (Build Brief v4 Part 2): a batch landing at all — new or a
+  // duplicate retry of one already ingested — means the ingest path itself
+  // is working, which is the only thing this signal is meant to answer.
+  if (result === null) {
+    await recordSystemHealthSuccess('mail_ingest', 'duplicate retry — already ingested');
+    return { ok: true }; // raced with another retry — already created, nothing to do
+  }
 
+  await recordSystemHealthSuccess('mail_ingest', `receipt batch #${result.batchId}, ${uploaded.length} file(s)`);
   return { ok: true, ...result, attachmentCount: uploaded.length };
 }
 

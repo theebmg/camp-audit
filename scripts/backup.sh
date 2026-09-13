@@ -51,21 +51,30 @@ START_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 # stdout now; the crontab redirect is the ONE place persistence happens.
 log() { echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') $1"; }
 
-# Records one row in `backup_runs` per run — db.js's getBackupStatus reads
-# it for the dashboard warning (2026-09-12 pre-live audit, B6). Same
-# trust-auth path already used for pg_dump below, no new credentials.
-# Failing to record a status row is logged but never fails the backup
-# itself: a missed dashboard update is a much smaller problem than treating
-# a real, successful backup as a failure. Piped over stdin (`-i`, a heredoc)
-# rather than `-c`: psql's `:'var'` interpolation is only applied to script
-# input (stdin/-f), NOT to a -c argument, in this psql version — confirmed
-# by hand before landing this, `-c` silently sent the literal text `:'var'`
-# to the server as a syntax error.
+# Records one row in `backup_runs` per run, AND updates this subsystem's
+# current-state row in `system_health` (Build Brief v4 Part 2, 2026-09-13) —
+# db.js's getSystemHealth reads the latter for the dashboard warning; the
+# former stays the detailed per-run log system_health doesn't try to be.
+# Same trust-auth path already used for pg_dump below, no new credentials.
+# Failing to record either row is logged but never fails the backup itself:
+# a missed dashboard update is a much smaller problem than treating a real,
+# successful backup as a failure. Piped over stdin (`-i`, a heredoc) rather
+# than `-c`: psql's `:'var'` interpolation is only applied to script input
+# (stdin/-f), NOT to a -c argument, in this psql version — confirmed by hand
+# before landing this, `-c` silently sent the literal text `:'var'` to the
+# server as a syntax error.
 record_backup_run() {
   local status="$1" detail="$2"
   docker exec -i "$DB_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 \
-    -v started="$START_TIME" -v status="$status" -v detail="$detail" >/dev/null 2>&1 <<'SQL' || log "WARNING failed to record backup_runs status row (non-fatal)"
+    -v started="$START_TIME" -v status="$status" -v detail="$detail" >/dev/null 2>&1 <<'SQL' || log "WARNING failed to record backup_runs/system_health status row (non-fatal)"
 INSERT INTO backup_runs (started_at, finished_at, status, detail) VALUES (:'started', now(), :'status', :'detail');
+UPDATE system_health SET
+  last_success = CASE WHEN :'status' = 'ok' THEN now() ELSE last_success END,
+  last_failure = CASE WHEN :'status' = 'failed' THEN now() ELSE last_failure END,
+  last_message = :'detail',
+  state = CASE WHEN :'status' = 'ok' THEN 'ok' ELSE 'failed' END,
+  updated_at = now()
+WHERE subsystem = 'backup';
 SQL
 }
 
