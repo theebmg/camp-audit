@@ -1,3 +1,80 @@
+# Runbook: Build Brief v4 Parts 1–2 — System Health, Google Calendar OAuth, schedule times & event types (2026-09-13/14)
+
+Build order was: (1) system_health + dashboard panel + backup integration,
+(2) OAuth flow + admin connection screen, then two additions Ben asked for
+before step 3 (outbound sync) starts. Step 3 itself — the sync queue,
+worker, event create/update/delete, and per-event color mapping
+(gcal_event_colors) — is NOT built yet.
+
+**System health** (migration 0057): `system_health` table, one row per
+subsystem (`backup`, `gcal_sync`, `mail_ingest`), replacing the backup-only
+check from the pre-live audit's B6 fix. `getSystemHealth()`/
+`recordSystemHealthSuccess`/`recordSystemHealthFailure` in db.js are the
+shared read/write path — `backup.sh` writes both `backup_runs` (detailed
+per-run log, kept) and `system_health` now; mail-inbound.js/receipt-
+inbound.js record `mail_ingest` success on any landed batch. Dashboard
+panel is generic: backup keeps its quiet "Last backup: …" line, any *other*
+subsystem reporting `failed` gets a warning card automatically, no
+per-integration UI work needed. `gcal_sync` stays `unknown` (silent) until
+step 3's worker exists to report into it.
+
+**Google Calendar OAuth** (migrations 0058–0059; `src/gcal.js`;
+`src/routes/gcal-oauth-callback.js`; Admin > Integrations > Google Calendar
+Sync): `gcal.js` is the only module that talks to Google's OAuth/Calendar
+REST endpoints (raw `fetch`, no SDK — same style as `mailer.js`'s Gmail
+OAuth2). `gcal_connection` is a singleton row (refresh_token, google_email,
+calendar_id, calendar_summary) — same pattern as `display_settings`.
+
+Two live fixes worth knowing if this breaks again:
+- **Scopes**: `calendar.events` alone 403s on anything calendar-metadata
+  (get account email, list calendars, create a calendar) — those need
+  `calendar.calendarlist` + `calendar.calendars` too. All three are
+  requested together now.
+- **Calendar picker misses shared calendars**: Google's `calendarList.list`
+  omits `hidden` entries by default, and a calendar someone just shared
+  with you starts out hidden until manually toggled visible in Google's own
+  UI. Fixed with `showHidden=true&minAccessRole=writer` on that call.
+
+Calendar selection is deliberately a separate post-connect step, not
+automatic during the OAuth callback (Ben already had a calendar — "Sychar
+Events" — made directly in the camp's Google account and shared to his
+own, rather than wanting a fresh auto-created "Camp Work" one every time).
+The picker lists every calendar the connected account can write to, plus a
+"+ Create a new 'Camp Work' calendar" option.
+
+Also added: `public-pg/privacy.html` and `terms.html` (Google's consent
+screen links to these), linked from the sidebar footer.
+
+**Schedule times & event types, added before step 3** (migrations
+0060–0061): `job_lines.scheduled_start_time` + `scheduled_duration_hours`
+(both nullable, travel together — blank stays an all-day sync event,
+both-set syncs timed; duration not end_time, to match the table's existing
+hours-based fields). `calendar_event_types` (admin-editable: name,
+sort_order, `gcal_color_id`, active; seeded with Constituent Visitation /
+Volunteer Workday / Group Rental / Board Meeting / Camp Session / Other) —
+new Admin > System > Calendar Event Types screen. `calendar_events` got
+`type_id` (NOT NULL, backfilled to 'Other'), `start_time`, `end_time`, and
+`end_date` for multi-day span (a rental running Friday–Sunday).
+`expandRecurrence` in db.js now matches the whole `[start, start+span]`
+window against the query range, not just the start date, so a multi-day
+event starting in one month but running into the next still appears; the
+frontend places the same occurrence on every day it spans. Google's
+11-color event palette (`GOOGLE_EVENT_COLORS` in app.js) is hardcoded as a
+stable external platform constant — what's admin-editable is which of
+those 11 each type maps to. The actual title-prefixing on the synced
+Google event and reading `gcal_color_id` for the 'calendar_event' kind are
+step 3's job once the sync worker exists.
+
+**Bug found and fixed along the way** (unrelated to the above, found while
+smoke-testing): `renderWorkOrderDetail` in app.js referenced
+`jobLineStatuses` before its `const` declaration a few lines later —
+invisible for as long as production had zero job lines anywhere (`.map()`
+never invokes its callback on an empty array), but a live
+"Cannot access 'jobLineStatuses' before initialization" the moment any
+work order gets its first job line. Fixed by reordering the declarations.
+
+---
+
 # Follow-up: Mailgun free-tier route consolidation (same day as Build Brief v3)
 
 Ben's Mailgun account is on the free tier, which allows only one inbound

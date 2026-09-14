@@ -83,7 +83,9 @@ For each line, set:
   Fund, or Other (and which specific campaign/holder/fund/category)
 - **Estimated hours/cost**, and a scheduled date (defaults to the work
   order's date, but you can move one line independently — the vendor comes
-  Tuesday, the volunteers come Saturday)
+  Tuesday, the volunteers come Saturday). A start time and duration are
+  optional — leave them blank for an all-day entry ("sometime Tuesday" is a
+  real answer), or set both if it's an actual appointment.
 
 **Actual Cost** on a job line is two things added together: whatever you
 type into the field directly (for a vendor invoice paid straight by camp, or
@@ -279,5 +281,17 @@ editable — no developer needed to add a new one. Under **Admin**:
 - **Map GPS Calibration** — a one-time setup (3 reference points) that lets
   the Inbox suggest "which asset is this photo probably of" based on where
   it was taken.
+- **Calendar Event Types** — what a calendar event IS (Constituent
+  Visitation, Volunteer Workday, Group Rental, Board Meeting, Camp Session,
+  or Other), and which Google Calendar color each one gets once sync is
+  turned on.
 - **Users** — who can log in and whether they're an admin.
 - **Activity Log** — a running record of everything anyone's done.
+
+Under **Integrations**:
+
+- **Google Calendar Sync** — connect a Google account and pick which
+  calendar scheduled work and calendar events get mirrored to (an existing
+  calendar you can already edit, or a new one created on request). The
+  CMMS owns the data here — anything edited or moved directly in Google
+  gets overwritten the next time it syncs, by design.
