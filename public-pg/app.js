@@ -7264,11 +7264,17 @@ async function renderWorkOrderDetail({ id }, container = app) {
   state._allVolunteers = allVolunteers.volunteers;
   state._allVendors = allVendors.vendors;
 
-  const jobLineRows = jobLines.map((jl) => jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses })).join('')
-    || '<p class="muted">No job lines yet — add the scope of work below.</p>';
-
   const workOrderStatuses = state.options.workOrderStatuses; // admin-editable (2.2) — never hardcode this list
   const jobLineStatuses = state.options.jobLineStatuses; // admin-editable (2.1)
+
+  // jobLineStatuses must be declared above this — jobLineCardHtml reads it
+  // immediately, and .map()'s callback only skips evaluating it when
+  // jobLines is empty, which is exactly why this latent TDZ bug (declared
+  // below its use) stayed invisible until a work order actually had a job
+  // line on it. Found live, 2026-09-14, while smoke-testing this file's own
+  // schedule-time fields.
+  const jobLineRows = jobLines.map((jl) => jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses })).join('')
+    || '<p class="muted">No job lines yet — add the scope of work below.</p>';
   const logRows = logEntries.map((e) => `
     <div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start">
       <div style="flex:1;min-width:200px">
