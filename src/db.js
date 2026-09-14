@@ -585,6 +585,17 @@ const JOB_LINE_EXPENSE_COST_SQL = `
 const JOB_LINE_ACTUAL_COST_EXPR = `(CASE WHEN jl.actual_cost IS NULL AND ec.expense_cost IS NULL THEN NULL
     ELSE COALESCE(jl.actual_cost,0) + COALESCE(ec.expense_cost,0) END)`;
 
+// A job line's contribution to a forward-looking budget total: $0 once the
+// LINE itself (not its work order — a WO can stay open with other lines
+// still going while this one is long since decided) reaches a terminal
+// status that isn't counts_as_work_performed (Not Needed/Cancelled — nothing
+// was spent and nothing remains owed), otherwise its realized actual cost
+// (manual + linked expenses) if known, else its estimate (not yet realized,
+// still pending). Requires job_line_statuses joined as `jls` alongside
+// whatever JOB_LINE_ACTUAL_COST_EXPR itself requires (`ec`).
+const JOB_LINE_COMMITTED_COST_EXPR = `(CASE WHEN jls.is_terminal AND NOT jls.counts_as_work_performed THEN 0
+    ELSE COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0) END)`;
+
 // Shared rollup subquery: every work order's job lines summed into one row
 // (hours/cost totals, line count, earliest scheduled date, distinct
 // responsibility classes present). Embedded via LEFT JOIN everywhere a list
@@ -1231,16 +1242,23 @@ export async function deleteCabinHolder(id) {
 export async function getBudgetOverview() {
   const settings = await getBudgetSettings();
 
-  // Cost per job line is COALESCE(actual_cost, estimated_cost) — same rule
-  // as everywhere else (see this section's header comment). Grouping by job
-  // line, not work order, is the point of Phase 1: one WO can have lines
-  // against three different funding sources.
+  // Cost per job line is JOB_LINE_COMMITTED_COST_EXPR — same rule as
+  // everywhere else (see its header comment). Grouping by job line, not
+  // work order, is the point of Phase 1: one WO can have lines against
+  // three different funding sources, and — the bug this used to have — a
+  // line's own done/not-done state is not its work order's: a WO can stay
+  // open (other lines still going) long after one particular line finished,
+  // and this used to key pending-vs-done off ws.is_terminal (the WORK
+  // ORDER's status) instead of jls.is_terminal (the LINE's own status),
+  // so a completed line sitting in a still-open WO was counted as pending
+  // spend that hadn't happened yet, and a Not Needed/Cancelled line's
+  // estimate was counted as spend at all.
   const opRes = await pool.query(`
-    SELECT jl.id, ws.name AS status, ws.is_terminal, COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0) AS cost
+    SELECT jl.id, jls.name AS status, jls.is_terminal, ${JOB_LINE_COMMITTED_COST_EXPR} AS cost
     FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
-    JOIN work_order_statuses ws ON ws.id = w.status_id
+    JOIN job_line_statuses jls ON jls.id = jl.status_id
     LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
-    WHERE jl.funding_source = 'operating_budget' AND COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0) > 0
+    WHERE jl.funding_source = 'operating_budget' AND ${JOB_LINE_COMMITTED_COST_EXPR} > 0
   `);
   const pendingOpCost = opRes.rows.filter((r) => !r.is_terminal).reduce((s, r) => s + Number(r.cost), 0);
   const totalOpCost = opRes.rows.reduce((s, r) => s + Number(r.cost), 0);
@@ -1248,10 +1266,10 @@ export async function getBudgetOverview() {
   async function itemizedGroups(fundingSource, entities) {
     const lineRes = await pool.query(
       `SELECT jl.id AS job_line_id, jl.title AS job_line_title, jl.funding_ref_id,
-              w.id AS work_order_id, w.title AS wo_title, ws.name AS status,
-              COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost, 0) AS cost
+              w.id AS work_order_id, w.title AS wo_title, jls.name AS status,
+              ${JOB_LINE_COMMITTED_COST_EXPR} AS cost
        FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
-       JOIN work_order_statuses ws ON ws.id = w.status_id
+       JOIN job_line_statuses jls ON jls.id = jl.status_id
        LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
        WHERE jl.funding_source = $1`,
       [fundingSource]
@@ -4082,13 +4100,22 @@ export async function getWorkOrderFamily(woId) {
     actualHours += rollup.ActualHours;
   }
   // TotalCost is the single blended figure the Family panel shows — same
-  // actual-or-estimated-per-line convention as getBudgetOverview (see its
+  // JOB_LINE_COMMITTED_COST_EXPR convention as getBudgetOverview (see its
   // header comment), computed directly from job_lines so a WO with a mix of
   // actualed and not-yet-actualed lines contributes both correctly instead
-  // of the all-or-nothing WO-level fallback above.
+  // of the all-or-nothing WO-level fallback above. This used to hand-roll
+  // COALESCE(jl.actual_cost, jl.estimated_cost, 0) here instead of reusing
+  // the shared expression, which silently dropped every linked-expense cost
+  // (a line paid for entirely through a linked expense, with no manual
+  // actual_cost typed in, read as if nothing had been spent and fell back to
+  // its estimate) and still counted a Not Needed/Cancelled line's estimate
+  // as real spend.
   const { rows: costRows } = await pool.query(
-    `SELECT COALESCE(SUM(COALESCE(jl.actual_cost, jl.estimated_cost, 0)), 0) AS cost
-     FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id WHERE w.split_root_id = $1`,
+    `SELECT COALESCE(SUM(${JOB_LINE_COMMITTED_COST_EXPR}), 0) AS cost
+     FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
+     JOIN job_line_statuses jls ON jls.id = jl.status_id
+     LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+     WHERE w.split_root_id = $1`,
     [rootId]
   );
   return {
