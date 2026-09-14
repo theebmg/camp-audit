@@ -43,19 +43,24 @@
 
       <h2>Google account data</h2>
       <p>Sychar Operations integrates with Google Calendar (Calendar API,
-      <code>calendar.events</code> scope only) so that scheduled maintenance
+      scoped to calendar and event management — it cannot access Gmail,
+      Drive, or anything outside Calendar) so that scheduled maintenance
       work is visible on a calendar. Specifically:</p>
       <ul>
-        <li>The system creates a dedicated <strong>"Camp Work"</strong> calendar on
-        the operator's own Google account — it never reads from or writes to
-        the operator's primary calendar or any other calendar.</li>
-        <li>It creates, updates, and deletes events on that dedicated calendar
-        only, mirroring scheduled maintenance work (job lines, deferred
-        revisit dates, and similar) that already exists in the system's own
-        database.</li>
+        <li>On first connecting, the operator picks which calendar sync writes
+        to — an existing calendar the operator's account can already edit, or
+        a new dedicated one the system creates on request. The system does
+        list the operator's own calendar names in order to show that picker;
+        it does not read event content on any calendar other than the one
+        chosen for sync.</li>
+        <li>It creates, updates, and deletes events on that one chosen
+        calendar only, mirroring scheduled maintenance work (job lines,
+        deferred revisit dates, and similar) that already exists in the
+        system's own database.</li>
         <li>It does not read event content the operator or anyone else adds
-        directly in Google Calendar. The relationship is one-way: this system
-        writes to Google Calendar, it does not read from it.</li>
+        directly on the chosen calendar, or any other calendar. The
+        relationship is one-way: this system writes events, it does not read
+        them back.</li>
         <li>No calendar data, or any other Google account data, is sold,
         shared with third parties, or used for advertising.</li>
         <li>The Google account refresh token used to maintain this connection

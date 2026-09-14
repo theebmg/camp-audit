@@ -9,14 +9,24 @@
 // for Gmail's own OAuth2, via nodemailer's built-in support rather than a
 // Google API client).
 //
-// Scope is deliberately narrow: calendar.events, not the full `calendar`
-// scope (brief §1.7) — this app only ever needs to create/update/delete
-// events on a calendar it owns, never to read or manage calendars generally.
-
+// Scope (revised 2026-09-14, after a live 403 "insufficient authentication
+// scopes"): calendar.events alone only covers the Events resource
+// (list/get/insert/update/delete) — it does NOT cover calendars.get,
+// calendars.insert, or calendarList.list/patch, which is everything the
+// admin screen's calendar picker and "create a new Camp Work calendar"
+// option need (listWritableCalendars, createCampWorkCalendar,
+// getPrimaryCalendarEmail below). Three granular scopes instead of the
+// single legacy `calendar` scope — narrower than `calendar` (which also
+// grants ACLs and free/busy access this app never touches), but wide enough
+// to actually cover calendar management, not just events.
 const CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID;
 const CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET;
 const REDIRECT_URI = 'https://audit.fracturedrv.com/api/pg/gcal/oauth/callback';
-const SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+const SCOPE = [
+  'https://www.googleapis.com/auth/calendar.events',
+  'https://www.googleapis.com/auth/calendar.calendarlist',
+  'https://www.googleapis.com/auth/calendar.calendars',
+].join(' ');
 
 export function gcalIsConfigured() {
   return Boolean(CLIENT_ID && CLIENT_SECRET);
@@ -126,8 +136,9 @@ async function calendarApi(accessToken, method, path, body) {
 
 // The account's own email, purely for display on the admin screen
 // ("connected as ben@..."). The primary calendar's own id IS the account's
-// email address, so no separate userinfo scope/call is needed beyond
-// calendar.events.
+// email address, so no separate userinfo scope/call is needed — just the
+// calendar.calendars scope this module already requests (calendars.get is
+// outside calendar.events, which is what caused the original 403 here).
 export async function getPrimaryCalendarEmail(accessToken) {
   const primary = await calendarApi(accessToken, 'GET', '/calendars/primary');
   return primary.id;
