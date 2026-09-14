@@ -6069,26 +6069,56 @@ function datesBetween(startStr, endStr) {
   }
   return out;
 }
+function addDays(d, n) { return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n); }
+function weekStartOf(d) { return addDays(d, -d.getDay()); } // Sunday of that week — matches the month grid's Sun-start
 
-// Icon + optional time + label for one calendar-grid entry (job line or
-// calendar event) — shared by the month grid and the day panel so this
-// logic lives in one place. Calendar events get a Google-color dot and
-// their Type name prefixed (unless it's the "Other" catch-all) — this
-// mirrors, in the app's own UI, the same title-prefix idea step 3 applies
-// to the synced Google event itself.
+// Icon + optional time + label for one calendar-grid entry (job line,
+// calendar event, or deferred revisit date) — shared by every calendar
+// surface (month grid, week/day grid, the day panel) so this logic lives in
+// one place. Calendar events get a Google-color dot and their Type name
+// prefixed (unless it's the "Other" catch-all) — this mirrors, in the app's
+// own UI, the same title-prefix idea step 3 applies to the synced Google
+// event itself.
 function calendarEntryText(e) {
   if (e.type === 'jobLine') {
     const time = e.ScheduledStartTime ? `${formatTimeShort(e.ScheduledStartTime)} ` : '';
     return `🛠️ ${time}${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}`;
+  }
+  if (e.type === 'revisit') {
+    return `📌 Revisit: ${e.Asset ? `${escapeHtml(e.Asset.Name)} — ` : ''}${escapeHtml(e.Title)}`;
   }
   const time = e.StartTime ? `${formatTimeShort(e.StartTime)} ` : '';
   const typePrefix = e.TypeName && e.TypeName !== 'Other' ? `${escapeHtml(e.TypeName)}: ` : '';
   return `${googleColorDotHtml(e.TypeGcalColorId)}📅 ${time}${typePrefix}${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}`;
 }
 
+// Whether an entry is placed in the timed grid or the all-day band. A job
+// line with no start time is untimed; a revisit date never has a time; a
+// multi-day calendar event goes all-day regardless of its own start time —
+// same rule the month grid already uses to span it across days.
+function calendarEntryIsAllDay(e) {
+  if (e.type === 'jobLine') return !e.ScheduledStartTime;
+  if (e.type === 'revisit') return true;
+  return !e.StartTime || e.OccurrenceDate !== e.OccurrenceEndDate;
+}
+
+// Whether an entry can be dragged to reschedule (Build Brief v4 Part 1
+// amendment). A terminal-status job line (Done/Not Needed/Cancelled) is a
+// closed decision — its work order can stay open with other lines still
+// going, but this one is done moving. A revisit date is a commitment
+// already made for a stated reason, not an open slot. A recurring or
+// multi-day event's semantics on drag are genuinely ambiguous (move just
+// this occurrence, or the whole series? shift the whole span, or just the
+// start?) — deliberately out of scope, so both render fixed too.
+function calendarEntryIsDraggable(e) {
+  if (e.type === 'jobLine') return !e.StatusIsTerminal;
+  if (e.type === 'event') return e.RecurrenceType === 'none' && e.OccurrenceDate === e.OccurrenceEndDate;
+  return false;
+}
+
 // Slide-out panel from the right, listing one day's scheduled WOs/events —
-// opened by clicking a day cell's background (not one of its entry pills,
-// which still navigate straight to that WO/event as before).
+// still used by Month view (clicking a day cell's background); Week and Day
+// views show this same detail inline instead, so they don't need it.
 function openDayPanel(dateKey, entries) {
   closeDayPanel();
   const label = new Date(`${dateKey}T00:00:00`).toLocaleDateString('default', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
@@ -6103,6 +6133,8 @@ function openDayPanel(dateKey, entries) {
       </div>
       ${entries.length ? entries.map((e) => e.type === 'jobLine'
         ? `<div class="list-item day-panel-entry" data-wo-id="${e.WorkOrderId}"><span>${calendarEntryText(e)}</span>${statusPillHtml(e.WorkOrderStatus, e.WorkOrderStatusColor)}</div>`
+        : e.type === 'revisit'
+        ? `<div class="list-item day-panel-entry" ${e.WorkOrderId ? `data-wo-id="${e.WorkOrderId}"` : e.Asset ? `data-asset-id="${e.Asset.Id}"` : ''}><span>${calendarEntryText(e)}</span></div>`
         : `<div class="list-item day-panel-entry" data-event-id="${e.Id}"><span>${calendarEntryText(e)}</span></div>`
       ).join('') : '<p class="muted">Nothing scheduled this day.</p>'}
       <div class="btn-row"><button class="btn btn-primary" id="dayPanelAddEventBtn">+ Add Event This Day</button></div>
@@ -6113,124 +6145,448 @@ function openDayPanel(dateKey, entries) {
   document.getElementById('dayPanelAddEventBtn').addEventListener('click', () => { closeDayPanel(); go('newCalendarEvent', { date: dateKey }); });
   overlay.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => { closeDayPanel(); go('workOrderDetail', { id: el.dataset.woId }); }));
   overlay.querySelectorAll('[data-event-id]').forEach((el) => el.addEventListener('click', () => { closeDayPanel(); go('calendarEventDetail', { id: el.dataset.eventId }); }));
+  overlay.querySelectorAll('[data-asset-id]:not([data-wo-id])').forEach((el) => el.addEventListener('click', () => { closeDayPanel(); go('assetDetail', { id: el.dataset.assetId }); }));
 }
 function closeDayPanel() { document.getElementById('dayPanelOverlay')?.remove(); }
+
+// ---- Calendar view-mode toggle (Month/Week/Day) — same per-browser
+// localStorage pattern as getTableViewMode/tableViewToggleHtml, including
+// the same screen-width default: a whole month (or even a week) of tiny
+// pills doesn't work on a phone, one day's plan does.
+function getCalendarViewMode() {
+  const saved = localStorage.getItem('campAuditCalendarView');
+  if (saved === 'month' || saved === 'week' || saved === 'day') return saved;
+  return window.matchMedia('(max-width: 640px)').matches ? 'day' : 'month';
+}
+function calendarViewToggleHtml(mode) {
+  return `<div class="view-toggle">
+    ${['month', 'week', 'day'].map((m) => `<button type="button" class="view-toggle-btn cal-mode-btn ${mode === m ? 'active' : ''}" data-mode="${m}">${m[0].toUpperCase()}${m.slice(1)}</button>`).join('')}
+  </div>`;
+}
+
+// A working-hours window, not a full 24h Google-style day — this is a
+// scheduling tool for camp maintenance/events, not a general calendar (see
+// the brief's "scope to scheduling" note).
+const CAL_HOUR_START = 6, CAL_HOUR_END = 21; // 6 AM – 9 PM
+function calHourLabel(h) { return new Date(2000, 0, 1, h, 0).toLocaleTimeString('default', { hour: 'numeric' }); }
+function calStartHour(timeStr) { return Math.min(CAL_HOUR_END, Math.max(CAL_HOUR_START, Number(timeStr.slice(0, 2)))); }
+function calMinutesOfTime(t) { const [h, m] = t.split(':').map(Number); return h * 60 + m; }
+function calTimeFromMinutes(mins) {
+  const wrapped = ((mins % 1440) + 1440) % 1440;
+  return `${String(Math.floor(wrapped / 60)).padStart(2, '0')}:${String(wrapped % 60).padStart(2, '0')}`;
+}
+
+// Fetches everything the Calendar can show for [fromStr, toStr] and buckets
+// it by day — one map shared by Month/Week/Day so they never disagree about
+// what's scheduled. Job lines, not work orders, are what actually gets
+// scheduled (1.4) — a WO's lines can have divergent dates (vendor Tuesday,
+// volunteers Saturday, same WO), so each line is its own entry.
+async function loadCalendarRangeData(fromStr, toStr) {
+  const [{ occurrences }, { jobLines: scheduledJobLines }, { revisitDates }] = await Promise.all([
+    api(`/api/pg/calendar-events?from=${fromStr}&to=${toStr}`),
+    api(`/api/pg/job-lines/scheduled?from=${fromStr}&to=${toStr}`),
+    api(`/api/pg/revisit-dates?from=${fromStr}&to=${toStr}`),
+  ]);
+  const dayEntriesMap = new Map();
+  const push = (key, entry) => { if (!dayEntriesMap.has(key)) dayEntriesMap.set(key, []); dayEntriesMap.get(key).push(entry); };
+  for (const jl of scheduledJobLines) push(jl.ScheduledDate.slice(0, 10), { type: 'jobLine', ...jl });
+  for (const occ of occurrences) {
+    // Multi-day span (e.g. a Group Rental running Friday to Sunday) — place
+    // the same occurrence on every day it covers, not just its start day.
+    for (const key of datesBetween(occ.OccurrenceDate, occ.OccurrenceEndDate || occ.OccurrenceDate)) {
+      push(key, { type: 'event', ...occ });
+    }
+  }
+  for (const rv of revisitDates) push(rv.RevisitDate.slice(0, 10), { type: 'revisit', ...rv });
+  return dayEntriesMap;
+}
+
+// ---------- Drag-to-reschedule (Build Brief v4 Part 1 amendment) ----------
+// Pointer Events, not the HTML5 drag-and-drop API — HTML5 DnD has no real
+// touch support, and a phone is a first-class target here (Day view's whole
+// reason to exist is scheduling from one). A movement threshold keeps a
+// plain tap free to still open the entry instead of always starting a drag.
+const CAL_DRAG_THRESHOLD = 8;
+let calDragSuppressClick = false; // set right after a real drag-drop, so the click that always follows a pointerup doesn't also navigate
+let calRefreshCurrentView = null; // set by renderCalendar; drop handling lives outside its closure
+
+function calWireDraggable(el, getPayload) {
+  el.classList.add('cal-draggable');
+  el.addEventListener('pointerdown', (downEv) => {
+    if (downEv.pointerType === 'mouse' && downEv.button !== 0) return;
+    const startX = downEv.clientX, startY = downEv.clientY;
+    let dragging = false, ghost = null, lastZone = null;
+    function onMove(e) {
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      if (!dragging) {
+        if (Math.hypot(dx, dy) < CAL_DRAG_THRESHOLD) return;
+        dragging = true;
+        document.body.classList.add('cal-drag-active');
+        el.classList.add('cal-dragging-source');
+        ghost = el.cloneNode(true);
+        ghost.classList.add('cal-drag-ghost');
+        ghost.style.width = `${Math.min(el.offsetWidth, 260)}px`;
+        document.body.appendChild(ghost);
+      }
+      e.preventDefault();
+      if (ghost) { ghost.style.left = `${e.clientX + 14}px`; ghost.style.top = `${e.clientY + 14}px`; }
+      const under = document.elementFromPoint(e.clientX, e.clientY);
+      const zone = under?.closest('[data-drop-date], [data-drop-queue]') || null;
+      if (zone !== lastZone) {
+        lastZone?.classList.remove('cal-drop-target');
+        zone?.classList.add('cal-drop-target');
+        lastZone = zone;
+      }
+    }
+    function onUp() {
+      document.removeEventListener('pointermove', onMove);
+      document.body.classList.remove('cal-drag-active');
+      el.classList.remove('cal-dragging-source');
+      ghost?.remove();
+      lastZone?.classList.remove('cal-drop-target');
+      if (dragging && lastZone) {
+        calDragSuppressClick = true;
+        onCalendarDrop(getPayload(), lastZone.dataset);
+      }
+    }
+    document.addEventListener('pointermove', onMove, { passive: false });
+    document.addEventListener('pointerup', onUp, { once: true });
+  });
+}
+function calWireClick(el, onClick) {
+  el.addEventListener('click', (e) => {
+    if (calDragSuppressClick) { calDragSuppressClick = false; return; }
+    onClick(e);
+  });
+}
+
+async function onCalendarDrop(payload, zoneData) {
+  try {
+    if (zoneData.dropQueue !== undefined) {
+      // Dropping a scheduled line back onto the Queue clears its date (and
+      // any time) — it's fully unscheduled again, not "scheduled for
+      // nothing." Only job lines can go here; the queue is job-line-only.
+      if (payload.dragType !== 'jobLine') return;
+      await api(`/api/pg/job-lines/${payload.id}`, { method: 'PATCH', body: JSON.stringify({ scheduledDate: null, scheduledStartTime: null }) });
+      toast('Moved back to the Scheduling Queue');
+    } else if (payload.dragType === 'jobLine' || payload.dragType === 'queue') {
+      const body = { scheduledDate: zoneData.dropDate };
+      // A timed slot sets the time; the all-day band explicitly clears it
+      // (making a previously-timed line untimed); a bare date-only drop
+      // (Month view has no time-of-day concept) leaves whatever time it had.
+      if (zoneData.dropHour !== undefined) body.scheduledStartTime = `${String(zoneData.dropHour).padStart(2, '0')}:00`;
+      else if (zoneData.dropAllday !== undefined) body.scheduledStartTime = null;
+      await api(`/api/pg/job-lines/${payload.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+      toast('Job line rescheduled');
+    } else if (payload.dragType === 'event') {
+      const body = { eventDate: zoneData.dropDate };
+      if (zoneData.dropHour !== undefined) {
+        const newStart = `${String(zoneData.dropHour).padStart(2, '0')}:00`;
+        body.startTime = newStart;
+        body.endTime = (payload.startTime && payload.endTime)
+          ? calTimeFromMinutes(calMinutesOfTime(newStart) + (calMinutesOfTime(payload.endTime) - calMinutesOfTime(payload.startTime)))
+          : null;
+      } else if (zoneData.dropAllday !== undefined) {
+        body.startTime = null; body.endTime = null;
+      }
+      await api(`/api/pg/calendar-events/${payload.id}`, { method: 'PATCH', body: JSON.stringify(body) });
+      toast('Event rescheduled');
+    }
+  } catch (err) {
+    toast(err.message || 'Could not reschedule');
+  } finally {
+    try { await calRefreshCurrentView?.(); } catch { /* view navigated away mid-drop — nothing to refresh */ }
+  }
+}
+
+const PRIORITY_RANK = { Urgent: 0, High: 1, Medium: 2, Low: 3 };
 
 async function renderCalendar(params = {}) {
   setChrome({ title: 'Calendar', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const now = new Date();
-  let viewMonth = params.month != null ? Number(params.month) : now.getMonth();
-  let viewYear = params.year != null ? Number(params.year) : now.getFullYear();
-  const todayKey = isoDate(now);
-  let dayEntriesMap = new Map(); // dateKey -> entries[], refreshed each draw(); read by the day-cell click handler
+  if (!state.options) state.options = await api('/api/pg/options');
 
-  async function draw() {
-    closeDayPanel();
-    app.innerHTML = LOADING_HTML;
-    const firstOfMonth = new Date(viewYear, viewMonth, 1);
+  let mode = getCalendarViewMode();
+  let anchor = params.date ? new Date(`${params.date}T00:00:00`)
+    : params.month != null ? new Date(Number(params.year), Number(params.month), 1)
+    : new Date();
+  const todayKey = isoDate(new Date());
+
+  let dayEntriesMap = new Map();
+  let allUnscheduled = [];
+  let queueFilters = { statusId: '', assetId: '', locationId: '', fundKey: '' };
+  let queueFilterInitialized = false;
+
+  async function loadQueue() {
+    const { jobLines } = await api('/api/pg/job-lines/unscheduled');
+    allUnscheduled = jobLines;
+    // Default the queue's status filter to "Assessed" the first time it
+    // loads (Build Brief v4 Part 1 amendment) — assessed-but-unscheduled is
+    // exactly the backlog this panel is for. Once the user picks something
+    // else, that choice sticks for the rest of this visit to the page.
+    if (!queueFilterInitialized) {
+      queueFilterInitialized = true;
+      const assessed = (state.options?.workOrderStatuses || []).find((s) => s.Name === 'Assessed');
+      if (assessed) queueFilters.statusId = String(assessed.Id);
+    }
+  }
+
+  function rangeForMode() {
+    if (mode === 'month') {
+      const y = anchor.getFullYear(), m = anchor.getMonth();
+      const daysInMonth = new Date(y, m + 1, 0).getDate();
+      return { from: `${y}-${String(m + 1).padStart(2, '0')}-01`, to: `${y}-${String(m + 1).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}` };
+    }
+    if (mode === 'week') {
+      const start = weekStartOf(anchor);
+      return { from: isoDate(start), to: isoDate(addDays(start, 6)) };
+    }
+    return { from: isoDate(anchor), to: isoDate(anchor) };
+  }
+
+  async function refreshAll() {
+    const { from, to } = rangeForMode();
+    const [entriesMap] = await Promise.all([loadCalendarRangeData(from, to), loadQueue()]);
+    dayEntriesMap = entriesMap;
+    draw();
+  }
+  calRefreshCurrentView = refreshAll;
+
+  function headerLabel() {
+    if (mode === 'month') return anchor.toLocaleString('default', { month: 'long', year: 'numeric' });
+    if (mode === 'week') {
+      const start = weekStartOf(anchor), end = addDays(start, 6);
+      const sameMonth = start.getMonth() === end.getMonth();
+      const startLabel = start.toLocaleDateString('default', { month: 'short', day: 'numeric' });
+      const endLabel = end.toLocaleDateString('default', sameMonth ? { day: 'numeric', year: 'numeric' } : { month: 'short', day: 'numeric', year: 'numeric' });
+      return `${startLabel} – ${endLabel}`;
+    }
+    return anchor.toLocaleDateString('default', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  }
+  function stepAnchor(dir) {
+    if (mode === 'month') anchor = new Date(anchor.getFullYear(), anchor.getMonth() + dir, 1);
+    else if (mode === 'week') anchor = addDays(anchor, 7 * dir);
+    else anchor = addDays(anchor, dir);
+  }
+
+  function fixedTitleAttr(draggable, msg) { return draggable ? '' : ` title="${msg}"`; }
+  function entryHtmlMonth(e) {
+    const draggable = calendarEntryIsDraggable(e);
+    const fixedCls = draggable ? '' : ' cal-fixed';
+    const dragAttr = draggable ? ' data-draggable="1"' : '';
+    if (e.type === 'jobLine') return `<div class="cal-entry${fixedCls}" data-wo-id="${e.WorkOrderId}" data-jl-id="${e.JobLineId}"${dragAttr}${fixedTitleAttr(draggable, 'Fixed — a finished line can’t be rescheduled')}><span class="pill"${statusColorStyle(e.StatusColor)}>${calendarEntryText(e)}</span></div>`;
+    if (e.type === 'revisit') return `<div class="cal-entry cal-fixed" ${e.WorkOrderId ? `data-wo-id="${e.WorkOrderId}"` : e.Asset ? `data-asset-id="${e.Asset.Id}"` : ''}${fixedTitleAttr(false, 'Fixed — a revisit date is a commitment, not an open slot')}><span class="pill pop">${calendarEntryText(e)}</span></div>`;
+    return `<div class="cal-entry${fixedCls}" data-event-id="${e.Id}"${dragAttr}${draggable ? ` data-start-time="${e.StartTime || ''}" data-end-time="${e.EndTime || ''}"` : ''}${fixedTitleAttr(draggable, 'Fixed — a repeating or multi-day event isn’t draggable here')}><span class="pill pop">${calendarEntryText(e)}</span></div>`;
+  }
+
+  function drawMonth() {
+    const y = anchor.getFullYear(), m = anchor.getMonth();
+    const firstOfMonth = new Date(y, m, 1);
     const startWeekday = firstOfMonth.getDay();
-    const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
-    const monthLabel = firstOfMonth.toLocaleString('default', { month: 'long', year: 'numeric' });
-    const fromStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-01`;
-    const toStr = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`;
-
-    // Job lines, not work orders, are what actually gets scheduled (1.4) — a
-    // WO's lines can have divergent dates (vendor Tuesday, volunteers
-    // Saturday, same WO), so the grid shows one entry per line. The "Scheduled
-    // Date" on /work-orders is still there for the sidebar/unscheduled check
-    // (it's the earliest-line rollup — see listWorkOrders in db.js).
-    const [{ workOrders }, { occurrences }, { jobLines: scheduledJobLines }] = await Promise.all([
-      api('/api/pg/work-orders'), api(`/api/pg/calendar-events?from=${fromStr}&to=${toStr}`),
-      api(`/api/pg/job-lines/scheduled?from=${fromStr}&to=${toStr}`),
-    ]);
-
-    dayEntriesMap = new Map();
-    for (const jl of scheduledJobLines) {
-      const key = jl.ScheduledDate.slice(0, 10);
-      if (!dayEntriesMap.has(key)) dayEntriesMap.set(key, []);
-      dayEntriesMap.get(key).push({ type: 'jobLine', ...jl });
-    }
-    for (const occ of occurrences) {
-      // Multi-day span (Build Brief v4 Part 1, e.g. a Group Rental running
-      // Friday to Sunday) — place the same occurrence on every day it
-      // covers, not just its start day, so it actually shows as ongoing.
-      for (const key of datesBetween(occ.OccurrenceDate, occ.OccurrenceEndDate || occ.OccurrenceDate)) {
-        if (!dayEntriesMap.has(key)) dayEntriesMap.set(key, []);
-        dayEntriesMap.get(key).push({ type: 'event', ...occ });
-      }
-    }
-    const allUnscheduled = workOrders.filter((w) => !w['Scheduled Date']);
-
-    const entryHtml = (e) => e.type === 'jobLine'
-      ? `<div class="cal-entry" data-wo-id="${e.WorkOrderId}"><span class="pill"${statusColorStyle(e.WorkOrderStatusColor)}>${calendarEntryText(e)}</span></div>`
-      : `<div class="cal-entry" data-event-id="${e.Id}"><span class="pill pop">${calendarEntryText(e)}</span></div>`;
-
+    const daysInMonth = new Date(y, m + 1, 0).getDate();
     const cells = [];
     for (let i = 0; i < startWeekday; i++) cells.push('<div class="cal-cell cal-empty"></div>');
     for (let d = 1; d <= daysInMonth; d++) {
-      const dateKey = `${viewYear}-${String(viewMonth + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+      const dateKey = `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
       const entries = dayEntriesMap.get(dateKey) || [];
       const shown = entries.slice(0, 3);
       const overflow = entries.length - shown.length;
-      cells.push(`<div class="cal-cell ${dateKey === todayKey ? 'cal-today' : ''}" data-date="${dateKey}">
+      cells.push(`<div class="cal-cell ${dateKey === todayKey ? 'cal-today' : ''}" data-date="${dateKey}" data-drop-date="${dateKey}">
         <div class="cal-daynum">${d}</div>
-        ${shown.map(entryHtml).join('')}
+        ${shown.map(entryHtmlMonth).join('')}
         ${overflow > 0 ? `<div class="muted" style="font-size:0.75rem">+${overflow} more</div>` : ''}
       </div>`);
     }
+    return `<div class="cal-scroll"><div class="cal-grid">
+      ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => `<div class="cal-head">${d}</div>`).join('')}
+      ${cells.join('')}
+    </div></div>`;
+  }
 
+  function entryChipHtml(e, detailed) {
+    const draggable = calendarEntryIsDraggable(e);
+    const cls = `cal-tg-entry${draggable ? '' : ' cal-fixed'}${detailed ? ' cal-tg-entry-detailed' : ''}`;
+    const dragAttr = draggable ? ' data-draggable="1"' : '';
+    const idAttr = e.type === 'jobLine' ? `data-wo-id="${e.WorkOrderId}" data-jl-id="${e.JobLineId}"`
+      : e.type === 'revisit' ? (e.WorkOrderId ? `data-wo-id="${e.WorkOrderId}"` : e.Asset ? `data-asset-id="${e.Asset.Id}"` : '')
+      : `data-event-id="${e.Id}"${draggable ? ` data-start-time="${e.StartTime || ''}" data-end-time="${e.EndTime || ''}"` : ''}`;
+    const titleAttr = fixedTitleAttr(draggable, e.type === 'revisit' ? 'Fixed — a revisit date is a commitment, not an open slot' : e.type === 'jobLine' ? 'Fixed — a finished line can’t be rescheduled' : 'Fixed — a repeating or multi-day event isn’t draggable here');
+    if (!detailed) return `<div class="${cls}" ${idAttr}${dragAttr}${titleAttr}>${calendarEntryText(e)}</div>`;
+    const extra = e.type === 'jobLine'
+      ? `${statusPillHtml(e.StatusName, e.StatusColor)}${e.Priority ? ` <span class="pill">${escapeHtml(e.Priority)}</span>` : ''}`
+      : e.type === 'revisit' ? `<span class="pill warn">${escapeHtml(e.DeferredReason || 'Deferred')}</span>`
+      : (e.TypeName ? `<span class="pill">${escapeHtml(e.TypeName)}</span>` : '');
+    return `<div class="${cls}" ${idAttr}${dragAttr}${titleAttr}>
+      <div>${calendarEntryText(e)}</div>
+      <div style="margin-top:4px">${extra}</div>
+    </div>`;
+  }
+
+  function timeGridHtml(days, detailed) {
+    const hours = [];
+    for (let h = CAL_HOUR_START; h <= CAL_HOUR_END; h++) hours.push(h);
+    let html = `<div class="cal-tg" style="grid-template-columns:56px repeat(${days.length}, minmax(${detailed ? 220 : 110}px, 1fr))">`;
+    html += `<div class="cal-tg-corner"></div>`;
+    for (const day of days) html += `<div class="cal-tg-daylabel ${day.key === todayKey ? 'cal-today' : ''}">${escapeHtml(day.label)}</div>`;
+    html += `<div class="cal-tg-alldaylabel">All-day</div>`;
+    for (const day of days) {
+      const entries = (dayEntriesMap.get(day.key) || []).filter(calendarEntryIsAllDay);
+      html += `<div class="cal-tg-allday" data-drop-date="${day.key}" data-drop-allday="1">${entries.map((e) => entryChipHtml(e, detailed)).join('')}</div>`;
+    }
+    for (const h of hours) {
+      html += `<div class="cal-tg-hourlabel">${calHourLabel(h)}</div>`;
+      for (const day of days) {
+        const entries = (dayEntriesMap.get(day.key) || []).filter((e) => !calendarEntryIsAllDay(e) && calStartHour(e.type === 'jobLine' ? e.ScheduledStartTime : e.StartTime) === h);
+        html += `<div class="cal-tg-hourcell" data-drop-date="${day.key}" data-drop-hour="${h}">${entries.map((e) => entryChipHtml(e, detailed)).join('')}</div>`;
+      }
+    }
+    html += `</div>`;
+    return html;
+  }
+  function drawWeek() {
+    const start = weekStartOf(anchor);
+    const days = Array.from({ length: 7 }, (_, i) => {
+      const d = addDays(start, i);
+      return { key: isoDate(d), label: d.toLocaleDateString('default', { weekday: 'short', day: 'numeric' }) };
+    });
+    return `<div class="cal-scroll">${timeGridHtml(days, false)}</div>`;
+  }
+  function drawDay() {
+    const days = [{ key: isoDate(anchor), label: anchor.toLocaleDateString('default', { weekday: 'short', day: 'numeric' }) }];
+    return `<div class="cal-scroll">${timeGridHtml(days, true)}</div>`;
+  }
+
+  function distinctOptions(list, pick) {
+    const seen = new Map();
+    for (const item of list) {
+      const v = pick(item);
+      if (v && !seen.has(String(v.id))) seen.set(String(v.id), v.name);
+    }
+    return [...seen.entries()].map(([id, name]) => ({ id, name }));
+  }
+  function queueFilteredSorted() {
+    return allUnscheduled
+      .filter((jl) => !queueFilters.statusId || String(jl.WorkOrderStatusId) === queueFilters.statusId)
+      .filter((jl) => !queueFilters.assetId || String(jl.Asset?.Id) === queueFilters.assetId)
+      .filter((jl) => !queueFilters.locationId || String(jl.Location?.Id) === queueFilters.locationId)
+      .filter((jl) => !queueFilters.fundKey || `${jl.FundingSource}:${jl.FundingRefId || ''}` === queueFilters.fundKey)
+      .sort((a, b) => (PRIORITY_RANK[a.Priority] ?? 9) - (PRIORITY_RANK[b.Priority] ?? 9));
+  }
+  function queueHtml() {
+    const items = queueFilteredSorted();
+    const assetOptions = distinctOptions(allUnscheduled, (jl) => jl.Asset && { id: jl.Asset.Id, name: jl.Asset.Name });
+    const locationOptions = distinctOptions(allUnscheduled, (jl) => jl.Location && { id: jl.Location.Id, name: jl.Location.Name });
+    const fundOptions = distinctOptions(allUnscheduled, (jl) => ({ id: `${jl.FundingSource}:${jl.FundingRefId || ''}`, name: jl.FundingRefLabel || FUNDING_SOURCE_LABELS[jl.FundingSource] || jl.FundingSource }));
+    return `
+      <div class="card">
+        <h3>Scheduling Queue${items.length ? ` (${items.length})` : ''}</h3>
+        <p class="muted">Job lines not yet on the calendar — drag one onto a day (or a time slot in Week/Day view) to schedule it. Drag a scheduled line back here to unschedule it.</p>
+        <div class="field-row"><label>Status</label>
+          <select id="queueFilterStatus"><option value="">— any —</option>${(state.options?.workOrderStatuses || []).map((s) => `<option value="${s.Id}" ${queueFilters.statusId === String(s.Id) ? 'selected' : ''}>${escapeHtml(s.Name)}</option>`).join('')}</select>
+        </div>
+        <div class="field-row"><label>Asset</label>
+          <select id="queueFilterAsset"><option value="">— any —</option>${assetOptions.map((o) => `<option value="${o.id}" ${queueFilters.assetId === String(o.id) ? 'selected' : ''}>${escapeHtml(o.name)}</option>`).join('')}</select>
+        </div>
+        <div class="field-row"><label>Location</label>
+          <select id="queueFilterLocation"><option value="">— any —</option>${locationOptions.map((o) => `<option value="${o.id}" ${queueFilters.locationId === String(o.id) ? 'selected' : ''}>${escapeHtml(o.name)}</option>`).join('')}</select>
+        </div>
+        <div class="field-row"><label>Fund</label>
+          <select id="queueFilterFund"><option value="">— any —</option>${fundOptions.map((o) => `<option value="${o.id}" ${queueFilters.fundKey === String(o.id) ? 'selected' : ''}>${escapeHtml(o.name)}</option>`).join('')}</select>
+        </div>
+        <div id="schedQueueDropZone" class="cal-queue-drop" data-drop-queue="1">
+          ${items.length ? items.map((jl) => `
+            <div class="list-item cal-queue-item" data-jl-id="${jl.JobLineId}" data-wo-id="${jl.WorkOrderId}" data-draggable="1">
+              <div style="flex:1;min-width:0">
+                <div>${jl.Asset ? `${escapeHtml(jl.Asset.Name)}: ` : ''}${escapeHtml(jl.WorkOrderTitle)} — ${escapeHtml(jl.JobLineTitle)}</div>
+                <div class="muted" style="font-size:0.78rem">${jl.EstimatedHours ? `${jl.EstimatedHours}h · ` : ''}${jl.EstimatedCost != null ? `$${jl.EstimatedCost.toLocaleString()} · ` : ''}${escapeHtml(jl.FundingRefLabel || FUNDING_SOURCE_LABELS[jl.FundingSource] || '')}</div>
+              </div>
+              ${statusPillHtml(jl.WorkOrderStatus, jl.WorkOrderStatusColor)}
+            </div>`).join('') : '<p class="muted">Nothing waiting — everything filtered in is scheduled. 🎉</p>'}
+        </div>
+      </div>`;
+  }
+
+  function draw() {
+    closeDayPanel();
     setApp(`
       ${params.fromWorkOrderId ? `
         <div class="btn-row" style="margin-bottom:10px">
           <button class="btn btn-secondary" id="backToWoBtn">← Back to Work Order${params.fromWorkOrderTitle ? `: ${escapeHtml(params.fromWorkOrderTitle)}` : ''}</button>
         </div>` : ''}
       <div class="cal-header">
-        <button class="btn btn-secondary" id="prevMonthBtn">‹ Prev</button>
-        <h3>${monthLabel}</h3>
-        <button class="btn btn-secondary" id="nextMonthBtn">Next ›</button>
+        <button class="btn btn-secondary" id="prevBtn">‹ Prev</button>
+        <h3>${escapeHtml(headerLabel())}</h3>
+        <button class="btn btn-secondary" id="nextBtn">Next ›</button>
+      </div>
+      <div class="btn-row" style="justify-content:space-between;margin-bottom:12px">
+        ${calendarViewToggleHtml(mode)}
+        <button class="btn btn-primary" id="addEventBtn">+ Add Event</button>
       </div>
       <div class="cal-layout">
-        <div class="cal-main">
-          <div class="btn-row" style="margin-bottom:12px"><button class="btn btn-primary" id="addEventBtn">+ Add Event</button></div>
-          <div class="cal-scroll"><div class="cal-grid">
-            ${['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((d) => `<div class="cal-head">${d}</div>`).join('')}
-            ${cells.join('')}
-          </div></div>
-        </div>
-        <div class="cal-sidebar">
-          <div class="card"><h3>Unscheduled Work Orders${allUnscheduled.length ? ` (${allUnscheduled.length})` : ''}</h3>
-            <p class="muted">Set a Scheduled Date on a work order to place it on the calendar.</p>
-            ${allUnscheduled.length ? allUnscheduled.map((w) => `<div class="list-item" data-wo-id="${w.Id}">
-              <span>${escapeHtml(w.Title)}${w.Asset ? ` — ${escapeHtml(w.Asset.Name)}` : ''}</span>
-              ${statusPillHtml(w.Status, w.StatusColor)}
-            </div>`).join('') : '<p class="muted">None — everything is scheduled. 🎉</p>'}
-          </div>
-        </div>
+        <div class="cal-main">${mode === 'month' ? drawMonth() : mode === 'week' ? drawWeek() : drawDay()}</div>
+        <div class="cal-sidebar">${queueHtml()}</div>
       </div>`);
     wire();
   }
 
-  function wire() {
-    document.getElementById('backToWoBtn')?.addEventListener('click', () => go('workOrderDetail', { id: params.fromWorkOrderId }));
-    document.getElementById('prevMonthBtn').addEventListener('click', () => {
-      viewMonth--; if (viewMonth < 0) { viewMonth = 11; viewYear--; } draw();
+  function wireQueueInteractions() {
+    app.querySelectorAll('#schedQueueDropZone .cal-queue-item').forEach((el) => {
+      calWireDraggable(el, () => ({ dragType: 'queue', id: el.dataset.jlId }));
+      calWireClick(el, () => go('workOrderDetail', { id: el.dataset.woId }));
     });
-    document.getElementById('nextMonthBtn').addEventListener('click', () => {
-      viewMonth++; if (viewMonth > 11) { viewMonth = 0; viewYear++; } draw();
-    });
-    document.getElementById('addEventBtn').addEventListener('click', () => go('newCalendarEvent', {}));
-    app.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
-    app.querySelectorAll('.cal-entry[data-event-id]').forEach((el) => el.addEventListener('click', (e) => {
-      e.stopPropagation(); go('calendarEventDetail', { id: el.dataset.eventId });
-    }));
-    app.querySelectorAll('.cal-cell[data-date]').forEach((cell) => cell.addEventListener('click', (e) => {
-      if (e.target.closest('.cal-entry')) return; // entry clicks navigate directly, handled above
-      openDayPanel(cell.dataset.date, dayEntriesMap.get(cell.dataset.date) || []);
-    }));
+  }
+  function wireQueueFilters() {
+    document.getElementById('queueFilterStatus')?.addEventListener('change', (e) => { queueFilters.statusId = e.target.value; redrawQueueOnly(); });
+    document.getElementById('queueFilterAsset')?.addEventListener('change', (e) => { queueFilters.assetId = e.target.value; redrawQueueOnly(); });
+    document.getElementById('queueFilterLocation')?.addEventListener('change', (e) => { queueFilters.locationId = e.target.value; redrawQueueOnly(); });
+    document.getElementById('queueFilterFund')?.addEventListener('change', (e) => { queueFilters.fundKey = e.target.value; redrawQueueOnly(); });
+  }
+  function redrawQueueOnly() {
+    const sidebar = app.querySelector('.cal-sidebar');
+    if (!sidebar) return;
+    sidebar.innerHTML = queueHtml();
+    wireQueueInteractions();
+    wireQueueFilters();
   }
 
-  draw();
+  function wireCalendarEntries() {
+    app.querySelectorAll('.cal-entry, .cal-tg-entry').forEach((el) => {
+      const jlId = el.dataset.jlId, woId = el.dataset.woId, eventId = el.dataset.eventId, assetId = el.dataset.assetId;
+      const clickTarget = eventId ? () => go('calendarEventDetail', { id: eventId })
+        : woId ? () => go('workOrderDetail', { id: woId })
+        : assetId ? () => go('assetDetail', { id: assetId })
+        : null;
+      if (clickTarget) calWireClick(el, (e) => { e.stopPropagation(); clickTarget(); });
+      if (el.dataset.draggable === '1') {
+        if (jlId) calWireDraggable(el, () => ({ dragType: 'jobLine', id: jlId }));
+        else if (eventId) calWireDraggable(el, () => ({ dragType: 'event', id: eventId, startTime: el.dataset.startTime || null, endTime: el.dataset.endTime || null }));
+      }
+    });
+  }
+
+  function wire() {
+    document.getElementById('backToWoBtn')?.addEventListener('click', () => go('workOrderDetail', { id: params.fromWorkOrderId }));
+    document.getElementById('prevBtn').addEventListener('click', async () => { stepAnchor(-1); await refreshAll(); });
+    document.getElementById('nextBtn').addEventListener('click', async () => { stepAnchor(1); await refreshAll(); });
+    document.getElementById('addEventBtn').addEventListener('click', () => go('newCalendarEvent', {}));
+    app.querySelectorAll('.cal-mode-btn').forEach((btn) => btn.addEventListener('click', async () => {
+      mode = btn.dataset.mode;
+      localStorage.setItem('campAuditCalendarView', mode);
+      await refreshAll();
+    }));
+    // Month cells: clicking the background (not an entry) opens the day
+    // panel; entries themselves navigate straight through (wired below).
+    app.querySelectorAll('.cal-cell[data-date]').forEach((cell) => cell.addEventListener('click', (e) => {
+      if (calDragSuppressClick) { calDragSuppressClick = false; return; }
+      if (e.target.closest('.cal-entry')) return;
+      openDayPanel(cell.dataset.date, dayEntriesMap.get(cell.dataset.date) || []);
+    }));
+    wireCalendarEntries();
+    wireQueueInteractions();
+    wireQueueFilters();
+  }
+
+  await refreshAll();
 }
 
 // Google Calendar's event colorId palette (Build Brief v4 Part 1) — a fixed,
@@ -7479,7 +7835,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
   container.querySelector('#viewOnCalendarLink')?.addEventListener('click', (e) => {
     e.preventDefault();
     const d = new Date(rollup.EarliestScheduledDate);
-    go('calendar', { month: d.getMonth(), year: d.getFullYear(), fromWorkOrderId: id, fromWorkOrderTitle: wo.Title });
+    go('calendar', { month: d.getMonth(), year: d.getFullYear(), date: isoDate(d), fromWorkOrderId: id, fromWorkOrderTitle: wo.Title });
   });
 
   container.querySelector('#splitLinesBtn')?.addEventListener('click', async () => {

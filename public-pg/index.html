@@ -434,6 +434,47 @@
     }
     .day-panel-entry { cursor: pointer; }
     @keyframes dayPanelSlideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
+
+    /* Calendar Week/Day time grid (Build Brief v4 Part 1) — a working-hours
+       scheduling grid, not a full Google-style 24h calendar. One shared
+       .cal-tg grid: a corner + a day-label row, an all-day band row, then
+       one row per hour. Cells render in DOM row order so plain CSS Grid
+       auto-flow places everything correctly with no per-cell positioning. */
+    .cal-tg { display: grid; gap: 1px; background: var(--border); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); overflow: hidden; }
+    .cal-tg-corner { background: var(--surface-alt); }
+    .cal-tg-daylabel { background: var(--surface-alt); padding: 8px 6px; font-size: 0.8rem; font-weight: 700;
+      color: var(--muted); text-align: center; }
+    .cal-tg-daylabel.cal-today { color: var(--accent-dark); }
+    .cal-tg-alldaylabel, .cal-tg-hourlabel { background: var(--surface-alt); padding: 4px 8px; font-size: 0.7rem;
+      color: var(--muted); text-align: right; white-space: nowrap; }
+    .cal-tg-allday, .cal-tg-hourcell { background: var(--surface); padding: 3px; display: flex;
+      flex-direction: column; gap: 3px; transition: background-color 0.15s ease; }
+    .cal-tg-allday { min-height: 30px; }
+    .cal-tg-hourcell { min-height: 42px; }
+    .cal-tg-entry { background: var(--accent-soft); color: var(--accent-dark); border-radius: 4px;
+      padding: 3px 7px; font-size: 0.78rem; line-height: 1.35; cursor: pointer; }
+    .cal-tg-entry-detailed { font-size: 0.88rem; padding: 7px 9px; }
+
+    /* Fixed (non-draggable) entries — a terminal-status job line, a
+       deferred revisit date, or a recurring/multi-day event. Visibly
+       different from a draggable one at a glance, not just on hover. */
+    .cal-entry.cal-fixed, .cal-tg-entry.cal-fixed { opacity: 0.62; cursor: default; }
+    .cal-tg-entry.cal-fixed { background: var(--surface-alt); color: var(--muted); }
+
+    /* Drag-to-reschedule (Pointer Events — see calWireDraggable in app.js).
+       .cal-draggable is added by JS once an entry is actually wired up. */
+    .cal-draggable { cursor: grab; touch-action: none; }
+    .cal-dragging-source { opacity: 0.3; }
+    .cal-drag-ghost { position: fixed; top: 0; left: 0; pointer-events: none; z-index: 1200;
+      opacity: 0.92; box-shadow: var(--shadow-md); border-radius: var(--radius-sm); }
+    .cal-drop-target { outline: 2px dashed var(--accent); outline-offset: -2px; background: var(--accent-soft) !important; }
+
+    /* Scheduling Queue (Build Brief v4 Part 1 amendment) — the Calendar
+       sidebar's unscheduled-job-line backlog; also a drop target for
+       unscheduling a line dragged back off the grid. */
+    .cal-queue-drop { min-height: 60px; }
+    .cal-queue-item { cursor: grab; }
   </style>
   <script>
     // Applied before body paints, so there's no flash of the wrong theme or
