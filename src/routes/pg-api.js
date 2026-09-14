@@ -76,8 +76,11 @@ import {
   listExpenseCategories, createExpenseCategory, updateExpenseCategory, deleteExpenseCategory,
   listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
   getExpensesReportRawData,
+  getGcalConnection, getGcalRefreshToken, clearGcalConnection,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
+import crypto from 'crypto';
+import { buildAuthUrl, revokeToken } from '../gcal.js';
 import {
   buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows, buildCrewSessionReportRows,
   buildJobLineReportRows, JOB_LINE_COLUMN_SPECS, buildFindingReportRows, FINDING_COLUMN_SPECS,
@@ -184,6 +187,30 @@ router.get('/inbox/count', async (req, res, next) => {
 });
 router.get('/system-health', async (req, res, next) => {
   try { res.json({ subsystems: await getSystemHealth() }); } catch (e) { next(e); }
+});
+
+// ── Google Calendar connection (Build Brief v4 Part 1, step 2) — the
+//    OAuth callback itself lives outside this router (gcal-oauth-callback.js,
+//    mounted pre-auth in server.js); everything else, including kicking off
+//    the flow, sits behind this router's normal requireAuth like any other
+//    admin action. ──────────────────────────────────────────────────────────
+router.get('/gcal/status', async (req, res, next) => {
+  try { res.json(await getGcalConnection()); } catch (e) { next(e); }
+});
+router.get('/gcal/oauth/start', (req, res, next) => {
+  try {
+    const state = crypto.randomBytes(16).toString('hex');
+    req.session.gcalOauthState = state;
+    res.redirect(buildAuthUrl(state));
+  } catch (e) { next(e); }
+});
+router.post('/gcal/disconnect', async (req, res, next) => {
+  try {
+    const refreshToken = await getGcalRefreshToken();
+    if (refreshToken) await revokeToken(refreshToken);
+    await clearGcalConnection();
+    res.json({ ok: true });
+  } catch (e) { next(e); }
 });
 router.get('/inbox/suggest-assets', async (req, res, next) => {
   try {

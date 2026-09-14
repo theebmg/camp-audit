@@ -11,6 +11,7 @@ import requestPortalRouter from './routes/request-portal.js';
 import mailInboundRouter from './routes/mail-inbound.js';
 import receiptInboundRouter from './routes/receipt-inbound.js';
 import mailDispatchRouter from './routes/mail-dispatch.js';
+import gcalOauthCallbackRouter from './routes/gcal-oauth-callback.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -84,6 +85,12 @@ app.use('/api/pg/receipt-inbound', receiptInboundRouter);
 // signature/idempotency checks intact) so nothing broke mid-cutover, but
 // nothing points Mailgun at them anymore once this route is live.
 app.use('/api/pg/mail-dispatch', mailDispatchRouter);
+// Google OAuth callback (Build Brief v4 Part 1) — Google redirects the
+// browser here directly, not an authenticated fetch from this app, so it's
+// mounted pre-auth at its own fully-specific path, same reasoning as the
+// three Mailgun routes above. See gcal-oauth-callback.js's header comment
+// for why this doesn't open up any other /gcal/* route.
+app.use('/api/pg/gcal/oauth/callback', gcalOauthCallbackRouter);
 // Postgres-backed parallel API (migration in progress) — additive, does not
 // replace /api. See toClaudeCode/camp-cmms-postgres-migration-brief.md.
 app.use('/api/pg', requireAuth, pgApiRouter);

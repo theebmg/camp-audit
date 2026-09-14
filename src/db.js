@@ -3857,6 +3857,50 @@ export async function recordSystemHealthFailure(subsystem, message = null) {
   );
 }
 
+// ── Google Calendar connection (Build Brief v4 Part 1) — one singleton
+//    row, same pattern as display_settings/budget_settings. src/gcal.js (the
+//    only module that talks to Google's APIs) never touches SQL directly;
+//    the OAuth route composes the two, the same way any other route
+//    composes storage.js + db.js. ──────────────────────────────────────────
+
+export async function getGcalConnection() {
+  const { rows } = await pool.query('SELECT * FROM gcal_connection ORDER BY id LIMIT 1');
+  const r = rows[0];
+  return {
+    Connected: !!r?.refresh_token,
+    GoogleEmail: r?.google_email || null,
+    CalendarId: r?.calendar_id || null,
+    ConnectedAt: r?.connected_at || null,
+    ConnectedBy: r?.connected_by || null,
+  };
+}
+
+// Internal — only the sync worker (step 3) needs the raw token to make
+// authenticated calls, so it's deliberately not part of getGcalConnection's
+// public shape above.
+export async function getGcalRefreshToken() {
+  const { rows } = await pool.query('SELECT refresh_token FROM gcal_connection ORDER BY id LIMIT 1');
+  return rows[0]?.refresh_token || null;
+}
+
+export async function saveGcalConnection({ refreshToken, googleEmail, calendarId, connectedBy }) {
+  await pool.query(
+    `UPDATE gcal_connection SET refresh_token = $1, google_email = $2, calendar_id = $3, connected_at = now(), connected_by = $4
+     WHERE id = (SELECT id FROM gcal_connection ORDER BY id LIMIT 1)`,
+    [refreshToken, googleEmail, calendarId, connectedBy]
+  );
+  await logActivity({ action: 'connected', entityType: 'gcal_connection', entityLabel: googleEmail || 'Google Calendar' });
+}
+
+export async function clearGcalConnection() {
+  const { rows } = await pool.query('SELECT google_email FROM gcal_connection ORDER BY id LIMIT 1');
+  await pool.query(
+    `UPDATE gcal_connection SET refresh_token = NULL, google_email = NULL, calendar_id = NULL, connected_at = NULL, connected_by = NULL
+     WHERE id = (SELECT id FROM gcal_connection ORDER BY id LIMIT 1)`
+  );
+  await logActivity({ action: 'disconnected', entityType: 'gcal_connection', entityLabel: rows[0]?.google_email || 'Google Calendar' });
+}
+
 // Fuzzy asset-name match for a batch's subject/body (§5.2) — plain word
 // overlap, not a real search index. Never auto-assigns; the inbox surfaces
 // the top matches as tappable suggestions only. A silent wrong match

@@ -701,6 +701,7 @@ async function render(view, params = {}) {
       requests: () => renderRequests(params),
       requestDetail: () => renderRequestDetail(params),
       adminRequestFields: () => renderAdminRequestFields(),
+      adminGcal: () => renderAdminGcal(),
     };
     if (handlers[view]) {
       await handlers[view]();
@@ -1074,6 +1075,7 @@ const ADMIN_LEAF_RENDERERS = {
   adminChecklistTemplates: (params, container) => renderAdminChecklistTemplates(container),
   adminUsers: (params, container) => renderAdminUsers(container),
   activityLog: (params, container) => renderActivityLog(container),
+  adminGcal: (params, container) => renderAdminGcal(container),
 };
 
 async function renderAdminDrilldown() {
@@ -4646,6 +4648,12 @@ const ADMIN_CATEGORIES = {
       { view: 'adminMapCalibration', icon: '🧭', label: 'Map GPS Calibration' },
     ],
   },
+  integrations: {
+    icon: '🔗', title: 'Integrations', description: 'External services this system connects to',
+    items: [
+      { view: 'adminGcal', icon: '🗓️', label: 'Google Calendar Sync' },
+    ],
+  },
 };
 // Flat view -> label lookup for the breadcrumb trail (see renderBreadcrumbs) —
 // every leaf tool across every category, in one map.
@@ -4840,6 +4848,57 @@ async function renderAdminUsers(container = app) {
     }));
   }
 
+  draw();
+}
+
+// Google Calendar Sync admin screen (Build Brief v4 Part 1, step 2 of 4).
+// Connect/disconnect only for now — the color-mapping editor and
+// "Regenerate all events" button (brief §1.7) land in step 3, once there's
+// an actual sync worker and event-colors table for them to act on.
+async function renderAdminGcal(container = app) {
+  if (container === app) setChrome({ title: 'Google Calendar Sync', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const [status, healthRes] = await Promise.all([
+    api('/api/pg/gcal/status'),
+    api('/api/pg/system-health').catch(() => null),
+  ]);
+  const gcalHealth = healthRes?.subsystems?.find((s) => s.Subsystem === 'gcal_sync');
+
+  function draw() {
+    setApp(`
+      <div class="card">
+        <h3>Google Calendar Sync</h3>
+        <p class="muted" style="margin-top:-4px">
+          Mirrors scheduled job lines, deferred revisit dates, and calendar events onto a dedicated
+          "Camp Work" calendar on a connected Google account. <strong>The CMMS owns the data</strong> —
+          an event moved or edited directly in Google is overwritten on the next sync. That's correct
+          behavior, not a bug: this is a one-way mirror, not two-way sync.
+        </p>
+        ${status.Connected ? `
+          <p style="margin-top:14px">✅ Connected as <strong>${escapeHtml(status.GoogleEmail)}</strong></p>
+          <p class="muted" style="margin-top:-6px">Calendar: Camp Work${status.ConnectedAt ? ` · connected ${new Date(status.ConnectedAt).toLocaleString()}${status.ConnectedBy ? ` by ${escapeHtml(status.ConnectedBy)}` : ''}` : ''}</p>
+          <p class="muted" style="margin-top:6px">🗓️ Last successful sync: ${gcalHealth?.LastSuccess ? new Date(gcalHealth.LastSuccess).toLocaleString() : 'never yet — outbound sync isn’t built yet'}</p>
+          ${gcalHealth?.State === 'failed' ? `<p style="margin-top:6px;color:#c0392b">⚠️ Most recent sync attempt failed${gcalHealth.LastMessage ? `: ${escapeHtml(gcalHealth.LastMessage)}` : ''}.</p>` : ''}
+          <div class="btn-row" style="margin-top:14px">
+            <button class="btn btn-secondary" id="gcalDisconnectBtn">Disconnect</button>
+          </div>
+        ` : `
+          <p style="margin-top:14px">Not connected.</p>
+          <div class="btn-row" style="margin-top:10px">
+            <a class="btn btn-primary" href="/api/pg/gcal/oauth/start">Connect Google Calendar</a>
+          </div>
+        `}
+      </div>
+    `, container);
+    container.querySelector('#gcalDisconnectBtn')?.addEventListener('click', async () => {
+      if (!await confirmDialog('Disconnect Google Calendar? Nothing on the Camp Work calendar in Google is deleted automatically — it just stops being updated.', { danger: false, confirmLabel: 'Disconnect' })) return;
+      try {
+        await api('/api/pg/gcal/disconnect', { method: 'POST' });
+        toast('Disconnected');
+        renderAdminGcal(container);
+      } catch (err) { toast(err.message); }
+    });
+  }
   draw();
 }
 
@@ -7757,6 +7816,21 @@ async function renderCrew() {
 
 renderThemePicker();
 
+// One-time check for a redirect back from the Google Calendar OAuth flow
+// (src/routes/gcal-oauth-callback.js). This app has no URL-based routing
+// otherwise — go(view, params) never touches the browser URL — so this is
+// the one place a query string is read, and it's stripped immediately after
+// via replaceState so a page refresh never re-shows the toast.
+function handleGcalOauthRedirect() {
+  const params = new URLSearchParams(window.location.search);
+  const connected = params.get('gcalConnected');
+  const error = params.get('gcalError');
+  if (!connected && !error) return;
+  window.history.replaceState({}, '', window.location.pathname);
+  if (connected) toast(`Connected to Google Calendar as ${connected}`, 5000);
+  else toast(`Google Calendar connection failed: ${error}`, 6000);
+}
+
 (async function boot() {
   try {
     const res = await fetch('/api/pg/options');
@@ -7765,7 +7839,8 @@ renderThemePicker();
     // is enough to proceed, this just skips the "Signed in as ..." label until
     // the next successful /login call populates it.
     state.user = state.user || 'you';
-    go('dashboard', {});
+    await go('dashboard', {});
+    handleGcalOauthRedirect();
   } catch {
     render('login');
   }
