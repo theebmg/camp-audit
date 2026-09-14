@@ -179,8 +179,17 @@ export async function createCampWorkCalendar(accessToken) {
 // elsewhere, not only a calendar this app created. `primary` is surfaced so
 // the picker can label it clearly — nothing here blocks selecting it, that
 // call is left to the admin now that this is an explicit manual choice.
+//
+// showHidden=true is required here (found live, 2026-09-14): calendarList.list
+// silently OMITS any entry marked hidden by default, and a calendar someone
+// just shared with you starts out hidden in your list until you manually
+// toggle it visible in Google Calendar's own UI — so a freshly-shared
+// calendar like "Sychar Events" would never appear in this picker without it,
+// even with full owner-level access. minAccessRole=writer asks Google to do
+// the writer-or-better filtering server-side; the client-side filter below
+// stays as a harmless belt-and-suspenders check.
 export async function listWritableCalendars(accessToken) {
-  const list = await calendarApi(accessToken, 'GET', '/users/me/calendarList');
+  const list = await calendarApi(accessToken, 'GET', '/users/me/calendarList?showHidden=true&minAccessRole=writer');
   return (list?.items || [])
     .filter((c) => c.accessRole === 'owner' || c.accessRole === 'writer')
     .map((c) => ({ id: c.id, summary: c.summary, primary: !!c.primary }));
