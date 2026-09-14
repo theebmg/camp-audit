@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Sychar Operations — Terms of Service</title>
+  <link rel="stylesheet" href="/style.css" />
+  <style>
+    /* Standalone static page — not part of the authenticated SPA shell.
+       Reuses shared style.css tokens, same pattern as request.html. */
+    body { display: flex; justify-content: center; padding: 24px 16px 60px; }
+    .wrap { width: 100%; max-width: 720px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 24px 28px; margin-bottom: 14px; box-shadow: var(--shadow-sm); }
+    .card h1 { font-size: 1.4rem; margin: 0 0 4px; }
+    .card h2 { font-size: 1.05rem; margin: 24px 0 8px; }
+    .card p, .card li { line-height: 1.55; }
+    .muted { color: var(--muted); }
+    a { color: var(--accent, #3b6fd6); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Terms of Service</h1>
+      <p class="muted">Sychar Operations — last updated September 14, 2026</p>
+
+      <p>Sychar Operations is an internal tool built and operated for Camp
+      Sychar's own maintenance and operations use. It is not offered as a
+      public product or service, and these terms exist mainly to satisfy
+      third-party integration requirements (such as Google's OAuth review
+      process) rather than to govern a general user base.</p>
+
+      <h2>Who this is for</h2>
+      <p>Access to the system itself (login accounts) is limited to the
+      camp's operations staff. The one public-facing part of the system is
+      the Maintenance Request form at <code>/request</code>, which any camp
+      community member may use to report a maintenance issue.</p>
+
+      <h2>No warranty</h2>
+      <p>The system is provided as-is, for internal use, with no warranty of
+      any kind. It is maintained by a single operator on a best-effort basis
+      as part of that operator's camp responsibilities, not as a commercial
+      service with guaranteed uptime or support response times.</p>
+
+      <h2>Google integration</h2>
+      <p>Where this system connects to a Google account (Calendar API) to
+      mirror maintenance scheduling data onto a dedicated calendar, that
+      connection is used solely for that purpose, as described in the
+      <a href="/privacy.html">Privacy Policy</a>, and can be revoked at any
+      time by the operator.</p>
+
+      <h2>Changes</h2>
+      <p>These terms may be updated as the system's scope changes. Continued
+      operation of the system after a change constitutes acceptance of the
+      updated terms by its operator.</p>
+
+      <h2>Contact</h2>
+      <p>Questions about these terms can be sent to
+      <a href="mailto:ben@fracturedrv.com">ben@fracturedrv.com</a>.</p>
+    </div>
+  </div>
+</body>
+</html>

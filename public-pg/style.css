@@ -153,6 +153,16 @@ body { min-height: 100vh; }
   cursor: pointer;
 }
 
+.sidebar-legal {
+  margin-top: 10px;
+  font-size: 0.76rem;
+  color: var(--muted);
+  text-align: center;
+}
+.sidebar-legal a {
+  color: var(--muted);
+}
+
 .sidebar-overlay {
   display: none;
 }

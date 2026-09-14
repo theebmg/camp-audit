@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <title>Sychar Operations — Privacy Policy</title>
+  <link rel="stylesheet" href="/style.css" />
+  <style>
+    /* Standalone static page — not part of the authenticated SPA shell.
+       Reuses shared style.css tokens, same pattern as request.html. */
+    body { display: flex; justify-content: center; padding: 24px 16px 60px; }
+    .wrap { width: 100%; max-width: 720px; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 24px 28px; margin-bottom: 14px; box-shadow: var(--shadow-sm); }
+    .card h1 { font-size: 1.4rem; margin: 0 0 4px; }
+    .card h2 { font-size: 1.05rem; margin: 24px 0 8px; }
+    .card p, .card li { line-height: 1.55; }
+    .muted { color: var(--muted); }
+    a { color: var(--accent, #3b6fd6); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Privacy Policy</h1>
+      <p class="muted">Sychar Operations — last updated September 14, 2026</p>
+
+      <p>Sychar Operations is an internal maintenance-management system built and
+      operated for Camp Sychar (Mount Vernon, Ohio). It has a single operator and
+      is not a public product or service — this page exists to describe how the
+      system handles data, including data accessed through Google APIs, for
+      that operator's own accountability and for Google's OAuth review process.</p>
+
+      <h2>What this system is</h2>
+      <p>Sychar Operations tracks the camp's buildings, grounds assets, work
+      orders, maintenance findings, expenses, and photos, for the camp's own
+      operations and board reporting. It is not available to the public and
+      does not collect data from or about the general public, with the
+      exception of the optional Maintenance Request form at <code>/request</code>,
+      which any camp community member may use to report a maintenance issue
+      (name, contact info, and a description of the issue, submitted
+      voluntarily and used only to create and track that request).</p>
+
+      <h2>Google account data</h2>
+      <p>Sychar Operations integrates with Google Calendar (Calendar API,
+      <code>calendar.events</code> scope only) so that scheduled maintenance
+      work is visible on a calendar. Specifically:</p>
+      <ul>
+        <li>The system creates a dedicated <strong>"Camp Work"</strong> calendar on
+        the operator's own Google account — it never reads from or writes to
+        the operator's primary calendar or any other calendar.</li>
+        <li>It creates, updates, and deletes events on that dedicated calendar
+        only, mirroring scheduled maintenance work (job lines, deferred
+        revisit dates, and similar) that already exists in the system's own
+        database.</li>
+        <li>It does not read event content the operator or anyone else adds
+        directly in Google Calendar. The relationship is one-way: this system
+        writes to Google Calendar, it does not read from it.</li>
+        <li>No calendar data, or any other Google account data, is sold,
+        shared with third parties, or used for advertising.</li>
+        <li>The Google account refresh token used to maintain this connection
+        is stored in the system's own database, accessible only to the
+        operator, and can be revoked at any time from the system's admin
+        screen or from the operator's own Google Account settings.</li>
+      </ul>
+
+      <h2>Other data</h2>
+      <p>Photos, documents, and records entered into the system (asset
+      condition, work performed, expenses, and similar) are stored on the
+      system's own database and object storage, used solely to operate and
+      report on camp maintenance, and are not shared outside the system's
+      operator and camp leadership.</p>
+
+      <h2>Contact</h2>
+      <p>Questions about this policy or about data held in this system can be
+      sent to <a href="mailto:ben@fracturedrv.com">ben@fracturedrv.com</a>.</p>
+    </div>
+  </div>
+</body>
+</html>
