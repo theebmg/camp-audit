@@ -78,10 +78,12 @@ import {
   listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
   getExpensesReportRawData,
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
+  getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import crypto from 'crypto';
-import { buildAuthUrl, revokeToken, refreshAccessToken, listWritableCalendars, createCampWorkCalendar } from '../gcal.js';
+import { buildAuthUrl, revokeToken, getAccessTokenOrThrow, listWritableCalendars, createCampWorkCalendar } from '../gcal.js';
+import { runGcalSyncDrain } from '../gcalSync.js';
 import {
   buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows, buildCrewSessionReportRows,
   buildJobLineReportRows, JOB_LINE_COLUMN_SPECS, buildFindingReportRows, FINDING_COLUMN_SPECS,
@@ -217,11 +219,11 @@ router.post('/gcal/disconnect', async (req, res, next) => {
 // Gets a live access token from the stored refresh token — every call here
 // refreshes rather than caching, since these are low-frequency admin-screen
 // actions (list calendars, save a choice), not the sync worker's hot path.
+// getAccessTokenOrThrow (gcal.js) is the same helper the worker uses for
+// its own refresh, shared so the "not connected"/dead-token error shaping
+// only exists once.
 async function getFreshGcalAccessToken() {
-  const refreshToken = await getGcalRefreshToken();
-  if (!refreshToken) { const e = new Error('Google Calendar is not connected'); e.status = 400; throw e; }
-  const tokens = await refreshAccessToken(refreshToken);
-  return tokens.access_token;
+  return getAccessTokenOrThrow(await getGcalRefreshToken());
 }
 // Calendar picker (2026-09-14 revision) — calendar choice happens after
 // connecting, not during the OAuth callback, since listing calendars needs
@@ -254,6 +256,30 @@ router.post('/gcal/calendar', async (req, res, next) => {
     }
     await saveGcalCalendar({ calendarId: id, calendarSummary: summary });
     res.json({ ok: true, calendarId: id, calendarSummary: summary });
+  } catch (e) { next(e); }
+});
+
+// ── Step 3 — outbound sync worker admin surface (brief §1.7). The worker
+//    itself runs off a cron'd script (scripts/gcal-sync-worker.js); these
+//    let the admin screen trigger the same drain on demand and manage the
+//    one color-mapping kind that's actually wired up (see migration 0063's
+//    comment on gcal_event_colors for why only 'job_line' exists yet). ─────
+router.get('/gcal/event-colors', async (req, res, next) => {
+  try { res.json({ colors: await getGcalEventColors() }); } catch (e) { next(e); }
+});
+router.patch('/gcal/event-colors/:kind', async (req, res, next) => {
+  try {
+    await setGcalEventColor(req.params.kind, req.body?.gcalColorId ?? null);
+    res.json({ ok: true, colors: await getGcalEventColors() });
+  } catch (e) { next(e); }
+});
+router.post('/gcal/sync-now', async (req, res, next) => {
+  try { res.json({ ok: true, result: await runGcalSyncDrain() }); } catch (e) { next(e); }
+});
+router.post('/gcal/resync-all', async (req, res, next) => {
+  try {
+    await requeueAllGcalSyncs();
+    res.json({ ok: true, result: await runGcalSyncDrain() });
   } catch (e) { next(e); }
 });
 router.get('/inbox/suggest-assets', async (req, res, next) => {

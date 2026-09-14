@@ -2916,6 +2916,11 @@ export async function createJobLine(woId, {
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,(SELECT id FROM job_line_statuses WHERE name = 'Not Started')) RETURNING *`,
     [woId, title, maxRows[0].next, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate, conditionFindingId]
   );
+  // A line created with a scheduled_date already set (e.g. from a template,
+  // or Create WO from Findings) needs to reach the sync worker on day one —
+  // otherwise it'd sit invisible on Google's calendar until its next edit
+  // through updateJobLine, which is the only other place this gets queued.
+  if (scheduledDate) await queueGcalSync(pool, 'job_line', rows[0].id);
   if (conditionFindingId) await autoScheduleFindingIfLinked(pool, conditionFindingId);
   await logActivity({ action: 'created', entityType: 'job_line', entityId: rows[0].id, entityLabel: rows[0].title, details: `On Work Order #${woId}` });
   return hydrateJobLine(rows[0]);
@@ -2993,9 +2998,20 @@ async function changeJobLineStatus(client, jobLineId, newStatusId, { statusNote 
 async function queueGcalSync(queryable, entityType, entityId) {
   await queryable.query(
     `INSERT INTO gcal_pending_syncs (entity_type, entity_id) VALUES ($1,$2)
-     ON CONFLICT (entity_type, entity_id) DO UPDATE SET queued_at = now()`,
+     ON CONFLICT (entity_type, entity_id) DO UPDATE SET queued_at = now(), attempts = 0, next_attempt_at = now(), last_error = NULL`,
     [entityType, entityId]
   );
+}
+
+// Delete-side counterpart, migration 0063: by the time a job_line/
+// calendar_event row is actually gone, there's nothing left to re-query for
+// a Google event id, so deleteJobLine/deleteCalendarEvent capture it in the
+// same statement that deletes the row and hand it straight here. A line/
+// event that was never synced (gcalEventId null — e.g. deleted before the
+// worker ever ran) has nothing on Google to clean up.
+async function queueGcalDelete(gcalEventId) {
+  if (!gcalEventId) return;
+  await pool.query('INSERT INTO gcal_pending_deletes (gcal_event_id) VALUES ($1)', [gcalEventId]);
 }
 
 const JOB_LINE_UPDATE_COLUMNS = [
@@ -3054,8 +3070,11 @@ export async function updateJobLine(id, fields) {
   return hydrateJobLine(rows[0]);
 }
 export async function deleteJobLine(id) {
-  const { rows } = await pool.query('DELETE FROM job_lines WHERE id = $1 RETURNING title, work_order_id', [id]);
-  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'job_line', entityId: Number(id), entityLabel: rows[0].title, details: `On Work Order #${rows[0].work_order_id}` });
+  const { rows } = await pool.query('DELETE FROM job_lines WHERE id = $1 RETURNING title, work_order_id, gcal_event_id', [id]);
+  if (!rows[0]) return;
+  await queueGcalDelete(rows[0].gcal_event_id);
+  await pool.query('DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2', ['job_line', Number(id)]);
+  await logActivity({ action: 'deleted', entityType: 'job_line', entityId: Number(id), entityLabel: rows[0].title, details: `On Work Order #${rows[0].work_order_id}` });
 }
 
 // ── Causes catalog (1.6) — admin-editable dropdown that gets counted.
@@ -3863,10 +3882,14 @@ export async function getInboxCount() {
 // staleness. Backups are the one instance of that today (B6's original
 // >48h threshold, carried over unchanged). Mail ingest deliberately has no
 // cadence — "no mail for a week is normal" (Build Brief v4 §2.2) — and must
-// never be flagged by this; gcal_sync isn't given a cadence here either
-// until Part 1's sync worker actually exists and its own failure signal
-// (repeated failure / dead token) makes a separate staleness check
-// unnecessary for it.
+// never be flagged by this. gcal_sync (step 3, now built) still isn't given
+// one either: the worker writes success/failure on every cron tick it
+// actually runs, so a real failure already shows as `state = 'failed'`
+// without needing a staleness check on top — the only gap a staleness
+// check would catch is the cron job itself silently not running at all
+// (crashed script, removed crontab line), which isn't distinguishable from
+// "healthy and just quiet" without a bespoke heartbeat, and nothing
+// currently reads `Stale` for this subsystem anyway.
 const STALE_AFTER_HOURS = { backup: 48 };
 
 export async function getSystemHealth() {
@@ -3962,6 +3985,135 @@ export async function clearGcalConnection() {
      WHERE id = (SELECT id FROM gcal_connection ORDER BY id LIMIT 1)`
   );
   await logActivity({ action: 'disconnected', entityType: 'gcal_connection', entityLabel: rows[0]?.google_email || 'Google Calendar' });
+}
+
+// Both the refresh token (to get a fresh access token) and the target
+// calendar id, in one round trip — what every sync-worker run needs before
+// it can do anything at all.
+export async function getGcalSyncTarget() {
+  const { rows } = await pool.query('SELECT refresh_token, calendar_id FROM gcal_connection ORDER BY id LIMIT 1');
+  return { refreshToken: rows[0]?.refresh_token || null, calendarId: rows[0]?.calendar_id || null };
+}
+
+// ── Step 3: outbound sync worker support. Queue reads/writes and the
+//    per-entity detail queries the worker needs to build a Google event
+//    body — orchestration itself (retry math, event bodies, calling
+//    gcal.js) lives in gcalSync.js, kept out of db.js like every other
+//    non-SQL concern in this file. ──────────────────────────────────────────
+
+// queued_at comes back as ::text, not the bare timestamptz column — pg's
+// wire protocol only round-trips a timestamptz through node-postgres as a
+// JS Date at millisecond precision, but the column itself stores
+// microseconds (DEFAULT now()). Handing that truncated Date back as the
+// optimistic-concurrency guard in resolveGcalSync/markGcalSyncRetry below
+// would never match the stored value again — found live, first real drain
+// run: two genuinely-succeeded items stayed stuck in the queue forever
+// because their "delete if still this queued_at" WHERE clause silently
+// matched zero rows every time. Comparing as text sidesteps the precision
+// loss entirely.
+export async function listDueGcalSyncs(limit = 25) {
+  const { rows } = await pool.query(
+    `SELECT entity_type, entity_id, queued_at::text AS queued_at, attempts FROM gcal_pending_syncs
+     WHERE next_attempt_at <= now() ORDER BY queued_at LIMIT $1`,
+    [limit]
+  );
+  return rows;
+}
+export async function listDueGcalDeletes(limit = 25) {
+  const { rows } = await pool.query(
+    `SELECT id, gcal_event_id, attempts FROM gcal_pending_deletes
+     WHERE next_attempt_at <= now() ORDER BY queued_at LIMIT $1`,
+    [limit]
+  );
+  return rows;
+}
+
+// Deleted with a queued_at guard: if the row changed again (a newer edit
+// bumped queued_at) between the worker reading it and finishing the API
+// call, this DELETE affects zero rows and the newer change stays queued
+// for the next pass instead of being silently dropped.
+export async function resolveGcalSync(entityType, entityId, queuedAt) {
+  await pool.query(
+    'DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2 AND queued_at::text = $3',
+    [entityType, entityId, queuedAt]
+  );
+}
+export async function markGcalSyncRetry(entityType, entityId, queuedAt, { attempts, nextAttemptAt, error }) {
+  await pool.query(
+    `UPDATE gcal_pending_syncs SET attempts = $4, next_attempt_at = $5, last_error = $6
+     WHERE entity_type = $1 AND entity_id = $2 AND queued_at::text = $3`,
+    [entityType, entityId, queuedAt, attempts, nextAttemptAt, error]
+  );
+}
+export async function resolveGcalDelete(id) {
+  await pool.query('DELETE FROM gcal_pending_deletes WHERE id = $1', [id]);
+}
+export async function markGcalDeleteRetry(id, { attempts, nextAttemptAt, error }) {
+  await pool.query(
+    'UPDATE gcal_pending_deletes SET attempts = $2, next_attempt_at = $3, last_error = $4 WHERE id = $1',
+    [id, attempts, nextAttemptAt, error]
+  );
+}
+
+// Deliberately its own narrow query, not hydrateJobLine — the worker needs
+// exactly what goes into a Google event body (title, schedule, the WO/
+// asset context for the summary/description) and nothing else; hydrateJobLine's
+// cause/assignee/expense-rollup joins would be wasted work on every sync.
+export async function getJobLineForGcalSync(id) {
+  const { rows } = await pool.query(
+    `SELECT jl.id, jl.title, jl.scheduled_date, jl.scheduled_start_time, jl.scheduled_duration_hours, jl.gcal_event_id,
+            w.id AS work_order_id, w.title AS wo_title, jls.name AS status_name,
+            a.name AS asset_name, l.name AS location_name
+     FROM job_lines jl
+     JOIN work_orders w ON w.id = jl.work_order_id
+     JOIN job_line_statuses jls ON jls.id = jl.status_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN locations l ON l.id = COALESCE(a.location_id, w.location_id)
+     WHERE jl.id = $1`,
+    [id]
+  );
+  return rows[0] || null;
+}
+export async function setJobLineGcalEventId(id, gcalEventId) {
+  await pool.query('UPDATE job_lines SET gcal_event_id = $2 WHERE id = $1', [id, gcalEventId]);
+}
+
+// Raw row (not calendarEventRowShape) — CALENDAR_EVENT_SELECT already joins
+// in everything the event body needs (type name/color, WO/job-line titles)
+// and the worker wants the underlying column names, not the frontend's
+// PascalCase shape.
+export async function getCalendarEventForGcalSync(id) {
+  const { rows } = await pool.query(`${CALENDAR_EVENT_SELECT} WHERE e.id = $1`, [id]);
+  return rows[0] || null;
+}
+export async function setCalendarEventGcalEventId(id, gcalEventId) {
+  await pool.query('UPDATE calendar_events SET gcal_event_id = $2 WHERE id = $1', [id, gcalEventId]);
+}
+
+export async function getGcalEventColors() {
+  const { rows } = await pool.query('SELECT kind, gcal_color_id FROM gcal_event_colors ORDER BY kind');
+  return rows.map((r) => ({ Kind: r.kind, GcalColorId: r.gcal_color_id }));
+}
+export async function setGcalEventColor(kind, gcalColorId) {
+  const { rowCount } = await pool.query('UPDATE gcal_event_colors SET gcal_color_id = $2 WHERE kind = $1', [kind, gcalColorId || null]);
+  if (!rowCount) { const e = new Error(`Unknown event color kind: ${kind}`); e.status = 400; throw e; }
+}
+
+// Admin "Regenerate all events" (brief §1.7) — re-enqueues every job line
+// that's actually scheduled and every calendar event, resetting retry state
+// on anything already queued. For after a color-mapping change, a calendar
+// switch, or just wanting to confirm sync is healthy again post-reconnect —
+// not something normal editing needs, since every real edit already queues
+// itself.
+export async function requeueAllGcalSyncs() {
+  await pool.query(`
+    INSERT INTO gcal_pending_syncs (entity_type, entity_id)
+    SELECT 'job_line', id FROM job_lines WHERE scheduled_date IS NOT NULL
+    UNION ALL
+    SELECT 'calendar_event', id FROM calendar_events
+    ON CONFLICT (entity_type, entity_id) DO UPDATE
+      SET queued_at = now(), attempts = 0, next_attempt_at = now(), last_error = NULL
+  `);
 }
 
 // Fuzzy asset-name match for a batch's subject/body (§5.2) — plain word
@@ -4492,6 +4644,10 @@ export async function createCalendarEvent({ title, description, eventDate, endDa
     [title, description || null, eventDate, endDate || null, startTime || null, endTime || null,
       recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null, jobLineId || null, workOrderTemplateId || null, resolvedTypeId]
   );
+  // Unlike a job line (which may or may not have a scheduled_date yet),
+  // every calendar_event row has a real event_date from the moment it's
+  // created — it always needs to reach Google, not just on later edits.
+  await queueGcalSync(pool, 'calendar_event', rows[0].id);
   await logActivity({ action: 'created', entityType: 'calendar_event', entityId: rows[0].id, entityLabel: rows[0].title });
   return calendarEventRowShape(rows[0]);
 }
@@ -4524,8 +4680,11 @@ export async function updateCalendarEvent(id, fields) {
 }
 
 export async function deleteCalendarEvent(id) {
-  const { rows } = await pool.query('DELETE FROM calendar_events WHERE id = $1 RETURNING title', [id]);
-  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'calendar_event', entityId: Number(id), entityLabel: rows[0].title });
+  const { rows } = await pool.query('DELETE FROM calendar_events WHERE id = $1 RETURNING title, gcal_event_id', [id]);
+  if (!rows[0]) return;
+  await queueGcalDelete(rows[0].gcal_event_id);
+  await pool.query('DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2', ['calendar_event', Number(id)]);
+  await logActivity({ action: 'deleted', entityType: 'calendar_event', entityId: Number(id), entityLabel: rows[0].title });
 }
 
 // ── Calendar event types (Build Brief v4 Part 1, added before step 3

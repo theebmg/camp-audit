@@ -1,3 +1,105 @@
+# Runbook: Build Brief v4 step 3 — outbound Google Calendar sync worker (2026-09-14)
+
+Drains `gcal_pending_syncs`/`gcal_pending_deletes` (migrations 0058–0062
+were groundwork only — nothing had reached Google until this session).
+Migration 0063 adds `job_lines.gcal_event_id`/`calendar_events.gcal_event_id`,
+retry columns on `gcal_pending_syncs`, `gcal_pending_deletes` (see below),
+and `gcal_event_colors` (seeded with just `'job_line'` — see its migration
+comment for why `'calendar_event'` doesn't get a row: it already resolves
+color from `calendar_event_types.gcal_color_id`, and `wo_revisit`/
+`finding_revisit`/`pm_due` aren't wired into the queue at all yet, see
+Known gaps below).
+
+**Camp timezone.** Every date/time in this app is naive (no TZ anywhere,
+container runs in UTC) — asked Ben, answered **America/New_York**. Hardcoded
+as `CAMP_TIMEZONE` in `src/gcalSync.js`, attached to every timed Google event
+via `timeZone` alongside a naive `dateTime` string. If Sychar ever runs work
+at a second camp in another zone this stops being a single constant; not a
+concern today.
+
+**Architecture**: `src/gcal.js` gained `getAccessTokenOrThrow` (shared by
+the admin routes' existing `getFreshGcalAccessToken` and the worker — one
+place for the "not connected"/dead-token error shaping) and
+`insertEvent`/`updateEvent`/`deleteEvent`. `src/gcalSync.js` is new — all
+the orchestration (event body construction, retry/backoff, calling
+gcal.js, reporting into system_health) that belongs in neither db.js
+(SQL-only) nor gcal.js (Google-API-only). `runGcalSyncDrain()` there is one
+drain pass, called from three places: `scripts/gcal-sync-worker.js` (cron,
+`*/2 * * * *`, same `docker exec camp-audit node scripts/...` pattern as
+`cleanup-orphaned-uploads.js`), and the admin screen's new "Sync now"/
+"Regenerate all events" buttons via `POST /gcal/sync-now`/`/gcal/resync-all`.
+
+**Two enqueue gaps found and fixed while building this** (the queue itself
+was groundwork from Part 1, but nothing had ever exercised the drain side
+until now): `createJobLine` never queued a sync when created with a
+`scheduledDate` already set (e.g. from Create WO from Findings), and
+`createCalendarEvent` never queued one at all — both only queued on a later
+*edit* through `updateJobLine`/`updateCalendarEvent`. Fixed by queuing in
+both create paths too. Also: `deleteJobLine`/`deleteCalendarEvent` never
+cleaned up the Google-side event — by design the queue looks at current row
+state, which doesn't exist anymore once a row is deleted, so a new
+`gcal_pending_deletes` table (just `gcal_event_id` + retry columns, no
+entity reference) captures the id at delete time, in the same statement
+that deletes the row.
+
+**Retry/backoff**: transient failures get exponential backoff (2^attempts
+minutes, capped at 60) via `attempts`/`next_attempt_at`/`last_error` on both
+queue tables. A dead refresh token (`invalid_grant`) aborts the entire drain
+pass before any per-item API call — per the brief, "do NOT retry on a dead
+token" — so nothing gets counted as a failed attempt just because the token
+was bad that run; every pending row is picked back up untouched once
+reconnected.
+
+**Two real bugs caught by live testing against the actual connected
+calendar, not by code review:**
+- **Optimistic-concurrency delete never actually matched.** `resolveGcalSync`
+  guarded its DELETE with `queued_at = $3` so a newer edit arriving mid-
+  processing wouldn't get silently dropped — but pg's timestamptz column
+  stores microseconds and node-postgres hands a JS `Date` back at
+  millisecond precision, so the round-tripped value could never equal the
+  stored one. First real drain run: two genuinely-synced items (one
+  succeeded job line, one succeeded calendar event) stayed stuck in the
+  queue forever, re-attempted (and re-PUT to Google, harmlessly but
+  wastefully) on every single cron tick. Fixed by comparing
+  `queued_at::text` instead of the parsed Date.
+- **PATCHing an all-day event into a timed one 400s** ("Invalid start
+  time") even though the identical body succeeds as an insert or as a
+  timed-to-timed patch — a genuine Google Calendar API quirk with the
+  all-day/timed transition specifically. Since the worker always rebuilds
+  the complete event body from the CMMS row (never a true partial patch),
+  switched `gcal.js`'s update call from PATCH to PUT (full replace), which
+  handles the transition correctly. Caught by an actual create→reschedule→
+  delete round trip against the real "Sychar Events" calendar (all
+  cleaned up after), not by reasoning about the API in the abstract.
+
+**Verified live** (real calendar, cleaned up after each run): job line
+create (all-day) → sync → gets a `gcal_event_id` → edit to a timed event →
+re-syncs the *same* Google event via PUT → delete → Google event actually
+removed, `gcal_pending_deletes` drains to empty. Same round trip for a
+calendar_event, plus a multi-day (Fri–Sun) recurring event — confirmed via
+a direct Google API read that `end.date` is correctly exclusive (Sunday the
+27th stored, `end.date` synced as the 28th) and the RRULE's `UNTIL` is
+date-only for an all-day event.
+
+## Known gaps / follow-ups
+- **Deferred revisit dates (`wo_revisit`/`finding_revisit`) and PM-due
+  reminders are not synced.** The admin screen's description text used to
+  promise "deferred revisit dates" as part of the mirror (written during
+  Part 1, before this step existed) — corrected now to say what's actually
+  built. `gcal_pending_syncs.entity_type` only allows `'job_line'`/
+  `'calendar_event'`; wiring in the other two kinds means new entity types,
+  new enqueue call sites (a WO/finding's Deferred transition), and deciding
+  what a synthetic "Google event" for a revisit date even looks like (there's
+  no calendar_events row backing one). Flagged to Ben rather than built
+  silently or left as stale UI copy — worth a real decision on scope before
+  a follow-up step, not a default yes.
+- `gcal_event_colors` only has a `'job_line'` row. Extending it to
+  `wo_revisit`/`finding_revisit`/`pm_due` is blocked on the same gap above.
+- No test coverage exercised a genuinely dead refresh token (would need
+  revoking access from the connected Google account) — the dead-token abort
+  path was verified by code reading of `refreshAccessToken`'s existing
+  `deadToken` flagging (Part 1), not a live revoke-and-retry this session.
+
 # Runbook: Build Brief v4 Parts 1–2 — System Health, Google Calendar OAuth, schedule times & event types (2026-09-13/14)
 
 Build order was: (1) system_health + dashboard panel + backup integration,

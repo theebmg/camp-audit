@@ -4863,10 +4863,8 @@ async function renderAdminUsers(container = app) {
   draw();
 }
 
-// Google Calendar Sync admin screen (Build Brief v4 Part 1, step 2 of 4).
-// Connect/disconnect + calendar picker for now — the color-mapping editor
-// and "Regenerate all events" button (brief §1.7) land in step 3, once
-// there's an actual sync worker and event-colors table for them to act on.
+// Google Calendar Sync admin screen (Build Brief v4 Part 1 step 2, step 3
+// color-mapping/manual-sync controls added once the worker existed).
 //
 // Calendar choice is its own step after connecting (2026-09-14 revision),
 // not automatic during OAuth — Ben may already have a calendar built for
@@ -4875,11 +4873,14 @@ async function renderAdminUsers(container = app) {
 async function renderAdminGcal(container = app) {
   if (container === app) setChrome({ title: 'Google Calendar Sync', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
-  const [status, healthRes] = await Promise.all([
+  const [status, healthRes, colorsRes] = await Promise.all([
     api('/api/pg/gcal/status'),
     api('/api/pg/system-health').catch(() => null),
+    api('/api/pg/gcal/event-colors').catch(() => null),
   ]);
   const gcalHealth = healthRes?.subsystems?.find((s) => s.Subsystem === 'gcal_sync');
+  const jobLineColor = colorsRes?.colors?.find((c) => c.Kind === 'job_line') || null;
+  let syncing = false;
   // Picker opens automatically the first time (connected, nothing chosen
   // yet) and can be reopened later via "Change calendar".
   let picking = status.Connected && !status.CalendarId;
@@ -4907,18 +4908,23 @@ async function renderAdminGcal(container = app) {
       <div class="card">
         <h3>Google Calendar Sync</h3>
         <p class="muted" style="margin-top:-4px">
-          Mirrors scheduled job lines, deferred revisit dates, and calendar events onto a dedicated
-          calendar on a connected Google account. <strong>The CMMS owns the data</strong> —
-          an event moved or edited directly in Google is overwritten on the next sync. That's correct
-          behavior, not a bug: this is a one-way mirror, not two-way sync.
+          Mirrors scheduled job lines and calendar events onto a dedicated calendar on a connected
+          Google account (deferred revisit dates aren't part of this sync yet).
+          <strong>The CMMS owns the data</strong> — an event moved or edited directly in Google is
+          overwritten on the next sync. That's correct behavior, not a bug: this is a one-way mirror,
+          not two-way sync.
         </p>
         ${status.Connected ? `
           <p style="margin-top:14px">✅ Connected as <strong>${escapeHtml(status.GoogleEmail)}</strong></p>
           <p class="muted" style="margin-top:-6px">${status.ConnectedAt ? `Connected ${new Date(status.ConnectedAt).toLocaleString()}${status.ConnectedBy ? ` by ${escapeHtml(status.ConnectedBy)}` : ''}` : ''}</p>
           ${!picking && status.CalendarId ? `
             <p style="margin-top:10px">Calendar: <strong>${escapeHtml(status.CalendarSummary || status.CalendarId)}</strong> <button id="gcalChangeCalBtn" style="background:none;border:none;padding:0;color:var(--accent-dark,#3b6fd6);text-decoration:underline;font-size:0.85rem;cursor:pointer">Change</button></p>
-            <p class="muted" style="margin-top:6px">🗓️ Last successful sync: ${gcalHealth?.LastSuccess ? new Date(gcalHealth.LastSuccess).toLocaleString() : 'never yet — outbound sync isn’t built yet'}</p>
+            <p class="muted" style="margin-top:6px">🗓️ Last successful sync: ${gcalHealth?.LastSuccess ? new Date(gcalHealth.LastSuccess).toLocaleString() : 'never yet'}${gcalHealth?.LastMessage && gcalHealth.State !== 'failed' ? ` — ${escapeHtml(gcalHealth.LastMessage)}` : ''}</p>
             ${gcalHealth?.State === 'failed' ? `<p style="margin-top:6px;color:#c0392b">⚠️ Most recent sync attempt failed${gcalHealth.LastMessage ? `: ${escapeHtml(gcalHealth.LastMessage)}` : ''}.</p>` : ''}
+            <div class="btn-row" style="margin-top:10px">
+              <button class="btn btn-secondary" id="gcalSyncNowBtn" ${syncing ? 'disabled' : ''}>${syncing ? 'Syncing…' : 'Sync now'}</button>
+              <button class="btn btn-secondary" id="gcalResyncAllBtn" ${syncing ? 'disabled' : ''}>Regenerate all events</button>
+            </div>
           ` : picking ? calendarPickerHtml() : `<p style="margin-top:14px" class="muted">No calendar chosen yet.</p>`}
           <div class="btn-row" style="margin-top:14px">
             <button class="btn btn-secondary" id="gcalDisconnectBtn">Disconnect</button>
@@ -4930,6 +4936,20 @@ async function renderAdminGcal(container = app) {
           </div>
         `}
       </div>
+      ${status.Connected && status.CalendarId && !picking ? `
+        <div class="card">
+          <h3>Event Color</h3>
+          <p class="muted" style="margin-top:-4px">Calendar events get their color from their own Type (Admin > System > Calendar Event Types). Job lines synced from Work Orders all get one flat color here, so they read as "CMMS work" at a glance next to admin-typed events.</p>
+          <div class="field-row" style="margin-top:10px">
+            <label>Job line events</label>
+            <select id="gcalJobLineColor">
+              <option value="">— calendar's default color —</option>
+              ${Object.entries(GOOGLE_EVENT_COLORS).map(([id, c]) => `<option value="${id}" ${jobLineColor?.GcalColorId === id ? 'selected' : ''}>${c.name}</option>`).join('')}
+            </select>
+            <button class="btn btn-primary" id="gcalSaveJobLineColorBtn" style="margin-top:8px">Save</button>
+          </div>
+        </div>
+      ` : ''}
     `, container);
 
     if (picking && !calendars) {
@@ -4963,6 +4983,30 @@ async function renderAdminGcal(container = app) {
         await api('/api/pg/gcal/disconnect', { method: 'POST' });
         toast('Disconnected');
         renderAdminGcal(container);
+      } catch (err) { toast(err.message); }
+    });
+    container.querySelector('#gcalSyncNowBtn')?.addEventListener('click', async () => {
+      syncing = true; draw();
+      try {
+        const { result } = await api('/api/pg/gcal/sync-now', { method: 'POST' });
+        toast(result?.skipped ? `Sync skipped: ${result.skipped.replaceAll('_', ' ')}` : `Synced ${result.succeeded}/${result.syncs + result.deletes} item(s)`);
+      } catch (err) { toast(err.message); }
+      finally { syncing = false; renderAdminGcal(container); }
+    });
+    container.querySelector('#gcalResyncAllBtn')?.addEventListener('click', async () => {
+      if (!await confirmDialog('Re-queue every scheduled job line and calendar event for a fresh sync? Useful after changing colors or reconnecting — not needed for normal day-to-day scheduling, which already syncs itself.', { danger: false, confirmLabel: 'Regenerate all' })) return;
+      syncing = true; draw();
+      try {
+        const { result } = await api('/api/pg/gcal/resync-all', { method: 'POST' });
+        toast(result?.skipped ? `Queued, but sync skipped: ${result.skipped.replaceAll('_', ' ')}` : `Synced ${result.succeeded}/${result.syncs + result.deletes} item(s) — remaining will catch up on the next scheduled run`);
+      } catch (err) { toast(err.message); }
+      finally { syncing = false; renderAdminGcal(container); }
+    });
+    container.querySelector('#gcalSaveJobLineColorBtn')?.addEventListener('click', async () => {
+      const gcalColorId = container.querySelector('#gcalJobLineColor').value || null;
+      try {
+        await api('/api/pg/gcal/event-colors/job_line', { method: 'PATCH', body: JSON.stringify({ gcalColorId }) });
+        toast('Saved — existing synced events keep their old color until next touched; use "Regenerate all events" to repaint everything now.');
       } catch (err) { toast(err.message); }
     });
   }

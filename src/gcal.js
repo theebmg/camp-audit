@@ -107,6 +107,26 @@ export async function refreshAccessToken(refreshToken) {
   }
 }
 
+// Shared by the admin routes (list/save calendar) and the sync worker
+// (step 3) — every caller needs the same two things: a clear error if
+// nothing's connected yet, and a fresh access token otherwise (refresh
+// tokens are exchanged for a new access token on every use here rather
+// than cached, since Google's access tokens are short-lived and this app
+// has no in-memory cache to invalidate correctly across the worker's
+// separate process). Throws with `deadToken` set (via refreshAccessToken
+// above) when the stored refresh token has been revoked — callers that
+// distinguish "not configured" from "dead token" for retry purposes
+// (the sync worker) should check that flag, not just catch-and-log.
+export async function getAccessTokenOrThrow(refreshToken) {
+  if (!refreshToken) {
+    const err = new Error('Google Calendar is not connected');
+    err.status = 400;
+    throw err;
+  }
+  const tokens = await refreshAccessToken(refreshToken);
+  return tokens.access_token;
+}
+
 // Best-effort revoke when disconnecting (the admin screen's Disconnect
 // button) — an already-invalid token 400s here, which is fine; the local
 // disconnect (clearGcalConnection in db.js) proceeds either way.
@@ -193,4 +213,38 @@ export async function listWritableCalendars(accessToken) {
   return (list?.items || [])
     .filter((c) => c.accessRole === 'owner' || c.accessRole === 'writer')
     .map((c) => ({ id: c.id, summary: c.summary, primary: !!c.primary }));
+}
+
+// ── Step 3: event create/update/delete on the connected calendar. Bodies
+//    are built entirely by the caller (gcalSync.js) — this module stays
+//    "just talks to Google," same as everywhere else here. ─────────────────
+
+export async function insertEvent(accessToken, calendarId, eventBody) {
+  return calendarApi(accessToken, 'POST', `/calendars/${encodeURIComponent(calendarId)}/events`, eventBody);
+}
+
+// PUT (full replace), not PATCH — the worker always rebuilds the complete
+// desired body from the CMMS row, never a partial field set, so PUT's
+// semantics are exactly right. Also sidesteps a real Google API quirk found
+// live: PATCHing an existing all-day event's start/end into a timed
+// dateTime+timeZone pair (or vice versa) 400s with "Invalid start time"
+// even though the identical body succeeds as an insert or as a timed-to-
+// timed patch — PUT handles the all-day/timed transition correctly where
+// PATCH doesn't.
+export async function updateEvent(accessToken, calendarId, eventId, eventBody) {
+  return calendarApi(accessToken, 'PUT', `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`, eventBody);
+}
+
+// A 404/410 here means the event is already gone from Google's side (hand-
+// deleted despite the one-way-mirror warning, or already cleaned up by a
+// previous run that crashed after the API call but before the CMMS-side
+// bookkeeping) — that's the caller's desired end state either way, so it's
+// treated as success rather than a retryable failure.
+export async function deleteEvent(accessToken, calendarId, eventId) {
+  try {
+    await calendarApi(accessToken, 'DELETE', `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`);
+  } catch (e) {
+    if (e.status === 404 || e.status === 410) return;
+    throw e;
+  }
 }
