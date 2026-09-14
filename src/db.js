@@ -2984,6 +2984,20 @@ async function changeJobLineStatus(client, jobLineId, newStatusId, { statusNote 
   );
 }
 
+// Build Brief v4 Part 1 groundwork: records that an entity's calendar-
+// relevant fields changed, for the step-3 sync worker (not built yet) to
+// pick up later — see migration 0062's header comment. One row per entity;
+// a second change before the worker gets to it just bumps queued_at rather
+// than piling up duplicates, since the worker only needs to see the
+// current state once, not every intermediate edit.
+async function queueGcalSync(queryable, entityType, entityId) {
+  await queryable.query(
+    `INSERT INTO gcal_pending_syncs (entity_type, entity_id) VALUES ($1,$2)
+     ON CONFLICT (entity_type, entity_id) DO UPDATE SET queued_at = now()`,
+    [entityType, entityId]
+  );
+}
+
 const JOB_LINE_UPDATE_COLUMNS = [
   'title', 'responsibility_class', 'funding_source', 'funding_ref_id',
   'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost', 'scheduled_date',
@@ -2991,6 +3005,11 @@ const JOB_LINE_UPDATE_COLUMNS = [
   'complaint', 'cause_note', 'correction', 'blocked_reason', 'blocked_since', 'completed_date',
   'condition_finding_id',
 ];
+// Any of these changing is a calendar-visible move — the job-line edit
+// form's Scheduled Date field and the Calendar's drag-to-reschedule both
+// go through this same function, so queuing the sync once here (rather
+// than at each call site) means neither path can forget to.
+const JOB_LINE_SCHEDULE_COLUMNS = ['scheduled_date', 'scheduled_start_time', 'scheduled_duration_hours'];
 export async function updateJobLine(id, fields) {
   const setCols = []; const vals = []; let i = 1;
   for (const [key, value] of Object.entries(fields)) {
@@ -3007,6 +3026,9 @@ export async function updateJobLine(id, fields) {
     if (setCols.length) {
       vals.push(id);
       await client.query(`UPDATE job_lines SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
+    }
+    if (JOB_LINE_SCHEDULE_COLUMNS.some((c) => c in fields)) {
+      await queueGcalSync(client, 'job_line', Number(id));
     }
     if (fields.status_id != null) {
       await changeJobLineStatus(client, id, Number(fields.status_id), { statusNote: fields.statusNote });
@@ -4313,10 +4335,12 @@ export async function listJobLinesScheduledInRange(fromDate, toDate) {
   const { rows } = await pool.query(
     `SELECT jl.id, jl.title, jl.scheduled_date, jl.scheduled_start_time, jl.scheduled_duration_hours, jl.work_order_id,
             w.title AS wo_title, ws.name AS wo_status, ws.color AS wo_status_color, w.priority,
+            jls.id AS status_id, jls.name AS status_name, jls.color AS status_color, jls.is_terminal AS status_is_terminal,
             a.id AS asset_id, a.name AS asset_name
      FROM job_lines jl
      JOIN work_orders w ON w.id = jl.work_order_id
      JOIN work_order_statuses ws ON ws.id = w.status_id
+     JOIN job_line_statuses jls ON jls.id = jl.status_id
      LEFT JOIN assets a ON a.id = w.asset_id
      WHERE jl.scheduled_date BETWEEN $1 AND $2
      ORDER BY jl.scheduled_date`,
@@ -4326,8 +4350,81 @@ export async function listJobLinesScheduledInRange(fromDate, toDate) {
     JobLineId: r.id, JobLineTitle: r.title, ScheduledDate: r.scheduled_date,
     ScheduledStartTime: r.scheduled_start_time, ScheduledDurationHours: r.scheduled_duration_hours != null ? Number(r.scheduled_duration_hours) : null,
     WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title, WorkOrderStatus: r.wo_status, WorkOrderStatusColor: r.wo_status_color, Priority: r.priority,
+    // The LINE's own status — distinct from the WO's above — is what
+    // decides drag-eligibility on the Calendar (a terminal line, Done/Not
+    // Needed/Cancelled, is a closed decision and stays put even if its work
+    // order is still open with other lines going).
+    StatusId: r.status_id, StatusName: r.status_name, StatusColor: r.status_color, StatusIsTerminal: r.status_is_terminal,
     Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
   }));
+}
+
+// Everything currently deferred with a revisit date — a work order Deferred
+// (2.3) or a condition finding Deferred, each with a reason + a promised
+// future date. Not job-line-shaped (no asset/funding to schedule against)
+// and not draggable on the Calendar: a revisit date is a commitment already
+// made for a stated reason, not an open scheduling slot, so it's surfaced
+// here purely for "what's already on the books" visibility (the whole point
+// of week/day view — see Build Brief v4 Part 1 amendment).
+export async function listRevisitDatesInRange(fromDate, toDate) {
+  const [woRows, findingRows] = await Promise.all([
+    pool.query(
+      `SELECT w.id, w.title, w.revisit_date, w.deferred_reason, a.id AS asset_id, a.name AS asset_name
+       FROM work_orders w LEFT JOIN assets a ON a.id = w.asset_id
+       JOIN work_order_statuses ws ON ws.id = w.status_id
+       WHERE ws.name = 'Deferred' AND w.revisit_date BETWEEN $1 AND $2`,
+      [fromDate, toDate]
+    ),
+    pool.query(
+      `SELECT cf.id, cf.title, cf.revisit_date, cf.deferred_reason, a.id AS asset_id, a.name AS asset_name
+       FROM condition_findings cf LEFT JOIN assets a ON a.id = cf.asset_id
+       WHERE cf.status = 'Deferred' AND cf.revisit_date BETWEEN $1 AND $2`,
+      [fromDate, toDate]
+    ),
+  ]);
+  return [
+    ...woRows.rows.map((r) => ({
+      RevisitEntityType: 'workOrder', WorkOrderId: r.id, Title: r.title, RevisitDate: r.revisit_date,
+      DeferredReason: r.deferred_reason, Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
+    })),
+    ...findingRows.rows.map((r) => ({
+      RevisitEntityType: 'finding', FindingId: r.id, Title: r.title, RevisitDate: r.revisit_date,
+      DeferredReason: r.deferred_reason, Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
+    })),
+  ];
+}
+
+// Every job line still waiting to be put on the calendar — the Scheduling
+// Queue's raw material (Build Brief v4 Part 1 amendment). Terminal lines
+// (Done/Not Needed/Cancelled) are excluded even if somehow dateless: there's
+// nothing left to schedule about a closed line. Small camp-scale dataset —
+// fetched whole and filtered/sorted client-side, same pattern as the
+// Calendar's old "Unscheduled Work Orders" sidebar it replaces.
+export async function listUnscheduledJobLines() {
+  const { rows } = await pool.query(
+    `SELECT jl.id, jl.title, jl.funding_source, jl.funding_ref_id, jl.estimated_cost, jl.estimated_hours,
+            w.id AS work_order_id, w.title AS wo_title, w.priority,
+            ws.id AS wo_status_id, ws.name AS wo_status, ws.color AS wo_status_color,
+            a.id AS asset_id, a.name AS asset_name, l.id AS location_id, l.name AS location_name
+     FROM job_lines jl
+     JOIN work_orders w ON w.id = jl.work_order_id
+     JOIN work_order_statuses ws ON ws.id = w.status_id
+     JOIN job_line_statuses jls ON jls.id = jl.status_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN locations l ON l.id = COALESCE(a.location_id, w.location_id)
+     WHERE jl.scheduled_date IS NULL AND NOT jls.is_terminal
+     ORDER BY w.id DESC`
+  );
+  return await Promise.all(rows.map(async (r) => ({
+    JobLineId: r.id, JobLineTitle: r.title, EstimatedCost: r.estimated_cost != null ? Number(r.estimated_cost) : null,
+    EstimatedHours: r.estimated_hours != null ? Number(r.estimated_hours) : null,
+    FundingSource: r.funding_source, FundingRefId: r.funding_ref_id,
+    FundingRefLabel: await getFundingRefLabel(r.funding_source, r.funding_ref_id),
+    WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title, Priority: r.priority,
+    WorkOrderStatusId: r.wo_status_id, WorkOrderStatus: r.wo_status, WorkOrderStatusColor: r.wo_status_color,
+    Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
+    Location: r.location_id ? { Id: r.location_id, Name: r.location_name } : null,
+  })));
 }
 
 // PM auto-generation: for every occurrence in [fromDate, min(toDate, today)]
@@ -4399,6 +4496,10 @@ export async function createCalendarEvent({ title, description, eventDate, endDa
   return calendarEventRowShape(rows[0]);
 }
 
+// Same set the Calendar's drag-to-reschedule touches — see
+// JOB_LINE_SCHEDULE_COLUMNS's comment for why this is checked once here
+// rather than at each call site.
+const CALENDAR_EVENT_SCHEDULE_COLUMNS = ['event_date', 'end_date', 'start_time', 'end_time'];
 export async function updateCalendarEvent(id, fields) {
   const allowed = [
     'title', 'description', 'event_date', 'end_date', 'start_time', 'end_time',
@@ -4414,6 +4515,9 @@ export async function updateCalendarEvent(id, fields) {
   vals.push(id);
   const { rowCount } = await pool.query(`UPDATE calendar_events SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
   if (!rowCount) return null;
+  if (CALENDAR_EVENT_SCHEDULE_COLUMNS.some((c) => c in fields)) {
+    await queueGcalSync(pool, 'calendar_event', Number(id));
+  }
   const event = await getCalendarEvent(id);
   await logActivity({ action: 'updated', entityType: 'calendar_event', entityId: Number(id), entityLabel: event?.Title });
   return event;

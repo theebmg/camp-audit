@@ -46,7 +46,7 @@ import {
   listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
   listCalendarEventTypes, createCalendarEventType, updateCalendarEventType, setCalendarEventTypeActive, deleteCalendarEventType,
-  listJobLinesScheduledInRange,
+  listJobLinesScheduledInRange, listRevisitDatesInRange, listUnscheduledJobLines,
   generateDueWorkOrdersForRange,
   listChecklistTemplates, createChecklistTemplate, updateChecklistTemplate, deleteChecklistTemplate,
   getChecklistInstanceForWorkOrder, getChecklistInstanceForCalendarEvent,
@@ -1624,6 +1624,20 @@ router.get('/job-lines/scheduled', async (req, res, next) => {
     if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to (YYYY-MM-DD) are required' });
     res.json({ jobLines: await listJobLinesScheduledInRange(from, to) });
   } catch (e) { next(e); }
+});
+// Deferred work-order/finding revisit dates in range — fixed, non-draggable
+// "already booked" markers the Calendar shows alongside scheduled job lines.
+router.get('/revisit-dates', async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to (YYYY-MM-DD) are required' });
+    res.json({ revisitDates: await listRevisitDatesInRange(from, to) });
+  } catch (e) { next(e); }
+});
+// The Scheduling Queue's raw material (Build Brief v4 Part 1 amendment) —
+// every non-terminal job line with no scheduled_date yet.
+router.get('/job-lines/unscheduled', async (req, res, next) => {
+  try { res.json({ jobLines: await listUnscheduledJobLines() }); } catch (e) { next(e); }
 });
 router.get('/calendar-events/:id', async (req, res, next) => {
   try {
