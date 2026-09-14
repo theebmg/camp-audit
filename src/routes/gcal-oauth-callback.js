@@ -13,8 +13,15 @@
 // The browser still carries the session cookie on this navigation (a
 // same-site top-level GET), so req.session is available here to both read
 // the CSRF state /oauth/start wrote and to record who connected it.
+// Deliberately does NOT pick or create a calendar (2026-09-14 revision) —
+// that now happens as its own step from the admin screen, after connecting,
+// because listing/creating calendars needs an access token this callback
+// has only just obtained, and because Ben may already have a calendar built
+// for this (e.g. one made directly in the camp Google account and shared to
+// his own) rather than always wanting a fresh auto-created one. See
+// saveGcalCalendar/listWritableCalendars for that step.
 import express from 'express';
-import { exchangeCodeForTokens, getPrimaryCalendarEmail, createCampWorkCalendar } from '../gcal.js';
+import { exchangeCodeForTokens, getPrimaryCalendarEmail } from '../gcal.js';
 import { saveGcalConnection } from '../db.js';
 
 const router = express.Router();
@@ -39,9 +46,8 @@ router.get('/', async (req, res) => {
       throw new Error('Google did not return a refresh token. Try removing this app\'s access under your Google Account\'s "Third-party access" settings, then reconnect.');
     }
     const googleEmail = await getPrimaryCalendarEmail(tokens.access_token);
-    const calendarId = await createCampWorkCalendar(tokens.access_token);
     await saveGcalConnection({
-      refreshToken: tokens.refresh_token, googleEmail, calendarId,
+      refreshToken: tokens.refresh_token, googleEmail,
       connectedBy: req.session?.user || null,
     });
     res.redirect(`/?gcalConnected=${encodeURIComponent(googleEmail)}`);

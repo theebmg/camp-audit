@@ -4852,9 +4852,14 @@ async function renderAdminUsers(container = app) {
 }
 
 // Google Calendar Sync admin screen (Build Brief v4 Part 1, step 2 of 4).
-// Connect/disconnect only for now — the color-mapping editor and
-// "Regenerate all events" button (brief §1.7) land in step 3, once there's
-// an actual sync worker and event-colors table for them to act on.
+// Connect/disconnect + calendar picker for now — the color-mapping editor
+// and "Regenerate all events" button (brief §1.7) land in step 3, once
+// there's an actual sync worker and event-colors table for them to act on.
+//
+// Calendar choice is its own step after connecting (2026-09-14 revision),
+// not automatic during OAuth — Ben may already have a calendar built for
+// this (e.g. one made directly in the camp Google account and shared to his
+// own) rather than always wanting a fresh auto-created "Camp Work" one.
 async function renderAdminGcal(container = app) {
   if (container === app) setChrome({ title: 'Google Calendar Sync', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
@@ -4863,22 +4868,46 @@ async function renderAdminGcal(container = app) {
     api('/api/pg/system-health').catch(() => null),
   ]);
   const gcalHealth = healthRes?.subsystems?.find((s) => s.Subsystem === 'gcal_sync');
+  // Picker opens automatically the first time (connected, nothing chosen
+  // yet) and can be reopened later via "Change calendar".
+  let picking = status.Connected && !status.CalendarId;
+  let calendars = null; // lazy-loaded only when the picker actually opens
 
-  function draw() {
+  function calendarPickerHtml() {
+    if (!calendars) return '<p class="muted" style="margin-top:14px">Loading calendars…</p>';
+    return `
+      <div class="field-row" style="margin-top:14px">
+        <label>Sync to calendar</label>
+        <select class="gcal-cal-select">
+          <option value="__create_new__">+ Create a new "Camp Work" calendar</option>
+          ${calendars.map((c) => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.summary)}${c.primary ? ' (primary)' : ''}</option>`).join('')}
+        </select>
+        ${calendars.some((c) => c.primary) ? '<p class="muted" style="margin-top:4px;font-size:0.82rem">Picking your primary calendar mixes synced events in with your personal ones.</p>' : ''}
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="gcalSaveCalBtn">Save</button>
+        ${status.CalendarId ? '<button class="btn btn-secondary" id="gcalCancelCalBtn">Cancel</button>' : ''}
+      </div>`;
+  }
+
+  async function draw() {
     setApp(`
       <div class="card">
         <h3>Google Calendar Sync</h3>
         <p class="muted" style="margin-top:-4px">
           Mirrors scheduled job lines, deferred revisit dates, and calendar events onto a dedicated
-          "Camp Work" calendar on a connected Google account. <strong>The CMMS owns the data</strong> —
+          calendar on a connected Google account. <strong>The CMMS owns the data</strong> —
           an event moved or edited directly in Google is overwritten on the next sync. That's correct
           behavior, not a bug: this is a one-way mirror, not two-way sync.
         </p>
         ${status.Connected ? `
           <p style="margin-top:14px">✅ Connected as <strong>${escapeHtml(status.GoogleEmail)}</strong></p>
-          <p class="muted" style="margin-top:-6px">Calendar: Camp Work${status.ConnectedAt ? ` · connected ${new Date(status.ConnectedAt).toLocaleString()}${status.ConnectedBy ? ` by ${escapeHtml(status.ConnectedBy)}` : ''}` : ''}</p>
-          <p class="muted" style="margin-top:6px">🗓️ Last successful sync: ${gcalHealth?.LastSuccess ? new Date(gcalHealth.LastSuccess).toLocaleString() : 'never yet — outbound sync isn’t built yet'}</p>
-          ${gcalHealth?.State === 'failed' ? `<p style="margin-top:6px;color:#c0392b">⚠️ Most recent sync attempt failed${gcalHealth.LastMessage ? `: ${escapeHtml(gcalHealth.LastMessage)}` : ''}.</p>` : ''}
+          <p class="muted" style="margin-top:-6px">${status.ConnectedAt ? `Connected ${new Date(status.ConnectedAt).toLocaleString()}${status.ConnectedBy ? ` by ${escapeHtml(status.ConnectedBy)}` : ''}` : ''}</p>
+          ${!picking && status.CalendarId ? `
+            <p style="margin-top:10px">Calendar: <strong>${escapeHtml(status.CalendarSummary || status.CalendarId)}</strong> <button id="gcalChangeCalBtn" style="background:none;border:none;padding:0;color:var(--accent-dark,#3b6fd6);text-decoration:underline;font-size:0.85rem;cursor:pointer">Change</button></p>
+            <p class="muted" style="margin-top:6px">🗓️ Last successful sync: ${gcalHealth?.LastSuccess ? new Date(gcalHealth.LastSuccess).toLocaleString() : 'never yet — outbound sync isn’t built yet'}</p>
+            ${gcalHealth?.State === 'failed' ? `<p style="margin-top:6px;color:#c0392b">⚠️ Most recent sync attempt failed${gcalHealth.LastMessage ? `: ${escapeHtml(gcalHealth.LastMessage)}` : ''}.</p>` : ''}
+          ` : picking ? calendarPickerHtml() : `<p style="margin-top:14px" class="muted">No calendar chosen yet.</p>`}
           <div class="btn-row" style="margin-top:14px">
             <button class="btn btn-secondary" id="gcalDisconnectBtn">Disconnect</button>
           </div>
@@ -4890,8 +4919,34 @@ async function renderAdminGcal(container = app) {
         `}
       </div>
     `, container);
+
+    if (picking && !calendars) {
+      try {
+        ({ calendars } = await api('/api/pg/gcal/calendars'));
+      } catch (err) {
+        toast(err.message);
+        calendars = [];
+      }
+      draw();
+      return;
+    }
+
+    container.querySelector('#gcalChangeCalBtn')?.addEventListener('click', () => { picking = true; calendars = null; draw(); });
+    container.querySelector('#gcalCancelCalBtn')?.addEventListener('click', () => { picking = false; draw(); });
+    container.querySelector('#gcalSaveCalBtn')?.addEventListener('click', async () => {
+      const val = container.querySelector('.gcal-cal-select').value;
+      try {
+        const body = val === '__create_new__' ? { createNew: true } : { calendarId: val };
+        const saved = await api('/api/pg/gcal/calendar', { method: 'POST', body: JSON.stringify(body) });
+        status.CalendarId = saved.calendarId;
+        status.CalendarSummary = saved.calendarSummary;
+        picking = false;
+        toast('Calendar saved');
+        draw();
+      } catch (err) { toast(err.message); }
+    });
     container.querySelector('#gcalDisconnectBtn')?.addEventListener('click', async () => {
-      if (!await confirmDialog('Disconnect Google Calendar? Nothing on the Camp Work calendar in Google is deleted automatically — it just stops being updated.', { danger: false, confirmLabel: 'Disconnect' })) return;
+      if (!await confirmDialog('Disconnect Google Calendar? Nothing on the connected calendar in Google is deleted automatically — it just stops being updated.', { danger: false, confirmLabel: 'Disconnect' })) return;
       try {
         await api('/api/pg/gcal/disconnect', { method: 'POST' });
         toast('Disconnected');
@@ -7827,7 +7882,7 @@ function handleGcalOauthRedirect() {
   const error = params.get('gcalError');
   if (!connected && !error) return;
   window.history.replaceState({}, '', window.location.pathname);
-  if (connected) toast(`Connected to Google Calendar as ${connected}`, 5000);
+  if (connected) toast(`Connected to Google Calendar as ${connected} — go to Admin > Integrations to choose a calendar`, 6000);
   else toast(`Google Calendar connection failed: ${error}`, 6000);
 }
 

@@ -3870,32 +3870,53 @@ export async function getGcalConnection() {
     Connected: !!r?.refresh_token,
     GoogleEmail: r?.google_email || null,
     CalendarId: r?.calendar_id || null,
+    CalendarSummary: r?.calendar_summary || null,
     ConnectedAt: r?.connected_at || null,
     ConnectedBy: r?.connected_by || null,
   };
 }
 
-// Internal — only the sync worker (step 3) needs the raw token to make
-// authenticated calls, so it's deliberately not part of getGcalConnection's
-// public shape above.
+// Internal — only the sync worker (step 3) and the calendar-picker routes
+// need the raw token to make authenticated calls, so it's deliberately not
+// part of getGcalConnection's public shape above.
 export async function getGcalRefreshToken() {
   const { rows } = await pool.query('SELECT refresh_token FROM gcal_connection ORDER BY id LIMIT 1');
   return rows[0]?.refresh_token || null;
 }
 
-export async function saveGcalConnection({ refreshToken, googleEmail, calendarId, connectedBy }) {
+// Just the OAuth identity — calendar choice is a deliberately separate step
+// (saveGcalCalendar below), made after connecting rather than during the
+// callback, since listing calendars needs a token the callback has only
+// just obtained (2026-09-14 revision: Ben may already have a calendar built
+// for this, e.g. one made directly in the camp Google account and shared to
+// his own, rather than always wanting a fresh auto-created one). Doesn't
+// touch calendar_id/calendar_summary at all, so a reconnect (token died,
+// re-authorized) never forgets a previously chosen calendar.
+export async function saveGcalConnection({ refreshToken, googleEmail, connectedBy }) {
   await pool.query(
-    `UPDATE gcal_connection SET refresh_token = $1, google_email = $2, calendar_id = $3, connected_at = now(), connected_by = $4
+    `UPDATE gcal_connection SET refresh_token = $1, google_email = $2, connected_at = now(), connected_by = $3
      WHERE id = (SELECT id FROM gcal_connection ORDER BY id LIMIT 1)`,
-    [refreshToken, googleEmail, calendarId, connectedBy]
+    [refreshToken, googleEmail, connectedBy]
   );
   await logActivity({ action: 'connected', entityType: 'gcal_connection', entityLabel: googleEmail || 'Google Calendar' });
+}
+
+// The calendar-picker's write path (admin screen, after connecting) —
+// either an existing calendar the account can write to, or one this app
+// just created via gcal.js's createCampWorkCalendar.
+export async function saveGcalCalendar({ calendarId, calendarSummary }) {
+  await pool.query(
+    `UPDATE gcal_connection SET calendar_id = $1, calendar_summary = $2
+     WHERE id = (SELECT id FROM gcal_connection ORDER BY id LIMIT 1)`,
+    [calendarId, calendarSummary]
+  );
+  await logActivity({ action: 'updated', entityType: 'gcal_connection', entityLabel: `sync calendar: ${calendarSummary || calendarId}` });
 }
 
 export async function clearGcalConnection() {
   const { rows } = await pool.query('SELECT google_email FROM gcal_connection ORDER BY id LIMIT 1');
   await pool.query(
-    `UPDATE gcal_connection SET refresh_token = NULL, google_email = NULL, calendar_id = NULL, connected_at = NULL, connected_by = NULL
+    `UPDATE gcal_connection SET refresh_token = NULL, google_email = NULL, calendar_id = NULL, calendar_summary = NULL, connected_at = NULL, connected_by = NULL
      WHERE id = (SELECT id FROM gcal_connection ORDER BY id LIMIT 1)`
   );
   await logActivity({ action: 'disconnected', entityType: 'gcal_connection', entityLabel: rows[0]?.google_email || 'Google Calendar' });

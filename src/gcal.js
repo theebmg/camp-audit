@@ -133,12 +133,15 @@ export async function getPrimaryCalendarEmail(accessToken) {
   return primary.id;
 }
 
-// Creates the dedicated "Camp Work" calendar (brief §1.3) — never the
-// primary calendar. Called once, on first authorization; the resulting
-// calendarId is stored in gcal_connection and reused for every event this
-// app ever writes. Inserting a calendar automatically adds it to the
-// creating account's own calendar list, which is what makes the follow-up
-// colorId patch below valid immediately.
+// Creates a fresh "Camp Work" calendar — one option in the admin screen's
+// calendar picker (src/routes/pg-api.js's POST /gcal/calendar), alongside
+// pointing sync at a calendar the admin already made themselves (revised
+// 2026-09-14: calendar choice is no longer automatic-and-immediate during
+// the OAuth callback, since Ben may already have a purpose-built calendar,
+// e.g. one created directly in the camp Google account and shared to his
+// own). Inserting a calendar automatically adds it to the creating
+// account's own calendar list, which is what makes the follow-up colorId
+// patch below valid immediately.
 //
 // Given its own color at creation (brief §1.4's calendar-level color, a
 // different axis from the future per-event colorId in gcal_event_colors) so
@@ -157,4 +160,17 @@ export async function createCampWorkCalendar(accessToken) {
     await calendarApi(accessToken, 'PATCH', `/users/me/calendarList/${encodeURIComponent(calendar.id)}`, { colorId });
   }
   return calendar.id;
+}
+
+// Calendars the connected account can write to — powers the admin screen's
+// picker (brief revision, 2026-09-14) so sync can point at any calendar Ben
+// has edit access to, including the primary calendar or one shared in from
+// elsewhere, not only a calendar this app created. `primary` is surfaced so
+// the picker can label it clearly — nothing here blocks selecting it, that
+// call is left to the admin now that this is an explicit manual choice.
+export async function listWritableCalendars(accessToken) {
+  const list = await calendarApi(accessToken, 'GET', '/users/me/calendarList');
+  return (list?.items || [])
+    .filter((c) => c.accessRole === 'owner' || c.accessRole === 'writer')
+    .map((c) => ({ id: c.id, summary: c.summary, primary: !!c.primary }));
 }

@@ -76,11 +76,11 @@ import {
   listExpenseCategories, createExpenseCategory, updateExpenseCategory, deleteExpenseCategory,
   listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
   getExpensesReportRawData,
-  getGcalConnection, getGcalRefreshToken, clearGcalConnection,
+  getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import crypto from 'crypto';
-import { buildAuthUrl, revokeToken } from '../gcal.js';
+import { buildAuthUrl, revokeToken, refreshAccessToken, listWritableCalendars, createCampWorkCalendar } from '../gcal.js';
 import {
   buildAssetReportRows, buildWorkOrderReportRows, buildWorkOrderLogReportRows, buildCrewSessionReportRows,
   buildJobLineReportRows, JOB_LINE_COLUMN_SPECS, buildFindingReportRows, FINDING_COLUMN_SPECS,
@@ -210,6 +210,49 @@ router.post('/gcal/disconnect', async (req, res, next) => {
     if (refreshToken) await revokeToken(refreshToken);
     await clearGcalConnection();
     res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// Gets a live access token from the stored refresh token — every call here
+// refreshes rather than caching, since these are low-frequency admin-screen
+// actions (list calendars, save a choice), not the sync worker's hot path.
+async function getFreshGcalAccessToken() {
+  const refreshToken = await getGcalRefreshToken();
+  if (!refreshToken) { const e = new Error('Google Calendar is not connected'); e.status = 400; throw e; }
+  const tokens = await refreshAccessToken(refreshToken);
+  return tokens.access_token;
+}
+// Calendar picker (2026-09-14 revision) — calendar choice happens after
+// connecting, not during the OAuth callback, since listing calendars needs
+// a token the callback has only just obtained, and Ben may want to point
+// sync at a calendar he already made rather than always creating a new one.
+router.get('/gcal/calendars', async (req, res, next) => {
+  try {
+    const accessToken = await getFreshGcalAccessToken();
+    res.json({ calendars: await listWritableCalendars(accessToken) });
+  } catch (e) { next(e); }
+});
+router.post('/gcal/calendar', async (req, res, next) => {
+  try {
+    const accessToken = await getFreshGcalAccessToken();
+    const { calendarId, createNew } = req.body || {};
+    let id, summary;
+    if (createNew) {
+      id = await createCampWorkCalendar(accessToken);
+      summary = 'Camp Work';
+    } else {
+      if (!calendarId) { const e = new Error('calendarId is required'); e.status = 400; throw e; }
+      // Re-check against the live list rather than trusting the client
+      // outright — the dropdown is sourced from this same list, but
+      // re-validating server-side means a stale or tampered request can't
+      // point sync at a calendar this account can't actually write to.
+      const calendars = await listWritableCalendars(accessToken);
+      const match = calendars.find((c) => c.id === calendarId);
+      if (!match) { const e = new Error('That calendar is not writable by the connected account'); e.status = 400; throw e; }
+      id = match.id; summary = match.summary;
+    }
+    await saveGcalCalendar({ calendarId: id, calendarSummary: summary });
+    res.json({ ok: true, calendarId: id, calendarSummary: summary });
   } catch (e) { next(e); }
 });
 router.get('/inbox/suggest-assets', async (req, res, next) => {
