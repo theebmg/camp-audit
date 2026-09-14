@@ -45,6 +45,7 @@ import {
   listAttachmentRoles, createAttachmentRole, updateAttachmentRole, deleteAttachmentRole,
   listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
+  listCalendarEventTypes, createCalendarEventType, updateCalendarEventType, setCalendarEventTypeActive, deleteCalendarEventType,
   listJobLinesScheduledInRange,
   generateDueWorkOrdersForRange,
   listChecklistTemplates, createChecklistTemplate, updateChecklistTemplate, deleteChecklistTemplate,
@@ -1300,6 +1301,8 @@ router.patch('/job-lines/:jobLineId', async (req, res, next) => {
     if (body.estimatedCost !== undefined) fields.estimated_cost = body.estimatedCost === '' ? null : Number(body.estimatedCost);
     if (body.actualCost !== undefined) fields.actual_cost = body.actualCost === '' ? null : Number(body.actualCost);
     if (body.scheduledDate !== undefined) fields.scheduled_date = body.scheduledDate;
+    if (body.scheduledStartTime !== undefined) fields.scheduled_start_time = body.scheduledStartTime === '' ? null : body.scheduledStartTime;
+    if (body.scheduledDurationHours !== undefined) fields.scheduled_duration_hours = body.scheduledDurationHours === '' ? null : Number(body.scheduledDurationHours);
     if (body.complaint !== undefined) fields.complaint = body.complaint;
     if (body.causeNote !== undefined) fields.cause_note = body.causeNote;
     if (body.correction !== undefined) fields.correction = body.correction;
@@ -1578,6 +1581,31 @@ router.delete('/work-order-templates/:id', async (req, res, next) => {
   try { await deleteWorkOrderTemplate(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
+// ---- Calendar event types (admin-editable — Build Brief v4 Part 1) ----
+router.get('/calendar-event-types', async (req, res, next) => {
+  try { res.json({ types: await listCalendarEventTypes({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/calendar-event-types', async (req, res, next) => {
+  try {
+    const { name, sortOrder, gcalColorId } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, type: await createCalendarEventType({ name: name.trim(), sortOrder, gcalColorId }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/calendar-event-types/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, gcalColorId, active } = req.body || {};
+    const updated = active !== undefined
+      ? await setCalendarEventTypeActive(req.params.id, active)
+      : await updateCalendarEventType(req.params.id, { name, sortOrder, gcalColorId });
+    if (!updated) return res.status(404).json({ ok: false, error: 'Type not found' });
+    res.json({ ok: true, type: updated });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/calendar-event-types/:id', async (req, res, next) => {
+  try { await deleteCalendarEventType(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
 // ---- Calendar Events (independent of Work Orders; optional link either way) ----
 
 router.get('/calendar-events', async (req, res, next) => {
@@ -1607,9 +1635,12 @@ router.get('/calendar-events/:id', async (req, res, next) => {
 });
 router.post('/calendar-events', async (req, res, next) => {
   try {
-    const { title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId } = req.body || {};
+    const { title, description, eventDate, endDate, startTime, endTime, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId, typeId } = req.body || {};
     if (!title || !eventDate) return res.status(400).json({ ok: false, error: 'title and eventDate are required' });
-    res.json({ ok: true, event: await createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId }) });
+    res.json({ ok: true, event: await createCalendarEvent({
+      title, description, eventDate, endDate, startTime, endTime, recurrenceType, recurrenceInterval, recurrenceEndDate,
+      workOrderId, jobLineId, workOrderTemplateId, typeId: typeId ? Number(typeId) : undefined,
+    }) });
   } catch (e) { next(e); }
 });
 router.patch('/calendar-events/:id', async (req, res, next) => {
@@ -1619,12 +1650,16 @@ router.patch('/calendar-events/:id', async (req, res, next) => {
     if (body.title != null) fields.title = body.title;
     if (body.description !== undefined) fields.description = body.description;
     if (body.eventDate != null) fields.event_date = body.eventDate;
+    if (body.endDate !== undefined) fields.end_date = body.endDate;
+    if (body.startTime !== undefined) fields.start_time = body.startTime;
+    if (body.endTime !== undefined) fields.end_time = body.endTime;
     if (body.recurrenceType != null) fields.recurrence_type = body.recurrenceType;
     if (body.recurrenceInterval != null) fields.recurrence_interval = body.recurrenceInterval;
     if (body.recurrenceEndDate !== undefined) fields.recurrence_end_date = body.recurrenceEndDate;
     if (body.workOrderId !== undefined) fields.work_order_id = body.workOrderId === '' ? null : Number(body.workOrderId);
     if (body.jobLineId !== undefined) fields.job_line_id = body.jobLineId === '' ? null : Number(body.jobLineId);
     if (body.workOrderTemplateId !== undefined) fields.work_order_template_id = body.workOrderTemplateId === '' ? null : Number(body.workOrderTemplateId);
+    if (body.typeId !== undefined) fields.type_id = body.typeId === '' ? null : Number(body.typeId);
     const event = await updateCalendarEvent(req.params.id, fields);
     if (!event) return res.status(404).json({ ok: false, error: 'Event not found' });
     res.json({ ok: true, event });

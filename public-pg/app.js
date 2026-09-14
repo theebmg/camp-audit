@@ -35,6 +35,15 @@ function formatDateNice(value) {
   return d.toLocaleDateString('default', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
 }
 
+// Postgres `time` columns arrive as "HH:MM:SS" — renders as "9:00 AM"
+// (Build Brief v4 Part 1: job line / calendar event start & end times).
+function formatTimeShort(value) {
+  if (!value) return '';
+  const [h, m] = value.split(':');
+  const d = new Date(2000, 0, 1, Number(h), Number(m));
+  return d.toLocaleTimeString('default', { hour: 'numeric', minute: '2-digit' });
+}
+
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -702,6 +711,7 @@ async function render(view, params = {}) {
       requestDetail: () => renderRequestDetail(params),
       adminRequestFields: () => renderAdminRequestFields(),
       adminGcal: () => renderAdminGcal(),
+      adminCalendarEventTypes: () => renderAdminCalendarEventTypes(),
     };
     if (handlers[view]) {
       await handlers[view]();
@@ -1076,6 +1086,7 @@ const ADMIN_LEAF_RENDERERS = {
   adminUsers: (params, container) => renderAdminUsers(container),
   activityLog: (params, container) => renderActivityLog(container),
   adminGcal: (params, container) => renderAdminGcal(container),
+  adminCalendarEventTypes: (params, container) => renderAdminCalendarEventTypes(container),
 };
 
 async function renderAdminDrilldown() {
@@ -4646,6 +4657,7 @@ const ADMIN_CATEGORIES = {
     items: [
       { view: 'activityLog', icon: '🕘', label: 'Activity Log' },
       { view: 'adminMapCalibration', icon: '🧭', label: 'Map GPS Calibration' },
+      { view: 'adminCalendarEventTypes', icon: '📅', label: 'Calendar Event Types' },
     ],
   },
   integrations: {
@@ -5858,6 +5870,95 @@ async function renderAdminAttachmentRoles(container = app) {
   });
 }
 
+// Calendar Event Types (Build Brief v4 Part 1, admin-editable per Decision
+// 7) — name, sort order, and the Google event colorId this type maps to.
+// Color drives both the synced Google event's color and its title prefix
+// (step 3's job); this screen only manages the mapping.
+async function renderAdminCalendarEventTypes(container = app) {
+  if (container === app) setChrome({ title: 'Calendar Event Types', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { types } = await api('/api/pg/calendar-event-types');
+  let editing = null; // 'new' | { id } | null
+
+  function colorSelectHtml(selectedId) {
+    return `<select class="cet-color">
+      <option value="">— calendar's default color —</option>
+      ${Object.entries(GOOGLE_EVENT_COLORS).map(([id, c]) => `<option value="${id}" ${selectedId === id ? 'selected' : ''}>${c.name}</option>`).join('')}
+    </select>`;
+  }
+
+  function formHtml(t) {
+    return `<div class="card">
+      <h3>${t ? `Edit "${escapeHtml(t.Name)}"` : 'Add Type'}</h3>
+      <div class="field-row"><label>Name</label><input class="cet-name" value="${escapeHtml(t?.Name || '')}" required /></div>
+      <div class="field-row"><label>Sort Order</label><input class="cet-sort" type="number" value="${t?.SortOrder ?? 100}" style="max-width:120px" /></div>
+      <div class="field-row"><label>Google Calendar Color</label>${colorSelectHtml(t?.GcalColorId || '')}</div>
+      <div class="btn-row">
+        <button class="btn btn-primary cet-save" data-id="${t?.Id ?? ''}">Save</button>
+        <button class="btn btn-secondary cet-cancel">Cancel</button>
+      </div>
+    </div>`;
+  }
+
+  function draw() {
+    const rows = types.map((t) => `
+      <div class="list-item" style="cursor:default">
+        <span>${googleColorDotHtml(t.GcalColorId)}${escapeHtml(t.Name)}${!t.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+        <div class="btn-row" style="margin-top:0">
+          <button class="btn btn-secondary cet-edit" data-id="${t.Id}">Edit</button>
+          <button class="btn btn-secondary cet-toggle-active" data-id="${t.Id}" data-active="${t.Active}">${t.Active ? 'Deactivate' : 'Reactivate'}</button>
+          <button class="btn btn-secondary cet-delete" data-id="${t.Id}" data-name="${escapeHtml(t.Name)}">Delete</button>
+        </div>
+      </div>`).join('') || '<p class="muted">No types defined yet.</p>';
+
+    setApp(`
+      <div class="card"><h3>Calendar Event Types</h3>
+        <p class="muted">What a calendar event IS — drives its Google Calendar color and title prefix once sync is built. "Other" is the seeded catch-all; every event always has a type.</p>
+      </div>
+      <div class="card">${rows}</div>
+      ${editing === 'new' ? formHtml(null) : `<div class="btn-row" style="margin-top:10px"><button class="btn btn-secondary" id="addTypeBtn">+ Add Type</button></div>`}
+      ${editing?.id ? formHtml(types.find((t) => t.Id === editing.id)) : ''}
+    `, container);
+    wire();
+  }
+
+  function wire() {
+    container.querySelector('#addTypeBtn')?.addEventListener('click', () => { editing = 'new'; draw(); });
+    container.querySelectorAll('.cet-edit').forEach((btn) => btn.addEventListener('click', () => { editing = { id: Number(btn.dataset.id) }; draw(); }));
+    container.querySelectorAll('.cet-cancel').forEach((btn) => btn.addEventListener('click', () => { editing = null; draw(); }));
+    container.querySelectorAll('.cet-save').forEach((btn) => btn.addEventListener('click', async () => {
+      const card = btn.closest('.card');
+      const id = btn.dataset.id;
+      const name = card.querySelector('.cet-name').value.trim();
+      const sortOrder = Number(card.querySelector('.cet-sort').value) || 100;
+      const gcalColorId = card.querySelector('.cet-color').value || null;
+      if (!name) { toast('Name is required'); return; }
+      try {
+        if (id) await api(`/api/pg/admin/calendar-event-types/${id}`, { method: 'PATCH', body: JSON.stringify({ name, sortOrder, gcalColorId }) });
+        else await api('/api/pg/admin/calendar-event-types', { method: 'POST', body: JSON.stringify({ name, sortOrder, gcalColorId }) });
+        toast('Saved');
+        editing = null;
+        renderAdminCalendarEventTypes(container);
+      } catch (err) { toast(err.message); }
+    }));
+    container.querySelectorAll('.cet-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
+      try {
+        await api(`/api/pg/admin/calendar-event-types/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) });
+        renderAdminCalendarEventTypes(container);
+      } catch (err) { toast(err.message); }
+    }));
+    container.querySelectorAll('.cet-delete').forEach((btn) => btn.addEventListener('click', async () => {
+      if (!await confirmDialog(`Delete type "${btn.dataset.name}"? Only possible if no calendar event uses it — deactivate instead if it's in use.`)) return;
+      try {
+        await api(`/api/pg/admin/calendar-event-types/${btn.dataset.id}`, { method: 'DELETE' });
+        toast('Type deleted');
+        renderAdminCalendarEventTypes(container);
+      } catch (err) { toast(err.message); }
+    }));
+  }
+  draw();
+}
+
 // Build Brief v2 Phase 5 (§5.3): the one-time affine calibration that makes
 // "nearest-asset suggestion from GPS" possible in the inbox. Needs exactly 3
 // non-collinear reference points — pick 3 assets whose real-world GPS
@@ -5952,6 +6053,39 @@ async function renderAdminSubAreas(container = app) {
 
 // ---------- Calendar / Scheduler ----------
 
+// Inclusive list of YYYY-MM-DD date-key strings from startStr to endStr —
+// used to place a multi-day calendar event (Build Brief v4 Part 1, e.g. a
+// Group Rental running Friday to Sunday) on every day it spans, not just
+// its start day.
+function datesBetween(startStr, endStr) {
+  const out = [];
+  let d = new Date(`${startStr}T00:00:00`);
+  const end = new Date(`${endStr}T00:00:00`);
+  let guard = 0;
+  while (d <= end && guard < 60) { // 60-day cap — plenty for any real camp rental/session, guards a bad date pair
+    out.push(isoDate(d));
+    d = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
+    guard++;
+  }
+  return out;
+}
+
+// Icon + optional time + label for one calendar-grid entry (job line or
+// calendar event) — shared by the month grid and the day panel so this
+// logic lives in one place. Calendar events get a Google-color dot and
+// their Type name prefixed (unless it's the "Other" catch-all) — this
+// mirrors, in the app's own UI, the same title-prefix idea step 3 applies
+// to the synced Google event itself.
+function calendarEntryText(e) {
+  if (e.type === 'jobLine') {
+    const time = e.ScheduledStartTime ? `${formatTimeShort(e.ScheduledStartTime)} ` : '';
+    return `🛠️ ${time}${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}`;
+  }
+  const time = e.StartTime ? `${formatTimeShort(e.StartTime)} ` : '';
+  const typePrefix = e.TypeName && e.TypeName !== 'Other' ? `${escapeHtml(e.TypeName)}: ` : '';
+  return `${googleColorDotHtml(e.TypeGcalColorId)}📅 ${time}${typePrefix}${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}`;
+}
+
 // Slide-out panel from the right, listing one day's scheduled WOs/events —
 // opened by clicking a day cell's background (not one of its entry pills,
 // which still navigate straight to that WO/event as before).
@@ -5968,8 +6102,8 @@ function openDayPanel(dateKey, entries) {
         <button class="btn btn-secondary" id="closeDayPanelBtn">✕</button>
       </div>
       ${entries.length ? entries.map((e) => e.type === 'jobLine'
-        ? `<div class="list-item day-panel-entry" data-wo-id="${e.WorkOrderId}"><span>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span>${statusPillHtml(e.WorkOrderStatus, e.WorkOrderStatusColor)}</div>`
-        : `<div class="list-item day-panel-entry" data-event-id="${e.Id}"><span>📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`
+        ? `<div class="list-item day-panel-entry" data-wo-id="${e.WorkOrderId}"><span>${calendarEntryText(e)}</span>${statusPillHtml(e.WorkOrderStatus, e.WorkOrderStatusColor)}</div>`
+        : `<div class="list-item day-panel-entry" data-event-id="${e.Id}"><span>${calendarEntryText(e)}</span></div>`
       ).join('') : '<p class="muted">Nothing scheduled this day.</p>'}
       <div class="btn-row"><button class="btn btn-primary" id="dayPanelAddEventBtn">+ Add Event This Day</button></div>
     </div>`;
@@ -6018,14 +6152,19 @@ async function renderCalendar(params = {}) {
       dayEntriesMap.get(key).push({ type: 'jobLine', ...jl });
     }
     for (const occ of occurrences) {
-      if (!dayEntriesMap.has(occ.OccurrenceDate)) dayEntriesMap.set(occ.OccurrenceDate, []);
-      dayEntriesMap.get(occ.OccurrenceDate).push({ type: 'event', ...occ });
+      // Multi-day span (Build Brief v4 Part 1, e.g. a Group Rental running
+      // Friday to Sunday) — place the same occurrence on every day it
+      // covers, not just its start day, so it actually shows as ongoing.
+      for (const key of datesBetween(occ.OccurrenceDate, occ.OccurrenceEndDate || occ.OccurrenceDate)) {
+        if (!dayEntriesMap.has(key)) dayEntriesMap.set(key, []);
+        dayEntriesMap.get(key).push({ type: 'event', ...occ });
+      }
     }
     const allUnscheduled = workOrders.filter((w) => !w['Scheduled Date']);
 
     const entryHtml = (e) => e.type === 'jobLine'
-      ? `<div class="cal-entry" data-wo-id="${e.WorkOrderId}"><span class="pill"${statusColorStyle(e.WorkOrderStatusColor)}>🛠️ ${escapeHtml(e.Asset?.Name || '')}${e.Asset ? ': ' : ''}${escapeHtml(e.WorkOrderTitle)} — ${escapeHtml(e.JobLineTitle)}</span></div>`
-      : `<div class="cal-entry" data-event-id="${e.Id}"><span class="pill pop">📅 ${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}</span></div>`;
+      ? `<div class="cal-entry" data-wo-id="${e.WorkOrderId}"><span class="pill"${statusColorStyle(e.WorkOrderStatusColor)}>${calendarEntryText(e)}</span></div>`
+      : `<div class="cal-entry" data-event-id="${e.Id}"><span class="pill pop">${calendarEntryText(e)}</span></div>`;
 
     const cells = [];
     for (let i = 0; i < startWeekday; i++) cells.push('<div class="cal-cell cal-empty"></div>');
@@ -6092,6 +6231,51 @@ async function renderCalendar(params = {}) {
   }
 
   draw();
+}
+
+// Google Calendar's event colorId palette (Build Brief v4 Part 1) — a fixed,
+// Google-documented set of 11 IDs (distinct from the larger calendar-level
+// colorId space gcal.js uses when creating a calendar). This is a stable
+// external platform constant, not app vocabulary, so unlike causes/statuses/
+// roles it's fine to hardcode rather than make admin-editable — the thing
+// that IS admin-editable is which of these 11 each calendar_event_type maps
+// to (calendar_event_types.gcal_color_id).
+const GOOGLE_EVENT_COLORS = {
+  '1': { name: 'Lavender', hex: '#7986cb' }, '2': { name: 'Sage', hex: '#33b679' },
+  '3': { name: 'Grape', hex: '#8e24aa' }, '4': { name: 'Flamingo', hex: '#e67c73' },
+  '5': { name: 'Banana', hex: '#f6c026' }, '6': { name: 'Tangerine', hex: '#f5511d' },
+  '7': { name: 'Peacock', hex: '#039be5' }, '8': { name: 'Graphite', hex: '#616161' },
+  '9': { name: 'Blueberry', hex: '#3f51b5' }, '10': { name: 'Basil', hex: '#0b8043' },
+  '11': { name: 'Tomato', hex: '#d60000' },
+};
+function googleColorDotHtml(colorId) {
+  const c = GOOGLE_EVENT_COLORS[colorId];
+  if (!c) return '';
+  return `<span title="${escapeHtml(c.name)}" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${c.hex};margin-right:5px;vertical-align:middle"></span>`;
+}
+
+// Type + end date (multi-day) + start/end time — shared by New/Edit Calendar
+// Event (Build Brief v4 Part 1). No blank option on Type: every event is
+// always categorized (Decision 7 — "Other" is the seeded catch-all, same
+// role as "Unknown" on causes, so nobody leaves it unset or guesses wrong).
+function typeAndScheduleFieldsHtml(ev = {}, types = []) {
+  return `
+    <div class="field-row"><label>Type</label>
+      <select name="typeId">
+        ${types.map((t) => `<option value="${t.Id}" ${(ev.TypeId ?? types.find((x) => x.Name === 'Other')?.Id) === t.Id ? 'selected' : ''}>${escapeHtml(t.Name)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field-row"><label>End Date (optional — for a multi-day event, e.g. a rental Friday–Sunday)</label>
+      <input name="endDate" type="date" value="${(ev.EndDate || '').slice(0, 10)}" />
+    </div>
+    <div class="field-row">
+      <label>Start / End Time (optional)</label>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <input name="startTime" type="time" value="${ev.StartTime ? ev.StartTime.slice(0, 5) : ''}" style="max-width:140px" />
+        <input name="endTime" type="time" value="${ev.EndTime ? ev.EndTime.slice(0, 5) : ''}" style="max-width:140px" />
+      </div>
+      <p class="muted" style="font-size:0.8rem;margin-top:4px">Leave both blank for an all-day event.</p>
+    </div>`;
 }
 
 const RECURRENCE_LABELS = { none: 'Does not repeat', daily: 'Day(s)', weekly: 'Week(s)', monthly: 'Month(s)', yearly: 'Year(s)' };
@@ -6197,8 +6381,8 @@ function wireCalendarLinkFields(root) {
 
 async function renderNewCalendarEvent(params = {}) {
   setChrome({ title: 'New Calendar Event', showBack: true, showLogout: true });
-  const [{ workOrders }, { templates: workOrderTemplates }] = await Promise.all([
-    api('/api/pg/work-orders'), api('/api/pg/work-order-templates'),
+  const [{ workOrders }, { templates: workOrderTemplates }, { types }] = await Promise.all([
+    api('/api/pg/work-orders'), api('/api/pg/work-order-templates'), api('/api/pg/calendar-event-types'),
   ]);
   setApp(`
     <div class="card">
@@ -6207,6 +6391,7 @@ async function renderNewCalendarEvent(params = {}) {
         <div class="field-row"><label>Title</label><input name="title" required /></div>
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${params.date || ''}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
+        ${typeAndScheduleFieldsHtml({}, types)}
         ${recurrenceFieldsHtml()}
         ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates })}
         <div class="btn-row">
@@ -6224,6 +6409,8 @@ async function renderNewCalendarEvent(params = {}) {
     try {
       const { event } = await api('/api/pg/calendar-events', { method: 'POST', body: JSON.stringify({
         title: fd.get('title'), eventDate: fd.get('eventDate'), description: fd.get('description'),
+        typeId: fd.get('typeId'), endDate: fd.get('endDate') || undefined,
+        startTime: fd.get('startTime') || undefined, endTime: fd.get('endTime') || undefined,
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || undefined,
         workOrderId: fd.get('workOrderId') || undefined,
@@ -6239,13 +6426,14 @@ async function renderNewCalendarEvent(params = {}) {
 async function renderCalendarEventDetail({ id }) {
   setChrome({ title: 'Calendar Event', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
-  const [detail, workOrdersRes, tplRes, woTplRes] = await Promise.all([
-    api(`/api/pg/calendar-events/${id}`), api('/api/pg/work-orders'), api('/api/pg/checklist-templates'), api('/api/pg/work-order-templates'),
+  const [detail, workOrdersRes, tplRes, woTplRes, typesRes] = await Promise.all([
+    api(`/api/pg/calendar-events/${id}`), api('/api/pg/work-orders'), api('/api/pg/checklist-templates'), api('/api/pg/work-order-templates'), api('/api/pg/calendar-event-types'),
   ]);
   const { event: ev, checklist } = detail;
   const { workOrders } = workOrdersRes;
   const checklistTemplates = tplRes.templates;
   const workOrderTemplates = woTplRes.templates;
+  const { types } = typesRes;
   const initialJobLines = ev.WorkOrderId ? (await api(`/api/pg/work-orders/${ev.WorkOrderId}`)).jobLines : [];
 
   const checklistHtml = checklist ? checklistHtmlFor(checklist)
@@ -6262,6 +6450,7 @@ async function renderCalendarEventDetail({ id }) {
         <div class="field-row"><label>Title</label><input name="title" value="${escapeHtml(ev.Title)}" required /></div>
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${(ev.EventDate || '').slice(0, 10)}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(ev.Description || '')}</textarea></div>
+        ${typeAndScheduleFieldsHtml(ev, types)}
         ${recurrenceFieldsHtml(ev)}
         ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates, initialJobLines, ev })}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
@@ -6283,6 +6472,8 @@ async function renderCalendarEventDetail({ id }) {
     try {
       await api(`/api/pg/calendar-events/${id}`, { method: 'PATCH', body: JSON.stringify({
         title: fd.get('title'), eventDate: fd.get('eventDate'), description: fd.get('description'),
+        typeId: fd.get('typeId'), endDate: fd.get('endDate') || '',
+        startTime: fd.get('startTime') || '', endTime: fd.get('endTime') || '',
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || '', workOrderId: fd.get('workOrderId') || '',
         jobLineId: fd.get('jobLineId') || '', workOrderTemplateId: fd.get('workOrderTemplateId') || '',
@@ -7014,6 +7205,14 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }
         ${jl.LinkedExpenseCount ? `<p class="muted" style="margin-top:2px;font-size:0.8rem">+ $${jl.LinkedExpenseTotal.toLocaleString()} from ${jl.LinkedExpenseCount} linked expense${jl.LinkedExpenseCount === 1 ? '' : 's'} — this field is the manual/no-receipt amount only; totals elsewhere include both.</p>` : '<p class="muted" style="margin-top:2px;font-size:0.8rem">For costs with no receipt (invoice paid directly, donated materials). Link an expense instead when there is one.</p>'}
       </div>
       <div class="field-row"><label>Scheduled Date</label><input class="jl-e-scheduled-date" type="date" value="${(jl.ScheduledDate || '').slice(0, 10)}" /></div>
+      <div class="field-row">
+        <label>Start Time (optional)</label>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <input class="jl-e-start-time" type="time" value="${jl.ScheduledStartTime ? jl.ScheduledStartTime.slice(0, 5) : ''}" style="max-width:140px" />
+          <input class="jl-e-duration-hours" type="number" min="0" step="0.25" placeholder="Duration (hrs)" value="${jl.ScheduledDurationHours ?? ''}" style="max-width:150px" />
+        </div>
+        <p class="muted" style="font-size:0.8rem;margin-top:4px">Leave both blank for an all-day calendar entry — plenty of work is genuinely "sometime Tuesday." Set both to sync a timed event.</p>
+      </div>
       <div class="field-row"><label>Complaint</label><textarea class="jl-e-complaint" placeholder="What's wrong?">${escapeHtml(jl.Complaint || '')}</textarea></div>
       <div class="field-row"><label>Cause</label>
         <div class="skill-chips">${causesCatalog.map((c) => `<label class="skill-chip ${selectedCauseIds.has(c.Id) ? 'selected' : ''}" style="cursor:pointer"><input type="checkbox" class="jl-e-cause" value="${c.Id}" style="margin-right:6px" ${selectedCauseIds.has(c.Id) ? 'checked' : ''} />${escapeHtml(c.Name)}</label>`).join('')}</div>
@@ -7375,6 +7574,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
           estimatedCost: card.querySelector('.jl-e-est-cost').value,
           actualCost: card.querySelector('.jl-e-act-cost').value,
           scheduledDate: card.querySelector('.jl-e-scheduled-date').value,
+          scheduledStartTime: card.querySelector('.jl-e-start-time').value,
+          scheduledDurationHours: card.querySelector('.jl-e-duration-hours').value,
           complaint: card.querySelector('.jl-e-complaint').value,
           causeNote: card.querySelector('.jl-e-cause-note').value,
           correction: card.querySelector('.jl-e-correction').value,

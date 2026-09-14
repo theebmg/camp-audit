@@ -2841,6 +2841,7 @@ function jobLineRowShape(r) {
     EstimatedCost: r.estimated_cost != null ? Number(r.estimated_cost) : null,
     ActualCost: r.actual_cost != null ? Number(r.actual_cost) : null,
     ScheduledDate: r.scheduled_date,
+    ScheduledStartTime: r.scheduled_start_time, ScheduledDurationHours: r.scheduled_duration_hours != null ? Number(r.scheduled_duration_hours) : null,
     Complaint: r.complaint, CauseNote: r.cause_note, Correction: r.correction,
     BlockedReason: r.blocked_reason, BlockedSince: r.blocked_since, CompletedDate: r.completed_date,
     ConditionFindingId: r.condition_finding_id,
@@ -2968,6 +2969,7 @@ async function changeJobLineStatus(client, jobLineId, newStatusId, { statusNote 
 const JOB_LINE_UPDATE_COLUMNS = [
   'title', 'responsibility_class', 'funding_source', 'funding_ref_id',
   'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost', 'scheduled_date',
+  'scheduled_start_time', 'scheduled_duration_hours',
   'complaint', 'cause_note', 'correction', 'blocked_reason', 'blocked_since', 'completed_date',
   'condition_finding_id',
 ];
@@ -4172,17 +4174,48 @@ function addInterval(date, type, n) {
   return d;
 }
 
-// Returns the Date occurrences of one event that fall within [rangeStart, rangeEnd].
-// Fast-forwards past irrelevant early occurrences instead of walking one at a
-// time from the original date, so an old yearly/monthly event viewed much
-// later doesn't require hundreds of loop iterations.
+function calendarEventRowShape(r) {
+  return {
+    Id: r.id, Title: r.title, Description: r.description, EventDate: r.event_date,
+    RecurrenceType: r.recurrence_type, RecurrenceInterval: r.recurrence_interval, RecurrenceEndDate: r.recurrence_end_date,
+    WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title,
+    JobLineId: r.job_line_id, JobLineTitle: r.job_line_title,
+    WorkOrderTemplateId: r.work_order_template_id,
+    TypeId: r.type_id, TypeName: r.type_name, TypeGcalColorId: r.type_gcal_color_id,
+    StartTime: r.start_time, EndTime: r.end_time, EndDate: r.end_date,
+  };
+}
+
+// Expands recurring events into their occurrence dates within [fromDate, toDate]
+// (YYYY-MM-DD strings). Each returned entry is one occurrence, tagged with its
+// concrete Date so the calendar can place it on the right day. Fast-forwards
+// past irrelevant early occurrences instead of walking one at a time from
+// the original date, so an old yearly/monthly event viewed much later
+// doesn't require hundreds of loop iterations.
+//
+// spanMs (added for multi-day events, Build Brief v4 Part 1 addition) is how
+// many days past event_date the span's end_date runs — a Friday-to-Sunday
+// Group Rental has spanMs = 2 days, and "in range" now means the whole
+// [occStart, occStart + spanMs] window overlaps [rangeStart, rangeEnd], not
+// just occStart itself. Otherwise an event starting in August but running
+// into September would silently vanish from September's calendar.
+//
+// A PM-template-linked event has no static work_order_id of its own — each
+// occurrence gets its own generated Work Order once due (see
+// generateDueWorkOrdersForRange), so occurrences are joined against
+// calendar_event_generated_wo and WorkOrderId/WorkOrderTitle are overridden
+// per-occurrence when one has been generated. This means the existing
+// WorkOrderId-based "View Linked Work Order" UI keeps working unchanged
+// instead of a occurrence showing as a phantom entry with no real WO.
 function expandRecurrence(event, rangeStart, rangeEnd) {
   const base = new Date(event.event_date);
+  const spanMs = event.end_date ? Math.max(0, new Date(event.end_date) - base) : 0;
   const type = event.recurrence_type;
   const interval = Math.max(1, event.recurrence_interval || 1);
   const endLimit = event.recurrence_end_date ? new Date(event.recurrence_end_date) : null;
+  const overlaps = (occStart) => (occStart.getTime() + spanMs) >= rangeStart.getTime() && occStart <= rangeEnd;
   if (type === 'none' || !type) {
-    return (base >= rangeStart && base <= rangeEnd) ? [base] : [];
+    return overlaps(base) ? [base] : [];
   }
   let n = 0;
   if (rangeStart > base) {
@@ -4195,38 +4228,22 @@ function expandRecurrence(event, rangeStart, rangeEnd) {
   while (cursor <= rangeEnd && guard < 400) {
     guard++;
     if (endLimit && cursor > endLimit) break;
-    if (cursor >= rangeStart && cursor <= rangeEnd) occurrences.push(new Date(cursor));
+    if (overlaps(cursor)) occurrences.push(new Date(cursor));
     cursor = addInterval(cursor, type, interval);
   }
   return occurrences;
 }
 
-function calendarEventRowShape(r) {
-  return {
-    Id: r.id, Title: r.title, Description: r.description, EventDate: r.event_date,
-    RecurrenceType: r.recurrence_type, RecurrenceInterval: r.recurrence_interval, RecurrenceEndDate: r.recurrence_end_date,
-    WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title,
-    JobLineId: r.job_line_id, JobLineTitle: r.job_line_title,
-    WorkOrderTemplateId: r.work_order_template_id,
-  };
-}
+const CALENDAR_EVENT_SELECT = `
+  SELECT e.*, w.title AS wo_title, jl.title AS job_line_title, t.name AS type_name, t.gcal_color_id AS type_gcal_color_id
+  FROM calendar_events e
+  LEFT JOIN work_orders w ON w.id = e.work_order_id
+  LEFT JOIN job_lines jl ON jl.id = e.job_line_id
+  LEFT JOIN calendar_event_types t ON t.id = e.type_id`;
 
-// Expands recurring events into their occurrence dates within [fromDate, toDate]
-// (YYYY-MM-DD strings). Each returned entry is one occurrence, tagged with its
-// concrete Date so the calendar can place it on the right day.
-//
-// A PM-template-linked event has no static work_order_id of its own — each
-// occurrence gets its own generated Work Order once due (see
-// generateDueWorkOrdersForRange), so occurrences are joined against
-// calendar_event_generated_wo and WorkOrderId/WorkOrderTitle are overridden
-// per-occurrence when one has been generated. This means the existing
-// WorkOrderId-based "View Linked Work Order" UI keeps working unchanged
-// instead of a occurrence showing as a phantom entry with no real WO.
 export async function listCalendarEventOccurrences(fromDate, toDate) {
   const { rows } = await pool.query(
-    `SELECT e.*, w.title AS wo_title, jl.title AS job_line_title FROM calendar_events e
-     LEFT JOIN work_orders w ON w.id = e.work_order_id
-     LEFT JOIN job_lines jl ON jl.id = e.job_line_id
+    `${CALENDAR_EVENT_SELECT}
      WHERE e.event_date <= $2 AND (e.recurrence_end_date IS NULL OR e.recurrence_end_date >= $1)`,
     [fromDate, toDate]
   );
@@ -4242,12 +4259,15 @@ export async function listCalendarEventOccurrences(fromDate, toDate) {
   const out = [];
   for (const row of rows) {
     const shaped = calendarEventRowShape(row);
+    const spanMs = row.end_date ? Math.max(0, new Date(row.end_date) - new Date(row.event_date)) : 0;
     for (const occDate of expandRecurrence(row, rangeStart, rangeEnd)) {
       const occStr = occDate.toISOString().slice(0, 10);
+      const occEndStr = new Date(occDate.getTime() + spanMs).toISOString().slice(0, 10);
       const gen = genByKey.get(`${row.id}:${occStr}`);
       out.push({
         ...shaped,
         OccurrenceDate: occStr,
+        OccurrenceEndDate: occEndStr,
         WorkOrderId: gen ? gen.work_order_id : shaped.WorkOrderId,
         WorkOrderTitle: gen ? gen.wo_title : shaped.WorkOrderTitle,
       });
@@ -4264,7 +4284,7 @@ export async function listCalendarEventOccurrences(fromDate, toDate) {
 // second round trip.
 export async function listJobLinesScheduledInRange(fromDate, toDate) {
   const { rows } = await pool.query(
-    `SELECT jl.id, jl.title, jl.scheduled_date, jl.work_order_id,
+    `SELECT jl.id, jl.title, jl.scheduled_date, jl.scheduled_start_time, jl.scheduled_duration_hours, jl.work_order_id,
             w.title AS wo_title, ws.name AS wo_status, ws.color AS wo_status_color, w.priority,
             a.id AS asset_id, a.name AS asset_name
      FROM job_lines jl
@@ -4277,6 +4297,7 @@ export async function listJobLinesScheduledInRange(fromDate, toDate) {
   );
   return rows.map((r) => ({
     JobLineId: r.id, JobLineTitle: r.title, ScheduledDate: r.scheduled_date,
+    ScheduledStartTime: r.scheduled_start_time, ScheduledDurationHours: r.scheduled_duration_hours != null ? Number(r.scheduled_duration_hours) : null,
     WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title, WorkOrderStatus: r.wo_status, WorkOrderStatusColor: r.wo_status_color, Priority: r.priority,
     Asset: r.asset_id ? { Id: r.asset_id, Name: r.asset_name } : null,
   }));
@@ -4328,28 +4349,34 @@ export async function generateDueWorkOrdersForRange(fromDate, toDate) {
 }
 
 export async function getCalendarEvent(id) {
-  const { rows } = await pool.query(
-    `SELECT e.*, w.title AS wo_title, jl.title AS job_line_title FROM calendar_events e
-     LEFT JOIN work_orders w ON w.id = e.work_order_id
-     LEFT JOIN job_lines jl ON jl.id = e.job_line_id
-     WHERE e.id = $1`,
-    [id]
-  );
+  const { rows } = await pool.query(`${CALENDAR_EVENT_SELECT} WHERE e.id = $1`, [id]);
   return rows[0] ? calendarEventRowShape(rows[0]) : null;
 }
 
-export async function createCalendarEvent({ title, description, eventDate, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId }) {
+// typeId defaults to 'Other' (Decision 7: never leave a controlled field
+// unset, so nobody ends up on a phantom "no type" event) — resolved by name
+// rather than requiring the frontend to know the seeded id.
+export async function createCalendarEvent({ title, description, eventDate, endDate, startTime, endTime, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId, typeId }) {
+  let resolvedTypeId = typeId || null;
+  if (!resolvedTypeId) {
+    const { rows } = await pool.query(`SELECT id FROM calendar_event_types WHERE name = 'Other'`);
+    resolvedTypeId = rows[0]?.id || null;
+  }
   const { rows } = await pool.query(
-    `INSERT INTO calendar_events (title, description, event_date, recurrence_type, recurrence_interval, recurrence_end_date, work_order_id, job_line_id, work_order_template_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-    [title, description || null, eventDate, recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null, jobLineId || null, workOrderTemplateId || null]
+    `INSERT INTO calendar_events (title, description, event_date, end_date, start_time, end_time, recurrence_type, recurrence_interval, recurrence_end_date, work_order_id, job_line_id, work_order_template_id, type_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+    [title, description || null, eventDate, endDate || null, startTime || null, endTime || null,
+      recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null, jobLineId || null, workOrderTemplateId || null, resolvedTypeId]
   );
   await logActivity({ action: 'created', entityType: 'calendar_event', entityId: rows[0].id, entityLabel: rows[0].title });
   return calendarEventRowShape(rows[0]);
 }
 
 export async function updateCalendarEvent(id, fields) {
-  const allowed = ['title', 'description', 'event_date', 'recurrence_type', 'recurrence_interval', 'recurrence_end_date', 'work_order_id', 'job_line_id', 'work_order_template_id'];
+  const allowed = [
+    'title', 'description', 'event_date', 'end_date', 'start_time', 'end_time',
+    'recurrence_type', 'recurrence_interval', 'recurrence_end_date', 'work_order_id', 'job_line_id', 'work_order_template_id', 'type_id',
+  ];
   const setCols = []; const vals = []; let i = 1;
   for (const [key, value] of Object.entries(fields)) {
     if (!allowed.includes(key)) continue;
@@ -4368,6 +4395,56 @@ export async function updateCalendarEvent(id, fields) {
 export async function deleteCalendarEvent(id) {
   const { rows } = await pool.query('DELETE FROM calendar_events WHERE id = $1 RETURNING title', [id]);
   if (rows[0]) await logActivity({ action: 'deleted', entityType: 'calendar_event', entityId: Number(id), entityLabel: rows[0].title });
+}
+
+// ── Calendar event types (Build Brief v4 Part 1, added before step 3
+//    outbound sync) — admin-editable, same rule as every other list in this
+//    system (Part A, Decision 7: no hardcoded status/role/cause/category
+//    lists). gcal_color_id lives directly on the type, not a separate
+//    lookup keyed by a generic 'calendar_event' kind, since every
+//    calendar_events row now has a real type — step 3's gcal_event_colors
+//    table (job_line/wo_revisit/finding_revisit/pm_due) should read this
+//    column for 'calendar_event' color resolution instead of getting its
+//    own generic row there. Type also drives the synced Google event's
+//    title prefix (e.g. "Visitation — Dorothy, Bethel 04") — that
+//    construction happens in step 3's event-building code, not here. ──────
+export async function listCalendarEventTypes({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(`SELECT * FROM calendar_event_types ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`);
+  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, GcalColorId: r.gcal_color_id, Active: r.active }));
+}
+export async function createCalendarEventType({ name, sortOrder = 100, gcalColorId = null }) {
+  const { rows } = await pool.query(
+    'INSERT INTO calendar_event_types (name, sort_order, gcal_color_id) VALUES ($1,$2,$3) RETURNING *',
+    [name, sortOrder, gcalColorId || null]
+  );
+  await logActivity({ action: 'created', entityType: 'calendar_event_type', entityId: rows[0].id, entityLabel: rows[0].name });
+  return { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, GcalColorId: rows[0].gcal_color_id, Active: rows[0].active };
+}
+// Full overwrite of name/sortOrder/gcalColorId (the admin edit form always
+// submits all three together) — deliberately NOT a COALESCE-style partial
+// update like updateAttachmentRole, because gcalColorId needs to be
+// clearable back to null ("use the calendar's own default color") and
+// COALESCE can never distinguish "explicitly clear this" from "leave it
+// alone." Toggling Active is a separate, dedicated function below for
+// exactly that reason.
+export async function updateCalendarEventType(id, { name, sortOrder, gcalColorId }) {
+  const { rows } = await pool.query(
+    'UPDATE calendar_event_types SET name = $2, sort_order = $3, gcal_color_id = $4 WHERE id = $1 RETURNING *',
+    [id, name, sortOrder, gcalColorId || null]
+  );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'calendar_event_type', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] ? { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, GcalColorId: rows[0].gcal_color_id, Active: rows[0].active } : null;
+}
+export async function setCalendarEventTypeActive(id, active) {
+  const { rows } = await pool.query('UPDATE calendar_event_types SET active = $2 WHERE id = $1 RETURNING *', [id, active]);
+  if (rows[0]) await logActivity({ action: active ? 'reactivated' : 'deactivated', entityType: 'calendar_event_type', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] ? { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, GcalColorId: rows[0].gcal_color_id, Active: rows[0].active } : null;
+}
+export async function deleteCalendarEventType(id) {
+  const inUse = await pool.query('SELECT count(*) FROM calendar_events WHERE type_id = $1', [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} calendar event(s) still use this type — deactivate it instead of deleting`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM calendar_event_types WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'calendar_event_type', entityId: Number(id), entityLabel: rows[0].name });
 }
 
 // ── Checklists — simple ORDERED steps (no branching, v1 scope). Templates are
