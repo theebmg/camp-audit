@@ -1,3 +1,104 @@
+# Runbook: Revisit-date sync — closing Build Brief v4 step 3's last gap (2026-09-15)
+
+Follow-on to the outbound sync worker runbook directly below this one.
+That session flagged deferred work orders'/findings' revisit dates as an
+unbuilt gap and asked Ben whether it was in scope; he confirmed it was
+("the brief lists them for both deferred work orders and deferred
+findings") and gave the design in one message: all-day only, never timed;
+own color, distinct from job lines; a specific title/body format; not
+draggable (already true — the Calendar view never offered drag on these);
+and the Google event gets deleted the moment the record leaves Deferred.
+
+**Migration 0064**: two new `gcal_pending_syncs.entity_type` values,
+`wo_revisit`/`finding_revisit` (constraint dropped and re-added — Postgres
+has no `ALTER ... ADD VALUE` for a plain CHECK). `work_orders.gcal_event_id`/
+`condition_findings.gcal_event_id`, same nullable-until-first-sync pattern
+as migration 0063's two columns. One new `gcal_event_colors` row, `kind =
+'revisit'` — **shared by both entity types, not one each**: the brief's own
+wording ("own color... distinct from job lines") treats a deferred WO and a
+deferred finding as one visual concept ("a prompt, not an appointment"),
+not two things needing telling apart from each other.
+
+**gcalSync.js was restructured** from its job_line/calendar_event if/else
+into an `ENTITY_HANDLERS` dispatch table (`fetch`/`shouldExist`/`buildBody`/
+`setGcalEventId` per entity_type) now that there are four kinds instead of
+two — `processSync` itself is unchanged in behavior, just no longer
+hardcodes which two types exist. `buildRevisitEventBody` is one function for
+both `wo_revisit` and `finding_revisit` (identical shape — all-day, same
+title/body format), parameterized by a `kind` string only for the
+deep-link target and record vocabulary.
+
+**Enqueue/dequeue wiring** — no new call sites needed a new concept, just
+new branches in three functions that already own every relevant status
+transition: `changeWorkOrderStatus` (queues `wo_revisit` on entering
+Deferred, queues a delete + clears `gcal_event_id` on leaving it to
+anything else), `deferFinding` (queues `finding_revisit`), and two finding
+exit paths — `dismissFinding` and `autoResolveLinkedFinding` (the latter
+"fires regardless of the finding's current status" per its own header
+comment, which turns out to include straight out of Deferred — a real exit
+that needed the same teardown, not just the manual dismiss path).
+`requeueAllGcalSyncs` (the admin "Regenerate all events" button) now also
+sweeps every currently-Deferred WO/finding with a revisit_date, not just
+job lines/calendar events.
+
+**"Who deferred it"**: `condition_findings.reviewed_by` already existed for
+this (Phase 3). `work_orders` has no equivalent column — rather than add
+one, `getWorkOrderRevisitForGcalSync` reads it off the most recent
+`work_order_log_entries` row with `status_change = 'Deferred'` for that WO,
+which `changeWorkOrderStatus` already writes with `username` on every
+transition. No migration needed for this half of the "who deferred it"
+requirement.
+
+**Deep link — a real gap, addressed head-on rather than worked around.**
+`public-pg/app.js` had *no* URL-based routing at all going into this
+session ("`go(view, params)` never touches the browser URL" — its own
+existing comment, next to the one other query-string reader, the OAuth
+callback). A Google-side "deep link to the record" needed one to exist.
+Added the minimal version: `?openWorkOrder=<id>` / `?openAsset=<id>` read
+once at boot (`captureDeepLinkParams`), applied immediately if already
+logged in, or stashed in `pendingDeepLink` and applied right after login if
+not — mirrors the existing `handleGcalOauthRedirect` pattern exactly
+(strip via `replaceState`, don't re-trigger on refresh). A work order has
+its own detail view (`workOrderDetail`), so `wo_revisit` links straight
+there. **A finding does not** — Condition Findings have no dedicated
+detail view/route at all (db.js's `updateConditionFinding` comment: "listed
+read-only on the Asset detail page") — so `finding_revisit` links to the
+finding's asset page instead, the closest existing thing to "the record."
+An assetless finding (asset_id nullable) falls back to the app root; the
+finding's own title still names it in the event body either way. Worth
+knowing if a dedicated finding view ever gets built — the deep link should
+move to it then.
+
+**Verified live** against the real "Sychar Events" calendar with disposable
+WO/finding fixtures (created, exercised, hard-deleted in a `finally` block —
+same discipline as `scripts/verify-rollups.js`, not left behind): defer both
+→ drain → confirmed via a direct Google API read that both synced as
+all-day events with the correct exclusive end date, correct
+`Revisit — <asset> <title> (deferred)` summary, correct deferred-reason/
+deferred-by/deep-link body, and the right `extendedProperties` entity
+tagging → transitioned the WO to Done and the finding to Dismissed → drained
+again → confirmed both Google events came back `status: 'cancelled'` (a
+real Google delete, not just a local flag) and `gcal_pending_deletes`
+drained back to empty. `deferred_by` legitimately printed "unknown" in this
+test only because the fixture script runs outside any HTTP request (no
+`currentUsername()` context) — a real admin action through the UI stamps it
+correctly, same as every other `work_order_log_entries` row.
+
+## Known gaps / follow-ups
+- **PM-due reminders (`pm_due`) still aren't wired into the queue** — the
+  one entity type update-for-claude.md's step-3 runbook originally flagged
+  alongside revisit dates that Ben did *not* ask for in this follow-up. Not
+  built; `gcal_pending_syncs.entity_type` would need a fifth value if it
+  ever is.
+- No admin UI exists to jump to a specific finding even now that
+  `?openAsset=` deep-linking exists — it lands on the asset page, and
+  finding the right one among that asset's findings is still a manual
+  scroll if there's more than one. Not worth a bespoke finding-detail route
+  for this alone; flagged in case a real one gets built for other reasons
+  later.
+
+---
+
 # Runbook: Build Brief v4 step 3 — outbound Google Calendar sync worker (2026-09-14)
 
 Drains `gcal_pending_syncs`/`gcal_pending_deletes` (migrations 0058–0062

@@ -1671,7 +1671,7 @@ async function resolveWorkOrderStatusId(nameOrId) {
 // because that's where the board credibility comes from.
 async function changeWorkOrderStatus(client, woId, newStatusId, { deferredReason, revisitDate } = {}) {
   const { rows: curRows } = await client.query(
-    `SELECT w.status_id, ws.name AS old_name, w.title FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
+    `SELECT w.status_id, ws.name AS old_name, w.title, w.gcal_event_id FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
     [woId]
   );
   const cur = curRows[0];
@@ -1697,6 +1697,17 @@ async function changeWorkOrderStatus(client, woId, newStatusId, { deferredReason
     'INSERT INTO work_order_log_entries (work_order_id, note, status_change, username) VALUES ($1,$2,$3,$4)',
     [woId, `Status changed: ${cur.old_name} → ${newName}`, newName, currentUsername()]
   );
+  // Revisit sync (Build Brief v4 step 3, closed 2026-09-15): entering
+  // Deferred queues the prompt event; leaving it — to anything else — tears
+  // it down. A revisit date is a commitment tied to being Deferred, not a
+  // fact worth keeping visible once the WO has moved on.
+  if (newName === 'Deferred') {
+    await queueGcalSync(client, 'wo_revisit', woId);
+  } else if (cur.old_name === 'Deferred') {
+    await queueGcalDelete(cur.gcal_event_id);
+    await client.query('UPDATE work_orders SET gcal_event_id = NULL WHERE id = $1', [woId]);
+    await client.query('DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2', ['wo_revisit', woId]);
+  }
 }
 
 // jobLines: [{ title, responsibilityClass, fundingSource, fundingRefId,
@@ -2050,11 +2061,23 @@ export async function deferFinding(id, { reason, revisitDate }) {
     [id, reason.trim(), revisitDate, currentUsername()]
   );
   if (!rows[0]) return null;
+  // Revisit sync (Build Brief v4 step 3, closed 2026-09-15): a freshly
+  // Deferred finding needs its prompt event on Google on day one.
+  await queueGcalSync(pool, 'finding_revisit', rows[0].id);
   await logActivity({ action: 'deferred', entityType: 'condition_finding', entityId: rows[0].id, entityLabel: rows[0].title, details: reason.trim() });
   return { Id: rows[0].id, Title: rows[0].title };
 }
 export async function dismissFinding(id, { note }) {
   if (!note?.trim()) { const e = new Error('Dismissing a finding requires a note'); e.status = 400; throw e; }
+  const { rows: curRows } = await pool.query('SELECT status, gcal_event_id FROM condition_findings WHERE id = $1', [id]);
+  const cur = curRows[0];
+  if (cur?.status === 'Deferred') {
+    // Leaving Deferred tears the revisit prompt down — the same reasoning
+    // changeWorkOrderStatus applies to a Deferred work order's revisit event.
+    await queueGcalDelete(cur.gcal_event_id);
+    await pool.query('UPDATE condition_findings SET gcal_event_id = NULL WHERE id = $1', [id]);
+    await pool.query('DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2', ['finding_revisit', id]);
+  }
   const { rows } = await pool.query(
     `UPDATE condition_findings SET status = 'Dismissed', dismiss_note = $2, reviewed_by = $3, reviewed_at = now() WHERE id = $1 RETURNING id, title`,
     [id, note.trim(), currentUsername()]
@@ -2944,7 +2967,18 @@ async function autoResolveLinkedFinding(client, jobLineId) {
   const { rows } = await client.query('SELECT condition_finding_id FROM job_lines WHERE id = $1', [jobLineId]);
   const findingId = rows[0]?.condition_finding_id;
   if (!findingId) return;
+  const { rows: curRows } = await client.query('SELECT status, gcal_event_id FROM condition_findings WHERE id = $1', [findingId]);
+  const cur = curRows[0];
   await client.query(`UPDATE condition_findings SET status = 'Resolved' WHERE id = $1`, [findingId]);
+  if (cur?.status === 'Deferred') {
+    // This fires "regardless of the finding's current status" (see this
+    // function's own header comment) — including straight out of Deferred,
+    // which needs the same revisit-event teardown a manual dismiss/WO status
+    // change gets. Auto-resolve is a real exit from Deferred, not a no-op.
+    await queueGcalDelete(cur.gcal_event_id);
+    await client.query('UPDATE condition_findings SET gcal_event_id = NULL WHERE id = $1', [findingId]);
+    await client.query('DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2', ['finding_revisit', findingId]);
+  }
 }
 
 // Every job-line status transition writes a work_order_log_entries row
@@ -4090,6 +4124,46 @@ export async function setCalendarEventGcalEventId(id, gcalEventId) {
   await pool.query('UPDATE calendar_events SET gcal_event_id = $2 WHERE id = $1', [id, gcalEventId]);
 }
 
+// Revisit prompts (migration 0064) — a deferred work order or deferred
+// finding's revisit_date, synced as its own all-day "Revisit — ..." Google
+// event, never draggable/timed (brief, 2026-09-15: "they're prompts, not
+// appointments"). "who deferred it" has no dedicated column on work_orders
+// (unlike condition_findings.reviewed_by) — changeWorkOrderStatus already
+// writes a work_order_log_entries row with username on every status change,
+// so the most recent 'Deferred' one is that answer, without a new column.
+export async function getWorkOrderRevisitForGcalSync(id) {
+  const { rows } = await pool.query(
+    `SELECT w.id, w.title, w.revisit_date, w.deferred_reason, w.gcal_event_id, ws.name AS status_name,
+            a.id AS asset_id, a.name AS asset_name,
+            (SELECT le.username FROM work_order_log_entries le
+             WHERE le.work_order_id = w.id AND le.status_change = 'Deferred'
+             ORDER BY le.created_at DESC LIMIT 1) AS deferred_by
+     FROM work_orders w
+     JOIN work_order_statuses ws ON ws.id = w.status_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     WHERE w.id = $1`,
+    [id]
+  );
+  return rows[0] || null;
+}
+export async function setWorkOrderGcalEventId(id, gcalEventId) {
+  await pool.query('UPDATE work_orders SET gcal_event_id = $2 WHERE id = $1', [id, gcalEventId]);
+}
+export async function getFindingRevisitForGcalSync(id) {
+  const { rows } = await pool.query(
+    `SELECT cf.id, cf.title, cf.revisit_date, cf.deferred_reason, cf.reviewed_by AS deferred_by, cf.gcal_event_id, cf.status,
+            a.id AS asset_id, a.name AS asset_name
+     FROM condition_findings cf
+     LEFT JOIN assets a ON a.id = cf.asset_id
+     WHERE cf.id = $1`,
+    [id]
+  );
+  return rows[0] || null;
+}
+export async function setFindingGcalEventId(id, gcalEventId) {
+  await pool.query('UPDATE condition_findings SET gcal_event_id = $2 WHERE id = $1', [id, gcalEventId]);
+}
+
 export async function getGcalEventColors() {
   const { rows } = await pool.query('SELECT kind, gcal_color_id FROM gcal_event_colors ORDER BY kind');
   return rows.map((r) => ({ Kind: r.kind, GcalColorId: r.gcal_color_id }));
@@ -4111,6 +4185,11 @@ export async function requeueAllGcalSyncs() {
     SELECT 'job_line', id FROM job_lines WHERE scheduled_date IS NOT NULL
     UNION ALL
     SELECT 'calendar_event', id FROM calendar_events
+    UNION ALL
+    SELECT 'wo_revisit', w.id FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id
+      WHERE ws.name = 'Deferred' AND w.revisit_date IS NOT NULL
+    UNION ALL
+    SELECT 'finding_revisit', id FROM condition_findings WHERE status = 'Deferred' AND revisit_date IS NOT NULL
     ON CONFLICT (entity_type, entity_id) DO UPDATE
       SET queued_at = now(), attempts = 0, next_attempt_at = now(), last_error = NULL
   `);

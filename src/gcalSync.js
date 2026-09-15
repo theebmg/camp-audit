@@ -11,6 +11,8 @@ import {
   resolveGcalSync, markGcalSyncRetry, resolveGcalDelete, markGcalDeleteRetry,
   getJobLineForGcalSync, setJobLineGcalEventId,
   getCalendarEventForGcalSync, setCalendarEventGcalEventId,
+  getWorkOrderRevisitForGcalSync, setWorkOrderGcalEventId,
+  getFindingRevisitForGcalSync, setFindingGcalEventId,
   getGcalEventColors, recordSystemHealthSuccess, recordSystemHealthFailure,
 } from './db.js';
 import { gcalIsConfigured, getAccessTokenOrThrow, insertEvent, updateEvent, deleteEvent } from './gcal.js';
@@ -94,6 +96,11 @@ function buildRRule(recurrenceType, recurrenceInterval, recurrenceEndDate, isTim
 
 const MANAGED_FOOTER = 'Managed automatically by Sychar Operations — edits made directly in Google Calendar are overwritten on the next sync.';
 
+// Same host gcal.js's OAuth redirect_uri is hardcoded against — no env var
+// for the app's own base URL exists anywhere else in this codebase, and a
+// deep link back into the app (below) needs one.
+const APP_BASE_URL = 'https://audit.fracturedrv.com';
+
 // ── Event body builders — one per synced entity_type. ───────────────────────
 
 function buildJobLineEventBody(jl, jobLineColorId) {
@@ -151,28 +158,101 @@ function buildCalendarEventEventBody(ev) {
   };
 }
 
+// Revisit prompts (wo_revisit/finding_revisit) — the gap flagged when this
+// worker first shipped, closed 2026-09-15: a deferred work order or
+// deferred finding's revisit_date is a commitment already made, not an open
+// scheduling slot, so it always syncs as an all-day event, never timed —
+// "a prompt, not an appointment" (Ben's framing). One builder for both
+// entity types since the shape is identical; only the deep-link target and
+// the record's own vocabulary ("Work Order" vs "Finding") differ. The app
+// has no URL-based routing for a work order's own page, but does for an
+// asset's — a finding has no dedicated detail view at all (it's read-only
+// on the Asset page, see db.js's updateConditionFinding comment), so an
+// asset-page deep link is the closest thing to "the record" that exists;
+// an assetless finding falls back to the app's root.
+function buildRevisitEventBody(row, kind, revisitColorId) {
+  const place = row.asset_name ? `${row.asset_name} ` : '';
+  const summary = `Revisit — ${place}${row.title} (deferred)`;
+  const deepLink = kind === 'workOrder'
+    ? `${APP_BASE_URL}/?openWorkOrder=${row.id}`
+    : row.asset_id ? `${APP_BASE_URL}/?openAsset=${row.asset_id}` : APP_BASE_URL;
+  const description = [
+    `Deferred: ${row.deferred_reason || '(no reason recorded)'}`,
+    `Deferred by: ${row.deferred_by || 'unknown'}`,
+    '',
+    `Open in Sychar Operations: ${deepLink}`,
+    '',
+    MANAGED_FOOTER,
+  ].join('\n');
+  const dateOnly = dateStr(row.revisit_date);
+  return {
+    summary, description,
+    start: { date: dateOnly },
+    end: allDayPoint(dateOnly),
+    colorId: revisitColorId || undefined,
+    extendedProperties: {
+      private: { sychar_entity_type: kind === 'workOrder' ? 'wo_revisit' : 'finding_revisit', sychar_entity_id: String(row.id) },
+    },
+  };
+}
+
+// ── Per-entity-type dispatch — what to fetch, whether the Google event
+//    should currently exist at all, how to build its body, and where to
+//    store the resulting id back. One table instead of the job_line/
+//    calendar_event if/else this replaced, now that there are four kinds. ──
+const ENTITY_HANDLERS = {
+  job_line: {
+    fetch: getJobLineForGcalSync,
+    setGcalEventId: setJobLineGcalEventId,
+    shouldExist: (row) => !!row.scheduled_date,
+    buildBody: (row, ctx) => buildJobLineEventBody(row, ctx.jobLineColorId),
+  },
+  calendar_event: {
+    fetch: getCalendarEventForGcalSync,
+    setGcalEventId: setCalendarEventGcalEventId,
+    shouldExist: () => true,
+    buildBody: (row) => buildCalendarEventEventBody(row),
+  },
+  wo_revisit: {
+    fetch: getWorkOrderRevisitForGcalSync,
+    setGcalEventId: setWorkOrderGcalEventId,
+    shouldExist: (row) => row.status_name === 'Deferred' && !!row.revisit_date,
+    buildBody: (row, ctx) => buildRevisitEventBody(row, 'workOrder', ctx.revisitColorId),
+  },
+  finding_revisit: {
+    fetch: getFindingRevisitForGcalSync,
+    setGcalEventId: setFindingGcalEventId,
+    shouldExist: (row) => row.status === 'Deferred' && !!row.revisit_date,
+    buildBody: (row, ctx) => buildRevisitEventBody(row, 'finding', ctx.revisitColorId),
+  },
+};
+
 // ── One pending sync ─────────────────────────────────────────────────────
 
 async function processSync(item, ctx) {
   const entityType = item.entity_type, entityId = item.entity_id, queuedAt = item.queued_at;
-  const isJobLine = entityType === 'job_line';
-  const row = isJobLine ? await getJobLineForGcalSync(entityId) : await getCalendarEventForGcalSync(entityId);
+  const handler = ENTITY_HANDLERS[entityType];
+  const row = await handler.fetch(entityId);
 
   // Row is gone (raced with a delete — deleteJobLine/deleteCalendarEvent
-  // already handle the Google-side cleanup themselves) or, for a job line,
-  // no longer scheduled at all. Either way there's nothing to sync; if it
-  // still has a Google event from a previous sync, that needs deleting.
-  const shouldExist = row && (isJobLine ? !!row.scheduled_date : true);
+  // already handle the Google-side cleanup themselves), a job line no
+  // longer scheduled, or a revisit whose record already left Deferred
+  // (changeWorkOrderStatus/dismissFinding/autoResolveLinkedFinding queue
+  // their own delete on that transition, but this is a defensive second
+  // check against the same race the job_line comment above describes).
+  // Either way there's nothing to sync; if it still has a Google event from
+  // a previous sync, that needs deleting.
+  const shouldExist = row && handler.shouldExist(row);
   if (!shouldExist) {
     if (row?.gcal_event_id) {
       await deleteEvent(ctx.accessToken, ctx.calendarId, row.gcal_event_id);
-      if (isJobLine) await setJobLineGcalEventId(entityId, null);
+      await handler.setGcalEventId(entityId, null);
     }
     await resolveGcalSync(entityType, entityId, queuedAt);
     return { ok: true };
   }
 
-  const body = isJobLine ? buildJobLineEventBody(row, ctx.jobLineColorId) : buildCalendarEventEventBody(row);
+  const body = handler.buildBody(row, ctx);
   try {
     let gcalEventId = row.gcal_event_id;
     if (gcalEventId) {
@@ -186,8 +266,7 @@ async function processSync(item, ctx) {
     if (!gcalEventId) {
       const created = await insertEvent(ctx.accessToken, ctx.calendarId, body);
       gcalEventId = created.id;
-      if (isJobLine) await setJobLineGcalEventId(entityId, gcalEventId);
-      else await setCalendarEventGcalEventId(entityId, gcalEventId);
+      await handler.setGcalEventId(entityId, gcalEventId);
     }
     await resolveGcalSync(entityType, entityId, queuedAt);
     return { ok: true };
@@ -244,7 +323,11 @@ export async function runGcalSyncDrain() {
   }
 
   const colors = await getGcalEventColors();
-  const ctx = { accessToken, calendarId, jobLineColorId: colors.find((c) => c.Kind === 'job_line')?.GcalColorId || null };
+  const ctx = {
+    accessToken, calendarId,
+    jobLineColorId: colors.find((c) => c.Kind === 'job_line')?.GcalColorId || null,
+    revisitColorId: colors.find((c) => c.Kind === 'revisit')?.GcalColorId || null,
+  };
 
   const deletes = await listDueGcalDeletes(MAX_BATCH);
   const deleteResults = [];

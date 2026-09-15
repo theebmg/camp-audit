@@ -19,6 +19,22 @@ const globalSearchResults = document.getElementById('globalSearchResults');
 
 const state = { user: null, options: null, stack: [] };
 
+// A Google Calendar revisit-prompt event links back here (src/gcalSync.js's
+// buildRevisitEventBody) via ?openWorkOrder=<id>/?openAsset=<id> — the one
+// other query-string entry point besides the OAuth redirect below. Captured
+// once at boot (before the session check strips it) so it survives a
+// still-logged-out visit and gets applied right after login instead of
+// silently landing on the dashboard.
+let pendingDeepLink = null;
+function captureDeepLinkParams() {
+  const params = new URLSearchParams(window.location.search);
+  const woId = params.get('openWorkOrder');
+  const assetId = params.get('openAsset');
+  if (!woId && !assetId) return null;
+  window.history.replaceState({}, '', window.location.pathname);
+  return woId ? { view: 'workOrderDetail', params: { id: woId } } : { view: 'assetDetail', params: { id: assetId } };
+}
+
 function toast(msg, ms = 2500) {
   toastEl.textContent = msg;
   toastEl.hidden = false;
@@ -739,7 +755,12 @@ function renderLogin() {
     try {
       const body = await api('/login', { method: 'POST', body: JSON.stringify({ username: fd.get('username'), password: fd.get('password') }) });
       state.user = body.user;
-      go('dashboard', {}, { replace: true });
+      if (pendingDeepLink) {
+        const dl = pendingDeepLink; pendingDeepLink = null;
+        go(dl.view, dl.params, { replace: true, reset: true });
+      } else {
+        go('dashboard', {}, { replace: true });
+      }
     } catch (err) { toast(err.message); }
   });
 }
@@ -4880,6 +4901,7 @@ async function renderAdminGcal(container = app) {
   ]);
   const gcalHealth = healthRes?.subsystems?.find((s) => s.Subsystem === 'gcal_sync');
   const jobLineColor = colorsRes?.colors?.find((c) => c.Kind === 'job_line') || null;
+  const revisitColor = colorsRes?.colors?.find((c) => c.Kind === 'revisit') || null;
   let syncing = false;
   // Picker opens automatically the first time (connected, nothing chosen
   // yet) and can be reopened later via "Change calendar".
@@ -4908,8 +4930,8 @@ async function renderAdminGcal(container = app) {
       <div class="card">
         <h3>Google Calendar Sync</h3>
         <p class="muted" style="margin-top:-4px">
-          Mirrors scheduled job lines and calendar events onto a dedicated calendar on a connected
-          Google account (deferred revisit dates aren't part of this sync yet).
+          Mirrors scheduled job lines and calendar events, plus deferred work orders' and findings'
+          revisit dates, onto a dedicated calendar on a connected Google account.
           <strong>The CMMS owns the data</strong> — an event moved or edited directly in Google is
           overwritten on the next sync. That's correct behavior, not a bug: this is a one-way mirror,
           not two-way sync.
@@ -4939,7 +4961,7 @@ async function renderAdminGcal(container = app) {
       ${status.Connected && status.CalendarId && !picking ? `
         <div class="card">
           <h3>Event Color</h3>
-          <p class="muted" style="margin-top:-4px">Calendar events get their color from their own Type (Admin > System > Calendar Event Types). Job lines synced from Work Orders all get one flat color here, so they read as "CMMS work" at a glance next to admin-typed events.</p>
+          <p class="muted" style="margin-top:-4px">Calendar events get their color from their own Type (Admin > System > Calendar Event Types). Job lines synced from Work Orders all get one flat color here, so they read as "CMMS work" at a glance next to admin-typed events. Revisit prompts (deferred work orders/findings) get their own flat color too, distinct from both.</p>
           <div class="field-row" style="margin-top:10px">
             <label>Job line events</label>
             <select id="gcalJobLineColor">
@@ -4947,6 +4969,14 @@ async function renderAdminGcal(container = app) {
               ${Object.entries(GOOGLE_EVENT_COLORS).map(([id, c]) => `<option value="${id}" ${jobLineColor?.GcalColorId === id ? 'selected' : ''}>${c.name}</option>`).join('')}
             </select>
             <button class="btn btn-primary" id="gcalSaveJobLineColorBtn" style="margin-top:8px">Save</button>
+          </div>
+          <div class="field-row" style="margin-top:14px">
+            <label>Revisit prompts</label>
+            <select id="gcalRevisitColor">
+              <option value="">— calendar's default color —</option>
+              ${Object.entries(GOOGLE_EVENT_COLORS).map(([id, c]) => `<option value="${id}" ${revisitColor?.GcalColorId === id ? 'selected' : ''}>${c.name}</option>`).join('')}
+            </select>
+            <button class="btn btn-primary" id="gcalSaveRevisitColorBtn" style="margin-top:8px">Save</button>
           </div>
         </div>
       ` : ''}
@@ -5006,6 +5036,13 @@ async function renderAdminGcal(container = app) {
       const gcalColorId = container.querySelector('#gcalJobLineColor').value || null;
       try {
         await api('/api/pg/gcal/event-colors/job_line', { method: 'PATCH', body: JSON.stringify({ gcalColorId }) });
+        toast('Saved — existing synced events keep their old color until next touched; use "Regenerate all events" to repaint everything now.');
+      } catch (err) { toast(err.message); }
+    });
+    container.querySelector('#gcalSaveRevisitColorBtn')?.addEventListener('click', async () => {
+      const gcalColorId = container.querySelector('#gcalRevisitColor').value || null;
+      try {
+        await api('/api/pg/gcal/event-colors/revisit', { method: 'PATCH', body: JSON.stringify({ gcalColorId }) });
         toast('Saved — existing synced events keep their old color until next touched; use "Regenerate all events" to repaint everything now.');
       } catch (err) { toast(err.message); }
     });
@@ -8494,16 +8531,19 @@ function handleGcalOauthRedirect() {
 }
 
 (async function boot() {
+  const deepLink = captureDeepLinkParams();
   try {
     const res = await fetch('/api/pg/options');
-    if (res.status === 401) return render('login');
+    if (res.status === 401) { pendingDeepLink = deepLink; return render('login'); }
     // We don't know the username without a /whoami endpoint; the session cookie
     // is enough to proceed, this just skips the "Signed in as ..." label until
     // the next successful /login call populates it.
     state.user = state.user || 'you';
-    await go('dashboard', {});
+    if (deepLink) await go(deepLink.view, deepLink.params, { reset: true });
+    else await go('dashboard', {});
     handleGcalOauthRedirect();
   } catch {
+    pendingDeepLink = deepLink;
     render('login');
   }
 })();

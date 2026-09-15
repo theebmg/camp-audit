@@ -291,7 +291,10 @@ editable — no developer needed to add a new one. Under **Admin**:
 Under **Integrations**:
 
 - **Google Calendar Sync** — connect a Google account and pick which
-  calendar scheduled work and calendar events get mirrored to (an existing
-  calendar you can already edit, or a new one created on request). The
-  CMMS owns the data here — anything edited or moved directly in Google
-  gets overwritten the next time it syncs, by design.
+  calendar scheduled work, calendar events, and deferred work orders'/
+  findings' revisit dates get mirrored to (an existing calendar you can
+  already edit, or a new one created on request). Revisit dates sync as
+  all-day "Revisit — ..." prompts, never as draggable/timed appointments —
+  they disappear from the calendar automatically once the record is no
+  longer Deferred. The CMMS owns the data here — anything edited or moved
+  directly in Google gets overwritten the next time it syncs, by design.
