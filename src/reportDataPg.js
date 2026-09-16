@@ -3,7 +3,7 @@
 // once, regardless of which database it reads from.
 import {
   getAllComponentRowsWithAssetInfo, getBoardReportRawData, getBoardFocusItems, historicalAvgActualCost,
-  getWorkPerformedRawData, getDeferredFindingsBacklogRawData, getVisitorActivityRawData,
+  getWorkPerformedRawData, getDeferredFindingsBacklogRawData, getVisitorActivityRawData, getAdminTasksWorkPerformedRawData,
 } from './db.js';
 import { currentComponentState } from './components.js';
 import { FUNDING_SOURCE_LABELS } from './reports.js';
@@ -157,7 +157,10 @@ export async function buildForwardFocusReportPg() {
 // Every line shows regardless of its parent WO's status — see
 // getWorkPerformedRawData's comment for why that's the whole point.
 export async function buildWorkPerformedReportPg({ from, to }) {
-  const { lines, imagesByWo } = await getWorkPerformedRawData({ from, to });
+  const [{ lines, imagesByWo }, adminTasks] = await Promise.all([
+    getWorkPerformedRawData({ from, to }),
+    getAdminTasksWorkPerformedRawData({ from, to }),
+  ]);
 
   const byLocation = new Map();
   for (const l of lines) {
@@ -176,11 +179,30 @@ export async function buildWorkPerformedReportPg({ from, to }) {
     totalHours: lineItems.reduce((s, i) => s + i.hours, 0),
   })).sort((a, b) => a.location.localeCompare(b.location));
 
+  // Administrative Work — its own section, never folded into the building
+  // totals: these carry hours but no cost, and aren't at a building. Savings
+  // total only over tasks that actually filled the field (blank is the
+  // normal case, not $0); the section omits the savings line entirely when
+  // none did.
+  const savingsTasks = adminTasks.filter((t) => t.RecurringMonthlySavings != null && t.RecurringMonthlySavings > 0);
+  const monthlySavings = Math.round(savingsTasks.reduce((s, t) => s + t.RecurringMonthlySavings, 0) * 100) / 100;
+  const adminWork = {
+    tasks: adminTasks.map((t) => ({
+      id: t.Id, title: t.Title, description: t.Description, date: t.TaskDate, hours: t.Hours,
+      status: t.StatusName, category: t.CategoryName, recurringMonthlySavings: t.RecurringMonthlySavings,
+    })),
+    totalHours: Math.round(adminTasks.reduce((s, t) => s + (t.Hours || 0), 0) * 100) / 100,
+    savingsTaskCount: savingsTasks.length,
+    monthlySavings,
+    annualizedSavings: Math.round(monthlySavings * 12 * 100) / 100,
+  };
+
   return {
     from, to, buildings,
     totalLines: lines.length,
     totalCost: buildings.reduce((s, b) => s + b.totalCost, 0),
     totalHours: buildings.reduce((s, b) => s + b.totalHours, 0),
+    adminWork,
   };
 }
 

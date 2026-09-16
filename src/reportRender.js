@@ -127,7 +127,12 @@ export function renderForwardFocusText({ items, total }) {
 // embed (After photos, capped per WO — see getReportImagesForJobLines),
 // documents would link but this report only ever shows images by
 // construction (image-kind filter is in the raw-data query).
-export function renderWorkPerformedHtml({ from, to, buildings, totalLines, totalCost, totalHours }) {
+// Savings are the one place cents matter (a $14.99/mo subscription) — the
+// report's usual fmtMoney drops trailing zeros.
+const fmtMoneyCents = (n) => `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+const fmtHours = (n) => `${Math.round(Number(n) * 100) / 100}h`;
+
+export function renderWorkPerformedHtml({ from, to, buildings, totalLines, totalCost, totalHours, adminWork }) {
   const buildingHtml = (b) => `
     <h3 style="margin:20px 0 4px;font-size:1rem;">${escapeHtml(b.location)} <span style="color:#6b7086;font-weight:400;font-size:0.85rem;">— ${fmtMoney(b.totalCost)} · ${b.totalHours}h</span></h3>
     ${b.lines.map((l) => `
@@ -137,17 +142,39 @@ export function renderWorkPerformedHtml({ from, to, buildings, totalLines, total
         ${l.correction ? `<div style="font-size:0.9rem;margin-top:2px;">${escapeHtml(l.correction)}</div>` : ''}
         ${l.images.length ? `<div style="margin-top:6px;">${l.images.map((img) => `<img src="${escapeHtml(img.Url)}" alt="${escapeHtml(img.Caption || '')}" style="max-width:220px;max-height:220px;border-radius:8px;margin:0 6px 6px 0;" />`).join('')}</div>` : ''}
       </div>`).join('')}`;
-  return htmlShell('Work Performed', `${from} to ${to} · ${totalLines} line(s) · ${fmtMoney(totalCost)} · ${totalHours}h`, `
+  const tasks = adminWork?.tasks || [];
+  const adminHtml = `
+    <h2 style="margin:28px 0 4px;font-size:1.1rem;border-top:2px solid #eef0f6;padding-top:14px;">Administrative Work <span style="color:#6b7086;font-weight:400;font-size:0.85rem;">— ${tasks.length} task(s)${adminWork?.totalHours ? ` · ${fmtHours(adminWork.totalHours)}` : ''}</span></h2>
+    ${adminWork?.savingsTaskCount ? `
+      <div style="background:#eef7f0;border-left:4px solid #2e8b57;padding:8px 12px;margin:8px 0;border-radius:4px;">
+        <strong>Recurring savings: ${fmtMoneyCents(adminWork.monthlySavings)}/month · ${fmtMoneyCents(adminWork.annualizedSavings)}/year</strong>
+        <span style="color:#6b7086;font-size:0.85rem;"> — from ${adminWork.savingsTaskCount} task(s)</span>
+      </div>` : ''}
+    ${tasks.map((t) => `
+      <div style="border-bottom:1px solid #eef0f6;padding:10px 0;">
+        <div><strong>${escapeHtml(t.title)}</strong>${t.category ? ` <span style="color:#6b7086;font-size:0.85rem;">· ${escapeHtml(t.category)}</span>` : ''}</div>
+        <div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(fmtDate(t.date))} · ${escapeHtml(t.status)}${t.hours ? ` · ${fmtHours(t.hours)}` : ''}${t.recurringMonthlySavings ? ` · <span style="color:#2e8b57;">saves ${fmtMoneyCents(t.recurringMonthlySavings)}/mo</span>` : ''}</div>
+        ${t.description ? `<div style="font-size:0.9rem;margin-top:2px;white-space:pre-wrap;">${escapeHtml(t.description)}</div>` : ''}
+      </div>`).join('') || '<p style="color:#6b7086;margin:4px 0;">No administrative tasks in this range.</p>'}`;
+  return htmlShell('Work Performed', `${from} to ${to} · ${totalLines} line(s) · ${fmtMoney(totalCost)} · ${totalHours}h${tasks.length ? ` · ${tasks.length} admin task(s)` : ''}`, `
     ${buildings.map(buildingHtml).join('') || '<p style="color:#6b7086;">No completed work in this range.</p>'}
+    ${adminHtml}
   `);
 }
-export function renderWorkPerformedText({ from, to, buildings, totalLines, totalCost, totalHours }) {
-  const lines = ['CAMP SYCHAR — WORK PERFORMED', `${from} to ${to} — ${totalLines} line(s), ${fmtMoney(totalCost)}, ${totalHours}h`, ''];
+export function renderWorkPerformedText({ from, to, buildings, totalLines, totalCost, totalHours, adminWork }) {
+  const tasks = adminWork?.tasks || [];
+  const lines = ['CAMP SYCHAR — WORK PERFORMED', `${from} to ${to} — ${totalLines} line(s), ${fmtMoney(totalCost)}, ${totalHours}h${tasks.length ? `, ${tasks.length} admin task(s)` : ''}`, ''];
   buildings.forEach((b) => {
     lines.push(`${b.location} — ${fmtMoney(b.totalCost)}, ${b.totalHours}h`);
     b.lines.forEach((l) => lines.push(`  ${fmtDate(l.completedDate)}  ${l.title} (WO ${l.woNumber || l.workOrderId}${l.assetName ? `, ${l.assetName}` : ''}) — ${fmtMoney(l.cost)}`));
   });
   if (!buildings.length) lines.push('No completed work in this range.');
+  lines.push('', `ADMINISTRATIVE WORK — ${tasks.length} task(s)${adminWork?.totalHours ? `, ${fmtHours(adminWork.totalHours)}` : ''}`);
+  if (adminWork?.savingsTaskCount) {
+    lines.push(`  Recurring savings: ${fmtMoneyCents(adminWork.monthlySavings)}/month, ${fmtMoneyCents(adminWork.annualizedSavings)}/year (from ${adminWork.savingsTaskCount} task(s))`);
+  }
+  tasks.forEach((t) => lines.push(`  ${fmtDate(t.date)}  ${t.title}${t.category ? ` [${t.category}]` : ''} — ${t.status}${t.hours ? `, ${fmtHours(t.hours)}` : ''}${t.recurringMonthlySavings ? `, saves ${fmtMoneyCents(t.recurringMonthlySavings)}/mo` : ''}`));
+  if (!tasks.length) lines.push('  No administrative tasks in this range.');
   return lines.join('\n');
 }
 

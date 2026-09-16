@@ -237,7 +237,10 @@ Menu → **Reports**. Along the top:
 - **Work Performed** — pick a date range; every job line finished in that
   window, grouped by building, with After photos included, even if the
   bigger work order it belongs to is still open. This is the "here's what
-  we actually did" document.
+  we actually did" document. Administrative tasks dated in the range get
+  their own **Administrative Work** section after the buildings; if any of
+  them recorded a recurring savings, the section totals it per month and
+  per year.
 - **Deferred Backlog** — every finding marked Deferred, grouped by
   severity, with dollar totals. This is the capital-campaign argument
   document.
@@ -277,6 +280,30 @@ listing the visit. **Schedule anyway** goes ahead; it never blocks.
 If a visit turns up real work, record it as a finding on the asset — that
 converts to a job line the usual way. Visits don't turn into work orders
 themselves.
+
+---
+
+## Administrative Tasks
+
+Menu → **Admin Tasks** is for work that isn't tied to a building or a work
+order: vendor calls, account cleanup, insurance paperwork. **+ Add Task**:
+
+- **Title**, **Description**, **Date** (defaults to today), **Hours**.
+- **Status** (defaults to Done, since most tasks get logged after the
+  fact) and an optional **Category** — Vendor/Account, Insurance,
+  Compliance, Planning, Board/Governance, Other.
+- **Recurring monthly savings** — leave it blank unless the task cut a
+  recurring cost (a cancelled $45/month subscription, a renegotiated
+  rate). Blank never counts as $0.
+- **Attachments** — once the task is saved, same upload as everywhere else.
+
+There's no building, fund, cost, or job lines on a task. It's a record of
+the work, not an expense.
+
+Tasks with a status of In Progress, Waiting on Others, or Done show in
+Reports → Work Performed. To Do and Cancelled don't, and neither do their
+savings. Admin → **Administrative Tasks** is where you add or deactivate
+categories and statuses, and choose which statuses count toward the report.
 
 ---
 

@@ -77,6 +77,9 @@ import {
   getOpenFindingsForWoCreation, createWorkOrderFromFindings,
   listFunds, createFund, updateFund, deleteFund, getFundBalances,
   listExpenseCategories, createExpenseCategory, updateExpenseCategory, deleteExpenseCategory,
+  listAdminTaskCategories, createAdminTaskCategory, updateAdminTaskCategory, deleteAdminTaskCategory,
+  listAdminTaskStatuses, createAdminTaskStatus, updateAdminTaskStatus, deleteAdminTaskStatus,
+  listAdminTasks, getAdminTask, createAdminTask, updateAdminTask, deleteAdminTask,
   listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
   getExpensesReportRawData,
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
@@ -379,6 +382,122 @@ router.delete('/admin/expense-categories/:id', async (req, res, next) => {
   try { await deleteExpenseCategory(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
+// ---- Administrative tasks (migration 0066) — work that isn't tied to an
+// asset or a work order. Documentation, not accounting: no asset, fund, job
+// lines or cost, so none of those are accepted here. ----
+
+router.get('/admin-task-categories', async (req, res, next) => {
+  try { res.json({ categories: await listAdminTaskCategories({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/admin-task-categories', async (req, res, next) => {
+  try {
+    const { name, sortOrder } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, category: await createAdminTaskCategory({ name: name.trim(), sortOrder }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/admin-task-categories/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, active } = req.body || {};
+    const category = await updateAdminTaskCategory(req.params.id, { name: name?.trim() || undefined, sortOrder, active });
+    if (!category) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, category });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/admin-task-categories/:id', async (req, res, next) => {
+  try { await deleteAdminTaskCategory(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.get('/admin-task-statuses', async (req, res, next) => {
+  try { res.json({ statuses: await listAdminTaskStatuses({ includeInactive: currentRole() === 'admin' }) }); } catch (e) { next(e); }
+});
+router.post('/admin/admin-task-statuses', async (req, res, next) => {
+  try {
+    const { name, sortOrder, countsAsWorkPerformed } = req.body || {};
+    if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
+    res.json({ ok: true, status: await createAdminTaskStatus({ name: name.trim(), sortOrder, countsAsWorkPerformed }) });
+  } catch (e) { next(e); }
+});
+router.patch('/admin/admin-task-statuses/:id', async (req, res, next) => {
+  try {
+    const { name, sortOrder, countsAsWorkPerformed, active } = req.body || {};
+    const status = await updateAdminTaskStatus(req.params.id, { name: name?.trim() || undefined, sortOrder, countsAsWorkPerformed, active });
+    if (!status) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, status });
+  } catch (e) { next(e); }
+});
+router.delete('/admin/admin-task-statuses/:id', async (req, res, next) => {
+  try { await deleteAdminTaskStatus(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// Blank means "no value," never 0 — recurring_monthly_savings especially:
+// blank is the normal case and must not total as a $0 saving.
+function adminTaskNumber(value, label) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) { const e = new Error(`${label} must be a number, zero or more`); e.status = 400; throw e; }
+  return n;
+}
+router.get('/admin-tasks', async (req, res, next) => {
+  try {
+    const { statusId, categoryId, dateFrom, dateTo, q } = req.query;
+    res.json({ tasks: await listAdminTasks({ statusId, categoryId, dateFrom, dateTo, q: q?.trim() || undefined }) });
+  } catch (e) { next(e); }
+});
+router.get('/admin-tasks/:id', async (req, res, next) => {
+  try {
+    const task = await getAdminTask(req.params.id);
+    if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
+    res.json({ task });
+  } catch (e) { next(e); }
+});
+router.post('/admin-tasks', async (req, res, next) => {
+  try {
+    const { title, description, taskDate, hours, statusId, categoryId, recurringMonthlySavings } = req.body || {};
+    if (!title || !title.trim()) return res.status(400).json({ ok: false, error: 'Title is required' });
+    const task = await createAdminTask({
+      title: title.trim(), description: description?.trim() || null, taskDate: taskDate || null,
+      hours: adminTaskNumber(hours, 'Hours') ?? null, statusId: statusId ? Number(statusId) : null,
+      categoryId: categoryId ? Number(categoryId) : null,
+      recurringMonthlySavings: adminTaskNumber(recurringMonthlySavings, 'Recurring monthly savings') ?? null,
+      createdBy: currentUsername(),
+    });
+    res.json({ ok: true, task });
+  } catch (e) { next(e); }
+});
+router.patch('/admin-tasks/:id', async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const fields = {};
+    if ('title' in body) {
+      if (!body.title || !body.title.trim()) return res.status(400).json({ ok: false, error: 'Title is required' });
+      fields.title = body.title.trim();
+    }
+    if ('description' in body) fields.description = body.description?.trim() || null;
+    if ('taskDate' in body) {
+      if (!body.taskDate) return res.status(400).json({ ok: false, error: 'Date is required' });
+      fields.taskDate = body.taskDate;
+    }
+    if ('hours' in body) fields.hours = adminTaskNumber(body.hours, 'Hours');
+    if ('statusId' in body) {
+      if (!body.statusId) return res.status(400).json({ ok: false, error: 'Status is required' });
+      fields.statusId = Number(body.statusId);
+    }
+    if ('categoryId' in body) fields.categoryId = body.categoryId ? Number(body.categoryId) : null;
+    if ('recurringMonthlySavings' in body) fields.recurringMonthlySavings = adminTaskNumber(body.recurringMonthlySavings, 'Recurring monthly savings');
+    const task = await updateAdminTask(req.params.id, fields);
+    if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
+    res.json({ ok: true, task });
+  } catch (e) { next(e); }
+});
+router.delete('/admin-tasks/:id', async (req, res, next) => {
+  try {
+    if (!await deleteAdminTask(req.params.id)) return res.status(404).json({ ok: false, error: 'Task not found' });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
 // ---- Expenses (Build Brief v3 Part 1/3) — camp debit card spending.
 // Inbox mirrors the photo inbox's triage/void pattern; "Add expense" (manual
 // entry) and triage share the same create/update functions since a manual
@@ -543,10 +662,11 @@ router.get('/search', async (req, res, next) => {
 
 router.get('/options', async (req, res, next) => {
   try {
-    const [propertyFields, componentSchema, buildingTypes, workOrderStatuses, jobLineStatuses, displaySettings, attachmentRoles, funds, expenseCategories] = await Promise.all([
+    const [propertyFields, componentSchema, buildingTypes, workOrderStatuses, jobLineStatuses, displaySettings, attachmentRoles, funds, expenseCategories, adminTaskCategories, adminTaskStatuses] = await Promise.all([
       getAssetPropertyFields(), getComponentTypeCatalog(), listBuildingTypes(),
       listWorkOrderStatuses(), listJobLineStatuses(), getDisplaySettings(), listAttachmentRoles(),
       listFunds(), listExpenseCategories({ includeInactive: currentRole() === 'admin' }),
+      listAdminTaskCategories({ includeInactive: currentRole() === 'admin' }), listAdminTaskStatuses({ includeInactive: currentRole() === 'admin' }),
     ]);
     res.json({
       propertyFields,
@@ -557,7 +677,7 @@ router.get('/options', async (req, res, next) => {
       workOrderStatuses, jobLineStatuses, displaySettings,
       findingSeverity: FINDING_SEVERITY_OPTIONS,
       attachmentRoles,
-      funds, expenseCategories,
+      funds, expenseCategories, adminTaskCategories, adminTaskStatuses,
       currentUser: { username: currentUsername(), role: currentRole() },
     });
   } catch (e) { next(e); }

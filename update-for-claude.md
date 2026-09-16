@@ -1,3 +1,70 @@
+# Runbook: Administrative tasks (2026-09-16)
+
+**Checked before adding anything: there is no `tasks` table to reuse.**
+Migration 0009 never created a standalone `tasks` table. It created
+`work_order_tasks` (a WO-bound checklist, `work_order_id NOT NULL`). 0030
+renamed that to `job_lines`, and 0038 renamed the last `*task*` FK columns
+(`calendar_events.work_order_task_id` → `job_line_id`, etc.). Live DB:
+`\dt *task*` matched nothing before 0066. Its only UI is the job-line UI on a
+work order. It requires a WO and carries cost, funding, and responsibility, which
+is exactly what an admin task must not have. So this is a new table, not a
+second copy of an existing one.
+
+**Migration 0066**: `admin_tasks` (title, description, task_date NOT NULL
+default today, hours, status_id NOT NULL, category_id nullable,
+recurring_monthly_savings nullable ≥0, created_by, timestamps). Two
+admin-editable lists per Decision 7:
+- `admin_task_categories`, seeded Vendor/Account, Insurance, Compliance,
+  Planning, Board/Governance, Other.
+- `admin_task_statuses`, seeded To Do / In Progress / Waiting on Others /
+  Done / Cancelled, with a `counts_as_work_performed` flag that mirrors
+  `job_line_statuses`. It's true for In Progress, Waiting, and Done.
+
+No asset, fund, job-line, or cost column, by design ("documentation, not
+accounting").
+
+**Attachments**: `'admin_task'` added to `ATTACHMENT_ENTITY_TYPES`. The detail
+page uses the shared `renderAttachmentSection`, with Documentation as the default
+role. `deleteAdminTask` removes the task's `attachment_links` in the same
+transaction (polymorphic links have no FK cascade). The files themselves stay,
+same as a detach.
+
+**API**: `/api/pg/admin-tasks` (GET with statusId/categoryId/dateFrom/
+dateTo/q, GET/:id, POST, PATCH, DELETE). `/api/pg/admin-task-categories`
+and `/api/pg/admin-task-statuses` for reads; `/api/pg/admin/admin-task-*`
+for CRUD, following the Expense Categories pattern (delete refused while in
+use, so you deactivate instead). Both lists are also on `/options`. A blank
+hours or savings value is stored as NULL, never 0.
+
+**Work Performed report**: `getAdminTasksWorkPerformedRawData` returns
+tasks with `task_date` in range whose status `counts_as_work_performed`.
+`buildWorkPerformedReportPg` returns an `adminWork` block with tasks,
+totalHours, savingsTaskCount, monthlySavings, and annualizedSavings (×12).
+Savings total only over those same tasks, so a To Do task with savings
+doesn't count. The renderers add an **Administrative Work** section after the
+buildings. The savings banner appears only when at least one task has savings.
+Admin hours are *not* folded into the building totals or the header's `h`
+figure: those are job-line hours with cost attached.
+
+**UI**: sidebar **Admin Tasks** (`adminTasks` list with filters and a
+count/hours/savings summary; `adminTaskDetail` form). Admin → new
+**Administrative Tasks** category with the Categories and Statuses screens,
+registered in both the hub routes and `ADMIN_LEAF_RENDERERS`. Inactive
+statuses and categories stay selectable only on a task that already uses them.
+
+**Verified live**: created three tasks via the db functions in the
+container (one Done with savings, one defaulted status, one To Do with
+savings). The report returned 2 tasks, 3.5h, $60.49/mo, and $725.88/yr, and
+excluded the To Do. Filters and PATCH-to-null worked. Test rows and their
+activity_log entries were deleted.
+
+## Known gaps / follow-ups
+- Tasks don't appear on the Calendar or Dashboard; they're only in Admin
+  Tasks and the report.
+- Not in the Reports Data Explorer (no ad-hoc grouping or CSV export of tasks).
+
+---
+
 # Runbook: Camp visitor tracking (2026-09-16)
 
 **Checked before adding anything.** `calendar_event_types` already seeded

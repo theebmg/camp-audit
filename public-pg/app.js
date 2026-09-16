@@ -621,6 +621,7 @@ const NAV_ITEMS = [
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
   { icon: '📥', label: 'Inbox', view: 'inbox' },
   { icon: '💵', label: 'Expenses', view: 'expenses' },
+  { icon: '🗂️', label: 'Admin Tasks', view: 'adminTasks' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
   { icon: '👷', label: 'Crew', view: 'crew' },
@@ -706,6 +707,7 @@ function breadcrumbLabel({ view, params }) {
   if (view === 'assetDetail') return params.name || 'Asset';
   if (view === 'workOrderDetail') return params.title || 'Work Order';
   if (view === 'requestDetail') return params.label || 'Request';
+  if (view === 'adminTaskDetail') return params.title || (params.id ? 'Task' : 'New Task');
   if (view === 'adminCategory') return ADMIN_CATEGORIES[params.category]?.title || 'Category';
   if (ADMIN_TOOL_LABELS[view]) return ADMIN_TOOL_LABELS[view];
   return NAV_ITEMS.find((n) => n.view === view)?.label || view;
@@ -745,6 +747,10 @@ async function render(view, params = {}) {
       inbox: () => renderInbox(),
       expenses: () => renderExpenses(params),
       expenseDetail: () => renderExpenseDetail(params),
+      adminTasks: () => renderAdminTasks(),
+      adminTaskDetail: () => renderAdminTaskDetail(params),
+      adminTaskCategories: () => renderAdminTaskCategories(),
+      adminTaskStatuses: () => renderAdminTaskStatuses(),
       adminFunds: () => renderAdminFunds(),
       adminExpenseCategories: () => renderAdminExpenseCategories(),
       createWoFromFindings: () => renderCreateWoFromFindings(params),
@@ -1167,6 +1173,8 @@ const ADMIN_LEAF_RENDERERS = {
   activityLog: (params, container) => renderActivityLog(container),
   adminGcal: (params, container) => renderAdminGcal(container),
   adminCalendarEventTypes: (params, container) => renderAdminCalendarEventTypes(container),
+  adminTaskCategories: (params, container) => renderAdminTaskCategories(container),
+  adminTaskStatuses: (params, container) => renderAdminTaskStatuses(container),
 };
 
 async function renderAdminDrilldown() {
@@ -4023,6 +4031,189 @@ async function renderExpenseDetail({ id } = {}) {
   });
 }
 
+// ── Administrative tasks — work that isn't tied to an asset or a work order
+//    (vendor calls, account cleanup, insurance paperwork). Documentation, not
+//    accounting: no asset, fund, job lines or cost on purpose. Shows in the
+//    Work Performed report's Administrative Work section. ─────────────────
+function fmtSavings(n) {
+  return `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+async function renderAdminTasks() {
+  setChrome({ title: 'Admin Tasks', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const [{ statuses }, { categories }] = await Promise.all([
+    api('/api/pg/admin-task-statuses'), api('/api/pg/admin-task-categories'),
+  ]);
+
+  app.innerHTML = `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+        <h3 style="margin:0">Administrative Tasks</h3>
+        <button class="btn btn-primary" id="addAdminTaskBtn" style="width:auto;margin-top:0">+ Add Task</button>
+      </div>
+      <p class="muted">Work that isn't tied to a building or a work order — vendor calls, account cleanup, insurance paperwork. Shows in Reports → Work Performed alongside the buildings.</p>
+    </div>
+    <div class="card">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:10px">
+        <div class="field-row" style="flex:2;min-width:160px;margin:0"><label>Search</label><input type="text" id="atSearch" placeholder="Title or description" /></div>
+        <div class="field-row" style="flex:1;min-width:140px;margin:0"><label>Status</label><select id="atStatus">
+          <option value="">All statuses</option>
+          ${statuses.map((st) => `<option value="${st.Id}">${escapeHtml(st.Name)}${st.Active ? '' : ' (inactive)'}</option>`).join('')}
+        </select></div>
+        <div class="field-row" style="flex:1;min-width:140px;margin:0"><label>Category</label><select id="atCategory">
+          <option value="">All categories</option>
+          ${categories.map((c) => `<option value="${c.Id}">${escapeHtml(c.Name)}${c.Active ? '' : ' (inactive)'}</option>`).join('')}
+        </select></div>
+        <div class="field-row" style="flex:2;min-width:220px;margin:0"><label>Date range</label>
+          <div class="report-date-range">
+            <input type="date" id="atFrom" />
+            <span class="muted">to</span>
+            <input type="date" id="atTo" />
+          </div>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="report-table">
+          <thead><tr>
+            <th>Date</th><th>Title</th><th>Category</th><th>Status</th>
+            <th style="text-align:right">Hours</th><th style="text-align:right">Savings / mo</th>
+          </tr></thead>
+          <tbody id="atTableBody"></tbody>
+        </table>
+      </div>
+      <p class="muted" id="atEmpty" hidden style="margin:10px 0">No tasks match these filters.</p>
+      <p class="muted" id="atSummary" style="margin-top:6px;font-size:0.85rem"></p>
+    </div>`;
+
+  document.getElementById('addAdminTaskBtn').addEventListener('click', () => go('adminTaskDetail', {}));
+  const tbody = document.getElementById('atTableBody');
+  const emptyMsg = document.getElementById('atEmpty');
+  const summary = document.getElementById('atSummary');
+  let requestSeq = 0; // a slow earlier fetch must not overwrite a newer filter's results
+
+  async function load() {
+    const seq = ++requestSeq;
+    const qs = new URLSearchParams();
+    const val = (id) => document.getElementById(id).value.trim();
+    if (val('atSearch')) qs.set('q', val('atSearch'));
+    if (val('atStatus')) qs.set('statusId', val('atStatus'));
+    if (val('atCategory')) qs.set('categoryId', val('atCategory'));
+    if (val('atFrom')) qs.set('dateFrom', val('atFrom'));
+    if (val('atTo')) qs.set('dateTo', val('atTo'));
+    let tasks;
+    try { ({ tasks } = await api(`/api/pg/admin-tasks?${qs}`)); }
+    catch (err) { toast(err.message); return; }
+    if (seq !== requestSeq) return;
+    tbody.innerHTML = tasks.map((t) => `
+      <tr class="clickable-row" data-id="${t.Id}" style="cursor:pointer">
+        <td style="white-space:nowrap">${escapeHtml(formatDateNice(t.TaskDate))}</td>
+        <td>${escapeHtml(t.Title)}${t.AttachmentCount ? ` <span class="muted" title="${t.AttachmentCount} attachment(s)">📎${t.AttachmentCount}</span>` : ''}</td>
+        <td>${escapeHtml(t.CategoryName || '—')}</td>
+        <td>${escapeHtml(t.StatusName)}</td>
+        <td style="text-align:right">${t.Hours != null ? t.Hours : '—'}</td>
+        <td style="text-align:right">${t.RecurringMonthlySavings != null ? fmtSavings(t.RecurringMonthlySavings) : ''}</td>
+      </tr>`).join('');
+    emptyMsg.hidden = tasks.length > 0;
+    const hours = tasks.reduce((sum, t) => sum + (t.Hours || 0), 0);
+    const savings = tasks.reduce((sum, t) => sum + (t.RecurringMonthlySavings || 0), 0);
+    summary.textContent = tasks.length
+      ? `${tasks.length} task(s) · ${Math.round(hours * 100) / 100}h${savings ? ` · ${fmtSavings(savings)}/mo in recurring savings (${fmtSavings(savings * 12)}/yr)` : ''}`
+      : '';
+    tbody.querySelectorAll('tr[data-id]').forEach((row) => row.addEventListener('click', () => {
+      const t = tasks.find((x) => String(x.Id) === row.dataset.id);
+      go('adminTaskDetail', { id: row.dataset.id, title: t?.Title });
+    }));
+  }
+
+  let searchTimer;
+  document.getElementById('atSearch').addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(load, 250); });
+  ['atStatus', 'atCategory', 'atFrom', 'atTo'].forEach((id) => document.getElementById(id).addEventListener('change', load));
+  await load();
+}
+
+async function renderAdminTaskDetail({ id } = {}) {
+  setChrome({ title: id ? 'Admin Task' : 'New Admin Task', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const [taskRes, { statuses }, { categories }] = await Promise.all([
+    id ? api(`/api/pg/admin-tasks/${id}`) : Promise.resolve({ task: null }),
+    api('/api/pg/admin-task-statuses'), api('/api/pg/admin-task-categories'),
+  ]);
+  const task = taskRes.task;
+  if (id && !task) { app.innerHTML = '<div class="card"><p class="muted">Task not found.</p></div>'; return; }
+
+  // Inactive entries stay hidden from new picks but still show when a task
+  // already uses one, so editing an old task never silently changes it.
+  const statusChoices = statuses.filter((st) => st.Active || st.Id === task?.StatusId);
+  const categoryChoices = categories.filter((c) => c.Active || c.Id === task?.CategoryId);
+  const defaultStatus = task?.StatusId
+    ?? (statusChoices.find((st) => st.Name === 'Done') || statusChoices.find((st) => st.CountsAsWorkPerformed) || statusChoices[0])?.Id;
+
+  app.innerHTML = `
+    <div class="card">
+      <h3>${id ? 'Edit Task' : 'New Task'}</h3>
+      <form id="adminTaskForm">
+        <div class="field-row"><label>Title</label><input name="title" required value="${escapeHtml(task?.Title || '')}" placeholder="e.g. Cancelled unused Verizon line" /></div>
+        <div class="field-row"><label>Description</label><textarea name="description" rows="4">${escapeHtml(task?.Description || '')}</textarea></div>
+        <div class="field-row"><label>Date</label><input name="taskDate" type="date" required value="${escapeHtml(task?.TaskDate || isoDate(new Date()))}" /></div>
+        <div class="field-row"><label>Hours</label><input name="hours" type="number" step="0.25" min="0" value="${task?.Hours ?? ''}" /></div>
+        <div class="field-row"><label>Status</label><select name="statusId" required>
+          ${statusChoices.map((st) => `<option value="${st.Id}" ${st.Id === defaultStatus ? 'selected' : ''}>${escapeHtml(st.Name)}${st.Active ? '' : ' (inactive)'}</option>`).join('')}
+        </select>
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">Statuses marked "counts as work performed" in Admin put the task in the Work Performed report.</p>
+        </div>
+        <div class="field-row"><label>Category (optional)</label><select name="categoryId">${categoryPickerOptionsHtml(categoryChoices, task?.CategoryId)}</select></div>
+        <div class="field-row"><label>Recurring monthly savings (optional)</label>
+          <input name="recurringMonthlySavings" type="number" step="0.01" min="0" value="${task?.RecurringMonthlySavings ?? ''}" placeholder="Leave blank unless this cut a recurring cost" />
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">Only when the task eliminated or reduced a recurring cost — e.g. a cancelled $45/month subscription. The report totals it monthly and annualized.</p>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" type="submit">Save</button>
+          ${id ? '<button type="button" class="btn btn-secondary" id="deleteAdminTaskBtn">Delete</button>' : ''}
+        </div>
+      </form>
+      ${id ? '<div id="adminTaskAttachments"></div>' : '<p class="muted" style="margin-top:10px">You can attach documents once this is saved.</p>'}
+      ${task ? `<p class="muted" style="margin-top:10px;font-size:0.8rem">Added${task.CreatedBy ? ` by ${escapeHtml(task.CreatedBy)}` : ''} ${escapeHtml(formatDateNice(task.CreatedAt))}</p>` : ''}
+    </div>`;
+
+  if (id) {
+    renderAttachmentSection('admin_task', id, document.getElementById('adminTaskAttachments'), {
+      title: 'Attachments', defaultRoleName: 'Documentation', accept: 'image/*,application/pdf,.doc,.docx,.xls,.xlsx,.csv,.txt',
+    });
+  }
+
+  document.getElementById('adminTaskForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const payload = {
+      title: fd.get('title'),
+      description: fd.get('description') || null,
+      taskDate: fd.get('taskDate'),
+      hours: fd.get('hours') === '' ? null : fd.get('hours'),
+      statusId: fd.get('statusId'),
+      categoryId: fd.get('categoryId') || null,
+      recurringMonthlySavings: fd.get('recurringMonthlySavings') === '' ? null : fd.get('recurringMonthlySavings'),
+    };
+    try {
+      if (id) {
+        await api(`/api/pg/admin-tasks/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+        toast('Task saved');
+        go('adminTasks', {}, { replace: true });
+      } else {
+        const { task: created } = await api('/api/pg/admin-tasks', { method: 'POST', body: JSON.stringify(payload) });
+        toast('Task added — attach documents below if you have any');
+        go('adminTaskDetail', { id: created.Id, title: created.Title }, { replace: true });
+      }
+    } catch (err) { toast(err.message); }
+  });
+
+  document.getElementById('deleteAdminTaskBtn')?.addEventListener('click', async () => {
+    if (!await confirmDialog('Delete this task? Attached files are unlinked from it but not deleted.', { confirmLabel: 'Delete' })) return;
+    try { await api(`/api/pg/admin-tasks/${id}`, { method: 'DELETE' }); toast('Task deleted'); go('adminTasks', {}, { replace: true }); }
+    catch (err) { toast(err.message); }
+  });
+}
+
 async function renderMaintenanceLog() {
   setChrome({ title: 'Maintenance Log', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
@@ -4565,7 +4756,7 @@ async function renderWorkPerformedReport() {
       ${reportsTabsHtml('workPerformed')}
       <div class="card">
         <h3>Work Performed</h3>
-        <p class="muted">Job lines completed in this range, grouped by building — proves activity even while a big multi-line job is still open. After photos embed (capped per work order in Admin → Work Order Statuses).</p>
+        <p class="muted">Job lines completed in this range, grouped by building — proves activity even while a big multi-line job is still open. After photos embed (capped per work order in Admin → Work Order Statuses). Administrative tasks dated in the range get their own section after the buildings, with any recurring savings totalled monthly and annualized.</p>
         <div class="field-row"><label>Range</label>
           <div class="report-date-range">
             <input type="date" id="wpFrom" value="${from}" />
@@ -4764,6 +4955,13 @@ const ADMIN_CATEGORIES = {
     items: [
       { view: 'adminFunds', icon: '💰', label: 'Funds' },
       { view: 'adminExpenseCategories', icon: '🏷️', label: 'Expense Categories' },
+    ],
+  },
+  adminTasks: {
+    icon: '🗂️', title: 'Administrative Tasks', description: 'Categories and statuses for work that isn\'t tied to an asset or work order',
+    items: [
+      { view: 'adminTaskCategories', icon: '🏷️', label: 'Admin Task Categories' },
+      { view: 'adminTaskStatuses', icon: '🚦', label: 'Admin Task Statuses' },
     ],
   },
   requests: {
@@ -5828,6 +6026,115 @@ async function renderAdminExpenseCategories(container = app) {
     try {
       await api('/api/pg/admin/expense-categories', { method: 'POST', body: JSON.stringify({ name: fd.get('name') }) });
       renderAdminExpenseCategories(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+// Admin Task Categories — same name-only catalog shape as Expense
+// Categories; in-use entries deactivate rather than delete.
+async function renderAdminTaskCategories(container = app) {
+  if (container === app) setChrome({ title: 'Admin Task Categories', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { categories } = await api('/api/pg/admin-task-categories');
+
+  const rows = categories.map((c) => `
+    <div class="list-item" style="cursor:default">
+      <span>${escapeHtml(c.Name)}${!c.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary atc-toggle-active" data-id="${c.Id}" data-active="${c.Active}">${c.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary atc-delete" data-id="${c.Id}" data-name="${escapeHtml(c.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No categories defined yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Admin Task Categories</h3>
+      <p class="muted">Optional grouping for administrative tasks. Deactivating hides a category from new tasks without changing tasks that already use it.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Category</h3>
+      <form id="addAdminTaskCategoryForm">
+        <div class="field-row"><label>Name</label><input name="name" placeholder="e.g. Fundraising" required /></div>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  const patch = async (catId, body) => {
+    try { await api(`/api/pg/admin/admin-task-categories/${catId}`, { method: 'PATCH', body: JSON.stringify(body) }); renderAdminTaskCategories(container); }
+    catch (err) { toast(err.message); }
+  };
+  container.querySelectorAll('.atc-toggle-active').forEach((btn) => btn.addEventListener('click', () => patch(btn.dataset.id, { active: btn.dataset.active !== 'true' })));
+  container.querySelectorAll('.atc-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete category "${btn.dataset.name}"? Only possible if no task uses it — deactivate instead if it's in use.`)) return;
+    try {
+      await api(`/api/pg/admin/admin-task-categories/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Category deleted');
+      renderAdminTaskCategories(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addAdminTaskCategoryForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/admin-task-categories', { method: 'POST', body: JSON.stringify({ name: fd.get('name') }) });
+      renderAdminTaskCategories(container);
+    } catch (err) { toast(err.message); }
+  });
+}
+
+// Admin Task Statuses — "counts as work performed" decides whether a task
+// in that status shows in the Work Performed report (and whether its
+// recurring savings count toward the total there).
+async function renderAdminTaskStatuses(container = app) {
+  if (container === app) setChrome({ title: 'Admin Task Statuses', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { statuses } = await api('/api/pg/admin-task-statuses');
+
+  const rows = statuses.map((st) => `
+    <div class="list-item" style="cursor:default">
+      <span>${escapeHtml(st.Name)}
+        ${st.CountsAsWorkPerformed ? '<span class="muted">counts as work performed</span>' : ''}${!st.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary ats-toggle-wp" data-id="${st.Id}" data-wp="${st.CountsAsWorkPerformed}">${st.CountsAsWorkPerformed ? 'Exclude from report' : 'Include in report'}</button>
+        <button class="btn btn-secondary ats-toggle-active" data-id="${st.Id}" data-active="${st.Active}">${st.Active ? 'Deactivate' : 'Reactivate'}</button>
+        <button class="btn btn-secondary ats-delete" data-id="${st.Id}" data-name="${escapeHtml(st.Name)}">Delete</button>
+      </span>
+    </div>`).join('') || '<p class="muted">No statuses defined yet.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Admin Task Statuses</h3>
+      <p class="muted">Statuses that "count as work performed" put a task in the Work Performed report's Administrative Work section, and count its recurring savings. To Do and Cancelled don't by default.</p>
+    </div>
+    <div class="card">${rows}</div>
+    <div class="card">
+      <h3>Add Status</h3>
+      <form id="addAdminTaskStatusForm">
+        <div class="field-row"><label>Name</label><input name="name" placeholder="e.g. Scheduled" required /></div>
+        <label class="skill-chip" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="countsAsWorkPerformed" style="margin-right:6px" />Counts as work performed</label>
+        <button class="btn btn-primary" type="submit">Add</button>
+      </form>
+    </div>`;
+
+  const patch = async (statusId, body) => {
+    try { await api(`/api/pg/admin/admin-task-statuses/${statusId}`, { method: 'PATCH', body: JSON.stringify(body) }); renderAdminTaskStatuses(container); }
+    catch (err) { toast(err.message); }
+  };
+  container.querySelectorAll('.ats-toggle-wp').forEach((btn) => btn.addEventListener('click', () => patch(btn.dataset.id, { countsAsWorkPerformed: btn.dataset.wp !== 'true' })));
+  container.querySelectorAll('.ats-toggle-active').forEach((btn) => btn.addEventListener('click', () => patch(btn.dataset.id, { active: btn.dataset.active !== 'true' })));
+  container.querySelectorAll('.ats-delete').forEach((btn) => btn.addEventListener('click', async () => {
+    if (!await confirmDialog(`Delete status "${btn.dataset.name}"? Only possible if no task uses it — deactivate instead if it's in use.`)) return;
+    try {
+      await api(`/api/pg/admin/admin-task-statuses/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Status deleted');
+      renderAdminTaskStatuses(container);
+    } catch (err) { toast(err.message); }
+  }));
+  container.querySelector('#addAdminTaskStatusForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+      await api('/api/pg/admin/admin-task-statuses', { method: 'POST', body: JSON.stringify({ name: fd.get('name'), countsAsWorkPerformed: fd.has('countsAsWorkPerformed') }) });
+      renderAdminTaskStatuses(container);
     } catch (err) { toast(err.message); }
   });
 }

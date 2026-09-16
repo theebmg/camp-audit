@@ -3206,7 +3206,7 @@ async function getWorkOrderCrewRoster(woId) {
 //    finding, the before shot on the job line, and the reference image on
 //    the asset simultaneously, uploaded once. ──────────────────────────────
 
-const ATTACHMENT_ENTITY_TYPES = new Set(['asset', 'work_order', 'job_line', 'condition_finding', 'asset_component', 'maintenance_request', 'asset_note', 'expense']);
+const ATTACHMENT_ENTITY_TYPES = new Set(['asset', 'work_order', 'job_line', 'condition_finding', 'asset_component', 'maintenance_request', 'asset_note', 'expense', 'admin_task']);
 
 function attachmentRowShape(a) {
   return {
@@ -5448,4 +5448,183 @@ export async function convertRequestToWorkOrder(id, { scheduledDate } = {}) {
     entityLabel: request.requester_name || request.requester_email, details: `→ Work Order #${wo.workOrderId}`,
   });
   return { request: requestRowShape(updated[0]), workOrderId: wo.workOrderId };
+}
+
+// ── Administrative tasks (migration 0066) — Ben's work that isn't tied to an
+//    asset or a work order: vendor calls, account cleanup, insurance
+//    paperwork. Documentation, not accounting — deliberately no asset, fund,
+//    job lines or cost. Attachments ride the shared polymorphic system
+//    (entity_type 'admin_task'). Categories and statuses are admin-editable
+//    lists, same shape as expense_categories / job_line_statuses. ──────────
+
+function adminTaskCategoryRowShape(r) {
+  return { Id: r.id, Name: r.name, SortOrder: r.sort_order, Active: r.active };
+}
+export async function listAdminTaskCategories({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(`SELECT * FROM admin_task_categories ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`);
+  return rows.map(adminTaskCategoryRowShape);
+}
+export async function createAdminTaskCategory({ name, sortOrder = 100 }) {
+  const { rows } = await pool.query('INSERT INTO admin_task_categories (name, sort_order) VALUES ($1,$2) RETURNING *', [name, sortOrder]);
+  await logActivity({ action: 'created', entityType: 'admin_task_category', entityId: rows[0].id, entityLabel: rows[0].name });
+  return adminTaskCategoryRowShape(rows[0]);
+}
+export async function updateAdminTaskCategory(id, { name, sortOrder, active }) {
+  const { rows } = await pool.query(
+    'UPDATE admin_task_categories SET name = COALESCE($2,name), sort_order = COALESCE($3,sort_order), active = COALESCE($4,active) WHERE id = $1 RETURNING *',
+    [id, name ?? null, sortOrder ?? null, active ?? null]
+  );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'admin_task_category', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] ? adminTaskCategoryRowShape(rows[0]) : null;
+}
+export async function deleteAdminTaskCategory(id) {
+  const inUse = await pool.query('SELECT count(*) FROM admin_tasks WHERE category_id = $1', [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} task(s) still use this category — deactivate it instead of deleting`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM admin_task_categories WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'admin_task_category', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+function adminTaskStatusRowShape(r) {
+  return { Id: r.id, Name: r.name, SortOrder: r.sort_order, CountsAsWorkPerformed: r.counts_as_work_performed, Active: r.active };
+}
+export async function listAdminTaskStatuses({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(`SELECT * FROM admin_task_statuses ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`);
+  return rows.map(adminTaskStatusRowShape);
+}
+export async function createAdminTaskStatus({ name, sortOrder = 100, countsAsWorkPerformed = false }) {
+  const { rows } = await pool.query(
+    'INSERT INTO admin_task_statuses (name, sort_order, counts_as_work_performed) VALUES ($1,$2,$3) RETURNING *',
+    [name, sortOrder, !!countsAsWorkPerformed]
+  );
+  await logActivity({ action: 'created', entityType: 'admin_task_status', entityId: rows[0].id, entityLabel: rows[0].name });
+  return adminTaskStatusRowShape(rows[0]);
+}
+export async function updateAdminTaskStatus(id, { name, sortOrder, countsAsWorkPerformed, active }) {
+  const { rows } = await pool.query(
+    `UPDATE admin_task_statuses SET name = COALESCE($2,name), sort_order = COALESCE($3,sort_order),
+       counts_as_work_performed = COALESCE($4,counts_as_work_performed), active = COALESCE($5,active)
+     WHERE id = $1 RETURNING *`,
+    [id, name ?? null, sortOrder ?? null, countsAsWorkPerformed ?? null, active ?? null]
+  );
+  if (rows[0]) await logActivity({ action: 'updated', entityType: 'admin_task_status', entityId: rows[0].id, entityLabel: rows[0].name });
+  return rows[0] ? adminTaskStatusRowShape(rows[0]) : null;
+}
+export async function deleteAdminTaskStatus(id) {
+  const inUse = await pool.query('SELECT count(*) FROM admin_tasks WHERE status_id = $1', [id]);
+  if (Number(inUse.rows[0].count) > 0) { const e = new Error(`${inUse.rows[0].count} task(s) still use this status — deactivate it instead of deleting`); e.status = 400; throw e; }
+  const { rows } = await pool.query('DELETE FROM admin_task_statuses WHERE id = $1 RETURNING name', [id]);
+  if (rows[0]) await logActivity({ action: 'deleted', entityType: 'admin_task_status', entityId: Number(id), entityLabel: rows[0].name });
+}
+
+function adminTaskRowShape(r) {
+  return {
+    Id: r.id, Title: r.title, Description: r.description, TaskDate: r.task_date_text,
+    Hours: r.hours != null ? Number(r.hours) : null,
+    StatusId: r.status_id, StatusName: r.status_name, StatusCountsAsWorkPerformed: r.status_counts_as_work_performed,
+    CategoryId: r.category_id, CategoryName: r.category_name,
+    RecurringMonthlySavings: r.recurring_monthly_savings != null ? Number(r.recurring_monthly_savings) : null,
+    AttachmentCount: r.attachment_count != null ? Number(r.attachment_count) : undefined,
+    CreatedBy: r.created_by, CreatedAt: r.created_at, UpdatedAt: r.updated_at,
+  };
+}
+const ADMIN_TASK_SELECT = `
+  SELECT t.*, t.task_date::text AS task_date_text, s.name AS status_name, s.counts_as_work_performed AS status_counts_as_work_performed, c.name AS category_name,
+         (SELECT count(*) FROM attachment_links al JOIN attachments a ON a.id = al.attachment_id AND a.deleted_at IS NULL
+          WHERE al.entity_type = 'admin_task' AND al.entity_id = t.id) AS attachment_count
+  FROM admin_tasks t
+  JOIN admin_task_statuses s ON s.id = t.status_id
+  LEFT JOIN admin_task_categories c ON c.id = t.category_id`;
+
+// TaskDate goes out as plain YYYY-MM-DD text (task_date_text above) rather
+// than a pg Date — a date-only value has no timezone to get wrong.
+export async function listAdminTasks({ statusId, categoryId, dateFrom, dateTo, q } = {}) {
+  const where = []; const vals = [];
+  if (statusId) { vals.push(Number(statusId)); where.push(`t.status_id = $${vals.length}`); }
+  if (categoryId) { vals.push(Number(categoryId)); where.push(`t.category_id = $${vals.length}`); }
+  if (dateFrom) { vals.push(dateFrom); where.push(`t.task_date >= $${vals.length}`); }
+  if (dateTo) { vals.push(dateTo); where.push(`t.task_date <= $${vals.length}`); }
+  if (q) { vals.push(`%${q}%`); where.push(`(t.title ILIKE $${vals.length} OR t.description ILIKE $${vals.length})`); }
+  const { rows } = await pool.query(
+    `${ADMIN_TASK_SELECT} ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY t.task_date DESC, t.id DESC`,
+    vals
+  );
+  return rows.map(adminTaskRowShape);
+}
+export async function getAdminTask(id) {
+  const { rows } = await pool.query(`${ADMIN_TASK_SELECT} WHERE t.id = $1`, [id]);
+  return rows[0] ? adminTaskRowShape(rows[0]) : null;
+}
+
+// Status defaults to the first active status flagged as work performed
+// ('Done' as seeded) when the caller sends none — logging a task after the
+// fact is the common case, and a task with no status can't exist
+// (status_id NOT NULL, Decision 7).
+async function resolveAdminTaskStatusId(statusId) {
+  if (statusId) return statusId;
+  const { rows } = await pool.query(
+    `SELECT id FROM admin_task_statuses WHERE active ORDER BY (name = 'Done') DESC, counts_as_work_performed DESC, sort_order LIMIT 1`
+  );
+  if (!rows[0]) { const e = new Error('No active admin task statuses — add one in Admin'); e.status = 400; throw e; }
+  return rows[0].id;
+}
+export async function createAdminTask({ title, description, taskDate, hours, statusId, categoryId, recurringMonthlySavings, createdBy }) {
+  const resolvedStatusId = await resolveAdminTaskStatusId(statusId);
+  const { rows } = await pool.query(
+    `INSERT INTO admin_tasks (title, description, task_date, hours, status_id, category_id, recurring_monthly_savings, created_by)
+     VALUES ($1,$2,COALESCE($3::date, current_date),$4,$5,$6,$7,$8) RETURNING id, title`,
+    [title, description || null, taskDate || null, hours ?? null, resolvedStatusId, categoryId || null, recurringMonthlySavings ?? null, createdBy || null]
+  );
+  await logActivity({ action: 'created', entityType: 'admin_task', entityId: rows[0].id, entityLabel: rows[0].title });
+  return getAdminTask(rows[0].id);
+}
+const ADMIN_TASK_COLUMNS = {
+  title: 'title', description: 'description', taskDate: 'task_date', hours: 'hours',
+  statusId: 'status_id', categoryId: 'category_id', recurringMonthlySavings: 'recurring_monthly_savings',
+};
+export async function updateAdminTask(id, fields) {
+  const setCols = []; const vals = [];
+  for (const [key, col] of Object.entries(ADMIN_TASK_COLUMNS)) {
+    if (!(key in fields)) continue;
+    vals.push(fields[key]);
+    setCols.push(`${col} = $${vals.length}`);
+  }
+  if (!setCols.length) return getAdminTask(id);
+  vals.push(id);
+  const { rows } = await pool.query(`UPDATE admin_tasks SET ${setCols.join(', ')} WHERE id = $${vals.length} RETURNING id, title`, vals);
+  if (!rows[0]) return null;
+  await logActivity({ action: 'updated', entityType: 'admin_task', entityId: rows[0].id, entityLabel: rows[0].title });
+  return getAdminTask(id);
+}
+// Hard delete — a task is Ben's own note, nothing hangs off it but
+// attachment links. The links go with it (attachment_links is polymorphic,
+// so no FK cascade does this for us); the files themselves stay, same as
+// detaching them, so a document still linked elsewhere is untouched.
+export async function deleteAdminTask(id) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`DELETE FROM attachment_links WHERE entity_type = 'admin_task' AND entity_id = $1`, [id]);
+    const { rows } = await client.query('DELETE FROM admin_tasks WHERE id = $1 RETURNING title', [id]);
+    await client.query('COMMIT');
+    if (rows[0]) await logActivity({ action: 'deleted', entityType: 'admin_task', entityId: Number(id), entityLabel: rows[0].title });
+    return !!rows[0];
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Work Performed report's Administrative Work section — tasks dated in
+// range whose status counts as work performed (In Progress / Waiting /
+// Done as seeded; To Do and Cancelled don't). Savings are only totalled
+// over these same tasks: a cost reduction on a task that never happened
+// isn't a saving.
+export async function getAdminTasksWorkPerformedRawData({ from, to }) {
+  const { rows } = await pool.query(
+    `${ADMIN_TASK_SELECT} WHERE s.counts_as_work_performed AND t.task_date BETWEEN $1 AND $2 ORDER BY t.task_date, t.id`,
+    [from, to]
+  );
+  return rows.map(adminTaskRowShape);
 }
