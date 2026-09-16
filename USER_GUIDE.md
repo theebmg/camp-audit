@@ -241,10 +241,42 @@ Menu → **Reports**. Along the top:
 - **Deferred Backlog** — every finding marked Deferred, grouped by
   severity, with dollar totals. This is the capital-campaign argument
   document.
+- **Visitor Activity** — pick a date range; everyone with a visit on the
+  calendar, grouped by person, with how many visits and which buildings.
+  Visits linked to a cabin holder are listed separately from one-off
+  visitors.
 
 Anything with a ⭐ **Flag for Board** button on a work order or finding
 feeds Forward Focus. Anything with a checkbox to **Include in board
 report** on a photo feeds the embedded images in Work Performed.
+
+---
+
+## Visitors
+
+A visit is a calendar event with a visitor on it — Calendar → **+ Add
+Event**, then fill in the **Visitor** section (type is usually
+Constituent Visitation, picked for you once you enter a visitor):
+
+- **Cabin Holder** — search the roster and click a name to link the visit
+  to that holder. This fills in the visitor's name and their cabin; change
+  either if needed. If the holder has more than one cabin, you pick which.
+  Leave it blank for anyone who isn't a cabin holder. Typing a name in
+  **Visitor Name** never links anyone to a holder — only picking does.
+- **Visitor Name**, **Building / Asset**, **Purpose** ("moving belongings
+  out of the missionary cottage", "working on their own cabin"), and an
+  optional **Contact**.
+
+Visits show on the calendar as 🧳 *name · building — purpose* (hover in
+Month/Week for contact; Day view shows it). When you schedule a job line
+— dragging on the Calendar, saving a new date on the line, or creating a
+work order with dates — on a building where a visitor is booked that day
+(including work on something inside that building), you get a warning
+listing the visit. **Schedule anyway** goes ahead; it never blocks.
+
+If a visit turns up real work, record it as a finding on the asset — that
+converts to a job line the usual way. Visits don't turn into work orders
+themselves.
 
 ---
 

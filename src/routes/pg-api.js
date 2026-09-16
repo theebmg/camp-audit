@@ -7,10 +7,11 @@
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
-import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg, buildWorkPerformedReportPg, buildDeferredBacklogReportPg } from '../reportDataPg.js';
+import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
 import {
   renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText, renderPlainEmailHtml,
   renderWorkPerformedHtml, renderWorkPerformedText, renderDeferredBacklogHtml, renderDeferredBacklogText,
+  renderVisitorActivityHtml, renderVisitorActivityText,
 } from '../reportRender.js';
 import { storeAttachment } from '../storage.js';
 import { renderChecklistPdf, renderWorkOrderScopePdf } from '../pdf.js';
@@ -45,6 +46,7 @@ import {
   listAttachmentRoles, createAttachmentRole, updateAttachmentRole, deleteAttachmentRole,
   listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
+  listVisitorConflicts,
   listCalendarEventTypes, createCalendarEventType, updateCalendarEventType, setCalendarEventTypeActive, deleteCalendarEventType,
   listJobLinesScheduledInRange, listRevisitDatesInRange, listUnscheduledJobLines,
   generateDueWorkOrdersForRange,
@@ -1004,6 +1006,27 @@ router.get('/reports/deferred-backlog/preview', async (req, res, next) => {
     res.json({ title: 'Deferred Maintenance Backlog', html: renderDeferredBacklogHtml(data), text: renderDeferredBacklogText(data) });
   } catch (e) { next(e); }
 });
+// Visitor Activity — visits in range grouped by person (cabin-holder-linked
+// vs one-off visitors kept distinct), with each person's visit count and
+// the assets they were at.
+router.get('/reports/visitor-activity/preview', async (req, res, next) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to are required' });
+    const data = await buildVisitorActivityReportPg({ from, to });
+    res.json({ title: 'Visitor Activity', html: renderVisitorActivityHtml(data), text: renderVisitorActivityText(data) });
+  } catch (e) { next(e); }
+});
+router.post('/reports/visitor-activity/send', async (req, res, next) => {
+  try {
+    const { from, to, recipient, subject } = req.body || {};
+    if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to are required' });
+    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
+    const data = await buildVisitorActivityReportPg({ from, to });
+    await sendMail({ to: recipient, subject: subject || `Camp Sychar — Visitor Activity (${from} to ${to})`, html: renderVisitorActivityHtml(data), text: renderVisitorActivityText(data) });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
 router.post('/reports/deferred-backlog/send', async (req, res, next) => {
   try {
     const { recipient, subject } = req.body || {};
@@ -1660,6 +1683,16 @@ router.get('/revisit-dates', async (req, res, next) => {
     res.json({ revisitDates: await listRevisitDatesInRange(from, to) });
   } catch (e) { next(e); }
 });
+// Visitor events overlapping a date at an asset (or a job line's asset) —
+// the frontend asks before saving a job line's schedule and warns if
+// anything comes back. Never blocks: the PATCH itself doesn't consult this.
+router.get('/visitor-conflicts', async (req, res, next) => {
+  try {
+    const { date, assetId, jobLineId } = req.query;
+    if (!date) return res.status(400).json({ ok: false, error: 'date (YYYY-MM-DD) is required' });
+    res.json({ conflicts: await listVisitorConflicts({ date, assetId, jobLineId }) });
+  } catch (e) { next(e); }
+});
 // The Scheduling Queue's raw material (Build Brief v4 Part 1 amendment) —
 // every non-terminal job line with no scheduled_date yet.
 router.get('/job-lines/unscheduled', async (req, res, next) => {
@@ -1675,11 +1708,17 @@ router.get('/calendar-events/:id', async (req, res, next) => {
 });
 router.post('/calendar-events', async (req, res, next) => {
   try {
-    const { title, description, eventDate, endDate, startTime, endTime, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId, typeId } = req.body || {};
+    const { title, description, eventDate, endDate, startTime, endTime, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId, typeId,
+      visitorName, cabinHolderId, assetId, visitPurpose, visitorContact } = req.body || {};
     if (!title || !eventDate) return res.status(400).json({ ok: false, error: 'title and eventDate are required' });
     res.json({ ok: true, event: await createCalendarEvent({
       title, description, eventDate, endDate, startTime, endTime, recurrenceType, recurrenceInterval, recurrenceEndDate,
       workOrderId, jobLineId, workOrderTemplateId, typeId: typeId ? Number(typeId) : undefined,
+      visitorName, visitPurpose, visitorContact,
+      // undefined (not sent) vs ''/null (sent blank) matters here — see
+      // applyCabinHolderVisitDefaults.
+      cabinHolderId: cabinHolderId ? Number(cabinHolderId) : null,
+      assetId: assetId === undefined ? undefined : (assetId ? Number(assetId) : null),
     }) });
   } catch (e) { next(e); }
 });
@@ -1700,6 +1739,11 @@ router.patch('/calendar-events/:id', async (req, res, next) => {
     if (body.jobLineId !== undefined) fields.job_line_id = body.jobLineId === '' ? null : Number(body.jobLineId);
     if (body.workOrderTemplateId !== undefined) fields.work_order_template_id = body.workOrderTemplateId === '' ? null : Number(body.workOrderTemplateId);
     if (body.typeId !== undefined) fields.type_id = body.typeId === '' ? null : Number(body.typeId);
+    if (body.visitorName !== undefined) fields.visitor_name = body.visitorName?.trim() || null;
+    if (body.cabinHolderId !== undefined) fields.cabin_holder_id = body.cabinHolderId ? Number(body.cabinHolderId) : null;
+    if (body.assetId !== undefined) fields.asset_id = body.assetId ? Number(body.assetId) : null;
+    if (body.visitPurpose !== undefined) fields.visit_purpose = body.visitPurpose?.trim() || null;
+    if (body.visitorContact !== undefined) fields.visitor_contact = body.visitorContact?.trim() || null;
     const event = await updateCalendarEvent(req.params.id, fields);
     if (!event) return res.status(404).json({ ok: false, error: 'Event not found' });
     res.json({ ok: true, event });

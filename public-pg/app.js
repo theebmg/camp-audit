@@ -305,7 +305,66 @@ function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {
   input.addEventListener('focus', () => { if (input.value.trim() && resultsEl.innerHTML) resultsEl.hidden = false; });
   document.addEventListener('click', (e) => { if (!container.contains(e.target)) resultsEl.hidden = true; });
 
-  return { getSelected: () => selected };
+  return {
+    getSelected: () => selected,
+    // Programmatic pick (e.g. a cabin holder's cabin defaulting a visit's
+    // asset) — same end state as clicking a result, onSelect included.
+    setSelected: (asset) => {
+      selected = asset || null;
+      input.value = asset ? asset.Name : '';
+      resultsEl.hidden = true;
+      onSelect(selected);
+    },
+  };
+}
+
+// Cabin-holder search field. The only way a record gets a cabin_holder_id:
+// typing narrows the roster, and nothing is linked until a row is clicked —
+// editing the text afterward drops the link again rather than guessing which
+// holder the new text means. The roster is ~200 names, fetched once and
+// filtered client-side (listCabinHolders also syncs from assets.lodge_holder
+// on read, so it's always current).
+function mountCabinHolderCombobox(container, { initialHolder = null, onSelect = () => {} } = {}) {
+  let selected = initialHolder;
+  let roster = null;
+  container.classList.add('ac-wrap');
+  container.innerHTML = `
+    <input type="text" class="ac-input" autocomplete="off" placeholder="Type to search cabin holders…"
+      value="${initialHolder ? escapeHtml(initialHolder.Name) : ''}" />
+    <div class="ac-results" hidden></div>`;
+  const input = container.querySelector('.ac-input');
+  const resultsEl = container.querySelector('.ac-results');
+
+  async function loadRoster() {
+    if (!roster) roster = (await api('/api/pg/budget/cabin-holders')).items;
+    return roster;
+  }
+  input.addEventListener('input', async () => {
+    const hadSelection = !!selected;
+    selected = null;
+    if (hadSelection) onSelect(null);
+    const q = input.value.trim().toLowerCase();
+    if (!q) { resultsEl.hidden = true; return; }
+    const matches = (await loadRoster()).filter((h) => h.Name.toLowerCase().includes(q)).slice(0, 20);
+    resultsEl.innerHTML = matches.map((h) => `
+      <div class="ac-item" data-id="${h.Id}">
+        ${escapeHtml(h.Name)}${h.LinkedAssets?.length ? ` <span class="muted">— ${escapeHtml(h.LinkedAssets.map((a) => a.Name).join(', '))}</span>` : ''}
+      </div>`).join('') || '<div class="ac-item muted" style="cursor:default">No cabin holder matches — leave this blank for a one-off visitor.</div>';
+    resultsEl.hidden = false;
+    resultsEl.querySelectorAll('.ac-item[data-id]').forEach((el) => el.addEventListener('click', () => {
+      selected = roster.find((h) => String(h.Id) === el.dataset.id);
+      input.value = selected.Name;
+      resultsEl.hidden = true;
+      onSelect(selected);
+    }));
+  });
+  input.addEventListener('focus', () => { if (input.value.trim() && !selected && resultsEl.innerHTML) resultsEl.hidden = false; });
+  document.addEventListener('click', (e) => { if (!container.contains(e.target)) resultsEl.hidden = true; });
+
+  return {
+    getSelected: () => selected,
+    clear: () => { selected = null; input.value = ''; resultsEl.hidden = true; onSelect(null); },
+  };
 }
 
 async function api(path, opts = {}) {
@@ -4050,6 +4109,7 @@ const REPORT_TABS = [
   { key: 'forwardFocus', label: 'Forward Focus' },
   { key: 'workPerformed', label: 'Work Performed' },
   { key: 'deferredBacklog', label: 'Deferred Backlog' },
+  { key: 'visitorActivity', label: 'Visitor Activity' },
 ];
 function reportsTabsHtml(mode) {
   return `<div class="card">
@@ -4071,6 +4131,7 @@ async function renderReports(params = {}) {
   if (mode === 'forwardFocus') return renderForwardFocusReport();
   if (mode === 'workPerformed') return renderWorkPerformedReport();
   if (mode === 'deferredBacklog') return renderDeferredBacklogReport();
+  if (mode === 'visitorActivity') return renderVisitorActivityReport();
   return renderReportsExplorer(params);
 }
 
@@ -4525,6 +4586,50 @@ async function renderWorkPerformedReport() {
     to = document.getElementById('wpTo').value || to;
     generating = true; draw();
     try { report = await api(`/api/pg/reports/work-performed/preview?from=${from}&to=${to}`); }
+    catch (err) { toast(err.message); }
+    generating = false; draw();
+  }
+
+  draw();
+}
+
+// Visitor Activity — who came to camp in a range, grouped by person, with
+// cabin holders and one-off visitors in separate sections. Same range +
+// preview/email shape as Work Performed.
+async function renderVisitorActivityReport() {
+  setChrome({ title: 'Reports', showBack: false, showLogout: true });
+  const threeMonthsAgo = new Date(); threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - 3);
+  let from = isoDate(threeMonthsAgo);
+  let to = isoDate(new Date());
+  let report = null;
+  let generating = false;
+
+  function draw() {
+    setApp(`
+      ${reportsTabsHtml('visitorActivity')}
+      <div class="card">
+        <h3>Visitor Activity</h3>
+        <p class="muted">Calendar events with a visitor on them, grouped by person — visit count and which buildings. Visits linked to a cabin holder are listed separately from one-off visitors. A repeating visit counts once per occurrence.</p>
+        <div class="field-row"><label>Range</label>
+          <div class="report-date-range">
+            <input type="date" id="vaFrom" value="${from}" />
+            <span class="muted">to</span>
+            <input type="date" id="vaTo" value="${to}" />
+          </div>
+        </div>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="vaGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
+      </div>
+      ${reportPreviewAreaHtml(report)}`);
+    wireReportsTabs();
+    document.getElementById('vaGenBtn').addEventListener('click', generate);
+    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/visitor-activity/send', sendBody: () => ({ from, to }) });
+  }
+
+  async function generate() {
+    from = document.getElementById('vaFrom').value || from;
+    to = document.getElementById('vaTo').value || to;
+    generating = true; draw();
+    try { report = await api(`/api/pg/reports/visitor-activity/preview?from=${from}&to=${to}`); }
     catch (err) { toast(err.message); }
     generating = false; draw();
   }
@@ -6169,8 +6274,27 @@ function calendarEntryText(e) {
     return `📌 Revisit: ${e.Asset ? `${escapeHtml(e.Asset.Name)} — ` : ''}${escapeHtml(e.Title)}`;
   }
   const time = e.StartTime ? `${formatTimeShort(e.StartTime)} ` : '';
+  const repeat = e.RecurrenceType !== 'none' ? ' 🔁' : '';
+  // A visit reads as who · where — purpose, in place of the event's title
+  // (usually just "Visit — Name" anyway) and type prefix: the 🧳 already
+  // says "visit", and these three are what matters at a glance.
+  if (e.VisitorName) {
+    return `${googleColorDotHtml(e.TypeGcalColorId)}🧳 ${time}${escapeHtml(e.VisitorName)}${e.AssetName ? ` · ${escapeHtml(e.AssetName)}` : ''}${e.VisitPurpose ? ` — ${escapeHtml(e.VisitPurpose)}` : ''}${repeat}`;
+  }
   const typePrefix = e.TypeName && e.TypeName !== 'Other' ? `${escapeHtml(e.TypeName)}: ` : '';
-  return `${googleColorDotHtml(e.TypeGcalColorId)}📅 ${time}${typePrefix}${escapeHtml(e.Title)}${e.RecurrenceType !== 'none' ? ' 🔁' : ''}`;
+  return `${googleColorDotHtml(e.TypeGcalColorId)}📅 ${time}${typePrefix}${escapeHtml(e.Title)}${repeat}`;
+}
+
+// Plain-text hover tooltip for a calendar entry — Month/Week chips truncate
+// to one line, so a visit's full purpose/contact would otherwise be hidden.
+function calendarEntryTooltip(e) {
+  if (e.type !== 'event' || !e.VisitorName) return '';
+  return [
+    `${e.VisitorName}${e.CabinHolderId ? ' (cabin holder)' : ''}`,
+    e.AssetName ? `At: ${e.AssetName}` : null,
+    e.VisitPurpose ? `Purpose: ${e.VisitPurpose}` : null,
+    e.VisitorContact ? `Contact: ${e.VisitorContact}` : null,
+  ].filter(Boolean).join('\n');
 }
 
 // Whether an entry is placed in the timed grid or the all-day band. A job
@@ -6341,6 +6465,39 @@ function calWireClick(el, onClick) {
   });
 }
 
+// Visitor-overlap warning before a job line lands on a date (warn, never
+// block — same contract as the linked-expense double-count confirm and fund
+// overage). `checks` is [{ date, assetId } | { date, jobLineId }]; resolves
+// true to go ahead (nothing overlaps, or the user chose to schedule anyway),
+// false only if the user backed out. A failed lookup never stands in the
+// way of scheduling — it just can't warn.
+async function confirmVisitorConflicts(checks) {
+  const seen = new Set();
+  const conflicts = [];
+  for (const c of checks) {
+    if (!c.date || (!c.assetId && !c.jobLineId)) continue;
+    const qs = `date=${encodeURIComponent(c.date)}${c.assetId ? `&assetId=${c.assetId}` : `&jobLineId=${c.jobLineId}`}`;
+    try {
+      const { conflicts: found } = await api(`/api/pg/visitor-conflicts?${qs}`);
+      for (const f of found) {
+        const key = `${f.EventId}:${f.OccurrenceDate}`;
+        if (!seen.has(key)) { seen.add(key); conflicts.push(f); }
+      }
+    } catch { /* can't check — don't block scheduling over it */ }
+  }
+  if (!conflicts.length) return true;
+  const lines = conflicts.map((f) => {
+    const span = f.OccurrenceEndDate && f.OccurrenceEndDate !== f.OccurrenceDate
+      ? `${formatDateNice(f.OccurrenceDate)}–${formatDateNice(f.OccurrenceEndDate)}` : formatDateNice(f.OccurrenceDate);
+    const time = f.StartTime ? ` ${formatTimeShort(f.StartTime)}${f.EndTime ? `–${formatTimeShort(f.EndTime)}` : ''}` : '';
+    return `• ${f.VisitorName} at ${f.AssetName} — ${span}${time}${f.VisitPurpose ? ` (${f.VisitPurpose})` : ''}`;
+  });
+  return confirmDialog(
+    `A visitor is scheduled at this building then:\n${lines.join('\n')}\n\nSchedule the job line anyway?`,
+    { confirmLabel: 'Schedule anyway', cancelLabel: 'Go back', danger: false },
+  );
+}
+
 async function onCalendarDrop(payload, zoneData) {
   try {
     if (zoneData.dropQueue !== undefined) {
@@ -6351,6 +6508,7 @@ async function onCalendarDrop(payload, zoneData) {
       await api(`/api/pg/job-lines/${payload.id}`, { method: 'PATCH', body: JSON.stringify({ scheduledDate: null, scheduledStartTime: null }) });
       toast('Moved back to the Scheduling Queue');
     } else if (payload.dragType === 'jobLine' || payload.dragType === 'queue') {
+      if (!await confirmVisitorConflicts([{ date: zoneData.dropDate, jobLineId: payload.id }])) return;
       const body = { scheduledDate: zoneData.dropDate };
       // A timed slot sets the time; the all-day band explicitly clears it
       // (making a previously-timed line untimed); a bare date-only drop
@@ -6457,7 +6615,8 @@ async function renderCalendar(params = {}) {
     const dragAttr = draggable ? ' data-draggable="1"' : '';
     if (e.type === 'jobLine') return `<div class="cal-entry${fixedCls}" data-wo-id="${e.WorkOrderId}" data-jl-id="${e.JobLineId}"${dragAttr}${fixedTitleAttr(draggable, 'Fixed — a finished line can’t be rescheduled')}><span class="pill"${statusColorStyle(e.StatusColor)}>${calendarEntryText(e)}</span></div>`;
     if (e.type === 'revisit') return `<div class="cal-entry cal-fixed" ${e.WorkOrderId ? `data-wo-id="${e.WorkOrderId}"` : e.Asset ? `data-asset-id="${e.Asset.Id}"` : ''}${fixedTitleAttr(false, 'Fixed — a revisit date is a commitment, not an open slot')}><span class="pill pop">${calendarEntryText(e)}</span></div>`;
-    return `<div class="cal-entry${fixedCls}" data-event-id="${e.Id}"${dragAttr}${draggable ? ` data-start-time="${e.StartTime || ''}" data-end-time="${e.EndTime || ''}"` : ''}${fixedTitleAttr(draggable, 'Fixed — a repeating or multi-day event isn’t draggable here')}><span class="pill pop">${calendarEntryText(e)}</span></div>`;
+    const tip = calendarEntryTooltip(e);
+    return `<div class="cal-entry${fixedCls}" data-event-id="${e.Id}"${dragAttr}${draggable ? ` data-start-time="${e.StartTime || ''}" data-end-time="${e.EndTime || ''}"` : ''}${tip ? ` title="${escapeHtml(tip)}"` : fixedTitleAttr(draggable, 'Fixed — a repeating or multi-day event isn’t draggable here')}><span class="pill pop">${calendarEntryText(e)}</span></div>`;
   }
 
   function drawMonth() {
@@ -6491,14 +6650,20 @@ async function renderCalendar(params = {}) {
     const idAttr = e.type === 'jobLine' ? `data-wo-id="${e.WorkOrderId}" data-jl-id="${e.JobLineId}"`
       : e.type === 'revisit' ? (e.WorkOrderId ? `data-wo-id="${e.WorkOrderId}"` : e.Asset ? `data-asset-id="${e.Asset.Id}"` : '')
       : `data-event-id="${e.Id}"${draggable ? ` data-start-time="${e.StartTime || ''}" data-end-time="${e.EndTime || ''}"` : ''}`;
-    const titleAttr = fixedTitleAttr(draggable, e.type === 'revisit' ? 'Fixed — a revisit date is a commitment, not an open slot' : e.type === 'jobLine' ? 'Fixed — a finished line can’t be rescheduled' : 'Fixed — a repeating or multi-day event isn’t draggable here');
+    const tip = calendarEntryTooltip(e);
+    const titleAttr = tip ? ` title="${escapeHtml(tip)}"` : fixedTitleAttr(draggable, e.type === 'revisit' ? 'Fixed — a revisit date is a commitment, not an open slot' : e.type === 'jobLine' ? 'Fixed — a finished line can’t be rescheduled' : 'Fixed — a repeating or multi-day event isn’t draggable here');
     if (!detailed) return `<div class="${cls}" ${idAttr}${dragAttr}${titleAttr}>${calendarEntryText(e)}</div>`;
     const extra = e.type === 'jobLine'
       ? `${statusPillHtml(e.StatusName, e.StatusColor)}${e.Priority ? ` <span class="pill">${escapeHtml(e.Priority)}</span>` : ''}`
       : e.type === 'revisit' ? `<span class="pill warn">${escapeHtml(e.DeferredReason || 'Deferred')}</span>`
-      : (e.TypeName ? `<span class="pill">${escapeHtml(e.TypeName)}</span>` : '');
+      : `${e.TypeName ? `<span class="pill">${escapeHtml(e.TypeName)}</span>` : ''}${e.VisitorName && e.CabinHolderId ? ' <span class="pill">Cabin holder</span>' : ''}`;
+    // Day view has room for what Month/Week only show on hover.
+    const visitDetail = e.type === 'event' && e.VisitorName && (e.VisitorContact || (e.Title && e.Title !== `Visit — ${e.VisitorName}`))
+      ? `<div class="muted" style="font-size:0.8rem;margin-top:2px">${[e.Title && e.Title !== `Visit — ${e.VisitorName}` ? escapeHtml(e.Title) : null, e.VisitorContact ? `Contact: ${escapeHtml(e.VisitorContact)}` : null].filter(Boolean).join(' · ')}</div>`
+      : '';
     return `<div class="${cls}" ${idAttr}${dragAttr}${titleAttr}>
       <div>${calendarEntryText(e)}</div>
+      ${visitDetail}
       <div style="margin-top:4px">${extra}</div>
     </div>`;
   }
@@ -6715,6 +6880,88 @@ function typeAndScheduleFieldsHtml(ev = {}, types = []) {
     </div>`;
 }
 
+// Visitor fields — shared by New/Edit Calendar Event. A visit is just a
+// calendar event with a visitor on it (usually typed Constituent
+// Visitation), so these sit on every event form rather than behind a
+// separate "new visit" flow. Leaving Visitor Name blank means it's not a
+// visit, whatever else is filled in.
+function visitorFieldsHtml(ev = {}) {
+  return `
+    <h4 style="margin:16px 0 4px">Visitor (optional)</h4>
+    <p class="muted" style="font-size:0.82rem;margin:0 0 8px">For someone coming to camp — who, which building, and why. Scheduling a job line on that building while they're here will warn you.</p>
+    <div class="field-row"><label>Cabin Holder</label>
+      <div class="asset-picker" id="visitHolderPicker"></div>
+      <p class="muted" style="font-size:0.8rem;margin-top:4px">Pick from the roster to link this visit to a cabin holder — fills in name and cabin, both still editable. Leave blank for anyone else.</p>
+      <div id="visitHolderAssetChoices" class="btn-row" style="margin-top:6px;flex-wrap:wrap" hidden></div>
+    </div>
+    <div class="field-row"><label>Visitor Name</label><input name="visitorName" value="${escapeHtml(ev.VisitorName || '')}" placeholder="Anyone — holder or not" /></div>
+    <div class="field-row"><label>Building / Asset</label><div class="asset-picker" id="visitAssetPicker"></div></div>
+    <div class="field-row"><label>Purpose</label><input name="visitPurpose" value="${escapeHtml(ev.VisitPurpose || '')}" placeholder="e.g. Moving belongings out of the missionary cottage" /></div>
+    <div class="field-row"><label>Contact (optional)</label><input name="visitorContact" value="${escapeHtml(ev.VisitorContact || '')}" placeholder="Phone or email" /></div>`;
+}
+function wireVisitorFields(root, ev = {}, { isNew = false, types = [] } = {}) {
+  const nameInput = root.querySelector('[name="visitorName"]');
+  const titleInput = root.querySelector('[name="title"]');
+  const typeSelect = root.querySelector('[name="typeId"]');
+  const choicesEl = root.querySelector('#visitHolderAssetChoices');
+  const visitationType = types.find((t) => t.Name === 'Constituent Visitation');
+  let typeTouched = !isNew;
+  typeSelect?.addEventListener('change', () => { typeTouched = true; });
+  let autoTitle = null;
+
+  // New events only: a visitor name is a strong enough signal to pre-pick
+  // the Constituent Visitation type and a "Visit — Name" title, as long as
+  // neither has been set by hand. An existing event is never rewritten.
+  function applyVisitDefaults() {
+    if (!isNew) return;
+    const name = nameInput.value.trim();
+    if (!name) return;
+    if (!typeTouched && visitationType && typeSelect) typeSelect.value = String(visitationType.Id);
+    if (titleInput && (!titleInput.value.trim() || titleInput.value === autoTitle)) {
+      autoTitle = `Visit — ${name}`;
+      titleInput.value = autoTitle;
+    }
+  }
+  nameInput.addEventListener('input', applyVisitDefaults);
+
+  let asset = ev.AssetId ? { Id: ev.AssetId, Name: ev.AssetName } : null;
+  const assetPicker = mountAssetCombobox(root.querySelector('#visitAssetPicker'), { initialAsset: asset, onSelect: (a) => { asset = a; } });
+
+  const holderPicker = mountCabinHolderCombobox(root.querySelector('#visitHolderPicker'), {
+    initialHolder: ev.CabinHolderId ? { Id: ev.CabinHolderId, Name: ev.CabinHolderName || ev.VisitorName } : null,
+    onSelect: (holder) => {
+      choicesEl.hidden = true;
+      choicesEl.innerHTML = '';
+      // Unlinking leaves name/asset as they are — they may well still be
+      // right, and clearing typed-in data on a mis-click would be worse.
+      if (!holder) return;
+      nameInput.value = holder.Name;
+      const cabins = holder.LinkedAssets || [];
+      if (cabins.length === 1) assetPicker.setSelected(cabins[0]);
+      else if (cabins.length > 1) {
+        choicesEl.innerHTML = `<span class="muted" style="font-size:0.82rem;align-self:center">${escapeHtml(holder.Name)} holds ${cabins.length} cabins — which one?</span>`
+          + cabins.map((c) => `<button type="button" class="btn btn-secondary btn-small visit-cabin-choice" data-id="${c.Id}" data-name="${escapeHtml(c.Name)}">${escapeHtml(c.Name)}</button>`).join('');
+        choicesEl.hidden = false;
+        choicesEl.querySelectorAll('.visit-cabin-choice').forEach((btn) => btn.addEventListener('click', () => {
+          assetPicker.setSelected({ Id: Number(btn.dataset.id), Name: btn.dataset.name });
+          choicesEl.hidden = true;
+        }));
+      }
+      applyVisitDefaults();
+    },
+  });
+
+  return {
+    values: () => ({
+      visitorName: nameInput.value.trim(),
+      cabinHolderId: holderPicker.getSelected()?.Id || '',
+      assetId: asset?.Id || '',
+      visitPurpose: root.querySelector('[name="visitPurpose"]').value.trim(),
+      visitorContact: root.querySelector('[name="visitorContact"]').value.trim(),
+    }),
+  };
+}
+
 const RECURRENCE_LABELS = { none: 'Does not repeat', daily: 'Day(s)', weekly: 'Week(s)', monthly: 'Month(s)', yearly: 'Year(s)' };
 
 function recurrenceFieldsHtml(ev = {}) {
@@ -6829,6 +7076,7 @@ async function renderNewCalendarEvent(params = {}) {
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${params.date || ''}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
         ${typeAndScheduleFieldsHtml({}, types)}
+        ${visitorFieldsHtml()}
         ${recurrenceFieldsHtml()}
         ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates })}
         <div class="btn-row">
@@ -6839,10 +7087,16 @@ async function renderNewCalendarEvent(params = {}) {
     </div>`);
   wireRecurrenceToggle(document.getElementById('newEventForm'));
   wireCalendarLinkFields(document.getElementById('newEventForm'));
+  const visitorFields = wireVisitorFields(document.getElementById('newEventForm'), {}, { isNew: true, types });
   document.getElementById('cancelEventBtn').addEventListener('click', goBack);
   document.getElementById('newEventForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
+    const visitor = visitorFields.values();
+    if (!visitor.visitorName && (visitor.cabinHolderId || visitor.visitPurpose || visitor.visitorContact)) {
+      toast('Add a visitor name — the rest of the visitor fields only mean something with one');
+      return;
+    }
     try {
       const { event } = await api('/api/pg/calendar-events', { method: 'POST', body: JSON.stringify({
         title: fd.get('title'), eventDate: fd.get('eventDate'), description: fd.get('description'),
@@ -6853,6 +7107,7 @@ async function renderNewCalendarEvent(params = {}) {
         workOrderId: fd.get('workOrderId') || undefined,
         jobLineId: fd.get('jobLineId') || undefined,
         workOrderTemplateId: fd.get('workOrderTemplateId') || undefined,
+        ...visitor,
       }) });
       toast('Event created');
       go('calendarEventDetail', { id: event.Id }, { replace: true });
@@ -6888,11 +7143,13 @@ async function renderCalendarEventDetail({ id }) {
         <div class="field-row"><label>Date</label><input name="eventDate" type="date" value="${(ev.EventDate || '').slice(0, 10)}" required /></div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(ev.Description || '')}</textarea></div>
         ${typeAndScheduleFieldsHtml(ev, types)}
+        ${visitorFieldsHtml(ev)}
         ${recurrenceFieldsHtml(ev)}
         ${calendarLinkFieldsHtml({ workOrders, workOrderTemplates, initialJobLines, ev })}
         <button class="btn btn-secondary" type="submit">Save Changes</button>
       </form>
       ${ev.WorkOrderId ? `<div class="btn-row"><button class="btn btn-secondary" id="viewWoBtn">View Linked Work Order</button></div>` : ''}
+      ${ev.AssetId ? `<div class="btn-row"><button class="btn btn-secondary" id="viewEventAssetBtn">View ${escapeHtml(ev.AssetName)}</button></div>` : ''}
       ${ev.JobLineTitle ? `<p class="muted">Linked to job line: "${escapeHtml(ev.JobLineTitle)}"</p>` : ''}
       <div class="btn-row"><button class="btn btn-secondary" id="deleteEventBtn">Delete Event</button></div>
     </div>
@@ -6900,10 +7157,17 @@ async function renderCalendarEventDetail({ id }) {
 
   wireRecurrenceToggle(document.getElementById('eventForm'));
   wireCalendarLinkFields(document.getElementById('eventForm'));
+  const visitorFields = wireVisitorFields(document.getElementById('eventForm'), ev, { types });
 
   document.getElementById('viewWoBtn')?.addEventListener('click', () => go('workOrderDetail', { id: ev.WorkOrderId }));
+  document.getElementById('viewEventAssetBtn')?.addEventListener('click', () => go('assetDetail', { id: ev.AssetId }));
   document.getElementById('eventForm').addEventListener('submit', async (e) => {
     e.preventDefault();
+    const visitor = visitorFields.values();
+    if (!visitor.visitorName && (visitor.cabinHolderId || visitor.visitPurpose || visitor.visitorContact)) {
+      toast('Add a visitor name — the rest of the visitor fields only mean something with one');
+      return;
+    }
     if (!await confirmDialog('Save changes to this event?')) return;
     const fd = new FormData(e.target);
     try {
@@ -6914,6 +7178,7 @@ async function renderCalendarEventDetail({ id }) {
         recurrenceType: fd.get('recurrenceType'), recurrenceInterval: Number(fd.get('recurrenceInterval')) || 1,
         recurrenceEndDate: fd.get('recurrenceEndDate') || '', workOrderId: fd.get('workOrderId') || '',
         jobLineId: fd.get('jobLineId') || '', workOrderTemplateId: fd.get('workOrderTemplateId') || '',
+        ...visitor,
       }) });
       toast('Event updated');
       renderCalendarEventDetail({ id });
@@ -7566,6 +7831,9 @@ async function renderNewWorkOrder({ assetId, assetName }) {
     const assetUpdates = [...document.querySelectorAll('.au-row')].map((row) => ({
       targetField: row.querySelector('.au-field').value, newValue: row.querySelector('.au-value').value,
     })).filter((r) => r.newValue.trim());
+    const woScheduledDate = fd.get('scheduledDate');
+    const datesToCheck = [...new Set([woScheduledDate, ...jobLines.map((l) => l.scheduledDate)].filter(Boolean))];
+    if (!await confirmVisitorConflicts(datesToCheck.map((date) => ({ date, assetId: finalAssetId })))) return;
     try {
       const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({
         title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description'),
@@ -8004,6 +8272,9 @@ async function renderWorkOrderDetail({ id }, container = app) {
         );
         if (!ok) return;
       }
+      const newScheduledDate = card.querySelector('.jl-e-scheduled-date').value;
+      if (newScheduledDate && newScheduledDate !== (jl.ScheduledDate || '').slice(0, 10)
+          && !await confirmVisitorConflicts([{ date: newScheduledDate, jobLineId: jlId }])) return;
       const causeIds = [...card.querySelectorAll('.jl-e-cause:checked')].map((cb) => Number(cb.value));
       try {
         await api(`/api/pg/job-lines/${jlId}`, { method: 'PATCH', body: JSON.stringify({

@@ -179,6 +179,40 @@ export function renderDeferredBacklogText({ groups, totalCost, totalCount }) {
   return lines.join('\n');
 }
 
+// Visitor Activity — two sections so cabin-holder-linked visits read as
+// distinct from one-off visitors at a glance, not just via a badge.
+export function renderVisitorActivityHtml({ from, to, holders, oneOff, totalVisits, holderVisits, oneOffVisits }) {
+  const personHtml = (p) => `
+    <div style="border-bottom:1px solid #eef0f6;padding:10px 0;">
+      <div><strong>${escapeHtml(p.name)}</strong> <span style="color:#6b7086;font-size:0.85rem;">— ${p.visitCount} visit${p.visitCount === 1 ? '' : 's'}</span></div>
+      <div style="color:#6b7086;font-size:0.85rem;">${p.assets.map((a) => `${escapeHtml(a.name)}${a.count > 1 ? ` ×${a.count}` : ''}`).join(' · ')}</div>
+      ${p.visits.map((v) => `
+        <div style="font-size:0.85rem;margin-top:3px;">${escapeHtml(fmtDate(v.date))}${v.endDate ? `–${escapeHtml(fmtDate(v.endDate))}` : ''}${v.assetName ? ` · ${escapeHtml(v.assetName)}` : ''}${v.purpose ? ` — ${escapeHtml(v.purpose)}` : ''}${p.isCabinHolder && v.visitorName && v.visitorName !== p.name ? ` <span style="color:#6b7086;">(as ${escapeHtml(v.visitorName)})</span>` : ''}</div>`).join('')}
+    </div>`;
+  const section = (title, list, visits) => `
+    <h3 style="margin:20px 0 4px;font-size:1rem;">${escapeHtml(title)} <span style="color:#6b7086;font-weight:400;font-size:0.85rem;">— ${list.length} ${list.length === 1 ? 'person' : 'people'} · ${visits} visit${visits === 1 ? '' : 's'}</span></h3>
+    ${list.map(personHtml).join('') || '<p style="color:#6b7086;margin:4px 0;">None in this range.</p>'}`;
+  return htmlShell('Visitor Activity', `${from} to ${to} · ${totalVisits} visit(s) · ${holders.length + oneOff.length} people`, `
+    ${totalVisits ? `${section('Cabin Holders', holders, holderVisits)}${section('Other Visitors', oneOff, oneOffVisits)}` : '<p style="color:#6b7086;">No visits recorded in this range.</p>'}
+  `);
+}
+export function renderVisitorActivityText({ from, to, holders, oneOff, totalVisits, holderVisits, oneOffVisits }) {
+  const lines = ['CAMP SYCHAR — VISITOR ACTIVITY', `${from} to ${to} — ${totalVisits} visit(s), ${holders.length + oneOff.length} people`, ''];
+  if (!totalVisits) { lines.push('No visits recorded in this range.'); return lines.join('\n'); }
+  const section = (title, list, visits) => {
+    lines.push(`${title.toUpperCase()} — ${list.length} people, ${visits} visit(s)`);
+    if (!list.length) lines.push('  None in this range.');
+    list.forEach((p) => {
+      lines.push(`  ${p.name} — ${p.visitCount} visit(s) — ${p.assets.map((a) => `${a.name}${a.count > 1 ? ` x${a.count}` : ''}`).join(', ')}`);
+      p.visits.forEach((v) => lines.push(`    ${fmtDate(v.date)}${v.endDate ? `–${fmtDate(v.endDate)}` : ''}${v.assetName ? `  ${v.assetName}` : ''}${v.purpose ? ` — ${v.purpose}` : ''}`));
+    });
+    lines.push('');
+  };
+  section('Cabin Holders', holders, holderVisits);
+  section('Other Visitors', oneOff, oneOffVisits);
+  return lines.join('\n');
+}
+
 // Turns a plain-text message (a Requester notification, a free-form message
 // from the Requests inbox) into a simple branded HTML body — same htmlShell
 // as every other report email, just a preformatted paragraph instead of a

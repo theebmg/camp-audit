@@ -4463,6 +4463,9 @@ function calendarEventRowShape(r) {
     WorkOrderTemplateId: r.work_order_template_id,
     TypeId: r.type_id, TypeName: r.type_name, TypeGcalColorId: r.type_gcal_color_id,
     StartTime: r.start_time, EndTime: r.end_time, EndDate: r.end_date,
+    VisitorName: r.visitor_name, VisitPurpose: r.visit_purpose, VisitorContact: r.visitor_contact,
+    CabinHolderId: r.cabin_holder_id, CabinHolderName: r.cabin_holder_name,
+    AssetId: r.asset_id, AssetName: r.asset_name,
   };
 }
 
@@ -4515,11 +4518,14 @@ function expandRecurrence(event, rangeStart, rangeEnd) {
 }
 
 const CALENDAR_EVENT_SELECT = `
-  SELECT e.*, w.title AS wo_title, jl.title AS job_line_title, t.name AS type_name, t.gcal_color_id AS type_gcal_color_id
+  SELECT e.*, w.title AS wo_title, jl.title AS job_line_title, t.name AS type_name, t.gcal_color_id AS type_gcal_color_id,
+         a.name AS asset_name, ch.name AS cabin_holder_name
   FROM calendar_events e
   LEFT JOIN work_orders w ON w.id = e.work_order_id
   LEFT JOIN job_lines jl ON jl.id = e.job_line_id
-  LEFT JOIN calendar_event_types t ON t.id = e.type_id`;
+  LEFT JOIN calendar_event_types t ON t.id = e.type_id
+  LEFT JOIN assets a ON a.id = e.asset_id
+  LEFT JOIN cabin_holders ch ON ch.id = e.cabin_holder_id`;
 
 export async function listCalendarEventOccurrences(fromDate, toDate) {
   const { rows } = await pool.query(
@@ -4711,17 +4717,20 @@ export async function getCalendarEvent(id) {
 // typeId defaults to 'Other' (Decision 7: never leave a controlled field
 // unset, so nobody ends up on a phantom "no type" event) — resolved by name
 // rather than requiring the frontend to know the seeded id.
-export async function createCalendarEvent({ title, description, eventDate, endDate, startTime, endTime, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId, typeId }) {
+export async function createCalendarEvent({ title, description, eventDate, endDate, startTime, endTime, recurrenceType, recurrenceInterval, recurrenceEndDate, workOrderId, jobLineId, workOrderTemplateId, typeId, visitorName, cabinHolderId, assetId, visitPurpose, visitorContact }) {
   let resolvedTypeId = typeId || null;
   if (!resolvedTypeId) {
     const { rows } = await pool.query(`SELECT id FROM calendar_event_types WHERE name = 'Other'`);
     resolvedTypeId = rows[0]?.id || null;
   }
+  const visitor = await applyCabinHolderVisitDefaults({ cabin_holder_id: cabinHolderId, visitor_name: visitorName, asset_id: assetId });
   const { rows } = await pool.query(
-    `INSERT INTO calendar_events (title, description, event_date, end_date, start_time, end_time, recurrence_type, recurrence_interval, recurrence_end_date, work_order_id, job_line_id, work_order_template_id, type_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+    `INSERT INTO calendar_events (title, description, event_date, end_date, start_time, end_time, recurrence_type, recurrence_interval, recurrence_end_date, work_order_id, job_line_id, work_order_template_id, type_id,
+                                  visitor_name, cabin_holder_id, asset_id, visit_purpose, visitor_contact)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
     [title, description || null, eventDate, endDate || null, startTime || null, endTime || null,
-      recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null, jobLineId || null, workOrderTemplateId || null, resolvedTypeId]
+      recurrenceType || 'none', recurrenceInterval || 1, recurrenceEndDate || null, workOrderId || null, jobLineId || null, workOrderTemplateId || null, resolvedTypeId,
+      visitor.visitor_name, visitor.cabin_holder_id, visitor.asset_id, visitPurpose?.trim() || null, visitorContact?.trim() || null]
   );
   // Unlike a job line (which may or may not have a scheduled_date yet),
   // every calendar_event row has a real event_date from the moment it's
@@ -4731,15 +4740,33 @@ export async function createCalendarEvent({ title, description, eventDate, endDa
   return calendarEventRowShape(rows[0]);
 }
 
-// Same set the Calendar's drag-to-reschedule touches — see
+// Every column the synced Google event's body reads — see
 // JOB_LINE_SCHEDULE_COLUMNS's comment for why this is checked once here
-// rather than at each call site.
-const CALENDAR_EVENT_SCHEDULE_COLUMNS = ['event_date', 'end_date', 'start_time', 'end_time'];
+// rather than at each call site. Started as just the four schedule columns
+// the Calendar's drag touches; the visitor columns joined it because the
+// Google summary/description are built from them (a changed visitor or
+// asset is a different event on Google's side, not a no-op).
+const CALENDAR_EVENT_GCAL_COLUMNS = [
+  'event_date', 'end_date', 'start_time', 'end_time', 'title', 'description', 'type_id',
+  'visitor_name', 'cabin_holder_id', 'asset_id', 'visit_purpose', 'visitor_contact',
+];
 export async function updateCalendarEvent(id, fields) {
   const allowed = [
     'title', 'description', 'event_date', 'end_date', 'start_time', 'end_time',
     'recurrence_type', 'recurrence_interval', 'recurrence_end_date', 'work_order_id', 'job_line_id', 'work_order_template_id', 'type_id',
+    'visitor_name', 'cabin_holder_id', 'asset_id', 'visit_purpose', 'visitor_contact',
   ];
+  // Only when the holder link is actually changing to a new holder in this
+  // save, and only for columns the request didn't send — an edit that
+  // re-saves the same holder never re-derives anything, so a visitor_name
+  // or asset the user overrode (including cleared) stays that way.
+  if (fields.cabin_holder_id && !('visitor_name' in fields && 'asset_id' in fields)) {
+    const { rows: current } = await pool.query('SELECT cabin_holder_id FROM calendar_events WHERE id = $1', [id]);
+    if (current[0] && current[0].cabin_holder_id !== fields.cabin_holder_id) {
+      const merged = await applyCabinHolderVisitDefaults({ cabin_holder_id: fields.cabin_holder_id, visitor_name: fields.visitor_name, asset_id: fields.asset_id });
+      fields = { ...fields, visitor_name: merged.visitor_name, asset_id: merged.asset_id };
+    }
+  }
   const setCols = []; const vals = []; let i = 1;
   for (const [key, value] of Object.entries(fields)) {
     if (!allowed.includes(key)) continue;
@@ -4750,12 +4777,87 @@ export async function updateCalendarEvent(id, fields) {
   vals.push(id);
   const { rowCount } = await pool.query(`UPDATE calendar_events SET ${setCols.join(', ')} WHERE id = $${i}`, vals);
   if (!rowCount) return null;
-  if (CALENDAR_EVENT_SCHEDULE_COLUMNS.some((c) => c in fields)) {
+  if (CALENDAR_EVENT_GCAL_COLUMNS.some((c) => c in fields)) {
     await queueGcalSync(pool, 'calendar_event', Number(id));
   }
   const event = await getCalendarEvent(id);
   await logActivity({ action: 'updated', entityType: 'calendar_event', entityId: Number(id), entityLabel: event?.Title });
   return event;
+}
+
+// Cabin-holder defaults for a visit: visitor_name falls back to the
+// holder's name, asset_id to the holder's cabin. Only fills a value the
+// caller left undefined (didn't send at all) — an explicit null/'' is an
+// override, e.g. a holder visiting camp generally rather than their cabin.
+// The UI applies the same defaults at pick time so the user sees them;
+// this covers API callers that send only the holder. "The holder's cabin" means assets.lodge_holder
+// (cabin_holders has no asset column of its own; listCabinHolders derives
+// LinkedAssets the same way) and is only defaulted when the holder has
+// exactly one — with two cabins there's no right guess, so the UI offers
+// both and the server leaves it unset rather than silently picking one.
+// cabin_holder_id always arrives from an explicit pick; this never looks a
+// holder up by visitor_name.
+async function applyCabinHolderVisitDefaults({ cabin_holder_id, visitor_name, asset_id }) {
+  const out = { cabin_holder_id: cabin_holder_id || null, visitor_name: visitor_name?.trim() || null, asset_id: asset_id || null };
+  if (!out.cabin_holder_id || (visitor_name !== undefined && asset_id !== undefined)) return out;
+  const { rows } = await pool.query(
+    `SELECT ch.name, COALESCE(json_agg(a.id ORDER BY a.name) FILTER (WHERE a.id IS NOT NULL), '[]') AS asset_ids
+     FROM cabin_holders ch LEFT JOIN assets a ON lower(trim(a.lodge_holder)) = lower(ch.name)
+     WHERE ch.id = $1 GROUP BY ch.id`,
+    [out.cabin_holder_id]
+  );
+  if (!rows[0]) { const e = new Error('Cabin holder not found'); e.status = 400; throw e; }
+  if (visitor_name === undefined) out.visitor_name = rows[0].name;
+  if (asset_id === undefined && rows[0].asset_ids.length === 1) out.asset_id = rows[0].asset_ids[0];
+  return out;
+}
+
+// Visitor events overlapping `date` at the asset a job line is about to be
+// scheduled on — the scheduling warning (warn, never block: same contract
+// as fund overage and the linked-expense double-count confirm). "At the
+// asset" includes its ancestors: a visitor at a cabin conflicts with work
+// on that cabin's porch or water heater (a child asset) just as much as
+// with work on the cabin itself. Pass either assetId directly (new WO form,
+// before any job line exists) or jobLineId (resolved through its work
+// order, since job lines carry no asset of their own). Recurring and
+// multi-day visits are expanded through listCalendarEventOccurrences, the
+// same expansion the Calendar renders from, so the two can't disagree.
+export async function listVisitorConflicts({ date, assetId, jobLineId }) {
+  let resolvedAssetId = assetId ? Number(assetId) : null;
+  if (!resolvedAssetId && jobLineId) {
+    const { rows } = await pool.query('SELECT w.asset_id FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id WHERE jl.id = $1', [jobLineId]);
+    resolvedAssetId = rows[0]?.asset_id || null;
+  }
+  if (!resolvedAssetId || !date) return [];
+  const { rows: chain } = await pool.query(
+    `WITH RECURSIVE chain AS (
+       SELECT id, parent_asset_id, 0 AS depth FROM assets WHERE id = $1
+       UNION ALL
+       SELECT a.id, a.parent_asset_id, c.depth + 1 FROM assets a JOIN chain c ON a.id = c.parent_asset_id WHERE c.depth < 10
+     ) SELECT id FROM chain`,
+    [resolvedAssetId]
+  );
+  const assetIds = new Set(chain.map((r) => r.id));
+  return (await listCalendarEventOccurrences(date, date))
+    .filter((o) => o.VisitorName && o.AssetId && assetIds.has(o.AssetId))
+    .map((o) => ({
+      EventId: o.Id, Title: o.Title, VisitorName: o.VisitorName, CabinHolderId: o.CabinHolderId,
+      AssetId: o.AssetId, AssetName: o.AssetName, VisitPurpose: o.VisitPurpose,
+      OccurrenceDate: o.OccurrenceDate, OccurrenceEndDate: o.OccurrenceEndDate,
+      StartTime: o.StartTime, EndTime: o.EndTime, TypeName: o.TypeName,
+    }));
+}
+
+// Visitor Activity report's raw material — every visit occurrence in range.
+// A visit is any calendar event with a visitor_name, regardless of type:
+// Constituent Visitation is the expected type, but a Volunteer Workday
+// someone logs against a specific visitor/cabin is still a visit. Expanded
+// per occurrence (a recurring monthly visit counts once per month), and a
+// multi-day stay counts once, on its start date's occurrence.
+export async function getVisitorActivityRawData({ from, to }) {
+  return (await listCalendarEventOccurrences(from, to))
+    .filter((o) => o.VisitorName)
+    .sort((a, b) => a.OccurrenceDate.localeCompare(b.OccurrenceDate));
 }
 
 export async function deleteCalendarEvent(id) {

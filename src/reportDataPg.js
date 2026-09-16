@@ -3,7 +3,7 @@
 // once, regardless of which database it reads from.
 import {
   getAllComponentRowsWithAssetInfo, getBoardReportRawData, getBoardFocusItems, historicalAvgActualCost,
-  getWorkPerformedRawData, getDeferredFindingsBacklogRawData,
+  getWorkPerformedRawData, getDeferredFindingsBacklogRawData, getVisitorActivityRawData,
 } from './db.js';
 import { currentComponentState } from './components.js';
 import { FUNDING_SOURCE_LABELS } from './reports.js';
@@ -181,6 +181,47 @@ export async function buildWorkPerformedReportPg({ from, to }) {
     totalLines: lines.length,
     totalCost: buildings.reduce((s, b) => s + b.totalCost, 0),
     totalHours: buildings.reduce((s, b) => s + b.totalHours, 0),
+  };
+}
+
+// Visitor activity over a date range, grouped by person. A cabin-holder-
+// linked visit groups by cabin_holder_id (the picked link — never by name,
+// so a holder and a one-off visitor who happen to share a name stay two
+// people). A one-off visitor has no identity but the name typed in, so
+// those group by that name, case/whitespace-normalized only — that's
+// tidying one person's inconsistent capitalization, not matching anyone
+// against a roster.
+export async function buildVisitorActivityReportPg({ from, to }) {
+  const visits = await getVisitorActivityRawData({ from, to });
+  const byPerson = new Map();
+  for (const v of visits) {
+    const isHolder = !!v.CabinHolderId;
+    const key = isHolder ? `holder:${v.CabinHolderId}` : `visitor:${v.VisitorName.trim().toLowerCase().replace(/\s+/g, ' ')}`;
+    if (!byPerson.has(key)) {
+      byPerson.set(key, {
+        name: isHolder ? (v.CabinHolderName || v.VisitorName) : v.VisitorName.trim(),
+        isCabinHolder: isHolder, visits: [], assetCounts: new Map(),
+      });
+    }
+    const person = byPerson.get(key);
+    person.visits.push({
+      date: v.OccurrenceDate, endDate: v.OccurrenceEndDate !== v.OccurrenceDate ? v.OccurrenceEndDate : null,
+      assetName: v.AssetName, purpose: v.VisitPurpose, visitorName: v.VisitorName, eventId: v.Id,
+    });
+    const assetLabel = v.AssetName || 'No asset recorded';
+    person.assetCounts.set(assetLabel, (person.assetCounts.get(assetLabel) || 0) + 1);
+  }
+  const people = [...byPerson.values()].map((p) => ({
+    name: p.name, isCabinHolder: p.isCabinHolder, visitCount: p.visits.length, visits: p.visits,
+    assets: [...p.assetCounts.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
+  })).sort((a, b) => b.visitCount - a.visitCount || a.name.localeCompare(b.name));
+  const holders = people.filter((p) => p.isCabinHolder);
+  const oneOff = people.filter((p) => !p.isCabinHolder);
+  return {
+    from, to, holders, oneOff,
+    totalVisits: visits.length,
+    holderVisits: holders.reduce((s, p) => s + p.visitCount, 0),
+    oneOffVisits: oneOff.reduce((s, p) => s + p.visitCount, 0),
   };
 }
 

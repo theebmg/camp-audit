@@ -131,9 +131,21 @@ function buildJobLineEventBody(jl, jobLineColorId) {
   };
 }
 
+// A visit's summary names who and where ("Constituent Visitation — Dorothy,
+// Bethel 04") instead of the free-text title — that's what someone glancing
+// at the shared Google calendar needs to know. Purpose/contact go in the body.
 function buildCalendarEventEventBody(ev) {
-  const summary = ev.type_name ? `${ev.type_name} — ${ev.title}` : ev.title;
+  const headline = ev.visitor_name ? [ev.visitor_name, ev.asset_name].filter(Boolean).join(', ') : ev.title;
+  const summary = ev.type_name ? `${ev.type_name} — ${headline}` : headline;
   const descriptionLines = [];
+  if (ev.visitor_name) {
+    descriptionLines.push(`Visitor: ${ev.visitor_name}${ev.cabin_holder_id ? ' (cabin holder)' : ''}`);
+    if (ev.asset_name) descriptionLines.push(`At: ${ev.asset_name}`);
+    if (ev.visit_purpose) descriptionLines.push(`Purpose: ${ev.visit_purpose}`);
+    if (ev.visitor_contact) descriptionLines.push(`Contact: ${ev.visitor_contact}`);
+    if (ev.title && ev.title !== ev.visitor_name) descriptionLines.push(`Event: ${ev.title}`);
+    descriptionLines.push('');
+  }
   if (ev.description) descriptionLines.push(ev.description, '');
   if (ev.work_order_id) descriptionLines.push(`Work Order #${ev.work_order_id} — ${ev.wo_title}`);
   if (ev.job_line_id) descriptionLines.push(`Job line: ${ev.job_line_title}`);

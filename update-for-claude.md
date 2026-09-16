@@ -1,3 +1,73 @@
+# Runbook: Camp visitor tracking (2026-09-16)
+
+**Checked before adding anything.** `calendar_event_types` already seeded
+`Constituent Visitation` (0061). `calendar_events` had: id, title,
+description, event_date, end_date, start_time, end_time, recurrence_type/
+interval/end_date, work_order_id, job_line_id, work_order_template_id,
+type_id, gcal_event_id, created_at/updated_at — **no asset_id** (only an
+indirect asset via work_order_id). `cabin_holders` is id/name(unique)/
+notes/created_at with no asset column; a holder's cabins are derived from
+`assets.lodge_holder` (see `listCabinHolders`'s `LinkedAssets`).
+
+**Migration 0065** adds `visitor_name`, `cabin_holder_id` (FK, ON DELETE
+SET NULL), `asset_id` (FK assets, ON DELETE SET NULL), `visit_purpose`,
+`visitor_contact` to `calendar_events`. A visit is any event with a
+`visitor_name`, regardless of type — no new entity.
+
+**Cabin holder link is pick-only.** `mountCabinHolderCombobox` (app.js) is
+the only way `cabin_holder_id` gets set; editing the text after a pick
+drops the link. Picking fills visitor name + the holder's cabin (only when
+they hold exactly one; with several, chips ask which). Server-side
+`applyCabinHolderVisitDefaults` mirrors this for API callers but only fills
+a column the request *didn't send* — an explicit blank is an override.
+Nothing anywhere looks a holder up by `visitor_name`.
+
+**Conflict warning.** `GET /api/pg/visitor-conflicts?date=&assetId=|jobLineId=`
+→ `listVisitorConflicts`: occurrences (via `listCalendarEventOccurrences`,
+so recurrence/multi-day spans match the Calendar exactly) with a visitor at
+the asset **or any ancestor** (recursive CTE on `parent_asset_id` — a
+visitor at a cabin conflicts with work on its porch). Frontend
+`confirmVisitorConflicts` runs before: Calendar drag/queue drop of a job
+line, job-line edit save when Scheduled Date changed, and New Work Order
+submit (WO-level + per-line dates). "Schedule anyway" / "Go back" confirm —
+same warn-never-block contract as the linked-expense double-count confirm.
+The PATCH/POST routes never consult it. Not wired: PM auto-generation
+(no human present to warn).
+
+**Display.** `calendarEntryText` renders visits as `🧳 name · asset —
+purpose`; `calendarEntryTooltip` puts contact/holder in a hover title
+(Month/Week); Day view's detailed chip shows contact, a non-default title,
+and a Cabin holder pill. Google sync summary becomes `Type — Visitor,
+Asset` with purpose/contact in the body; `CALENDAR_EVENT_SCHEDULE_COLUMNS`
+became `CALENDAR_EVENT_GCAL_COLUMNS` (adds title/description/type_id and
+the visitor columns — previously a title-only edit never re-synced).
+
+**Report.** Reports → Visitor Activity (`buildVisitorActivityReportPg`):
+occurrences in range grouped by person — holder-linked visits by
+`cabin_holder_id`, one-off visitors by case/whitespace-normalized name —
+split into Cabin Holders / Other Visitors sections with visit count and
+per-asset counts. Preview + email like Work Performed.
+
+**Deliberately not built:** visit → work order conversion. A visit that
+turns up work becomes a finding on the asset, which already converts to a
+job line.
+
+**Verified** with disposable fixtures against the live DB (created and
+deleted in a `finally`, 0 rows left): holder-only create defaults name +
+single cabin; explicit blank asset kept; multi-cabin holder leaves asset
+unset; child-asset conflict against a multi-day visit at its parent, none
+the day after; holder change on PATCH defaults only unsent columns; report
+groups a one-off visitor across capitalization and counts a weekly
+recurring visit per occurrence.
+
+## Known gaps / follow-ups
+- The warning is one-directional as asked: creating a visit on a building
+  that already has job lines scheduled that day doesn't warn.
+- Calendar grid doesn't flag a job line that already overlaps a visit —
+  the warning fires only at scheduling time.
+
+---
+
 # Runbook: Revisit-date sync — closing Build Brief v4 step 3's last gap (2026-09-15)
 
 Follow-on to the outbound sync worker runbook directly below this one.
