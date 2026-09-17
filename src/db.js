@@ -1641,18 +1641,24 @@ export async function adminDeleteJobLineStatus(id) {
 // ── Display settings (2.6) — single admin-wide toggle for now: whether the
 //    WO grid's progress bar defaults to cost-weighted or line-count-weighted. ─
 export async function getDisplaySettings() {
-  const { rows } = await pool.query('SELECT wo_progress_weighting, report_image_cap FROM display_settings ORDER BY id LIMIT 1');
-  return { WoProgressWeighting: rows[0]?.wo_progress_weighting || 'cost', ReportImageCap: rows[0]?.report_image_cap ?? 4 };
+  const { rows } = await pool.query('SELECT wo_progress_weighting, report_image_cap, nav_layout FROM display_settings ORDER BY id LIMIT 1');
+  return { WoProgressWeighting: rows[0]?.wo_progress_weighting || 'cost', ReportImageCap: rows[0]?.report_image_cap ?? 4, NavLayout: rows[0]?.nav_layout ?? null };
 }
-export async function updateDisplaySettings({ woProgressWeighting, reportImageCap }) {
+// navLayout: undefined = leave alone, null = reset to the built-in default
+// (COALESCE can't express that, hence the separate $4 flag).
+export async function updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout }) {
   await pool.query(
     `UPDATE display_settings SET
        wo_progress_weighting = COALESCE($1, wo_progress_weighting),
-       report_image_cap = COALESCE($2, report_image_cap)
+       report_image_cap = COALESCE($2, report_image_cap),
+       nav_layout = CASE WHEN $4 THEN $3::jsonb ELSE nav_layout END
      WHERE id = (SELECT id FROM display_settings ORDER BY id LIMIT 1)`,
-    [woProgressWeighting || null, reportImageCap ?? null]
+    [woProgressWeighting || null, reportImageCap ?? null, navLayout ? JSON.stringify(navLayout) : null, navLayout !== undefined]
   );
-  await logActivity({ action: 'updated', entityType: 'display_settings', entityLabel: 'display settings', details: `weighting=${woProgressWeighting || '—'} imageCap=${reportImageCap ?? '—'}` });
+  // Nav reorders save on every move — don't flood the activity feed with them.
+  if (woProgressWeighting !== undefined || reportImageCap !== undefined) {
+    await logActivity({ action: 'updated', entityType: 'display_settings', entityLabel: 'display settings', details: `weighting=${woProgressWeighting || '—'} imageCap=${reportImageCap ?? '—'}` });
+  }
   return getDisplaySettings();
 }
 async function resolveWorkOrderStatusId(nameOrId) {

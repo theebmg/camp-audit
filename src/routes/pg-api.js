@@ -1577,15 +1577,29 @@ router.delete('/admin/job-line-statuses/:id', async (req, res, next) => {
 });
 
 // ---- Display settings (2.6) ----
+// Shape check only — the client owns the list of nav views and reconciles
+// unknown/missing ones on load, so the server doesn't duplicate that list.
+function isValidNavLayout(layout) {
+  if (!Array.isArray(layout) || layout.length === 0 || layout.length > 20) return false;
+  let total = 0;
+  for (const section of layout) {
+    if (!section || typeof section !== 'object') return false;
+    if (section.header !== null && (typeof section.header !== 'string' || section.header.length > 40)) return false;
+    if (!Array.isArray(section.items) || !section.items.every((v) => typeof v === 'string' && v.length <= 60)) return false;
+    total += section.items.length;
+  }
+  return total <= 100;
+}
 router.get('/display-settings', async (req, res, next) => {
   try { res.json(await getDisplaySettings()); } catch (e) { next(e); }
 });
 router.put('/display-settings', async (req, res, next) => {
   try {
-    const { woProgressWeighting, reportImageCap } = req.body || {};
+    const { woProgressWeighting, reportImageCap, navLayout } = req.body || {};
     if (woProgressWeighting !== undefined && !['cost', 'count'].includes(woProgressWeighting)) return res.status(400).json({ ok: false, error: 'woProgressWeighting must be "cost" or "count"' });
     if (reportImageCap !== undefined && (!Number.isInteger(reportImageCap) || reportImageCap < 1)) return res.status(400).json({ ok: false, error: 'reportImageCap must be a positive integer' });
-    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting, reportImageCap }) });
+    if (navLayout !== undefined && navLayout !== null && !isValidNavLayout(navLayout)) return res.status(400).json({ ok: false, error: 'navLayout must be null or an array of { header: string|null, items: string[] }' });
+    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout }) });
   } catch (e) { next(e); }
 });
 

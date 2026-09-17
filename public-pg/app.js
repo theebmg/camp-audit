@@ -64,6 +64,58 @@ function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// ---------- Password visibility toggle ----------
+// Every <input type="password"> in the app gets its own eye button, applied
+// automatically by the observer below — views build their forms via
+// innerHTML, so wiring each form by hand would miss the next one someone
+// adds. Always starts hidden (a freshly rendered input is type=password), and
+// flips back to hidden when its form submits so the browser never sees a
+// visible password on submit/save-password.
+const PW_EYE_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+const PW_EYE_OFF_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-6.5 0-10-7-10-7a18.5 18.5 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c6.5 0 10 7 10 7a18.5 18.5 0 0 1-2.16 3.19"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/><line x1="2" y1="2" x2="22" y2="22"/></svg>';
+function enhancePasswordInput(input) {
+  if (input.dataset.pwToggle) return;
+  input.dataset.pwToggle = '1';
+  const wrap = document.createElement('span');
+  wrap.className = 'pw-wrap';
+  input.parentNode.insertBefore(wrap, input);
+  wrap.appendChild(input);
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'pw-toggle';
+  if (input.id) btn.setAttribute('aria-controls', input.id);
+  wrap.appendChild(btn);
+  const setVisible = (visible) => {
+    input.type = visible ? 'text' : 'password';
+    btn.innerHTML = visible ? PW_EYE_OFF_SVG : PW_EYE_SVG;
+    btn.setAttribute('aria-label', visible ? 'Hide password' : 'Show password');
+    btn.setAttribute('aria-pressed', String(visible));
+  };
+  setVisible(false);
+  // Don't steal focus from the input on mouse/touch — keeps the phone keyboard
+  // up and the caret where it was. Keyboard activation still works normally.
+  btn.addEventListener('pointerdown', (e) => { if (document.activeElement === input) e.preventDefault(); });
+  btn.addEventListener('click', () => {
+    const hadFocus = document.activeElement === input;
+    const { selectionStart, selectionEnd } = input;
+    setVisible(input.type === 'password');
+    if (hadFocus) {
+      input.focus();
+      try { input.setSelectionRange(selectionStart, selectionEnd); } catch { /* type swap unsupported */ }
+    }
+  });
+  input.form?.addEventListener('submit', () => setVisible(false), true);
+}
+function enhancePasswordInputs(root) {
+  if (root.nodeType !== 1) return;
+  if (root.matches('input[type="password"]')) enhancePasswordInput(root);
+  root.querySelectorAll('input[type="password"]:not([data-pw-toggle])').forEach(enhancePasswordInput);
+}
+new MutationObserver((mutations) => {
+  for (const m of mutations) m.addedNodes.forEach(enhancePasswordInputs);
+}).observe(document.body, { childList: true, subtree: true });
+enhancePasswordInputs(document.body);
+
 function slugify(s) { return String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''); }
 
 function downloadBlob(content, filename, mime) {
@@ -614,36 +666,238 @@ logoutBtn.addEventListener('click', async () => {
 
 const NAV_ITEMS = [
   { icon: '🏠', label: 'Dashboard', view: 'dashboard' },
-  { icon: '📝', label: 'Start Audit', view: 'auditPicker' },
-  { icon: '📍', label: 'Locations', view: 'locations' },
-  { icon: '🗺️', label: 'Map', view: 'map' },
-  { icon: '🗒️', label: 'Notes', view: 'notes' },
   { icon: '🛠️', label: 'Work Orders', view: 'workOrders' },
-  { icon: '📥', label: 'Inbox', view: 'inbox' },
-  { icon: '💵', label: 'Expenses', view: 'expenses' },
-  { icon: '🗂️', label: 'Admin Tasks', view: 'adminTasks' },
-  { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '📅', label: 'Calendar', view: 'calendar' },
+  { icon: '📥', label: 'Inbox', view: 'inbox' },
+  { icon: '🗂️', label: 'Admin Tasks', view: 'adminTasks' },
+  { icon: '📝', label: 'Start Audit', view: 'auditPicker' },
+  { icon: '🗺️', label: 'Map', view: 'map' },
+  { icon: '📍', label: 'Locations', view: 'locations' },
+  { icon: '🗒️', label: 'Notes', view: 'notes' },
+  { icon: '💵', label: 'Expenses', view: 'expenses' },
+  { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
+  { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '👷', label: 'Crew', view: 'crew' },
   { icon: '🕒', label: 'Hours', view: 'crewHours' },
   { icon: '📋', label: 'Maintenance Log', view: 'maintenanceLog' },
-  { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
   { icon: '📊', label: 'Reports', view: 'reports' },
   { icon: '⚙️', label: 'Admin', view: 'admin' },
 ];
+const NAV_ITEM_BY_VIEW = Object.fromEntries(NAV_ITEMS.map((n) => [n.view, n]));
+
+// Default grouping. Headers are fixed; items move freely between sections in
+// the sidebar's reorder mode, and the result is saved to display_settings
+// (nav_layout). The trailing null-header section renders without a label.
+const DEFAULT_NAV_LAYOUT = [
+  { header: 'Daily', items: ['dashboard', 'workOrders', 'calendar', 'inbox', 'adminTasks'] },
+  { header: 'Field', items: ['auditPicker', 'map', 'locations', 'notes'] },
+  { header: 'Money', items: ['expenses', 'capitalPlan'] },
+  { header: 'Records', items: ['requests', 'crew', 'crewHours', 'maintenanceLog'] },
+  { header: null, items: ['reports', 'admin'] },
+];
+
+// A saved layout can go stale as the app changes: sections get renamed/added
+// and nav items come and go. Keep the default's section list, place each saved
+// item under its saved header when that header still exists, drop views that
+// no longer exist, and slot any never-placed view into its default section.
+function reconcileNavLayout(saved) {
+  const layout = DEFAULT_NAV_LAYOUT.map((sec) => ({ header: sec.header, items: [] }));
+  const placed = new Set();
+  if (Array.isArray(saved)) {
+    for (const sec of saved) {
+      const target = layout.find((l) => l.header === (sec?.header ?? null));
+      if (!target || !Array.isArray(sec.items)) continue;
+      for (const view of sec.items) {
+        if (!NAV_ITEM_BY_VIEW[view] || placed.has(view)) continue;
+        target.items.push(view); placed.add(view);
+      }
+    }
+  }
+  DEFAULT_NAV_LAYOUT.forEach((sec, i) => sec.items.forEach((view) => {
+    if (!placed.has(view)) { layout[i].items.push(view); placed.add(view); }
+  }));
+  return layout;
+}
+
+let navEditMode = false;
+let navLayoutSaveTimer = null;
+let navLayoutPending = undefined; // layout (or null = reset) not yet PUT
+
+function currentNavLayout() {
+  return reconcileNavLayout(state.options?.displaySettings?.NavLayout);
+}
+function setNavLayout(layout) {
+  if (state.options) state.options.displaySettings = { ...(state.options.displaySettings || {}), NavLayout: layout };
+  navLayoutPending = layout;
+  clearTimeout(navLayoutSaveTimer);
+  // Debounced so tapping ▼ five times in a row is one request, not five.
+  navLayoutSaveTimer = setTimeout(flushNavLayoutSave, 600);
+}
+async function flushNavLayoutSave() {
+  clearTimeout(navLayoutSaveTimer);
+  if (navLayoutPending === undefined) return;
+  const navLayout = navLayoutPending;
+  navLayoutPending = undefined;
+  try { await api('/api/pg/display-settings', { method: 'PUT', body: JSON.stringify({ navLayout }) }); }
+  catch (err) { if (err.message !== 'Not authenticated') toast(`Couldn't save menu order: ${err.message}`); }
+}
+
+// Move one item a step. Stepping past either end of a section carries the
+// item into the neighboring section (end of the one above / start of the one
+// below), which is how items change sections without drag on a phone.
+function moveNavItem(view, dir) {
+  const layout = currentNavLayout();
+  const si = layout.findIndex((sec) => sec.items.includes(view));
+  if (si < 0) return;
+  const items = layout[si].items;
+  const i = items.indexOf(view);
+  if (dir < 0) {
+    if (i > 0) [items[i - 1], items[i]] = [items[i], items[i - 1]];
+    else if (si > 0) { items.splice(i, 1); layout[si - 1].items.push(view); }
+    else return;
+  } else {
+    if (i < items.length - 1) [items[i], items[i + 1]] = [items[i + 1], items[i]];
+    else if (si < layout.length - 1) { items.splice(i, 1); layout[si + 1].items.unshift(view); }
+    else return;
+  }
+  setNavLayout(layout);
+}
+// Drag-drop placement: before `beforeView` in section `si`, or at the end of
+// that section when beforeView is null.
+function placeNavItem(view, si, beforeView) {
+  if (view === beforeView) return;
+  const layout = currentNavLayout();
+  layout.forEach((sec) => { sec.items = sec.items.filter((v) => v !== view); });
+  const items = layout[si].items;
+  const at = beforeView ? items.indexOf(beforeView) : -1;
+  if (at < 0) items.push(view); else items.splice(at, 0, view);
+  setNavLayout(layout);
+}
 
 function renderSidebar(activeView) {
-  sidebarNavEl.innerHTML = NAV_ITEMS.map((item) => `
-    <button class="nav-item ${item.view === activeView ? 'active' : ''}" data-view="${item.view}">
-      <span class="nav-icon">${item.icon}</span><span>${item.label}</span>
-    </button>`).join('');
-  sidebarNavEl.querySelectorAll('.nav-item').forEach((btn) => {
-    btn.addEventListener('click', () => { closeSidebar(); go(btn.dataset.view, {}, { reset: true }); });
-  });
+  const layout = currentNavLayout();
+  const flat = layout.flatMap((sec) => sec.items);
+  const first = flat[0], last = flat[flat.length - 1];
+  const sectionHtml = layout.map((sec, si) => {
+    // Outside edit mode an emptied section just disappears; in edit mode it
+    // stays visible so there's somewhere to move items back into.
+    if (!sec.items.length && !navEditMode) return '';
+    const header = sec.header
+      ? `<div class="nav-section-header">${escapeHtml(sec.header)}</div>`
+      : (navEditMode ? '<div class="nav-section-header nav-section-unlabeled">No header</div>' : '<div class="nav-section-divider"></div>');
+    const items = sec.items.map((view) => {
+      const item = NAV_ITEM_BY_VIEW[view];
+      const label = escapeHtml(item.label);
+      if (!navEditMode) {
+        return `<button class="nav-item ${view === activeView ? 'active' : ''}" data-view="${view}">
+          <span class="nav-icon">${item.icon}</span><span>${label}</span>
+        </button>`;
+      }
+      return `<div class="nav-item nav-item-editing" data-view="${view}" draggable="true">
+          <span class="nav-drag-handle" aria-hidden="true">⠿</span>
+          <span class="nav-icon">${item.icon}</span><span class="nav-label">${label}</span>
+          <button type="button" class="nav-move" data-view="${view}" data-dir="-1" aria-label="Move ${label} up" ${view === first ? 'disabled' : ''}>▲</button>
+          <button type="button" class="nav-move" data-view="${view}" data-dir="1" aria-label="Move ${label} down" ${view === last ? 'disabled' : ''}>▼</button>
+        </div>`;
+    }).join('');
+    return `<div class="nav-section" data-section="${si}">${header}${items}</div>`;
+  }).join('');
+
+  const editBar = navEditMode
+    ? `<div class="nav-edit-bar">
+        <button type="button" class="btn btn-primary nav-edit-done">Done</button>
+        <button type="button" class="btn btn-secondary nav-edit-reset">Reset to default</button>
+      </div>
+      <p class="nav-edit-hint">Use ▲ ▼ (or drag) to reorder. Moving past the top or bottom of a section moves the item into the next one. Menu order is shared by everyone.</p>`
+    : '';
+  sidebarNavEl.classList.toggle('editing', navEditMode);
+  sidebar.classList.toggle('nav-editing', navEditMode); // widens the drawer so labels fit beside the arrows
+  sidebarNavEl.innerHTML = editBar + sectionHtml
+    + (navEditMode ? '' : '<button type="button" class="nav-edit-toggle">↕ Reorder menu</button>');
+
+  if (!navEditMode) {
+    sidebarNavEl.querySelectorAll('.nav-item').forEach((btn) => {
+      btn.addEventListener('click', () => { closeSidebar(); go(btn.dataset.view, {}, { reset: true }); });
+    });
+    sidebarNavEl.querySelector('.nav-edit-toggle').addEventListener('click', () => {
+      navEditMode = true; renderSidebar(activeView);
+      sidebarNavEl.querySelector('.nav-edit-done')?.focus();
+    });
+  } else {
+    sidebarNavEl.querySelector('.nav-edit-done').addEventListener('click', () => {
+      navEditMode = false; flushNavLayoutSave(); renderSidebar(activeView);
+      sidebarNavEl.querySelector('.nav-edit-toggle')?.focus();
+    });
+    sidebarNavEl.querySelector('.nav-edit-reset').addEventListener('click', () => {
+      if (!confirm('Reset the menu to the default order and sections?')) return;
+      setNavLayout(null); flushNavLayoutSave(); renderSidebar(activeView);
+    });
+    sidebarNavEl.querySelectorAll('.nav-move').forEach((btn) => btn.addEventListener('click', () => {
+      const { view, dir } = btn.dataset;
+      moveNavItem(view, Number(dir));
+      renderSidebar(activeView);
+      // Keep focus on the same arrow of the moved item so repeated taps /
+      // Enter presses keep moving it; fall back to the other arrow at an end.
+      const sel = (d) => sidebarNavEl.querySelector(`.nav-move[data-view="${view}"][data-dir="${d}"]`);
+      const again = sel(dir);
+      (again && !again.disabled ? again : sel(-Number(dir)))?.focus();
+      again?.closest('.nav-item')?.scrollIntoView({ block: 'nearest' });
+    }));
+
+    // Pointer drag (desktop). Touch devices use the arrows.
+    let dragView = null;
+    const clearMarks = () => sidebarNavEl.querySelectorAll('.drop-before, .drop-into').forEach((el) => el.classList.remove('drop-before', 'drop-into'));
+    sidebarNavEl.querySelectorAll('.nav-item-editing').forEach((row) => {
+      row.addEventListener('dragstart', (e) => {
+        dragView = row.dataset.view;
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', dragView);
+        row.classList.add('dragging');
+      });
+      row.addEventListener('dragend', () => { dragView = null; row.classList.remove('dragging'); clearMarks(); });
+    });
+    sidebarNavEl.querySelectorAll('.nav-section').forEach((secEl) => {
+      const si = Number(secEl.dataset.section);
+      // Drop target = the row the pointer is over (insert before it, or after
+      // it when in its lower half); over the header / empty space = section end
+      // or start.
+      const targetFor = (e) => {
+        const row = e.target.closest('.nav-item-editing');
+        if (row) {
+          const r = row.getBoundingClientRect();
+          if (e.clientY < r.top + r.height / 2) return { before: row.dataset.view, markEl: row };
+          const next = row.nextElementSibling;
+          return next ? { before: next.dataset.view, markEl: next } : { before: null, markEl: secEl };
+        }
+        if (e.target.closest('.nav-section-header')) {
+          const firstRow = secEl.querySelector('.nav-item-editing');
+          return firstRow ? { before: firstRow.dataset.view, markEl: firstRow } : { before: null, markEl: secEl };
+        }
+        return { before: null, markEl: secEl };
+      };
+      secEl.addEventListener('dragover', (e) => {
+        if (!dragView) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        const { markEl } = targetFor(e);
+        clearMarks();
+        markEl.classList.add(markEl === secEl ? 'drop-into' : 'drop-before');
+      });
+      secEl.addEventListener('drop', (e) => {
+        if (!dragView) return;
+        e.preventDefault();
+        const { before } = targetFor(e);
+        placeNavItem(dragView, si, before);
+        dragView = null;
+        renderSidebar(activeView);
+      });
+    });
+  }
   sidebarUserEl.textContent = state.user ? `Signed in as ${state.user}` : '';
 }
 function openSidebar() { sidebar.classList.add('open'); sidebarOverlay.hidden = false; }
-function closeSidebar() { sidebar.classList.remove('open'); sidebarOverlay.hidden = true; }
+function closeSidebar() { sidebar.classList.remove('open'); sidebarOverlay.hidden = true; flushNavLayoutSave(); }
+window.addEventListener('pagehide', flushNavLayoutSave);
 menuBtn.addEventListener('click', openSidebar);
 sidebarOverlay.addEventListener('click', closeSidebar);
 document.getElementById('closeSidebarBtn').addEventListener('click', closeSidebar);
