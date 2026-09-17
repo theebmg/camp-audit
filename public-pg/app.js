@@ -315,7 +315,12 @@ function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {
   async function showQuickCreateForm(name) {
     resultsEl.innerHTML = `<div class="ac-item" style="cursor:default">
       <div class="field-row" style="margin-bottom:8px"><label>New asset name</label><input class="ac-new-name" value="${escapeHtml(name)}" /></div>
-      <div class="field-row" style="margin-bottom:8px"><label>Location</label><select class="ac-new-location"><option value="">— unset —</option></select></div>
+      <div class="field-row" style="margin-bottom:8px"><label>Location</label><select class="ac-new-location"><option value="">— unset —</option><option value="__new__">➕ New location…</option></select></div>
+      <div class="ac-new-loc-fields" hidden>
+        <div class="field-row" style="margin-bottom:8px"><label>New location name</label><input class="ac-new-loc-name" placeholder="e.g. North Cabin Row" /></div>
+        <div class="field-row" style="margin-bottom:8px"><label>Parent location</label><select class="ac-new-loc-parent"><option value="">— top-level —</option></select></div>
+        <div class="field-row" style="margin-bottom:8px"><label>Location type</label><input class="ac-new-loc-type" /></div>
+      </div>
       <div class="field-row" style="margin-bottom:8px"><label>Asset Type</label><input class="ac-new-type" placeholder="e.g. Full Cabin" /></div>
       <div class="btn-row" style="margin-top:0">
         <button type="button" class="btn btn-primary ac-create-confirm">Create Asset</button>
@@ -323,16 +328,42 @@ function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {
       </div>
     </div>`;
     const locSelect = resultsEl.querySelector('.ac-new-location');
+    const newLocFields = resultsEl.querySelector('.ac-new-loc-fields');
     api('/api/pg/locations').then(({ locations }) => {
-      locSelect.insertAdjacentHTML('beforeend', locations.map((l) => `<option value="${l.Id}">${escapeHtml(l.Name)}</option>`).join(''));
+      const opts = locations.map((l) => `<option value="${l.Id}">${escapeHtml(l.Name)}</option>`).join('');
+      locSelect.insertAdjacentHTML('beforeend', opts);
+      resultsEl.querySelector('.ac-new-loc-parent').insertAdjacentHTML('beforeend', opts);
+    });
+    // A location that doesn't exist yet can be created in the same step, so
+    // a WO for a brand-new spot doesn't mean leaving the form for Locations.
+    locSelect.addEventListener('change', () => {
+      newLocFields.hidden = locSelect.value !== '__new__';
+      if (!newLocFields.hidden) resultsEl.querySelector('.ac-new-loc-name').focus();
     });
     resultsEl.querySelector('.ac-create-cancel').addEventListener('click', () => { resultsEl.hidden = true; });
     resultsEl.querySelector('.ac-create-confirm').addEventListener('click', async () => {
       const finalName = resultsEl.querySelector('.ac-new-name').value.trim();
       if (!finalName) { toast('Name is required'); return; }
+      let locationId = locSelect.value || undefined;
+      const newLocName = resultsEl.querySelector('.ac-new-loc-name').value.trim();
+      if (locationId === '__new__' && !newLocName) { toast('New location name is required'); return; }
       try {
+        if (locationId === '__new__') {
+          const { location } = await api('/api/pg/locations', { method: 'POST', body: JSON.stringify({
+            name: newLocName,
+            parentLocationId: resultsEl.querySelector('.ac-new-loc-parent').value || undefined,
+            locationType: resultsEl.querySelector('.ac-new-loc-type').value.trim() || undefined,
+          }) });
+          locationId = location.Id;
+          // Swap the placeholder for the real row so a failed asset create
+          // retried from here doesn't make a duplicate location.
+          locSelect.insertAdjacentHTML('beforeend', `<option value="${location.Id}">${escapeHtml(location.Name)}</option>`);
+          locSelect.value = String(location.Id);
+          newLocFields.hidden = true;
+          toast(`Created location "${location.Name}"`);
+        }
         const { asset } = await api('/api/pg/assets', { method: 'POST', body: JSON.stringify({
-          name: finalName, locationId: locSelect.value || undefined, assetType: resultsEl.querySelector('.ac-new-type').value.trim() || undefined,
+          name: finalName, locationId, assetType: resultsEl.querySelector('.ac-new-type').value.trim() || undefined,
         }) });
         selected = asset;
         input.value = asset.Name;
