@@ -4410,7 +4410,7 @@ async function renderAdminTaskDetail({ id } = {}) {
         <div class="field-row"><label>Title</label><input name="title" required value="${escapeHtml(task?.Title || '')}" placeholder="e.g. Cancelled unused Verizon line" /></div>
         <div class="field-row"><label>Description</label><textarea name="description" rows="4">${escapeHtml(task?.Description || '')}</textarea></div>
         <div class="field-row"><label>Date</label><input name="taskDate" type="date" required value="${escapeHtml(task?.TaskDate || isoDate(new Date()))}" /></div>
-        <div class="field-row"><label>Hours</label><input name="hours" type="number" step="0.25" min="0" value="${task?.Hours ?? ''}" /></div>
+        <div class="field-row"><label>Hours</label><input name="hours" type="number" step="any" min="0" value="${task?.Hours ?? ''}" /></div>
         <div class="field-row"><label>Status</label><select name="statusId" required>
           ${statusChoices.map((st) => `<option value="${st.Id}" ${st.Id === defaultStatus ? 'selected' : ''}>${escapeHtml(st.Name)}${st.Active ? '' : ' (inactive)'}</option>`).join('')}
         </select>
@@ -8279,7 +8279,7 @@ async function renderNewWorkOrder({ assetId, assetName }) {
         <label>${escapeHtml(FUNDING_SOURCE_LABELS[fundingSource] || '')}</label>
         <select class="jl-funding-ref">${fundingRefOptionsHtml(fundingSource, row.fundingRefId)}</select>
       </div>
-      <div class="field-row"><label>Est. Hours</label><input class="jl-est-hours" type="number" min="0" value="${row.estimatedHours ?? ''}" /></div>
+      <div class="field-row"><label>Est. Hours</label><input class="jl-est-hours" type="number" step="any" min="0" value="${row.estimatedHours ?? ''}" /></div>
       <div class="field-row"><label>Est. Cost</label><input class="jl-est-cost" type="number" step="0.01" min="0" value="${row.estimatedCost ?? ''}" /></div>
       <div class="field-row"><label>Scheduled Date</label><input class="jl-scheduled-date" type="date" value="${row.scheduledDate || ''}" />
         <p class="muted" style="margin-top:2px;font-size:0.8rem">Defaults to the work order's date if left blank.</p>
@@ -8464,8 +8464,8 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }
         <label>${escapeHtml(FUNDING_SOURCE_LABELS[fundingSource] || '')}</label>
         <select class="jl-e-funding-ref">${fundingRefOptions}</select>
       </div>
-      <div class="field-row"><label>Estimated Hours</label><input class="jl-e-est-hours" type="number" min="0" value="${jl.EstimatedHours ?? ''}" /></div>
-      <div class="field-row"><label>Actual Hours</label><input class="jl-e-act-hours" type="number" min="0" value="${jl.ActualHours ?? ''}" /></div>
+      <div class="field-row"><label>Estimated Hours</label><input class="jl-e-est-hours" type="number" step="any" min="0" value="${jl.EstimatedHours ?? ''}" /></div>
+      <div class="field-row"><label>Actual Hours</label><input class="jl-e-act-hours" type="number" step="any" min="0" value="${jl.ActualHours ?? ''}" /></div>
       <div class="field-row"><label>Estimated Cost</label><input class="jl-e-est-cost" type="number" step="0.01" min="0" value="${jl.EstimatedCost ?? ''}" /></div>
       <div class="field-row"><label>Actual Cost</label><input class="jl-e-act-cost" type="number" step="0.01" min="0" value="${jl.ActualCost ?? ''}" />
         ${jl.LinkedExpenseCount ? `<p class="muted" style="margin-top:2px;font-size:0.8rem">+ $${jl.LinkedExpenseTotal.toLocaleString()} from ${jl.LinkedExpenseCount} linked expense${jl.LinkedExpenseCount === 1 ? '' : 's'} — this field is the manual/no-receipt amount only; totals elsewhere include both.</p>` : '<p class="muted" style="margin-top:2px;font-size:0.8rem">For costs with no receipt (invoice paid directly, donated materials). Link an expense instead when there is one.</p>'}
@@ -8475,7 +8475,7 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }
         <label>Start Time (optional)</label>
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
           <input class="jl-e-start-time" type="time" value="${jl.ScheduledStartTime ? jl.ScheduledStartTime.slice(0, 5) : ''}" style="max-width:140px" />
-          <input class="jl-e-duration-hours" type="number" min="0" step="0.25" placeholder="Duration (hrs)" value="${jl.ScheduledDurationHours ?? ''}" style="max-width:150px" />
+          <input class="jl-e-duration-hours" type="number" min="0" step="any" placeholder="Duration (hrs)" value="${jl.ScheduledDurationHours ?? ''}" style="max-width:150px" />
         </div>
         <p class="muted" style="font-size:0.8rem;margin-top:4px">Leave both blank for an all-day calendar entry — plenty of work is genuinely "sometime Tuesday." Set both to sync a timed event.</p>
       </div>
@@ -8661,7 +8661,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       ${logRows}
       <form id="addLogEntryForm" style="margin-top:10px">
         <div class="field-row"><label>Note</label><textarea name="note" required placeholder="What did you do?"></textarea></div>
-        <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
+        <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="any" min="0" /></div>
         <div class="field-row"><label>Update Status To (optional)</label>
           <select name="statusChange"><option value="" selected>— no change —</option>${workOrderStatuses.filter((s) => s.Name !== 'Deferred').map((s) => `<option>${escapeHtml(s.Name)}</option>`).join('')}</select>
           <p class="muted" style="font-size:0.8rem;margin-top:4px">Deferring requires a reason and revisit date — use the Status field above for that.</p>
@@ -8690,7 +8690,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       ${(crewRoster.volunteers.length || crewRoster.vendors.length) ? `
       <form id="addCrewSessionForm" style="margin-top:10px">
         <div class="field-row"><label>Date</label><input name="sessionDate" type="date" value="${isoDate(new Date())}" required /></div>
-        <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
+        <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="any" min="0" /></div>
         <div class="field-row"><label>Job Line (optional)</label>
           <select name="jobLineId"><option value="">— general WO time —</option>${jobLines.map((jl) => `<option value="${jl.Id}">${escapeHtml(jl.Title)}</option>`).join('')}</select>
         </div>
@@ -9114,7 +9114,7 @@ async function renderCrewHours() {
         <form id="logActivityForm">
           <div class="field-row"><label>Date</label><input name="sessionDate" type="date" value="${isoDate(new Date())}" required /></div>
           <div class="field-row"><label>Activity</label><input name="activity" required placeholder="e.g. Mowing, Grounds Cleanup" /></div>
-          <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="0.25" min="0" /></div>
+          <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="any" min="0" /></div>
           <div class="field-row"><label>Who was here?</label>
             <div class="skill-chips" id="activityAttendeeChips">
               ${volunteers.map((v) => `<span class="skill-chip crew-attendee-chip" data-kind="vol" data-id="${v.Id}">${escapeHtml(v.Name)}</span>`).join('')}
