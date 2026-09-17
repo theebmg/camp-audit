@@ -5534,6 +5534,7 @@ function adminTaskRowShape(r) {
     StatusId: r.status_id, StatusName: r.status_name, StatusCountsAsWorkPerformed: r.status_counts_as_work_performed,
     CategoryId: r.category_id, CategoryName: r.category_name,
     RecurringMonthlySavings: r.recurring_monthly_savings != null ? Number(r.recurring_monthly_savings) : null,
+    IncludeInBoardReport: r.include_in_board_report,
     AttachmentCount: r.attachment_count != null ? Number(r.attachment_count) : undefined,
     CreatedBy: r.created_by, CreatedAt: r.created_at, UpdatedAt: r.updated_at,
   };
@@ -5578,12 +5579,12 @@ async function resolveAdminTaskStatusId(statusId) {
   if (!rows[0]) { const e = new Error('No active admin task statuses — add one in Admin'); e.status = 400; throw e; }
   return rows[0].id;
 }
-export async function createAdminTask({ title, description, taskDate, hours, statusId, categoryId, recurringMonthlySavings, createdBy }) {
+export async function createAdminTask({ title, description, taskDate, hours, statusId, categoryId, recurringMonthlySavings, includeInBoardReport = true, createdBy }) {
   const resolvedStatusId = await resolveAdminTaskStatusId(statusId);
   const { rows } = await pool.query(
-    `INSERT INTO admin_tasks (title, description, task_date, hours, status_id, category_id, recurring_monthly_savings, created_by)
-     VALUES ($1,$2,COALESCE($3::date, current_date),$4,$5,$6,$7,$8) RETURNING id, title`,
-    [title, description || null, taskDate || null, hours ?? null, resolvedStatusId, categoryId || null, recurringMonthlySavings ?? null, createdBy || null]
+    `INSERT INTO admin_tasks (title, description, task_date, hours, status_id, category_id, recurring_monthly_savings, include_in_board_report, created_by)
+     VALUES ($1,$2,COALESCE($3::date, current_date),$4,$5,$6,$7,$8,$9) RETURNING id, title`,
+    [title, description || null, taskDate || null, hours ?? null, resolvedStatusId, categoryId || null, recurringMonthlySavings ?? null, includeInBoardReport !== false, createdBy || null]
   );
   await logActivity({ action: 'created', entityType: 'admin_task', entityId: rows[0].id, entityLabel: rows[0].title });
   return getAdminTask(rows[0].id);
@@ -5591,6 +5592,7 @@ export async function createAdminTask({ title, description, taskDate, hours, sta
 const ADMIN_TASK_COLUMNS = {
   title: 'title', description: 'description', taskDate: 'task_date', hours: 'hours',
   statusId: 'status_id', categoryId: 'category_id', recurringMonthlySavings: 'recurring_monthly_savings',
+  includeInBoardReport: 'include_in_board_report',
 };
 export async function updateAdminTask(id, fields) {
   const setCols = []; const vals = [];
@@ -5632,6 +5634,15 @@ export async function deleteAdminTask(id) {
 // Done as seeded; To Do and Cancelled don't). Savings are only totalled
 // over these same tasks: a cost reduction on a task that never happened
 // isn't a saving.
+// Board Report's Administrative Work section — same "counts as work
+// performed" rule as the Work Performed report, narrowed to flagged tasks.
+export async function getAdminTasksBoardReportRawData({ from, to }) {
+  const { rows } = await pool.query(
+    `${ADMIN_TASK_SELECT} WHERE s.counts_as_work_performed AND t.include_in_board_report AND t.task_date BETWEEN $1 AND $2 ORDER BY t.task_date, t.id`,
+    [from, to]
+  );
+  return rows.map(adminTaskRowShape);
+}
 export async function getAdminTasksWorkPerformedRawData({ from, to }) {
   const { rows } = await pool.query(
     `${ADMIN_TASK_SELECT} WHERE s.counts_as_work_performed AND t.task_date BETWEEN $1 AND $2 ORDER BY t.task_date, t.id`,

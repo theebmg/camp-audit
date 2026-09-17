@@ -454,13 +454,14 @@ router.get('/admin-tasks/:id', async (req, res, next) => {
 });
 router.post('/admin-tasks', async (req, res, next) => {
   try {
-    const { title, description, taskDate, hours, statusId, categoryId, recurringMonthlySavings } = req.body || {};
+    const { title, description, taskDate, hours, statusId, categoryId, recurringMonthlySavings, includeInBoardReport } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ ok: false, error: 'Title is required' });
     const task = await createAdminTask({
       title: title.trim(), description: description?.trim() || null, taskDate: taskDate || null,
       hours: adminTaskNumber(hours, 'Hours') ?? null, statusId: statusId ? Number(statusId) : null,
       categoryId: categoryId ? Number(categoryId) : null,
       recurringMonthlySavings: adminTaskNumber(recurringMonthlySavings, 'Recurring monthly savings') ?? null,
+      includeInBoardReport: includeInBoardReport !== false,
       createdBy: currentUsername(),
     });
     res.json({ ok: true, task });
@@ -486,6 +487,7 @@ router.patch('/admin-tasks/:id', async (req, res, next) => {
     }
     if ('categoryId' in body) fields.categoryId = body.categoryId ? Number(body.categoryId) : null;
     if ('recurringMonthlySavings' in body) fields.recurringMonthlySavings = adminTaskNumber(body.recurringMonthlySavings, 'Recurring monthly savings');
+    if ('includeInBoardReport' in body) fields.includeInBoardReport = !!body.includeInBoardReport;
     const task = await updateAdminTask(req.params.id, fields);
     if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
     res.json({ ok: true, task });

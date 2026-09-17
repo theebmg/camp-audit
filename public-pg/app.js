@@ -4452,6 +4452,9 @@ async function renderAdminTaskDetail({ id } = {}) {
           <input name="recurringMonthlySavings" type="number" step="0.01" min="0" value="${task?.RecurringMonthlySavings ?? ''}" placeholder="Leave blank unless this cut a recurring cost" />
           <p class="muted" style="margin-top:2px;font-size:0.8rem">Only when the task eliminated or reduced a recurring cost — e.g. a cancelled $45/month subscription. The report totals it monthly and annualized.</p>
         </div>
+        <div class="field-row">
+          <label class="skill-chip ${task?.IncludeInBoardReport !== false ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="includeInBoardReport" style="margin-right:6px" ${task?.IncludeInBoardReport !== false ? 'checked' : ''} />Include in board report</label>
+        </div>
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Save</button>
           ${id ? '<button type="button" class="btn btn-secondary" id="deleteAdminTaskBtn">Delete</button>' : ''}
@@ -4460,6 +4463,11 @@ async function renderAdminTaskDetail({ id } = {}) {
       ${id ? '<div id="adminTaskAttachments"></div>' : '<p class="muted" style="margin-top:10px">You can attach documents once this is saved.</p>'}
       ${task ? `<p class="muted" style="margin-top:10px;font-size:0.8rem">Added${task.CreatedBy ? ` by ${escapeHtml(task.CreatedBy)}` : ''} ${escapeHtml(formatDateNice(task.CreatedAt))}</p>` : ''}
     </div>`;
+
+  const boardReportCheckbox = document.querySelector('#adminTaskForm input[name="includeInBoardReport"]');
+  boardReportCheckbox.addEventListener('change', () => {
+    boardReportCheckbox.closest('.skill-chip').classList.toggle('selected', boardReportCheckbox.checked);
+  });
 
   if (id) {
     renderAttachmentSection('admin_task', id, document.getElementById('adminTaskAttachments'), {
@@ -4478,6 +4486,7 @@ async function renderAdminTaskDetail({ id } = {}) {
       statusId: fd.get('statusId'),
       categoryId: fd.get('categoryId') || null,
       recurringMonthlySavings: fd.get('recurringMonthlySavings') === '' ? null : fd.get('recurringMonthlySavings'),
+      includeInBoardReport: fd.has('includeInBoardReport'),
     };
     try {
       if (id) {

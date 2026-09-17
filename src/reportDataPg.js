@@ -4,6 +4,7 @@
 import {
   getAllComponentRowsWithAssetInfo, getBoardReportRawData, getBoardFocusItems, historicalAvgActualCost,
   getWorkPerformedRawData, getDeferredFindingsBacklogRawData, getVisitorActivityRawData, getAdminTasksWorkPerformedRawData,
+  getAdminTasksBoardReportRawData,
 } from './db.js';
 import { currentComponentState } from './components.js';
 import { FUNDING_SOURCE_LABELS } from './reports.js';
@@ -87,7 +88,10 @@ export async function buildBoardReportPg({ periodStart, periodEnd } = {}) {
   const start = periodStart || `${todayStr.slice(0, 7)}-01`;
   const end = periodEnd || todayStr;
 
-  const { openStatusRows, openFundingRows, completedRows, upcomingRows, overdueRows } = await getBoardReportRawData({ periodStart: start, periodEnd: end, todayStr });
+  const [{ openStatusRows, openFundingRows, completedRows, upcomingRows, overdueRows }, adminTasks] = await Promise.all([
+    getBoardReportRawData({ periodStart: start, periodEnd: end, todayStr }),
+    getAdminTasksBoardReportRawData({ from: start, to: end }),
+  ]);
 
   const statusCounts = new Map();
   const priorityCounts = new Map();
@@ -120,6 +124,24 @@ export async function buildBoardReportPg({ periodStart, periodEnd } = {}) {
     })),
     upcoming: upcomingRows.map(rowShape),
     overdue: overdueRows.map(rowShape),
+    adminWork: summarizeAdminTasks(adminTasks),
+  };
+}
+
+// Shared by the Work Performed and Board reports' Administrative Work
+// sections.
+function summarizeAdminTasks(adminTasks) {
+  const savingsTasks = adminTasks.filter((t) => t.RecurringMonthlySavings != null && t.RecurringMonthlySavings > 0);
+  const monthlySavings = Math.round(savingsTasks.reduce((s, t) => s + t.RecurringMonthlySavings, 0) * 100) / 100;
+  return {
+    tasks: adminTasks.map((t) => ({
+      id: t.Id, title: t.Title, description: t.Description, date: t.TaskDate, hours: t.Hours,
+      status: t.StatusName, category: t.CategoryName, recurringMonthlySavings: t.RecurringMonthlySavings,
+    })),
+    totalHours: Math.round(adminTasks.reduce((s, t) => s + (t.Hours || 0), 0) * 100) / 100,
+    savingsTaskCount: savingsTasks.length,
+    monthlySavings,
+    annualizedSavings: Math.round(monthlySavings * 12 * 100) / 100,
   };
 }
 
@@ -184,18 +206,7 @@ export async function buildWorkPerformedReportPg({ from, to }) {
   // total only over tasks that actually filled the field (blank is the
   // normal case, not $0); the section omits the savings line entirely when
   // none did.
-  const savingsTasks = adminTasks.filter((t) => t.RecurringMonthlySavings != null && t.RecurringMonthlySavings > 0);
-  const monthlySavings = Math.round(savingsTasks.reduce((s, t) => s + t.RecurringMonthlySavings, 0) * 100) / 100;
-  const adminWork = {
-    tasks: adminTasks.map((t) => ({
-      id: t.Id, title: t.Title, description: t.Description, date: t.TaskDate, hours: t.Hours,
-      status: t.StatusName, category: t.CategoryName, recurringMonthlySavings: t.RecurringMonthlySavings,
-    })),
-    totalHours: Math.round(adminTasks.reduce((s, t) => s + (t.Hours || 0), 0) * 100) / 100,
-    savingsTaskCount: savingsTasks.length,
-    monthlySavings,
-    annualizedSavings: Math.round(monthlySavings * 12 * 100) / 100,
-  };
+  const adminWork = summarizeAdminTasks(adminTasks);
 
   return {
     from, to, buildings,
