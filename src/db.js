@@ -3549,10 +3549,15 @@ export async function createReceiptInboundBatch({ subject, bodyText, bodyHtml, s
     if (!rows[0]) { await client.query('ROLLBACK'); return null; }
     const batchId = rows[0].id;
 
+    // purchase_date defaults to the day the email hit receipts@ (camp-local,
+    // not UTC — a 9pm Eastern forward is still that day), NOT the date
+    // regex-parsed out of the body: that parse grabs whatever date appears
+    // first (ship dates, footers) and left the field blank when it found
+    // nothing. Still editable at triage like every other field.
     const expenseRes = await client.query(
       `INSERT INTO expenses (vendor, amount, purchase_date, triage_status, batch_id, source, parsed_confidence)
-       VALUES ($1,$2,$3,'inbox',$4,'email',$5) RETURNING id`,
-      [parsed?.vendor || null, parsed?.amount ?? null, parsed?.purchaseDate || null, batchId, parsed?.confidence || 'none']
+       VALUES ($1,$2,($3::timestamptz AT TIME ZONE 'America/New_York')::date,'inbox',$4,'email',$5) RETURNING id`,
+      [parsed?.vendor || null, parsed?.amount ?? null, receivedAt || new Date(), batchId, parsed?.confidence || 'none']
     );
     const expenseId = expenseRes.rows[0].id;
 
