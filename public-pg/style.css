@@ -679,3 +679,162 @@ label {
   }
   :root:not([data-theme="light"]) .topbar { background: rgba(18, 20, 28, 0.88); }
 }
+
+/* ---------- Searchable combobox (§9) ----------
+   One component behind the funding source, asset, cabin-holder, vendor and
+   crew pickers. .ac-wrap/.ac-results/.ac-item base styles live in
+   index.html's <style> block (they predate this); what's here is the
+   keyboard-highlight state and the sizing the dropdown needs once a list can
+   be 300 rows long. */
+.cbx-results { max-height: 320px; overflow-y: auto; }
+.cbx-item.cbx-active { background: var(--accent-soft); color: var(--accent-dark); }
+.cbx-input { text-overflow: ellipsis; }
+
+/* ---------- Job Line Grid ---------- */
+.jlg-wrap {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+.jlg-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border); background: var(--surface-alt);
+}
+.jlg-toolbar-hint { flex: 1; min-width: 200px; font-size: 0.78rem; }
+.jlg-scroll { overflow-x: auto; }
+
+.jlg-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; table-layout: fixed; min-width: 900px; }
+.jlg-table th {
+  text-align: left; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--muted); font-weight: 700; padding: 7px 8px; border-bottom: 1px solid var(--border);
+  background: var(--surface-alt); position: sticky; top: 0; z-index: 3;
+}
+.jlg-table td { padding: 3px 6px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.jlg-table tr:last-child td { border-bottom: none; }
+/* Uniform row height is the whole point of the grid — a focused cell overlays
+   rather than pushing its neighbours around (§2). */
+.jlg-row { height: 40px; }
+.jlg-row.jlg-dragging { opacity: 0.4; }
+.jlg-row.jlg-drop-target td { box-shadow: inset 0 2px 0 var(--accent); }
+
+.jlg-c-idx { width: 54px; white-space: nowrap; color: var(--muted); }
+.jlg-th-title { width: 28%; }
+.jlg-th-estHours, .jlg-th-estCost { width: 90px; }
+.jlg-th-responsibility_class { width: 130px; }
+.jlg-th-status_id { width: 140px; }
+.jlg-th-scheduled_date { width: 150px; }
+.jlg-c-menu { width: 40px; text-align: center; }
+.jlg-drag { cursor: grab; user-select: none; margin-right: 4px; }
+.jlg-drag:active { cursor: grabbing; }
+.jlg-rownum { font-size: 0.75rem; }
+
+.jlg-table input, .jlg-table select, .jlg-table textarea {
+  width: 100%; padding: 5px 7px; font-size: 0.88rem; font-family: inherit;
+  border: 1px solid transparent; border-radius: 6px;
+  background: transparent; color: var(--text); text-overflow: ellipsis;
+}
+.jlg-table input:hover, .jlg-table select:hover, .jlg-table textarea:hover { border-color: var(--border); }
+.jlg-table input:focus, .jlg-table select:focus, .jlg-table textarea:focus {
+  outline: none; border-color: var(--accent); background: var(--surface);
+}
+.jlg-table .cbx-input { padding: 5px 7px; font-size: 0.88rem; border: 1px solid transparent; background: transparent; }
+
+/* Title cell: the textarea is the real control (so it can grow in height when
+   focused), and the div on top of it renders the one-line, ellipsis-truncated
+   view when it isn't. The div is pointer-events:none, so clicking the cell
+   still lands in the textarea underneath. */
+.jlg-c-title { position: relative; }
+.jlg-title {
+  resize: none; overflow: hidden; white-space: pre; height: 30px; line-height: 20px;
+  color: transparent; caret-color: transparent;
+}
+.jlg-title-display {
+  position: absolute; inset: 3px 6px; display: flex; align-items: center;
+  padding: 0 8px; pointer-events: none;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.jlg-title:focus {
+  position: absolute; left: 6px; right: 6px; top: 3px; z-index: 6;
+  white-space: pre-wrap; height: auto; min-height: 30px;
+  color: var(--text); caret-color: auto; background: var(--surface); box-shadow: var(--shadow-md);
+}
+.jlg-title:focus ~ .jlg-title-display { display: none; }
+
+/* Following vs pinned (§3): a dimmed, italic cell is showing row 1's value
+   and will keep tracking it; a solid one holds its own. */
+.jlg-follow, .jlg-follow .cbx-input { color: var(--muted); font-style: italic; }
+.jlg-error, .jlg-error .cbx-input {
+  border-color: var(--danger) !important; background: var(--danger-soft) !important; color: #991b1b;
+}
+.jlg-remove {
+  border: none; background: none; color: var(--muted); cursor: pointer;
+  font-size: 0.95rem; padding: 4px 6px; border-radius: 6px;
+}
+.jlg-remove:hover { background: var(--danger-soft); color: var(--danger); }
+
+.jlg-footer { padding: 9px 12px; border-top: 1px solid var(--border); background: var(--surface-alt); }
+.jlg-footer-total { font-size: 0.92rem; }
+.jlg-footer-breakdown { margin-top: 3px; font-size: 0.8rem; }
+.jlg-footer-error { margin-top: 4px; font-size: 0.82rem; color: var(--danger); font-weight: 600; }
+
+/* The legend IS the documentation for the grid's shortcuts (§4), so it stays
+   put at the bottom of the grid rather than hiding in a tooltip. */
+.jlg-legend {
+  position: sticky; bottom: 0;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  padding: 6px 12px; border-top: 1px solid var(--border);
+  background: var(--surface); color: var(--muted); font-size: 0.75rem;
+}
+.jlg-legend kbd {
+  font-family: inherit; font-size: 0.72rem; font-weight: 700;
+  background: var(--surface-alt); border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 5px; margin-right: 3px; color: var(--text);
+}
+.jlg-legend-sep { opacity: 0.5; }
+
+.jlg-cascade-pop {
+  position: relative; margin: 8px 10px; padding: 12px 14px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface); box-shadow: var(--shadow-md); z-index: 8;
+}
+.jlg-cascade-pop h4 { margin: 0 0 4px; font-size: 0.9rem; }
+.jlg-cascade-opt { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 0.9rem; cursor: pointer; }
+.jlg-cascade-opt input { width: auto; }
+
+.ac-quickcreate { position: relative; z-index: 4; }
+
+/* ---------- Row-delete undo toast (§6) ---------- */
+.action-toast { display: flex; align-items: center; gap: 14px; }
+.action-toast-btn {
+  background: none; border: none; color: var(--accent);
+  font: inherit; font-weight: 700; cursor: pointer; padding: 0;
+}
+.action-toast-btn:hover { text-decoration: underline; }
+
+/* ---------- Mobile reorder sheet (§7) ----------
+   Titles only, one row each, big arrow buttons — no touch drag, which is the
+   thing that never works on a phone. */
+.reorder-sheet {
+  position: fixed; inset: 0; z-index: 60;
+  background: var(--bg); display: flex; flex-direction: column;
+}
+.reorder-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--surface);
+}
+.reorder-head h3 { flex: 1; margin: 0; font-size: 1rem; }
+.reorder-cancel { background: none; border: none; font-size: 1.3rem; cursor: pointer; color: var(--muted); }
+.reorder-list { flex: 1; overflow-y: auto; padding: 10px 12px; }
+.reorder-row {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 10px 12px; margin-bottom: 8px;
+}
+.reorder-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reorder-move {
+  width: 46px; height: 46px; flex-shrink: 0;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--surface-alt); color: var(--text); font-size: 1.15rem; cursor: pointer;
+}
+.reorder-move:disabled { opacity: 0.35; cursor: default; }

@@ -164,6 +164,34 @@ function confirmDialog(message, { confirmLabel = 'Confirm', cancelLabel = 'Cance
   });
 }
 
+// Pick one row from a list, in the same floating modal confirmDialog uses.
+// Resolves the chosen value, or null on cancel.
+function pickFromListDialog(title, items, { cancelLabel = 'Cancel' } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" role="dialog" aria-modal="true">
+        <h3 style="margin-top:0">${escapeHtml(title)}</h3>
+        <div style="max-height:50vh;overflow-y:auto">
+          ${items.map((i) => `<div class="list-item pick-row" data-value="${escapeHtml(i.value)}">
+            <span>${escapeHtml(i.label)}${i.sublabel ? `<div class="muted">${escapeHtml(i.sublabel)}</div>` : ''}</span>
+          </div>`).join('')}
+        </div>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+          <button type="button" class="btn btn-secondary modal-cancel">${escapeHtml(cancelLabel)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    function close(result) { document.removeEventListener('keydown', onKeydown); overlay.remove(); resolve(result); }
+    function onKeydown(e) { if (e.key === 'Escape') close(null); }
+    overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(null); });
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => close(null));
+    overlay.querySelectorAll('.pick-row').forEach((el) => el.addEventListener('click', () => close(el.dataset.value)));
+    document.addEventListener('keydown', onKeydown);
+  });
+}
+
 // Sets #app's content and replays the fade-in — every view render should go
 // through this instead of `app.innerHTML =` directly, so view swaps feel like
 // transitions rather than instant flashes.
@@ -189,6 +217,11 @@ const LOADING_HTML = '<div class="loading-wrap"><div class="spinner"></div><span
 // better experience on a laptop-width window anyway rather than 3 cramped
 // columns.
 const DRILLDOWN_MIN_WIDTH = 1750;
+// Below this the job line grid isn't a sensible editing surface — the phone
+// stays on the card view for reading, status changes, notes/photos and the
+// reorder sheet (§7). Not a media-query breakpoint; it only gates the entry
+// point into the grid.
+const GRID_MIN_WIDTH = 900;
 const DRILLDOWN_VIEWS = new Set(['locations', 'workOrders', 'admin']); // views with a pane variant to swap to/from on resize
 
 // ---- Theme (Light/Dark/System) + accent color — persisted per-browser.
@@ -280,40 +313,73 @@ function bucketColorKey(bucket) {
 // list — see the migration brief's "dynamic assets" requirement), and offers
 // "+ Add new asset" when nothing matches. Call this once per container;
 // returns { getSelected() } so the caller can read the chosen asset on submit.
+// Asset picker (§9). Built on the shared combobox, so it gets substring
+// matching and full keyboard operation for free; what's specific to assets is
+// the quick-create flow below, which lets a WO for a brand-new spot be raised
+// without leaving the form.
+//
+// The roster (~340 rows) is fetched once per page and filtered in the
+// browser. The old implementation fired a debounced /assets-search request on
+// every keystroke, which also meant a prefix-ish server LIKE rather than the
+// match-anywhere behaviour the brief asks for.
+let allAssetsPromise = null;
+function loadAllAssets() {
+  if (!allAssetsPromise) allAssetsPromise = api('/api/pg/assets-all').then((r) => r.assets).catch(() => []);
+  return allAssetsPromise;
+}
+const assetOptionOf = (a) => ({ value: a.Id, label: a.Name, sublabel: a.locationName || null });
+
 function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {} } = {}) {
   let selected = initialAsset;
-  let searchTimer;
-  container.classList.add('ac-wrap');
-  container.innerHTML = `
-    <input type="text" class="ac-input" autocomplete="off" placeholder="Type to search assets…"
-      value="${initialAsset ? escapeHtml(initialAsset.Name) : ''}" />
-    <div class="ac-results" hidden></div>`;
-  const input = container.querySelector('.ac-input');
-  const resultsEl = container.querySelector('.ac-results');
+  let assets = initialAsset ? [initialAsset] : [];
 
-  function renderResults(items, query) {
-    const rows = items.map((a) => `
-      <div class="ac-item" data-id="${a.Id}" data-name="${escapeHtml(a.Name)}">
-        ${escapeHtml(a.Name)}${a.locationName ? ` <span class="muted">— ${escapeHtml(a.locationName)}</span>` : ''}
-      </div>`).join('');
-    const addRow = query ? `<div class="ac-item ac-add" data-add-name="${escapeHtml(query)}">➕ Add new asset "${escapeHtml(query)}"…</div>` : '';
-    resultsEl.innerHTML = rows + addRow;
-    resultsEl.hidden = false;
-    resultsEl.querySelectorAll('.ac-item[data-id]').forEach((el) => el.addEventListener('click', () => {
-      selected = { Id: Number(el.dataset.id), Name: el.dataset.name };
-      input.value = el.dataset.name;
-      resultsEl.hidden = true;
+  const wrap = document.createElement('div');
+  const panel = document.createElement('div');
+  panel.className = 'ac-quickcreate';
+  panel.hidden = true;
+  container.innerHTML = '';
+  container.append(wrap, panel);
+
+  const cbx = mountCombobox(wrap, {
+    options: assets.map(assetOptionOf),
+    value: initialAsset ? initialAsset.Id : null,
+    placeholder: 'Type to search assets…',
+    emptyText: 'No asset matches',
+    extraRowHtml: (query) => (query ? `<div class="ac-item ac-add" data-add-name="${escapeHtml(query)}">➕ Add new asset "${escapeHtml(query)}"…</div>` : ''),
+    onExtraRow: (resultsEl, query) => {
+      resultsEl.querySelector('.ac-add')?.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        showQuickCreate(query);
+        cbx.input.blur(); // closes the dropdown; the typed name is already in the panel
+      });
+    },
+    onSelect: (opt) => {
+      selected = opt ? assets.find((a) => String(a.Id) === String(opt.value)) || null : null;
       onSelect(selected);
-    }));
-    resultsEl.querySelector('.ac-add')?.addEventListener('click', () => showQuickCreateForm(resultsEl.querySelector('.ac-add').dataset.addName));
+    },
+  });
+
+  loadAllAssets().then((list) => {
+    assets = list;
+    cbx.setOptions(list.map(assetOptionOf));
+  });
+
+  function adopt(asset) {
+    if (!assets.some((a) => a.Id === asset.Id)) assets = [...assets, asset];
+    cbx.setOptions(assets.map(assetOptionOf));
+    selected = asset;
+    cbx.setValue(asset.Id);
   }
 
   // A location matters for reporting, so the quick-add flow asks for it (and
   // asset type) inline rather than creating a bare, unlocated asset — the
   // rest of an asset's properties still go through Edit Asset afterward,
   // matching the "deliberate action" spirit for anything beyond the basics.
-  async function showQuickCreateForm(name) {
-    resultsEl.innerHTML = `<div class="ac-item" style="cursor:default">
+  // It lives in its own panel below the field, not inside the dropdown, so
+  // clicking into its inputs can't dismiss it.
+  function showQuickCreate(name) {
+    panel.hidden = false;
+    panel.innerHTML = `<div class="card" style="margin-top:8px">
       <div class="field-row" style="margin-bottom:8px"><label>New asset name</label><input class="ac-new-name" value="${escapeHtml(name)}" /></div>
       <div class="field-row" style="margin-bottom:8px"><label>Location</label><select class="ac-new-location"><option value="">— unset —</option><option value="__new__">➕ New location…</option></select></div>
       <div class="ac-new-loc-fields" hidden>
@@ -327,32 +393,32 @@ function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {
         <button type="button" class="btn btn-secondary ac-create-cancel">Cancel</button>
       </div>
     </div>`;
-    const locSelect = resultsEl.querySelector('.ac-new-location');
-    const newLocFields = resultsEl.querySelector('.ac-new-loc-fields');
+    const locSelect = panel.querySelector('.ac-new-location');
+    const newLocFields = panel.querySelector('.ac-new-loc-fields');
     api('/api/pg/locations').then(({ locations }) => {
       const opts = locations.map((l) => `<option value="${l.Id}">${escapeHtml(l.Name)}</option>`).join('');
       locSelect.insertAdjacentHTML('beforeend', opts);
-      resultsEl.querySelector('.ac-new-loc-parent').insertAdjacentHTML('beforeend', opts);
+      panel.querySelector('.ac-new-loc-parent').insertAdjacentHTML('beforeend', opts);
     });
     // A location that doesn't exist yet can be created in the same step, so
     // a WO for a brand-new spot doesn't mean leaving the form for Locations.
     locSelect.addEventListener('change', () => {
       newLocFields.hidden = locSelect.value !== '__new__';
-      if (!newLocFields.hidden) resultsEl.querySelector('.ac-new-loc-name').focus();
+      if (!newLocFields.hidden) panel.querySelector('.ac-new-loc-name').focus();
     });
-    resultsEl.querySelector('.ac-create-cancel').addEventListener('click', () => { resultsEl.hidden = true; });
-    resultsEl.querySelector('.ac-create-confirm').addEventListener('click', async () => {
-      const finalName = resultsEl.querySelector('.ac-new-name').value.trim();
+    panel.querySelector('.ac-create-cancel').addEventListener('click', () => { panel.hidden = true; panel.innerHTML = ''; });
+    panel.querySelector('.ac-create-confirm').addEventListener('click', async () => {
+      const finalName = panel.querySelector('.ac-new-name').value.trim();
       if (!finalName) { toast('Name is required'); return; }
       let locationId = locSelect.value || undefined;
-      const newLocName = resultsEl.querySelector('.ac-new-loc-name').value.trim();
+      const newLocName = panel.querySelector('.ac-new-loc-name').value.trim();
       if (locationId === '__new__' && !newLocName) { toast('New location name is required'); return; }
       try {
         if (locationId === '__new__') {
           const { location } = await api('/api/pg/locations', { method: 'POST', body: JSON.stringify({
             name: newLocName,
-            parentLocationId: resultsEl.querySelector('.ac-new-loc-parent').value || undefined,
-            locationType: resultsEl.querySelector('.ac-new-loc-type').value.trim() || undefined,
+            parentLocationId: panel.querySelector('.ac-new-loc-parent').value || undefined,
+            locationType: panel.querySelector('.ac-new-loc-type').value.trim() || undefined,
           }) });
           locationId = location.Id;
           // Swap the placeholder for the real row so a failed asset create
@@ -363,90 +429,58 @@ function mountAssetCombobox(container, { initialAsset = null, onSelect = () => {
           toast(`Created location "${location.Name}"`);
         }
         const { asset } = await api('/api/pg/assets', { method: 'POST', body: JSON.stringify({
-          name: finalName, locationId, assetType: resultsEl.querySelector('.ac-new-type').value.trim() || undefined,
+          name: finalName, locationId, assetType: panel.querySelector('.ac-new-type').value.trim() || undefined,
         }) });
-        selected = asset;
-        input.value = asset.Name;
-        resultsEl.hidden = true;
+        panel.hidden = true; panel.innerHTML = '';
+        adopt(asset);
         toast(`Created asset "${asset.Name}"`);
         onSelect(selected);
       } catch (err) { toast(err.message); }
     });
   }
 
-  input.addEventListener('input', () => {
-    selected = null;
-    onSelect(null);
-    clearTimeout(searchTimer);
-    const q = input.value.trim();
-    if (!q) { resultsEl.hidden = true; return; }
-    searchTimer = setTimeout(async () => {
-      const { assets } = await api(`/api/pg/assets-search?q=${encodeURIComponent(q)}`);
-      renderResults(assets, q);
-    }, 250);
-  });
-  input.addEventListener('focus', () => { if (input.value.trim() && resultsEl.innerHTML) resultsEl.hidden = false; });
-  document.addEventListener('click', (e) => { if (!container.contains(e.target)) resultsEl.hidden = true; });
-
   return {
     getSelected: () => selected,
     // Programmatic pick (e.g. a cabin holder's cabin defaulting a visit's
     // asset) — same end state as clicking a result, onSelect included.
     setSelected: (asset) => {
-      selected = asset || null;
-      input.value = asset ? asset.Name : '';
-      resultsEl.hidden = true;
+      if (asset) adopt(asset); else { selected = null; cbx.setValue(null); }
       onSelect(selected);
     },
   };
 }
 
 // Cabin-holder search field. The only way a record gets a cabin_holder_id:
-// typing narrows the roster, and nothing is linked until a row is clicked —
-// editing the text afterward drops the link again rather than guessing which
-// holder the new text means. The roster is ~200 names, fetched once and
+// typing narrows the roster, and nothing is linked until a row is chosen —
+// clearing the text afterward drops the link again rather than guessing which
+// holder the new text means. The roster is ~300 names, fetched once and
 // filtered client-side (listCabinHolders also syncs from assets.lodge_holder
 // on read, so it's always current).
+let cabinHolderPromise = null;
+function loadCabinHolders() {
+  if (!cabinHolderPromise) cabinHolderPromise = api('/api/pg/budget/cabin-holders').then((r) => r.items).catch(() => []);
+  return cabinHolderPromise;
+}
 function mountCabinHolderCombobox(container, { initialHolder = null, onSelect = () => {} } = {}) {
   let selected = initialHolder;
-  let roster = null;
-  container.classList.add('ac-wrap');
-  container.innerHTML = `
-    <input type="text" class="ac-input" autocomplete="off" placeholder="Type to search cabin holders…"
-      value="${initialHolder ? escapeHtml(initialHolder.Name) : ''}" />
-    <div class="ac-results" hidden></div>`;
-  const input = container.querySelector('.ac-input');
-  const resultsEl = container.querySelector('.ac-results');
+  let roster = initialHolder ? [initialHolder] : [];
+  const holderOption = (h) => ({ value: h.Id, label: h.Name, sublabel: h.LinkedAssets?.length ? h.LinkedAssets.map((a) => a.Name).join(', ') : null });
 
-  async function loadRoster() {
-    if (!roster) roster = (await api('/api/pg/budget/cabin-holders')).items;
-    return roster;
-  }
-  input.addEventListener('input', async () => {
-    const hadSelection = !!selected;
-    selected = null;
-    if (hadSelection) onSelect(null);
-    const q = input.value.trim().toLowerCase();
-    if (!q) { resultsEl.hidden = true; return; }
-    const matches = (await loadRoster()).filter((h) => h.Name.toLowerCase().includes(q)).slice(0, 20);
-    resultsEl.innerHTML = matches.map((h) => `
-      <div class="ac-item" data-id="${h.Id}">
-        ${escapeHtml(h.Name)}${h.LinkedAssets?.length ? ` <span class="muted">— ${escapeHtml(h.LinkedAssets.map((a) => a.Name).join(', '))}</span>` : ''}
-      </div>`).join('') || '<div class="ac-item muted" style="cursor:default">No cabin holder matches — leave this blank for a one-off visitor.</div>';
-    resultsEl.hidden = false;
-    resultsEl.querySelectorAll('.ac-item[data-id]').forEach((el) => el.addEventListener('click', () => {
-      selected = roster.find((h) => String(h.Id) === el.dataset.id);
-      input.value = selected.Name;
-      resultsEl.hidden = true;
+  const cbx = mountCombobox(container, {
+    options: roster.map(holderOption),
+    value: initialHolder ? initialHolder.Id : null,
+    placeholder: 'Type to search cabin holders…',
+    emptyText: 'No cabin holder matches — leave this blank for a one-off visitor.',
+    onSelect: (opt) => {
+      selected = opt ? roster.find((h) => String(h.Id) === String(opt.value)) || null : null;
       onSelect(selected);
-    }));
+    },
   });
-  input.addEventListener('focus', () => { if (input.value.trim() && !selected && resultsEl.innerHTML) resultsEl.hidden = false; });
-  document.addEventListener('click', (e) => { if (!container.contains(e.target)) resultsEl.hidden = true; });
+  loadCabinHolders().then((list) => { roster = list; cbx.setOptions(list.map(holderOption)); });
 
   return {
     getSelected: () => selected,
-    clear: () => { selected = null; input.value = ''; resultsEl.hidden = true; onSelect(null); },
+    clear: () => { selected = null; cbx.setValue(null); onSelect(null); },
   };
 }
 
@@ -612,7 +646,7 @@ async function renderAttachmentEditPanel(a, roles, entityType, entityId, contain
       <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="attach-include" ${a.IncludeInReport ? 'checked' : ''} /> Include in board report</label>
       ${entityType === 'job_line' ? `
       <div class="quote-fields" ${a.RoleName === 'Quote' ? '' : 'hidden'}>
-        <div class="field-row"><label>Vendor</label><select class="attach-vendor"><option value="">— unset —</option>${vendorsRes.vendors.map((v) => `<option value="${v.Id}" ${a.VendorId === v.Id ? 'selected' : ''}>${escapeHtml(v.Name)}</option>`).join('')}</select></div>
+        <div class="field-row"><label>Vendor</label><div class="attach-vendor"></div></div>
         <div class="field-row"><label>Amount</label><input class="attach-amount" type="number" step="0.01" value="${a.QuotedAmount ?? ''}" /></div>
         <div class="field-row"><label>Date</label><input class="attach-quote-date" type="date" value="${(a.QuoteDate || '').slice(0, 10)}" /></div>
         <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="attach-selected-quote" ${a.IsSelectedQuote ? 'checked' : ''} /> This is the selected quote</label>
@@ -628,13 +662,22 @@ async function renderAttachmentEditPanel(a, roles, entityType, entityId, contain
     const qf = panel.querySelector('.quote-fields');
     if (qf) qf.hidden = Number(e.target.value) !== quoteRoleId;
   });
+  // §9: the vendor list is long enough to be worth searching rather than
+  // scrolling, so it uses the shared combobox like every other long list.
+  const vendorMount = panel.querySelector('.attach-vendor');
+  const vendorCbx = vendorMount ? mountCombobox(vendorMount, {
+    options: vendorsRes.vendors.map((v) => ({ value: v.Id, label: v.Name })),
+    value: a.VendorId ?? null,
+    placeholder: '— unset —',
+    emptyText: 'No vendor matches',
+  }) : null;
   panel.querySelector('.attach-save').addEventListener('click', async () => {
     try {
       await api(`/api/pg/attachment-links/${a.LinkId}`, { method: 'PATCH', body: JSON.stringify({
         roleId: panel.querySelector('.attach-role').value || null,
         caption: panel.querySelector('.attach-caption').value || null,
         includeInReport: panel.querySelector('.attach-include').checked,
-        vendorId: panel.querySelector('.attach-vendor')?.value || null,
+        vendorId: vendorCbx ? vendorCbx.getValue() : null,
         quotedAmount: panel.querySelector('.attach-amount')?.value || null,
         quoteDate: panel.querySelector('.attach-quote-date')?.value || null,
         isSelectedQuote: panel.querySelector('.attach-selected-quote')?.checked || false,
@@ -1017,6 +1060,10 @@ function renderBreadcrumbs() {
 
 async function render(view, params = {}) {
   try {
+    // #app is replaced wholesale on every view swap, so anything holding a
+    // window-level listener (the grid's unsaved-changes guard, its autosave
+    // timer) has to be torn down here rather than waiting to be garbage.
+    destroyActiveJobLineGrid();
     if (view === 'login') { await renderLogin(); return fadeInApp(); }
     if (!state.user) { await renderLogin(); return fadeInApp(); }
     if (!state.options) state.options = await api('/api/pg/options');
@@ -1069,6 +1116,7 @@ async function render(view, params = {}) {
       workOrders: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderWorkOrdersDrilldown(params) : renderWorkOrders(params)),
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
+      editWorkOrderLines: () => renderEditWorkOrderLines(params),
       crew: () => renderCrew(),
       crewHours: () => renderCrewHours(),
       adminUsers: () => renderAdminUsers(),
@@ -5650,8 +5698,10 @@ async function renderAdminGcal(container = app) {
 async function renderAdminWoTemplates(container = app) {
   if (container === app) setChrome({ title: 'Work Order Templates', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
-  const [tplRes, optsRes] = await Promise.all([api('/api/pg/work-order-templates'), Promise.resolve(state.options)]);
+  const [tplRes, gridCtx] = await Promise.all([api('/api/pg/work-order-templates'), loadGridContext()]);
+  const optsRes = state.options;
   const templates = tplRes.templates;
+  const { fundingOptions } = gridCtx;
   const fieldTitles = optsRes.propertyFields.map((f) => f.title);
   let editingId = null; // null | 'new' | number
 
@@ -5659,9 +5709,17 @@ async function renderAdminWoTemplates(container = app) {
   // class); asset_update_defaults is the separate, older "also change an
   // asset field" blueprint — the two got renamed apart in migration 0038/0039
   // specifically so "job line" stops meaning two different things.
-  const jlDefaultRowHtml = (row = {}) => `<div class="inline-add-row jld-row" style="align-items:center">
-    <input class="jld-title" value="${escapeHtml(row.title || '')}" placeholder="Job line title…" style="flex:1" />
-    <select class="jld-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${row.responsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
+  // One row per work_order_template_lines row (§8). Deliberately no date
+  // field: a template says what work is done, never when.
+  const jlDefaultRowHtml = (row = {}) => `<div class="inline-add-row jld-row" style="align-items:center;flex-wrap:wrap">
+    <input class="jld-title" value="${escapeHtml(row.Title || '')}" placeholder="Job line title…" style="flex:2;min-width:160px" />
+    <select class="jld-resp">
+      <option value="">— responsibility unset —</option>
+      ${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${row.ResponsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}
+    </select>
+    <div class="jld-funding" data-value="${row.FundingSource ? escapeHtml(fundingOptionValue(row.FundingSource, row.FundingRefId)) : ''}" style="flex:1;min-width:160px"></div>
+    <input class="jld-hours" type="number" step="any" min="0" placeholder="Hrs" value="${row.EstimatedHours ?? ''}" style="width:80px" />
+    <input class="jld-cost" type="number" step="0.01" min="0" placeholder="Cost" value="${row.EstimatedCost ?? ''}" style="width:100px" />
     <button type="button" class="btn btn-secondary row-remove">✕</button>
   </div>`;
   const auDefaultRowHtml = (row = {}) => `<div class="inline-add-row aud-row" style="align-items:center">
@@ -5671,18 +5729,19 @@ async function renderAdminWoTemplates(container = app) {
     </div>`;
 
   function formHtml(t) {
-    const jlRows = (t?.JobLineDefaults || []).map(jlDefaultRowHtml).join('');
+    const jlRows = (t?.Lines || []).map(jlDefaultRowHtml).join('');
     const auRows = (t?.AssetUpdateDefaults || []).map(auDefaultRowHtml).join('');
     return `<div class="card">
       <h3>${t ? `Edit "${escapeHtml(t.Name)}"` : 'New Template'}</h3>
       <div class="field-row"><label>Template Name</label><input class="tf-name" value="${escapeHtml(t?.Name || '')}" placeholder="e.g. Winterization" required /></div>
+      <div class="field-row"><label>Description</label><input class="tf-desc" value="${escapeHtml(t?.Description || '')}" placeholder="When to reach for this one" /></div>
       <div class="field-row"><label>Default Title</label><input class="tf-title" value="${escapeHtml(t?.DefaultTitle || '')}" placeholder="Fills in the WO title — you can still edit it per use" /></div>
       <div class="field-row"><label>Default Priority</label>
         <select class="tf-priority"><option value="">— none —</option>${['Low', 'Medium', 'High', 'Urgent'].map((p) => `<option ${t?.DefaultPriority === p ? 'selected' : ''}>${p}</option>`).join('')}</select>
       </div>
       <div class="field-row"><label>Default Description</label><textarea class="tf-description">${escapeHtml(t?.DefaultDescription || '')}</textarea></div>
       <div class="field-row"><label>Default Job Lines</label>
-        <p class="muted" style="margin:2px 0 8px">Pre-fills these job lines (title + responsibility) on every WO created from this template. Funding/hours/cost are set per use.</p>
+        <p class="muted" style="margin:2px 0 8px">Pre-fills these lines on every WO created from this template. A field left blank here follows row 1 in the grid; one with a value arrives pinned. Dates are never stored on a template.</p>
         <div class="tf-job-lines">${jlRows}</div>
         <button type="button" class="btn btn-secondary tf-add-line" style="margin-top:6px">+ Add Job Line</button>
       </div>
@@ -5704,7 +5763,8 @@ async function renderAdminWoTemplates(container = app) {
         <div>
           <strong>${escapeHtml(t.Name)}</strong>
           <div class="muted">${escapeHtml(t.DefaultTitle || '')}${t.DefaultPriority ? ' · ' + escapeHtml(t.DefaultPriority) : ''}</div>
-          ${t.JobLineDefaults?.length ? `<div class="muted">${t.JobLineDefaults.length} default job line${t.JobLineDefaults.length > 1 ? 's' : ''}</div>` : ''}
+          ${t.Description ? `<div class="muted">${escapeHtml(t.Description)}</div>` : ''}
+          ${t.Lines?.length ? `<div class="muted">${t.Lines.length} job line${t.Lines.length > 1 ? 's' : ''}</div>` : ''}
         </div>
         <div class="btn-row" style="margin-top:0">
           <button class="btn btn-secondary tpl-edit" data-id="${t.Id}">Edit</button>
@@ -5729,12 +5789,14 @@ async function renderAdminWoTemplates(container = app) {
     container.querySelectorAll('.tf-cancel').forEach((btn) => btn.addEventListener('click', () => { editingId = null; draw(); }));
     container.querySelectorAll('.tf-add-line').forEach((btn) => btn.addEventListener('click', () => {
       btn.previousElementSibling.insertAdjacentHTML('beforeend', jlDefaultRowHtml());
+      mountTemplateFundingPickers();
       wireRemoveButtons();
     }));
     container.querySelectorAll('.tf-add-au').forEach((btn) => btn.addEventListener('click', () => {
       btn.previousElementSibling.insertAdjacentHTML('beforeend', auDefaultRowHtml());
       wireRemoveButtons();
     }));
+    mountTemplateFundingPickers();
     wireRemoveButtons();
 
     container.querySelectorAll('.tpl-delete').forEach((btn) => btn.addEventListener('click', async () => {
@@ -5748,17 +5810,27 @@ async function renderAdminWoTemplates(container = app) {
       const card = btn.closest('.card');
       const name = card.querySelector('.tf-name').value.trim();
       if (!name) { toast('Template name is required'); return; }
-      const jobLineDefaults = [...card.querySelectorAll('.jld-row')].map((row) => ({
-        title: row.querySelector('.jld-title').value.trim(), responsibilityClass: row.querySelector('.jld-resp').value,
-      })).filter((r) => r.title);
+      const lines = [...card.querySelectorAll('.jld-row')].map((row) => {
+        const funding = row.querySelector('.jld-funding')._cbx?.getValue();
+        const parsed = funding ? parseFundingOptionValue(funding) : null;
+        return {
+          title: row.querySelector('.jld-title').value.trim(),
+          responsibilityClass: row.querySelector('.jld-resp').value || null,
+          fundingSource: parsed ? parsed.source : null,
+          fundingRefId: parsed ? parsed.refId : null,
+          estimatedHours: row.querySelector('.jld-hours').value || null,
+          estimatedCost: row.querySelector('.jld-cost').value || null,
+        };
+      }).filter((r) => r.title);
       const assetUpdateDefaults = [...card.querySelectorAll('.aud-row')].map((row) => ({
         targetField: row.querySelector('.aud-field').value, newValue: row.querySelector('.aud-value').value,
       })).filter((r) => r.newValue.trim());
       const fields = {
-        name, defaultTitle: card.querySelector('.tf-title').value.trim(),
+        name, description: card.querySelector('.tf-desc').value.trim(),
+        defaultTitle: card.querySelector('.tf-title').value.trim(),
         defaultPriority: card.querySelector('.tf-priority').value,
         defaultDescription: card.querySelector('.tf-description').value.trim(),
-        jobLineDefaults, assetUpdateDefaults,
+        lines, assetUpdateDefaults,
       };
       const id = btn.dataset.id;
       try {
@@ -5767,6 +5839,21 @@ async function renderAdminWoTemplates(container = app) {
         renderAdminWoTemplates(container);
       } catch (err) { toast(err.message); }
     }));
+  }
+
+  // Blank means "this template doesn't decide the funding" — the line will
+  // follow row 1 in the grid (§8), so the picker starts empty rather than
+  // silently defaulting to Operating Budget.
+  function mountTemplateFundingPickers() {
+    container.querySelectorAll('.jld-funding').forEach((el) => {
+      if (el._cbx) return;
+      el._cbx = mountCombobox(el, {
+        options: fundingOptions,
+        value: el.dataset.value || null,
+        placeholder: '— funding follows row 1 —',
+        emptyText: 'No funding source matches',
+      });
+    });
   }
 
   function wireRemoveButtons() {
@@ -6136,8 +6223,9 @@ async function renderAdminWorkOrderStatuses(container = app) {
   const rows = statuses.map((s) => `
     <div class="list-item" style="cursor:default;flex-wrap:wrap">
       <span><span class="pill" style="background:${s.Color}1a;color:${s.Color};border:1px solid ${s.Color}66">${escapeHtml(s.Name)}</span>
-        ${s.IsTerminal ? '<span class="muted">terminal</span>' : ''}${!s.Active ? ' <span class="pill">inactive</span>' : ''}</span>
+        ${s.IsTerminal ? '<span class="muted">terminal</span>' : ''}${s.IsReview ? ' <span class="pill good">review</span>' : ''}${!s.Active ? ' <span class="pill">inactive</span>' : ''}</span>
       <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary wos-toggle-review" data-id="${s.Id}" data-review="${s.IsReview}" title="The status the 'all lines resolved' prompt offers to move a work order to">${s.IsReview ? 'Unset review' : 'Mark as review'}</button>
         <button class="btn btn-secondary wos-toggle-active" data-id="${s.Id}" data-active="${s.Active}">${s.Active ? 'Deactivate' : 'Reactivate'}</button>
         <button class="btn btn-secondary wos-delete" data-id="${s.Id}" data-name="${escapeHtml(s.Name)}">Delete</button>
       </span>
@@ -6154,6 +6242,13 @@ async function renderAdminWorkOrderStatuses(container = app) {
         <option value="cost" ${displaySettings.WoProgressWeighting === 'cost' ? 'selected' : ''}>Cost-weighted</option>
         <option value="count" ${displaySettings.WoProgressWeighting === 'count' ? 'selected' : ''}>Line-count-weighted</option>
       </select>
+    </div>
+    <div class="card">
+      <h3>Job line grid — cascade defaults</h3>
+      <p class="muted">Which columns rows 2+ inherit from row 1 on a new work order, until someone types over them. Any single work order can override this from the grid's cascade popover; changing it here never alters lines already saved.</p>
+      <div id="cascadeDefaults">
+        ${JLG_CASCADE_COLUMNS.map((c) => `<label class="jlg-cascade-opt"><input type="checkbox" data-col="${c.key}" ${(displaySettings.CascadeDefaults || {})[c.key] !== false ? 'checked' : ''} /> ${escapeHtml(c.label)}</label>`).join('')}
+      </div>
     </div>
     <div class="card">
       <h3>Report embedded-photo cap</h3>
@@ -6180,6 +6275,12 @@ async function renderAdminWorkOrderStatuses(container = app) {
       if (state.options) state.options.displaySettings = await api('/api/pg/display-settings');
     } catch (err) { toast(err.message); }
   });
+  container.querySelectorAll('#cascadeDefaults input[data-col]').forEach((el) => el.addEventListener('change', async () => {
+    try {
+      await api('/api/pg/display-settings', { method: 'PUT', body: JSON.stringify({ cascadeDefaults: { [el.dataset.col]: el.checked } }) });
+      toast('Saved');
+    } catch (err) { toast(err.message); el.checked = !el.checked; }
+  }));
   container.querySelector('#reportImageCapInput').addEventListener('change', async (e) => {
     try {
       await api('/api/pg/display-settings', { method: 'PUT', body: JSON.stringify({ reportImageCap: Number(e.target.value) }) });
@@ -6187,6 +6288,21 @@ async function renderAdminWorkOrderStatuses(container = app) {
       if (state.options) state.options.displaySettings = await api('/api/pg/display-settings');
     } catch (err) { toast(err.message); }
   });
+  // §10: the review prompt targets whichever status carries this flag, so
+  // renaming or reordering "Review" never silently breaks it. Only one status
+  // can hold it at a time — setting it here clears it elsewhere.
+  container.querySelectorAll('.wos-toggle-review').forEach((btn) => btn.addEventListener('click', async () => {
+    const turningOn = btn.dataset.review !== 'true';
+    try {
+      if (turningOn) {
+        for (const other of statuses.filter((st) => st.IsReview && String(st.Id) !== btn.dataset.id)) {
+          await api(`/api/pg/admin/work-order-statuses/${other.Id}`, { method: 'PATCH', body: JSON.stringify({ isReview: false }) });
+        }
+      }
+      await api(`/api/pg/admin/work-order-statuses/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ isReview: turningOn }) });
+      renderAdminWorkOrderStatuses(container);
+    } catch (err) { toast(err.message); }
+  }));
   container.querySelectorAll('.wos-toggle-active').forEach((btn) => btn.addEventListener('click', async () => {
     try { await api(`/api/pg/admin/work-order-statuses/${btn.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ active: btn.dataset.active !== 'true' }) }); renderAdminWorkOrderStatuses(container); }
     catch (err) { toast(err.message); }
@@ -8071,6 +8187,7 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
     setApp(`
       <div class="btn-row" style="margin-bottom:12px;justify-content:space-between">
         <button class="btn btn-primary" id="newWoBtnTop">+ New Work Order</button>
+        <button class="btn btn-secondary" id="newWoFromTplBtn">+ From Template</button>
         <label style="display:flex;align-items:center;gap:6px;font-weight:400"><input type="checkbox" id="showAllSplitsToggle" ${showAllSplits ? 'checked' : ''} style="width:auto" /> Show all splits flat</label>
         ${onOpenWorkOrder ? '' : tableViewToggleHtml(mode)}
       </div>
@@ -8093,6 +8210,16 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
     `, container);
 
     container.querySelector('#newWoBtnTop').addEventListener('click', () => go('newWorkOrder', {}));
+    // §8: templates are picked on the New Work Order screen, which is where
+    // the grid lives — this is a shortcut into that picker, not a second flow.
+    container.querySelector('#newWoFromTplBtn').addEventListener('click', async () => {
+      const { templates } = await api('/api/pg/work-order-templates');
+      if (!templates.length) { toast('No templates yet — save one from a work order first'); return; }
+      const picked = await pickFromListDialog('New work order from template', templates.map((t) => ({
+        value: t.Id, label: t.Name, sublabel: t.Description || (t.Lines?.length ? `${t.Lines.length} job lines` : ''),
+      })));
+      if (picked != null) go('newWorkOrder', { templateId: picked });
+    });
     container.querySelector('#clearWoFilter')?.addEventListener('click', () => { statusFilter = null; scheduleFilter = null; draw(); });
     container.querySelector('#showAllSplitsToggle')?.addEventListener('change', (e) => { showAllSplits = e.target.checked; draw(); });
     container.querySelectorAll('.split-expand-chip').forEach((el) => el.addEventListener('click', (e) => {
@@ -8292,57 +8419,1057 @@ const RESPONSIBILITY_CLASS_LABELS = { self: 'Self', volunteer: 'Volunteer', vend
 // page after creation — same precedent this form already used for
 // responsibleSelf/crew before Phase 1, and the same "capture must be
 // zero-decision, classify later" principle the brief opens with.
-async function renderNewWorkOrder({ assetId, assetName }) {
-  setChrome({ title: 'New Work Order', showBack: true, showLogout: true });
-  const [{ templates }, campaignRes, cabinRes, otherRes, fundsRes] = await Promise.all([
-    api('/api/pg/work-order-templates'),
-    api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
-    api('/api/pg/funds'),
-  ]);
-  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items, fund: fundsRes.funds };
-  const fieldTitles = state.options.propertyFields.map((f) => f.title);
 
-  const fundingRefOptionsHtml = (source, selectedId) =>
-    (fundingEntities[source] || []).map((e) => `<option value="${e.Id}" ${e.Id === selectedId ? 'selected' : ''}>${escapeHtml(e.Name)}</option>`).join('');
+// ---------- Searchable combobox (§9) ----------
+// One component for every long list in the app — funding source / cabin
+// holder (~300 entries), the asset picker (~340), vendors. Options are loaded
+// once by the caller and filtered here, in the browser: no per-keystroke
+// server round-trip, and a substring match ANYWHERE in the name, so "green"
+// and "walt" both find "Greenawalt, Ben" (a prefix-only match finds neither
+// when the roster is stored surname-first).
+//
+// options: [{ value, label, sublabel? }] — `value` is compared with String().
+// Returns { getValue, setValue, setOptions, focus, input }.
+function mountCombobox(container, {
+  options = [], value = null, placeholder = 'Type to search…',
+  emptyText = 'No matches', inputClass = '', extraRowHtml = null, onExtraRow = null,
+  onSelect = () => {}, onClear = null,
+} = {}) {
+  let opts = options;
+  let selected = value == null ? null : opts.find((o) => String(o.value) === String(value)) || null;
+  let filtered = [];
+  let highlight = -1;
+  // Text this box is showing on someone else's behalf — a grid cell that is
+  // FOLLOWING row 1 displays row 1's label without owning it (§3). Without
+  // this, focusing such a cell and tabbing straight back out would revert the
+  // box to `selected`, which is null, and blank a cell nobody edited.
+  let displayOnly = null;
 
-  const jobLineRowHtml = (row = {}) => {
-    const fundingSource = row.fundingSource || 'operating_budget';
-    return `<div class="card jl-row" style="margin-bottom:10px">
-      <div class="field-row"><label>Title</label><input class="jl-title" value="${escapeHtml(row.title || '')}" placeholder="e.g. Roof repair" required /></div>
-      <div class="field-row"><label>Responsibility</label>
-        <select class="jl-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${row.responsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
-      </div>
-      <div class="field-row"><label>Funding Source</label>
-        <select class="jl-funding-source">${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}" ${fundingSource === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
-      </div>
-      <div class="field-row jl-funding-ref-row" ${fundingSource === 'operating_budget' ? 'hidden' : ''}>
-        <label>${escapeHtml(FUNDING_SOURCE_LABELS[fundingSource] || '')}</label>
-        <select class="jl-funding-ref">${fundingRefOptionsHtml(fundingSource, row.fundingRefId)}</select>
-      </div>
-      <div class="field-row"><label>Est. Hours</label><input class="jl-est-hours" type="number" step="any" min="0" value="${row.estimatedHours ?? ''}" /></div>
-      <div class="field-row"><label>Est. Cost</label><input class="jl-est-cost" type="number" step="0.01" min="0" value="${row.estimatedCost ?? ''}" /></div>
-      <div class="field-row"><label>Scheduled Date</label><input class="jl-scheduled-date" type="date" value="${row.scheduledDate || ''}" />
-        <p class="muted" style="margin-top:2px;font-size:0.8rem">Defaults to the work order's date if left blank.</p>
-      </div>
-      <button type="button" class="btn btn-secondary row-remove">✕ Remove line</button>
-    </div>`;
-  };
-  function wireJobLineRow(row) {
-    const sourceSelect = row.querySelector('.jl-funding-source');
-    const refRow = row.querySelector('.jl-funding-ref-row');
-    const refLabel = refRow.querySelector('label');
-    const refSelect = row.querySelector('.jl-funding-ref');
-    sourceSelect.addEventListener('change', () => {
-      const source = sourceSelect.value;
-      if (source === 'operating_budget') { refRow.hidden = true; return; }
-      refRow.hidden = false;
-      refLabel.textContent = FUNDING_SOURCE_LABELS[source];
-      refSelect.innerHTML = fundingRefOptionsHtml(source, null);
-    });
-    row.querySelector('.row-remove').onclick = () => row.remove();
+  container.classList.add('ac-wrap', 'cbx-wrap');
+  container.innerHTML = `
+    <input type="text" class="ac-input cbx-input ${inputClass}" autocomplete="off" role="combobox"
+      aria-expanded="false" aria-autocomplete="list" placeholder="${escapeHtml(placeholder)}"
+      value="${selected ? escapeHtml(selected.label) : ''}" />
+    <div class="ac-results cbx-results" role="listbox" hidden></div>`;
+  const input = container.querySelector('.cbx-input');
+  const resultsEl = container.querySelector('.cbx-results');
+
+  const labelFor = (v) => opts.find((o) => String(o.value) === String(v))?.label || '';
+
+  function close() {
+    resultsEl.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+    highlight = -1;
   }
 
-  const taskRowHtml = (text = '') => `<div class="inline-add-row task-row"><input class="task-text" value="${escapeHtml(text)}" placeholder="Task description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>`;
+  function draw() {
+    resultsEl.innerHTML = filtered.map((o, i) => `
+      <div class="ac-item cbx-item${i === highlight ? ' cbx-active' : ''}" role="option" data-i="${i}"
+        aria-selected="${i === highlight}">${escapeHtml(o.label)}${o.sublabel ? ` <span class="muted">— ${escapeHtml(o.sublabel)}</span>` : ''}</div>`).join('')
+      + (filtered.length ? '' : `<div class="ac-item ac-empty">${escapeHtml(emptyText)}</div>`)
+      + (extraRowHtml ? extraRowHtml(input.value.trim()) : '');
+    resultsEl.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+    resultsEl.querySelectorAll('.cbx-item').forEach((el) => {
+      // mousedown, not click: blur fires first on click and would close the
+      // list out from under the pointer.
+      el.addEventListener('mousedown', (e) => { e.preventDefault(); pick(filtered[Number(el.dataset.i)]); });
+    });
+    if (onExtraRow) onExtraRow(resultsEl, input.value.trim());
+    const active = resultsEl.querySelector('.cbx-active');
+    if (active) active.scrollIntoView({ block: 'nearest' });
+  }
+
+  function open(query = '') {
+    const q = query.trim().toLowerCase();
+    filtered = (q ? opts.filter((o) => o.label.toLowerCase().includes(q)) : opts).slice(0, 200);
+    highlight = filtered.length ? 0 : -1;
+    draw();
+  }
+
+  function pick(opt) {
+    selected = opt || null;
+    displayOnly = null;
+    input.value = selected ? selected.label : '';
+    close();
+    onSelect(selected);
+  }
+
+  input.addEventListener('input', () => open(input.value));
+  input.addEventListener('focus', () => { input.select(); open(''); });
+  input.addEventListener('blur', () => {
+    close();
+    const typed = input.value.trim();
+    if (!typed) {
+      // Clearing the box is a real action (§3.2: it un-pins a cascade cell),
+      // not a typo to be undone — so it commits rather than snapping back.
+      if (selected || displayOnly || onClear) { selected = null; displayOnly = null; (onClear || onSelect)(null); }
+      return;
+    }
+    // Anything else typed but not chosen reverts to what the box was showing:
+    // a half-typed name must never be mistaken for a selection, and a cell
+    // that was only displaying an inherited value keeps displaying it.
+    input.value = selected ? selected.label : (displayOnly || '');
+  });
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (resultsEl.hidden) { open(input.value); return; }
+      if (!filtered.length) return;
+      highlight = (highlight + (e.key === 'ArrowDown' ? 1 : -1) + filtered.length) % filtered.length;
+      draw();
+    } else if (e.key === 'Enter') {
+      if (!resultsEl.hidden && highlight >= 0) { e.preventDefault(); e.stopPropagation(); pick(filtered[highlight]); }
+    } else if (e.key === 'Escape') {
+      if (!resultsEl.hidden) { e.preventDefault(); e.stopPropagation(); close(); input.value = selected ? selected.label : ''; }
+    }
+  });
+
+  return {
+    input,
+    getValue: () => (selected ? selected.value : null),
+    setValue: (v, { silent = true } = {}) => {
+      selected = v == null ? null : opts.find((o) => String(o.value) === String(v)) || null;
+      displayOnly = null;
+      input.value = selected ? selected.label : '';
+      if (!silent) onSelect(selected);
+    },
+    // Display-only text for a value this combobox doesn't own (a grid cell
+    // showing what row 1 is currently set to, §3).
+    setDisplay: (v) => { input.value = labelFor(v); selected = null; displayOnly = input.value; },
+    setOptions: (next) => { opts = next; },
+    focus: () => input.focus(),
+  };
+}
+
+// The app's five funding sources flattened into one searchable list (§9).
+// funding_source + funding_ref_id are two columns in Postgres but one
+// decision to a person ("who's paying for this line?"), so the grid treats
+// them as one cell with a composite "source::refId" value.
+function fundingOptionValue(source, refId) { return `${source || 'operating_budget'}::${refId ?? ''}`; }
+function parseFundingOptionValue(value) {
+  const [source, ref] = String(value ?? '').split('::');
+  return { source: source || 'operating_budget', refId: ref ? Number(ref) : null };
+}
+function buildFundingOptions(fundingEntities) {
+  const out = [{ value: fundingOptionValue('operating_budget', null), label: FUNDING_SOURCE_LABELS.operating_budget }];
+  for (const source of ['capital_campaign', 'cabin_holder', 'other', 'fund']) {
+    for (const e of fundingEntities[source] || []) {
+      out.push({ value: fundingOptionValue(source, e.Id), label: `${FUNDING_SOURCE_LABELS[source]} › ${e.Name}`, sublabel: null });
+    }
+  }
+  return out;
+}
+
+// ---------- Job Line Grid (entry/edit surface for a WO's lines) ----------
+//
+// The grid replaces the stacked per-line form on New Work Order and on the
+// "Edit lines" screen. A saved WO's detail page keeps its card view — cards
+// are for READING (statuses, notes, split, attachments), the grid is for
+// entering and editing. Nothing about cascade/pinning survives into the
+// database as meaning: every line saves its fully resolved, displayed values
+// (§3), and pinned_fields rides along purely so reopening the grid can redraw
+// which cells were following.
+
+const JLG_COLUMNS = [
+  // Typed fields first, so Tab lands on them immediately (§2).
+  { key: 'title', label: 'Title', kind: 'text' },
+  { key: 'estHours', label: 'Est. Hours', kind: 'number' },
+  { key: 'estCost', label: 'Est. Cost', kind: 'number' },
+  { key: 'responsibility_class', label: 'Responsibility', kind: 'select', cascade: true },
+  { key: 'funding_source', label: 'Funding Source', kind: 'combobox', cascade: true },
+  { key: 'status_id', label: 'Status', kind: 'select', cascade: true },
+  { key: 'scheduled_date', label: 'Scheduled Date', kind: 'date', cascade: true },
+];
+const JLG_CASCADE_COLUMNS = JLG_COLUMNS.filter((c) => c.cascade);
+const JLG_CASCADE_DEFAULTS = { responsibility_class: true, funding_source: true, status_id: true, scheduled_date: true };
+// Every shortcut that exists appears in the legend — the legend IS the
+// documentation (§4).
+const JLG_SHORTCUTS = [
+  ['Enter', 'new line'], ['Ctrl+Shift+D', 'duplicate'], ['Alt+↑↓', 'move'],
+  ['Ctrl/Cmd+V', 'paste from sheet'], ['Tab', 'next cell'],
+];
+
+let jlgUid = 0;
+// One grid at a time; the SPA swaps #app wholesale, so render() tears the
+// previous one down (its beforeunload guard and autosave timer with it).
+let activeJobLineGrid = null;
+function destroyActiveJobLineGrid() {
+  if (activeJobLineGrid) { activeJobLineGrid.destroy(); activeJobLineGrid = null; }
+}
+
+function jlgDraftKey(woId) { return woId ? `wo-draft-${woId}` : 'wo-draft-new'; }
+
+function mountJobLineGrid(container, {
+  woId = null,
+  jobLineStatuses = [],
+  fundingOptions = [],
+  initialRows = null,
+  cascadeConfig = null,          // per-WO override; null = follow the global default
+  globalCascadeDefaults = JLG_CASCADE_DEFAULTS,
+  onCascadeConfigChange = null,  // persists the per-WO override
+  onDirtyChange = () => {},
+  draftKey = null,
+  draftExtra = () => null,       // extra state the screen wants stored with the draft
+} = {}) {
+  destroyActiveJobLineGrid();
+
+  const statusById = new Map(jobLineStatuses.map((s) => [String(s.Id), s]));
+  const firstOpenStatus = jobLineStatuses.find((s) => !s.IsTerminal) || jobLineStatuses[0];
+  const key = draftKey || jlgDraftKey(woId);
+  let perWoCascade = cascadeConfig ? { ...cascadeConfig } : null;
+  let rows = [];
+  let dirty = false;
+  let saveTimer = null;
+  let undoEntry = null;   // single-level row-delete undo (§6)
+  let dragUid = null;
+
+  const comboboxes = new Map();  // row uid -> funding combobox instance
+  const rowEls = new Map();      // row uid -> <tr>
+
+  const cascadeOn = (col) => {
+    const cfg = perWoCascade || globalCascadeDefaults || JLG_CASCADE_DEFAULTS;
+    return cfg[col] !== false;
+  };
+
+  const blankValues = () => ({
+    responsibility_class: 'self',
+    funding_source: fundingOptionValue('operating_budget', null),
+    status_id: firstOpenStatus ? String(firstOpenStatus.Id) : '',
+    scheduled_date: '',
+  });
+
+  function blankRow(seed = {}) {
+    return {
+      uid: ++jlgUid, id: seed.id ?? null,
+      title: seed.title ?? '', estHours: seed.estHours ?? '', estCost: seed.estCost ?? '',
+      values: { ...blankValues(), ...(seed.values || {}) },
+      pinned: new Set(seed.pinned || []),
+      touched: new Set(seed.touched || seed.pinned || []),
+      errors: new Map(Object.entries(seed.errors || {})),
+      originalStatusId: seed.originalStatusId ?? null,
+      statusNote: null,
+    };
+  }
+
+  // ---- cascade resolution (§3) ----
+  // Row 1 is the template. There is no hidden template object: whatever row
+  // is physically first supplies the value for every following cell below it.
+  function displayed(idx, col) {
+    const row = rows[idx];
+    if (!row) return '';
+    if (idx === 0 || !cascadeOn(col)) return row.values[col];
+    return row.pinned.has(col) ? row.values[col] : rows[0].values[col];
+  }
+  const isFollowing = (idx, col) => idx > 0 && cascadeOn(col) && !rows[idx].pinned.has(col);
+
+  function rowIsEmpty(row) {
+    return !String(row.title).trim() && String(row.estHours) === '' && String(row.estCost) === ''
+      && !row.pinned.size && !row.errors.size && row.id == null;
+  }
+
+  // ---- rendering ----
+  function cellControlHtml(col, idx, row) {
+    const value = displayed(idx, col.key);
+    const follow = isFollowing(idx, col.key);
+    const cls = `jlg-cell${follow ? ' jlg-follow' : ''}${row.errors.has(col.key) ? ' jlg-error' : ''}`;
+    const errTitle = row.errors.has(col.key) ? ` title="Couldn't match &quot;${escapeHtml(row.errors.get(col.key))}&quot; — pick a value or clear the cell"` : '';
+    const followOpt = idx > 0 && cascadeOn(col.key) ? '<option value="">— follow row 1 —</option>' : '';
+    if (col.kind === 'select' && col.key === 'responsibility_class') {
+      return `<select class="${cls}" data-col="${col.key}"${errTitle}>${followOpt}${
+        Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${value === k ? 'selected' : ''}>${escapeHtml(v)}</option>`).join('')}</select>`;
+    }
+    if (col.kind === 'select' && col.key === 'status_id') {
+      return `<select class="${cls}" data-col="${col.key}"${errTitle}>${followOpt}${
+        jobLineStatuses.map((s) => `<option value="${s.Id}" ${String(value) === String(s.Id) ? 'selected' : ''}>${escapeHtml(s.Name)}</option>`).join('')}</select>`;
+    }
+    if (col.kind === 'date') {
+      return `<input type="date" class="${cls}" data-col="${col.key}" value="${escapeHtml(value || '')}"${errTitle} />`;
+    }
+    return `<div class="jlg-fund-mount ${cls}" data-col="${col.key}"${errTitle}></div>`;
+  }
+
+  function rowHtml(row, idx) {
+    return `<tr class="jlg-row" data-uid="${row.uid}" data-idx="${idx}">
+      <td class="jlg-c-idx"><span class="jlg-drag" draggable="true" title="Drag to reorder">⠿</span><span class="jlg-rownum">${idx + 1}</span></td>
+      <td class="jlg-c-title">
+        <textarea class="jlg-title" rows="1" spellcheck="false" placeholder="${idx === 0 ? 'What needs doing?' : ''}">${escapeHtml(row.title)}</textarea>
+        <div class="jlg-title-display">${escapeHtml(row.title)}</div>
+      </td>
+      <td class="jlg-c-num"><input class="jlg-num${row.errors.has('estHours') ? ' jlg-error' : ''}" data-col="estHours" type="number" step="any" min="0" value="${escapeHtml(row.estHours)}" /></td>
+      <td class="jlg-c-num"><input class="jlg-num${row.errors.has('estCost') ? ' jlg-error' : ''}" data-col="estCost" type="number" step="0.01" min="0" value="${escapeHtml(row.estCost)}" /></td>
+      <td class="jlg-c-resp">${cellControlHtml(JLG_COLUMNS[3], idx, row)}</td>
+      <td class="jlg-c-fund">${cellControlHtml(JLG_COLUMNS[4], idx, row)}</td>
+      <td class="jlg-c-status">${cellControlHtml(JLG_COLUMNS[5], idx, row)}</td>
+      <td class="jlg-c-date">${cellControlHtml(JLG_COLUMNS[6], idx, row)}</td>
+      <td class="jlg-c-menu"><button type="button" class="jlg-remove" title="Remove this line" aria-label="Remove line ${idx + 1}">✕</button></td>
+    </tr>`;
+  }
+
+  function shellHtml() {
+    return `
+      <div class="jlg-wrap">
+        <div class="jlg-toolbar">
+          <button type="button" class="btn btn-secondary btn-small jlg-import-btn">⬆ Import lines</button>
+          <input type="file" class="jlg-file" accept=".csv,text/csv,text/plain" hidden />
+          <button type="button" class="btn btn-secondary btn-small jlg-cascade-btn" aria-haspopup="dialog">⚙ Cascade settings</button>
+          <span class="jlg-toolbar-hint muted">Row 1 sets the defaults — rows below follow it until you type over them.</span>
+        </div>
+        <div class="jlg-cascade-pop" hidden role="dialog" aria-label="Cascade settings"></div>
+        <div class="jlg-scroll">
+          <table class="jlg-table">
+            <thead><tr>
+              <th class="jlg-c-idx"></th>
+              ${JLG_COLUMNS.map((c) => `<th class="jlg-th-${c.key}">${escapeHtml(c.label)}</th>`).join('')}
+              <th class="jlg-c-menu"></th>
+            </tr></thead>
+            <tbody class="jlg-body"></tbody>
+          </table>
+        </div>
+        <div class="jlg-footer" aria-live="polite"></div>
+        <div class="jlg-legend">${JLG_SHORTCUTS.map(([k, v]) => `<span><kbd>${escapeHtml(k)}</kbd> ${escapeHtml(v)}</span>`).join('<span class="jlg-legend-sep">·</span>')}</div>
+      </div>`;
+  }
+
+  container.innerHTML = shellHtml();
+  const bodyEl = container.querySelector('.jlg-body');
+  const footerEl = container.querySelector('.jlg-footer');
+  const cascadePop = container.querySelector('.jlg-cascade-pop');
+
+  // ---- structural changes ----
+  // Row 1 IS the template (§3), so any change to which row is physically
+  // first has to leave the screen saying what it said a moment ago: the row
+  // arriving at the top stamps the values it was displaying, and the row
+  // leaving the top pins the values it was supplying, rather than suddenly
+  // starting to follow its replacement.
+  function withTemplateStability(mutate) {
+    const before = new Map(rows.map((r, i) => [r.uid, Object.fromEntries(JLG_CASCADE_COLUMNS.map((c) => [c.key, displayed(i, c.key)]))]));
+    const prevFirst = rows[0];
+    mutate();
+    const newFirst = rows[0];
+    if (!prevFirst || !newFirst || prevFirst === newFirst) return;
+    if (rows.includes(prevFirst)) {
+      for (const c of JLG_CASCADE_COLUMNS) { prevFirst.pinned.add(c.key); prevFirst.touched.add(c.key); }
+    }
+    const snap = before.get(newFirst.uid);
+    if (snap) for (const c of JLG_CASCADE_COLUMNS) newFirst.values[c.key] = snap[c.key];
+    newFirst.pinned.clear();
+    newFirst.touched.clear();
+  }
+
+  // Every structural change goes through this: rebuild, guarantee the single
+  // trailing blank row, renumber. Keeping them together is what stops a
+  // "delete the last line" path from leaving the grid with nowhere to type.
+  function redraw() { renderRows(); ensureTrailing(); reindexRows(); }
+
+  function renderRows() {
+    comboboxes.clear();
+    rowEls.clear();
+    bodyEl.innerHTML = rows.map((r, i) => rowHtml(r, i)).join('');
+    [...bodyEl.querySelectorAll('.jlg-row')].forEach((tr, i) => wireRow(tr, rows[i]));
+    syncFooter();
+  }
+
+  function appendRowDom(row) {
+    bodyEl.insertAdjacentHTML('beforeend', rowHtml(row, rows.length - 1));
+    wireRow(bodyEl.lastElementChild, row);
+    syncFooter();
+  }
+
+  // §2: the grid always keeps exactly one empty row at the bottom, and typing
+  // in it spawns the next one. Appending just that row's DOM (instead of
+  // re-rendering) is what lets you keep typing without losing the caret.
+  function ensureTrailing() {
+    while (rows.length > 1 && rowIsEmpty(rows[rows.length - 1]) && rowIsEmpty(rows[rows.length - 2])) {
+      const dropped = rows.pop();
+      comboboxes.delete(dropped.uid);
+      rowEls.delete(dropped.uid);
+      bodyEl.lastElementChild?.remove();
+    }
+    if (!rows.length || !rowIsEmpty(rows[rows.length - 1])) {
+      rows.push(blankRow());
+      appendRowDom(rows[rows.length - 1]);
+    }
+  }
+
+  function reindexRows() {
+    [...bodyEl.querySelectorAll('.jlg-row')].forEach((tr, i) => {
+      tr.dataset.idx = String(i);
+      tr.querySelector('.jlg-rownum').textContent = String(i + 1);
+    });
+  }
+
+  // ---- cascade propagation ----
+  function refreshFollowers(col) {
+    rows.forEach((row, i) => {
+      if (!isFollowing(i, col)) return;
+      const tr = rowEls.get(row.uid);
+      if (!tr) return;
+      const value = displayed(i, col);
+      if (col === 'funding_source') comboboxes.get(row.uid)?.setDisplay(value);
+      else {
+        const el = tr.querySelector(`[data-col="${col}"]`);
+        if (el) el.value = value ?? '';
+      }
+    });
+    syncFooter();
+  }
+
+  function setCascadeValue(idx, col, rawValue) {
+    const row = rows[idx];
+    const clearing = rawValue === '' || rawValue == null;
+    row.errors.delete(col);
+    if (idx > 0 && cascadeOn(col) && clearing) {
+      // §3.2: blank isn't a meaningful value in a cascade column, so clearing
+      // a pinned cell means "go back to following row 1" — including for
+      // `touched`, so a later toggle off/on doesn't resurrect the pin.
+      row.pinned.delete(col);
+      row.touched.delete(col);
+      row.values[col] = rows[0].values[col];
+    } else {
+      row.values[col] = rawValue;
+      if (idx > 0) { row.pinned.add(col); row.touched.add(col); }
+    }
+    const tr = rowEls.get(row.uid);
+    if (tr) {
+      const follow = isFollowing(idx, col);
+      const el = col === 'funding_source' ? tr.querySelector('.jlg-fund-mount') : tr.querySelector(`[data-col="${col}"]`);
+      if (el) {
+        el.classList.toggle('jlg-follow', follow);
+        el.classList.remove('jlg-error');
+        el.removeAttribute('title');
+      }
+      const value = displayed(idx, col);
+      if (col === 'funding_source') comboboxes.get(row.uid)?.[follow ? 'setDisplay' : 'setValue'](value);
+      else if (el) el.value = value ?? '';
+    }
+    if (idx === 0) refreshFollowers(col);
+    markDirty();
+    syncFooter();
+  }
+
+  // ---- row wiring ----
+  function wireRow(tr, row) {
+    rowEls.set(row.uid, tr);
+    const idxOf = () => rows.indexOf(row);
+
+    const titleEl = tr.querySelector('.jlg-title');
+    const titleDisplay = tr.querySelector('.jlg-title-display');
+    const autosize = () => { titleEl.style.height = 'auto'; titleEl.style.height = `${Math.max(titleEl.scrollHeight, 32)}px`; };
+    titleEl.addEventListener('focus', autosize);
+    titleEl.addEventListener('blur', () => { titleEl.style.height = ''; });
+    titleEl.addEventListener('input', () => {
+      row.title = titleEl.value;
+      titleDisplay.textContent = titleEl.value;
+      autosize();
+      markDirty(); ensureTrailing(); reindexRows(); syncFooter();
+    });
+
+    tr.querySelectorAll('.jlg-num').forEach((el) => el.addEventListener('input', () => {
+      row[el.dataset.col] = el.value;
+      markDirty(); ensureTrailing(); reindexRows(); syncFooter();
+    }));
+
+    tr.querySelectorAll('select.jlg-cell, input.jlg-cell').forEach((el) => {
+      el.addEventListener('change', () => {
+        const col = el.dataset.col;
+        const idx = idxOf();
+        // A SAVED line changing status is a lifecycle transition, so the
+        // status config's note requirement applies (§2) — ask now rather than
+        // failing the whole grid save later. Lines being created are arrears
+        // entry and never prompt.
+        if (col === 'status_id' && row.id != null && el.value && Number(el.value) !== row.originalStatusId) {
+          const status = statusById.get(String(el.value));
+          if (status?.RequiresNote) {
+            const note = window.prompt(status.NoteLabel || `A note is required to mark this line "${status.Name}"`, row.statusNote || '');
+            if (note == null || !note.trim()) { el.value = displayed(idx, col); toast('Status unchanged — that status needs a note'); return; }
+            row.statusNote = note.trim();
+          }
+        }
+        setCascadeValue(idx, col, el.value);
+      });
+    });
+
+    const fundMount = tr.querySelector('.jlg-fund-mount');
+    if (fundMount) {
+      const idx = idxOf();
+      const follow = isFollowing(idx, 'funding_source');
+      const cbx = mountCombobox(fundMount, {
+        options: fundingOptions,
+        value: follow ? null : displayed(idx, 'funding_source'),
+        placeholder: 'Operating Budget',
+        emptyText: 'No funding source matches',
+        onSelect: (opt) => setCascadeValue(idxOf(), 'funding_source', opt ? opt.value : ''),
+        onClear: () => setCascadeValue(idxOf(), 'funding_source', ''),
+      });
+      if (follow) cbx.setDisplay(displayed(idx, 'funding_source'));
+      comboboxes.set(row.uid, cbx);
+    }
+
+    tr.querySelector('.jlg-remove').addEventListener('click', () => removeRow(row));
+
+    const handle = tr.querySelector('.jlg-drag');
+    handle.addEventListener('dragstart', (e) => {
+      dragUid = row.uid;
+      tr.classList.add('jlg-dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(row.uid));
+    });
+    handle.addEventListener('dragend', () => { dragUid = null; tr.classList.remove('jlg-dragging'); bodyEl.querySelectorAll('.jlg-drop-target').forEach((el) => el.classList.remove('jlg-drop-target')); });
+    tr.addEventListener('dragover', (e) => {
+      if (dragUid == null || dragUid === row.uid) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      tr.classList.add('jlg-drop-target');
+    });
+    tr.addEventListener('dragleave', () => tr.classList.remove('jlg-drop-target'));
+    tr.addEventListener('drop', (e) => {
+      e.preventDefault();
+      tr.classList.remove('jlg-drop-target');
+      if (dragUid == null || dragUid === row.uid) return;
+      const from = rows.findIndex((r) => r.uid === dragUid);
+      const to = rows.indexOf(row);
+      if (from < 0 || to < 0) return;
+      withTemplateStability(() => { rows.splice(to, 0, rows.splice(from, 1)[0]); });
+      dragUid = null;
+      redraw(); markDirty();
+    });
+  }
+
+  // ---- row operations ----
+  function focusRow(row, selector = '.jlg-title') {
+    const el = rowEls.get(row.uid)?.querySelector(selector);
+    if (el) { el.focus(); if (el.select) el.select(); }
+  }
+
+  function insertRowBelow(row) {
+    const at = rows.indexOf(row) + 1;
+    const fresh = blankRow();
+    withTemplateStability(() => { rows.splice(at, 0, fresh); });
+    redraw();
+    focusRow(fresh);
+    markDirty();
+    return fresh;
+  }
+
+  // §3.4: a duplicate copies values AND pin state — a cell that was following
+  // in the source follows in the copy, rather than quietly becoming its own.
+  function duplicateRow(row) {
+    const at = rows.indexOf(row) + 1;
+    const copy = blankRow({
+      title: row.title, estHours: row.estHours, estCost: row.estCost,
+      values: { ...row.values }, pinned: [...row.pinned], touched: [...row.touched],
+    });
+    withTemplateStability(() => { rows.splice(at, 0, copy); });
+    redraw();
+    focusRow(copy);
+    markDirty();
+  }
+
+  function moveRow(row, delta) {
+    const from = rows.indexOf(row);
+    const to = from + delta;
+    if (to < 0 || to >= rows.length) return;
+    withTemplateStability(() => { rows.splice(to, 0, rows.splice(from, 1)[0]); });
+    redraw();
+    focusRow(row);
+    markDirty();
+  }
+
+  async function removeRow(row) {
+    const idx = rows.indexOf(row);
+    if (idx < 0) return;
+    if (rows.length === 1) { toast("That's the only line — clear it instead"); return; }
+    if (idx === 0 && rows.length > 1) {
+      // §3.5 — deleting the template is a decision, so it asks.
+      if (!await confirmDialog('This row is the template for the lines below — delete it?', { confirmLabel: 'Delete row 1' })) return;
+      withTemplateStability(() => { rows.splice(idx, 1); });
+      redraw(); markDirty();
+      return;
+    }
+    withTemplateStability(() => { rows.splice(idx, 1); });
+    redraw(); markDirty();
+    // §6: one level deep, rows only. Deleting another row replaces this.
+    undoEntry = { row, idx };
+    actionToast('Row deleted', 'Undo', () => {
+      if (!undoEntry) return;
+      const { row: restored, idx: at } = undoEntry;
+      undoEntry = null;
+      withTemplateStability(() => { rows.splice(Math.min(at, rows.length), 0, restored); });
+      redraw(); markDirty();
+      focusRow(restored);
+    }, 8000);
+  }
+
+  // ---- footer (§2) ----
+  function liveRows() { return rows.filter((r) => String(r.title).trim()); }
+  function syncFooter() {
+    const live = liveRows();
+    const hours = live.reduce((s, r) => s + (Number(r.estHours) || 0), 0);
+    const cost = live.reduce((s, r) => s + (Number(r.estCost) || 0), 0);
+    const bySource = new Map();
+    for (const r of live) {
+      const value = displayed(rows.indexOf(r), 'funding_source');
+      const label = fundingOptions.find((o) => String(o.value) === String(value))?.label || 'Unassigned';
+      bySource.set(label, (bySource.get(label) || 0) + (Number(r.estCost) || 0));
+    }
+    const money = (n) => `$${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+    const hrs = Number.isInteger(hours) ? hours : Number(hours.toFixed(2));
+    // Grand total always; the per-source split only when the sources differ.
+    const breakdown = bySource.size > 1
+      ? `<div class="jlg-footer-breakdown muted">${[...bySource.entries()].map(([label, amount]) => `${escapeHtml(label)} ${money(amount)}`).join(' · ')}</div>`
+      : '';
+    const errors = rows.filter((r) => r.errors.size).length;
+    footerEl.innerHTML = `
+      <div class="jlg-footer-total"><strong>${live.length} line${live.length === 1 ? '' : 's'}</strong> · ${hrs} hrs · ${money(cost)}</div>
+      ${breakdown}
+      ${errors ? `<div class="jlg-footer-error">⚠ ${errors} row${errors === 1 ? '' : 's'} have a value that didn't match — fix the red cells before saving.</div>` : ''}`;
+  }
+
+  // ---- keyboard (§4) ----
+  container.addEventListener('keydown', (e) => {
+    const tr = e.target.closest?.('.jlg-row');
+    if (!tr) return;
+    const row = rows.find((r) => r.uid === Number(tr.dataset.uid));
+    if (!row) return;
+    // Enter must never reach the surrounding form — on this screen it means
+    // "next line," not "create the work order."
+    if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault(); e.stopPropagation();
+      insertRowBelow(row);
+      return;
+    }
+    // preventDefault so the browser's own Ctrl+Shift+D (bookmark-all-tabs)
+    // never fires over the top of this.
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
+      e.preventDefault(); e.stopPropagation();
+      duplicateRow(row);
+      return;
+    }
+    if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault(); e.stopPropagation();
+      moveRow(row, e.key === 'ArrowUp' ? -1 : 1);
+    }
+  });
+
+  // ---- import: CSV file + clipboard paste (§5) ----
+  // Both paths land here, so a pasted Sheets range and an uploaded CSV can't
+  // drift apart in behaviour. The grid IS the preview — nothing touches the
+  // database until the screen's own Save.
+  const JLG_HEADER_ALIASES = {
+    title: 'title', name: 'title', 'job line': 'title', 'line': 'title',
+    hours: 'estHours', 'est hours': 'estHours', 'est. hours': 'estHours', 'estimated hours': 'estHours', hrs: 'estHours',
+    cost: 'estCost', 'est cost': 'estCost', 'est. cost': 'estCost', 'estimated cost': 'estCost',
+    responsibility: 'responsibility_class', 'responsible': 'responsibility_class',
+    funding: 'funding_source', 'funding source': 'funding_source', source: 'funding_source',
+    status: 'status_id',
+    date: 'scheduled_date', 'scheduled date': 'scheduled_date', scheduled: 'scheduled_date',
+  };
+
+  function detectHeader(cells) {
+    const mapped = cells.map((c) => JLG_HEADER_ALIASES[String(c || '').trim().toLowerCase()] || null);
+    // Treat it as a header only if most of the row is recognisable — one
+    // stray cell called "Status" in a data row shouldn't eat that row.
+    const hits = mapped.filter(Boolean).length;
+    return hits >= Math.max(1, Math.ceil(cells.filter((c) => String(c || '').trim()).length * 0.6)) ? mapped : null;
+  }
+
+  function matchOptionText(colKey, text) {
+    const q = text.trim().toLowerCase();
+    if (colKey === 'responsibility_class') {
+      const hit = Object.entries(RESPONSIBILITY_CLASS_LABELS).find(([k, v]) => k === q || v.toLowerCase() === q);
+      return hit ? hit[0] : null;
+    }
+    if (colKey === 'status_id') {
+      const hit = jobLineStatuses.find((s) => s.Name.toLowerCase() === q);
+      return hit ? String(hit.Id) : null;
+    }
+    if (colKey === 'funding_source') {
+      const byLabel = fundingOptions.find((o) => o.label.toLowerCase() === q);
+      if (byLabel) return byLabel.value;
+      // "Greenawalt, Ben" on its own should find the Cabin-Holder entry, and
+      // "Operating" should find Operating Budget, without demanding the
+      // full "Source › Name" spelling.
+      const byEntity = fundingOptions.find((o) => (o.label.split('›')[1] || '').trim().toLowerCase() === q);
+      if (byEntity) return byEntity.value;
+      const bySource = Object.entries(FUNDING_SOURCE_LABELS).find(([k, v]) => k === q || v.toLowerCase() === q || v.toLowerCase().startsWith(q));
+      if (bySource) {
+        const plain = fundingOptions.find((o) => String(o.value) === fundingOptionValue(bySource[0], null));
+        if (plain) return plain.value;
+      }
+      return null;
+    }
+    if (colKey === 'scheduled_date') return parseLooseDate(text);
+    return null;
+  }
+
+  function applyImportedCell(idx, colKey, raw) {
+    const row = rows[idx];
+    const text = String(raw ?? '').trim();
+    if (colKey === 'title') { row.title = text; return; }
+    if (colKey === 'estHours' || colKey === 'estCost') {
+      row.errors.delete(colKey);
+      if (!text) { row[colKey] = ''; return; }
+      const n = Number(text.replace(/[$,\s]/g, ''));
+      if (Number.isFinite(n)) row[colKey] = String(n);
+      else { row[colKey] = ''; row.errors.set(colKey, text); }
+      return;
+    }
+    // §5's one cascade rule: a cell WITH data arrives pinned, a blank cell
+    // (or an unmapped column) arrives following row 1. So a fully-populated
+    // file behaves as if cascade were off, and a titles-only file picks up
+    // row 1's defaults for everything else.
+    if (!text) {
+      row.errors.delete(colKey);
+      if (idx > 0) { row.pinned.delete(colKey); row.touched.delete(colKey); }
+      return;
+    }
+    const matched = matchOptionText(colKey, text);
+    if (matched == null) {
+      row.errors.set(colKey, text);
+      if (idx > 0) { row.pinned.add(colKey); row.touched.add(colKey); }
+      return;
+    }
+    row.errors.delete(colKey);
+    row.values[colKey] = matched;
+    if (idx > 0) { row.pinned.add(colKey); row.touched.add(colKey); }
+  }
+
+  function ingestMatrix(matrix, { anchorRowIdx = 0, anchorColIdx = 0 } = {}) {
+    const clean = matrix.filter((r) => r.some((c) => String(c ?? '').trim() !== ''));
+    if (!clean.length) return 0;
+    const header = detectHeader(clean[0]);
+    const data = header ? clean.slice(1) : clean;
+    const colKeys = header || JLG_COLUMNS.slice(anchorColIdx).map((c) => c.key);
+    if (!data.length) return 0;
+    withTemplateStability(() => {
+      data.forEach((cells, r) => {
+        const idx = anchorRowIdx + r;
+        while (rows.length <= idx) rows.push(blankRow());
+        cells.forEach((cell, c) => {
+          const colKey = colKeys[c];
+          if (colKey) applyImportedCell(idx, colKey, cell);
+        });
+      });
+    });
+    redraw(); markDirty();
+    return data.length;
+  }
+
+  container.addEventListener('paste', (e) => {
+    const text = e.clipboardData?.getData('text/plain');
+    if (!text) return;
+    const tr = e.target.closest?.('.jlg-row');
+    if (!tr) return;
+    const normalized = text.replace(/\r\n?/g, '\n').replace(/\n$/, '');
+    const lines = normalized.split('\n');
+    const hasTab = normalized.includes('\t');
+    if (!hasTab && lines.length < 2) return; // an ordinary one-cell paste — leave it to the browser
+    const anchorRowIdx = rows.findIndex((r) => r.uid === Number(tr.dataset.uid));
+    if (anchorRowIdx < 0) return;
+    const col = e.target.dataset?.col
+      || (e.target.classList?.contains('jlg-title') ? 'title' : null)
+      || (e.target.closest('.jlg-fund-mount') ? 'funding_source' : null);
+    const anchorColIdx = Math.max(0, JLG_COLUMNS.findIndex((c) => c.key === col));
+    e.preventDefault();
+    // Plain multi-line text with no tabs, pasted into a Title cell, is a list
+    // of titles — one line each, nothing else touched (§5).
+    const matrix = hasTab ? lines.map((l) => l.split('\t')) : lines.map((l) => [l]);
+    const count = ingestMatrix(matrix, { anchorRowIdx, anchorColIdx });
+    if (count) toast(`Pasted ${count} row${count === 1 ? '' : 's'}`);
+  });
+
+  const fileInput = container.querySelector('.jlg-file');
+  container.querySelector('.jlg-import-btn').addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files?.[0];
+    fileInput.value = '';
+    if (!file) return;
+    try {
+      const matrix = parseDelimitedText(await file.text());
+      // Appends after whatever is already in the grid, so an import never
+      // silently eats lines someone already typed.
+      const firstEmpty = rows.findIndex((r) => rowIsEmpty(r));
+      const count = ingestMatrix(matrix, { anchorRowIdx: firstEmpty >= 0 ? firstEmpty : rows.length, anchorColIdx: 0 });
+      toast(count ? `Imported ${count} row${count === 1 ? '' : 's'} — review before saving` : 'Nothing to import from that file');
+    } catch (err) { toast(`Couldn't read that file: ${err.message}`); }
+  });
+
+  // ---- cascade settings popover (§3.7) ----
+  function effectiveCascade() {
+    const base = { ...JLG_CASCADE_DEFAULTS, ...(globalCascadeDefaults || {}) };
+    return perWoCascade ? { ...base, ...perWoCascade } : base;
+  }
+
+  function setCascade(col, on) {
+    if (on === cascadeOn(col)) return;
+    // §3.8: turning a column OFF freezes every cell at the value it is
+    // currently showing — nothing on screen moves. Pin/touched state keeps
+    // being tracked underneath regardless, so turning it back ON resumes
+    // following only for cells that were never directly edited.
+    if (!on) rows.forEach((r, i) => { if (i > 0) r.values[col] = displayed(i, col); });
+    perWoCascade = { ...effectiveCascade(), [col]: on };
+    if (on) rows.forEach((r, i) => { if (i > 0 && !r.touched.has(col)) r.pinned.delete(col); });
+    redraw(); markDirty();
+    drawCascadePop();
+    if (onCascadeConfigChange) onCascadeConfigChange(perWoCascade);
+  }
+
+  function drawCascadePop() {
+    const eff = effectiveCascade();
+    cascadePop.innerHTML = `
+      <h4>Cascade columns</h4>
+      <p class="muted">Rows below row 1 inherit these until you type over them. This is set for <strong>this work order only</strong>${perWoCascade ? '' : ' (currently following the site default)'}.</p>
+      ${JLG_CASCADE_COLUMNS.map((c) => `<label class="jlg-cascade-opt"><input type="checkbox" data-col="${c.key}" ${eff[c.key] ? 'checked' : ''} /> ${escapeHtml(c.label)}</label>`).join('')}
+      <div class="btn-row">
+        <button type="button" class="btn btn-secondary btn-small jlg-cascade-reset" ${perWoCascade ? '' : 'disabled'}>Use site default</button>
+        <button type="button" class="btn btn-secondary btn-small jlg-cascade-close">Done</button>
+      </div>`;
+    cascadePop.querySelectorAll('input[data-col]').forEach((el) => el.addEventListener('change', () => setCascade(el.dataset.col, el.checked)));
+    cascadePop.querySelector('.jlg-cascade-reset').addEventListener('click', () => {
+      // Dropping the override has to leave the screen unchanged too, so the
+      // same freeze rule applies to any column the default turns off.
+      const base = { ...JLG_CASCADE_DEFAULTS, ...(globalCascadeDefaults || {}) };
+      for (const c of JLG_CASCADE_COLUMNS) {
+        if (cascadeOn(c.key) && base[c.key] === false) rows.forEach((r, i) => { if (i > 0) r.values[c.key] = displayed(i, c.key); });
+      }
+      perWoCascade = null;
+      for (const c of JLG_CASCADE_COLUMNS) {
+        if (base[c.key] !== false) rows.forEach((r, i) => { if (i > 0 && !r.touched.has(c.key)) r.pinned.delete(c.key); });
+      }
+      redraw(); markDirty(); drawCascadePop();
+      if (onCascadeConfigChange) onCascadeConfigChange(null);
+    });
+    cascadePop.querySelector('.jlg-cascade-close').addEventListener('click', () => { cascadePop.hidden = true; });
+  }
+
+  container.querySelector('.jlg-cascade-btn').addEventListener('click', () => {
+    cascadePop.hidden = !cascadePop.hidden;
+    if (!cascadePop.hidden) drawCascadePop();
+  });
+
+  // ---- draft autosave (§6) ----
+  function serializeDraft() {
+    return {
+      savedAt: Date.now(),
+      extra: draftExtra(),
+      cascadeConfig: perWoCascade,
+      rows: rows.map((r) => ({
+        id: r.id, title: r.title, estHours: r.estHours, estCost: r.estCost,
+        values: r.values, pinned: [...r.pinned], touched: [...r.touched],
+        errors: Object.fromEntries(r.errors), originalStatusId: r.originalStatusId,
+      })),
+    };
+  }
+
+  function writeDraft() {
+    try {
+      if (rows.every(rowIsEmpty)) { localStorage.removeItem(key); return; }
+      localStorage.setItem(key, JSON.stringify(serializeDraft()));
+    } catch { /* private mode / quota — the grid still works, it just won't survive a reload */ }
+  }
+
+  function beforeUnload(e) { e.preventDefault(); e.returnValue = ''; return ''; }
+
+  function markDirty() {
+    if (!dirty) { dirty = true; window.addEventListener('beforeunload', beforeUnload); onDirtyChange(true); }
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(writeDraft, 2000);
+  }
+
+  function clearDraft() {
+    clearTimeout(saveTimer);
+    try { localStorage.removeItem(key); } catch { /* ignore */ }
+    if (dirty) { dirty = false; window.removeEventListener('beforeunload', beforeUnload); onDirtyChange(false); }
+  }
+
+  // ---- save payload (§3's save semantics) ----
+  // Every line stamps its RESOLVED, displayed values. No nulls-meaning-
+  // inherit, no runtime resolution against a parent — a report reading these
+  // rows years from now never has to know cascade existed.
+  function getSaveLines() {
+    return rows.map((row, idx) => ({ row, idx }))
+      .filter(({ row }) => String(row.title).trim())
+      .map(({ row, idx }) => {
+        const funding = parseFundingOptionValue(displayed(idx, 'funding_source'));
+        return {
+          id: row.id,
+          title: String(row.title).trim(),
+          responsibilityClass: displayed(idx, 'responsibility_class') || 'self',
+          fundingSource: funding.source,
+          fundingRefId: funding.refId,
+          estimatedHours: row.estHours === '' ? null : Number(row.estHours),
+          estimatedCost: row.estCost === '' ? null : Number(row.estCost),
+          scheduledDate: displayed(idx, 'scheduled_date') || null,
+          statusId: displayed(idx, 'status_id') ? Number(displayed(idx, 'status_id')) : null,
+          statusNote: row.statusNote || undefined,
+          pinnedFields: [...row.pinned],
+        };
+      });
+  }
+
+  function destroy() {
+    clearTimeout(saveTimer);
+    window.removeEventListener('beforeunload', beforeUnload);
+  }
+
+  // ---- boot ----
+  rows = (initialRows && initialRows.length ? initialRows : [{}]).map((seed) => blankRow(seed));
+  const knownLineIds = rows.map((r) => r.id).filter((id) => id != null);
+  redraw();
+
+  const api = {
+    container,
+    getRows: () => rows,
+    getSaveLines,
+    knownLineIds,
+    lineCount: () => liveRows().length,
+    hasErrors: () => rows.some((r) => r.errors.size),
+    isDirty: () => dirty,
+    clearDraft,
+    destroy,
+    focusFirst: () => focusRow(rows[0]),
+    getCascadeConfig: () => perWoCascade,
+  };
+  activeJobLineGrid = api;
+  return api;
+}
+
+// ---------- Grid support helpers ----------
+
+// Minimal RFC4180-ish reader: quoted fields, doubled quotes inside them,
+// newlines inside quotes. Delimiter is sniffed from the first line so a
+// pasted Sheets range (tabs) and a CSV (commas) both read correctly.
+function parseDelimitedText(text, delimiter = null) {
+  const src = String(text).replace(/\r\n?/g, '\n');
+  const firstLine = src.split('\n')[0] || '';
+  const delim = delimiter || ((firstLine.match(/\t/g) || []).length > (firstLine.match(/,/g) || []).length ? '\t' : ',');
+  const out = [];
+  let row = [];
+  let field = '';
+  let quoted = false;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (src[i + 1] === '"') { field += '"'; i++; } else quoted = false;
+      } else field += ch;
+      continue;
+    }
+    if (ch === '"') { quoted = true; continue; }
+    if (ch === delim) { row.push(field); field = ''; continue; }
+    if (ch === '\n') { row.push(field); out.push(row); row = []; field = ''; continue; }
+    field += ch;
+  }
+  row.push(field);
+  out.push(row);
+  return out.filter((r) => r.length && !(r.length === 1 && r[0].trim() === ''));
+}
+
+// Accepts what a spreadsheet actually produces — 2026-09-21, 9/21/2026,
+// 9/21/26, "Sep 21, 2026" — and returns the YYYY-MM-DD an <input type=date>
+// needs, or null when it genuinely can't tell.
+function parseLooseDate(text) {
+  const t = String(text).trim();
+  if (!t) return null;
+  let m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}`;
+  m = t.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})$/);
+  if (m) {
+    const year = m[3].length === 2 ? `20${m[3]}` : m[3];
+    return `${year}-${String(m[1]).padStart(2, '0')}-${String(m[2]).padStart(2, '0')}`;
+  }
+  const d = new Date(`${t} UTC`);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
+
+// A toast with one button on it — used for the row-delete undo (§6), where a
+// plain message would be useless because the whole point is to click it.
+let actionToastEl = null;
+function actionToast(message, actionLabel, onAction, ms = 8000) {
+  if (actionToastEl) actionToastEl.remove();
+  const el = document.createElement('div');
+  actionToastEl = el;
+  el.className = 'toast action-toast';
+  el.innerHTML = `<span>${escapeHtml(message)}</span><button type="button" class="action-toast-btn">${escapeHtml(actionLabel)}</button>`;
+  document.body.appendChild(el);
+  const dismiss = () => { clearTimeout(timer); if (actionToastEl === el) actionToastEl = null; el.remove(); };
+  el.querySelector('.action-toast-btn').addEventListener('click', () => { dismiss(); onAction(); });
+  const timer = setTimeout(dismiss, ms);
+  return dismiss;
+}
+
+function jlgReadDraft(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const draft = JSON.parse(raw);
+    return Array.isArray(draft?.rows) && draft.rows.some((r) => String(r.title || '').trim()) ? draft : null;
+  } catch { return null; }
+}
+function jlgClearDraft(key) { try { localStorage.removeItem(key); } catch { /* ignore */ } }
+
+// The grid seeds a row per saved job line, restoring pin/follow rendering
+// from pinned_fields — the only thing that column is for (§3).
+function jlgRowsFromJobLines(jobLines) {
+  return jobLines.map((jl) => ({
+    id: jl.Id,
+    title: jl.Title || '',
+    estHours: jl.EstimatedHours ?? '',
+    estCost: jl.EstimatedCost ?? '',
+    values: {
+      responsibility_class: jl.ResponsibilityClass || 'self',
+      funding_source: fundingOptionValue(jl.FundingSource, jl.FundingRefId),
+      status_id: String(jl.StatusId ?? ''),
+      scheduled_date: (jl.ScheduledDate || '').slice(0, 10),
+    },
+    pinned: jl.PinnedFields || [],
+    originalStatusId: jl.StatusId ?? null,
+  }));
+}
+
+// Loads everything the grid needs to turn ids into names without a
+// round-trip per keystroke: the funding entities behind all five funding
+// sources, flattened into the one searchable list the Funding Source column
+// uses (§9).
+async function loadGridContext() {
+  const [campaignRes, cabinRes, otherRes, fundsRes, settings] = await Promise.all([
+    api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'),
+    api('/api/pg/budget/other-categories'), api('/api/pg/funds'), api('/api/pg/display-settings'),
+  ]);
+  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items, fund: fundsRes.funds };
+  return {
+    fundingEntities,
+    fundingOptions: buildFundingOptions(fundingEntities),
+    jobLineStatuses: state.options.jobLineStatuses,
+    globalCascadeDefaults: settings.CascadeDefaults || JLG_CASCADE_DEFAULTS,
+  };
+}
+
+// §10: offered after every save, whatever put the lines in a resolved status
+// — manual, arrears entry, import, or template. Defaults to Yes but requires
+// the click, and the WO never auto-closes; closing stays the manual action it
+// has always been.
+async function maybePromptReview(workOrderId, reviewPrompt) {
+  if (!reviewPrompt?.ShouldPrompt || !reviewPrompt.ReviewStatus) return;
+  const move = await confirmDialog(
+    `All lines are resolved. Move this work order to ${reviewPrompt.ReviewStatus.Name}?`,
+    { confirmLabel: `Move to ${reviewPrompt.ReviewStatus.Name}`, cancelLabel: 'Leave as is', danger: false }
+  );
+  if (!move) return;
+  try {
+    await api(`/api/pg/work-orders/${workOrderId}`, { method: 'PATCH', body: JSON.stringify({ statusId: reviewPrompt.ReviewStatus.Id }) });
+    toast(`Moved to ${reviewPrompt.ReviewStatus.Name}`);
+  } catch (err) { toast(err.message); }
+}
+
+async function renderNewWorkOrder({ assetId, assetName, templateId }) {
+  setChrome({ title: 'New Work Order', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const [{ templates }, gridCtx] = await Promise.all([api('/api/pg/work-order-templates'), loadGridContext()]);
+  const fieldTitles = state.options.propertyFields.map((f) => f.title);
+
   const assetUpdateRowHtml = (row = {}) => `<div class="inline-add-row au-row" style="align-items:center">
     <select class="au-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
     <input class="au-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
@@ -8352,10 +9479,10 @@ async function renderNewWorkOrder({ assetId, assetName }) {
   setApp(`
     <div class="card">
       <h3>New Work Order</h3>
-      ${templates.length ? `<div class="field-row"><label>Start from Template (optional)</label>
-        <select id="tplPicker"><option value="">— none —</option>${templates.map((t) => `<option value="${t.Id}">${escapeHtml(t.Name)}</option>`).join('')}</select>
-      </div>` : ''}
       <form id="newWoForm">
+        ${templates.length ? `<div class="field-row"><label>Start from Template (optional)</label>
+          <select id="tplPicker"><option value="">— none —</option>${templates.map((t) => `<option value="${t.Id}" ${String(templateId) === String(t.Id) ? 'selected' : ''}>${escapeHtml(t.Name)}</option>`).join('')}</select>
+        </div>` : ''}
         <div class="field-row"><label>Title</label><input name="title" required /></div>
         <div class="field-row"><label>Asset</label>
           ${assetId ? `<input value="${escapeHtml(assetName)}" disabled />` : `<div id="woAssetPicker"></div>`}
@@ -8363,12 +9490,13 @@ async function renderNewWorkOrder({ assetId, assetName }) {
         <div class="field-row"><label>Priority</label>
           <select name="priority"><option>Low</option><option selected>Medium</option><option>High</option><option>Urgent</option></select>
         </div>
-        <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" /></div>
+        <div class="field-row"><label>Scheduled Date</label><input name="scheduledDate" type="date" />
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">Any line left without its own date uses this one.</p>
+        </div>
         <div class="field-row"><label>Description</label><textarea name="description"></textarea></div>
         <div class="field-row"><label>Job Lines</label>
-          <p class="muted" style="margin:2px 0 8px">Each line is its own hours, cost, funding, and responsibility — a vendor on the roof, volunteers on the deck, same work order.</p>
-          <div class="jl-rows"></div>
-          <button type="button" class="btn btn-secondary" id="addJlRowBtn" style="margin-top:6px">+ Add Job Line</button>
+          <p class="muted" style="margin:2px 0 8px">One row per line — its own hours, cost, funding and responsibility. A vendor on the roof, volunteers on the deck, same work order.</p>
+          <div id="woGrid"></div>
         </div>
         <details style="margin:16px 0">
           <summary style="cursor:pointer;font-weight:700">Also update asset fields (optional)</summary>
@@ -8383,65 +9511,200 @@ async function renderNewWorkOrder({ assetId, assetName }) {
       </form>
     </div>`);
 
+  const form = document.getElementById('newWoForm');
   let assetPicker = null;
   if (!assetId) assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'));
 
-  function wireRowRemove() { app.querySelectorAll('.au-row .row-remove, .task-row .row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); }); }
-  function addJobLineRow(row) {
-    document.querySelector('.jl-rows').insertAdjacentHTML('beforeend', jobLineRowHtml(row));
-    wireJobLineRow(document.querySelector('.jl-rows').lastElementChild);
+  const draftKey = jlgDraftKey(null);
+  const gridHost = document.getElementById('woGrid');
+  let grid = null;
+
+  function headerState() {
+    return {
+      title: form.title.value, priority: form.priority.value,
+      scheduledDate: form.scheduledDate.value, description: form.description.value,
+    };
   }
-  document.getElementById('addJlRowBtn').addEventListener('click', () => addJobLineRow());
+
+  function buildGrid({ initialRows = null, cascadeConfig = null } = {}) {
+    grid = mountJobLineGrid(gridHost, {
+      woId: null,
+      jobLineStatuses: gridCtx.jobLineStatuses,
+      fundingOptions: gridCtx.fundingOptions,
+      globalCascadeDefaults: gridCtx.globalCascadeDefaults,
+      cascadeConfig,
+      initialRows,
+      draftKey,
+      draftExtra: headerState,
+    });
+    return grid;
+  }
+
+  // §6: a draft found on arrival is offered, never silently applied — the
+  // previous attempt might have been abandoned on purpose.
+  const draft = jlgReadDraft(draftKey);
+  if (draft && await confirmDialog(
+    `You have an unsaved work order draft from ${formatDraftAge(draft.savedAt)} (${draft.rows.filter((r) => String(r.title || '').trim()).length} lines). Restore it?`,
+    { confirmLabel: 'Restore draft', cancelLabel: 'Discard', danger: false })) {
+    buildGrid({ initialRows: draft.rows, cascadeConfig: draft.cascadeConfig });
+    if (draft.extra) {
+      form.title.value = draft.extra.title || '';
+      form.priority.value = draft.extra.priority || 'Medium';
+      form.scheduledDate.value = draft.extra.scheduledDate || '';
+      form.description.value = draft.extra.description || '';
+    }
+    toast('Draft restored');
+  } else {
+    if (draft) jlgClearDraft(draftKey);
+    buildGrid();
+  }
+
+  function wireRowRemove() { app.querySelectorAll('.au-row .row-remove').forEach((btn) => { btn.onclick = () => btn.closest('.inline-add-row').remove(); }); }
   document.getElementById('addAuBtn').addEventListener('click', () => {
     document.querySelector('.au-rows').insertAdjacentHTML('beforeend', assetUpdateRowHtml());
     wireRowRemove();
   });
-  addJobLineRow(); // start with one blank line — the common case is at least one
 
-  document.getElementById('tplPicker')?.addEventListener('change', (e) => {
-    const tpl = templates.find((t) => t.Id === Number(e.target.value));
-    const form = document.getElementById('newWoForm');
-    if (!tpl) return;
-    if (tpl.DefaultTitle) form.title.value = tpl.DefaultTitle;
-    if (tpl.DefaultPriority) form.priority.value = tpl.DefaultPriority;
-    if (tpl.DefaultDescription) form.description.value = tpl.DefaultDescription;
-    document.querySelector('.jl-rows').innerHTML = '';
-    (tpl.JobLineDefaults || []).forEach((l) => addJobLineRow({ ...(typeof l === 'string' ? { title: l } : l), responsibilityClass: (typeof l === 'object' && l.responsibilityClass) || tpl.DefaultResponsibilityClass }));
-    if (!(tpl.JobLineDefaults || []).length) addJobLineRow();
-    document.querySelector('.au-rows').innerHTML = (tpl.AssetUpdateDefaults || []).map(assetUpdateRowHtml).join('');
-    wireRowRemove();
-    toast(`Prefilled from "${tpl.Name}" — review before creating`);
-  });
+  // §8: the same /from-template endpoint the scheduler will use — called with
+  // dryRun, so picking a template prefills the grid without creating anything.
+  async function applyTemplate(id) {
+    if (!id) return;
+    try {
+      const result = await api('/api/pg/work-orders/from-template', { method: 'POST', body: JSON.stringify({ templateId: Number(id), dryRun: true }) });
+      if (result.workOrder.title) form.title.value = result.workOrder.title;
+      if (result.workOrder.priority) form.priority.value = result.workOrder.priority;
+      if (result.workOrder.description) form.description.value = result.workOrder.description;
+      buildGrid({
+        initialRows: result.jobLines.map((l) => ({
+          title: l.title, estHours: l.estimatedHours ?? '', estCost: l.estimatedCost ?? '',
+          values: {
+            responsibility_class: l.responsibilityClass,
+            funding_source: fundingOptionValue(l.fundingSource, l.fundingRefId),
+            scheduled_date: '',
+          },
+          pinned: l.pinnedFields,
+        })),
+      });
+      document.querySelector('.au-rows').innerHTML = (result.template.AssetUpdateDefaults || []).map(assetUpdateRowHtml).join('');
+      wireRowRemove();
+      toast(`Prefilled from "${result.template.Name}" — review before creating`);
+    } catch (err) { toast(err.message); }
+  }
+  document.getElementById('tplPicker')?.addEventListener('change', (e) => applyTemplate(e.target.value));
+  if (templateId) await applyTemplate(templateId);
 
   document.getElementById('cancelWoBtn').addEventListener('click', goBack);
-  document.getElementById('newWoForm').addEventListener('submit', async (e) => {
+  form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
     const title = fd.get('title');
     const finalAssetId = assetId || assetPicker?.getSelected()?.Id;
     if (!finalAssetId) { toast('Pick an asset first (or add a new one)'); return; }
-    const jobLines = [...document.querySelectorAll('.jl-row')].map((row) => ({
-      title: row.querySelector('.jl-title').value.trim(),
-      responsibilityClass: row.querySelector('.jl-resp').value,
-      fundingSource: row.querySelector('.jl-funding-source').value,
-      fundingRefId: row.querySelector('.jl-funding-ref-row').hidden ? null : (row.querySelector('.jl-funding-ref').value || null),
-      estimatedHours: row.querySelector('.jl-est-hours').value || null,
-      estimatedCost: row.querySelector('.jl-est-cost').value || null,
-      scheduledDate: row.querySelector('.jl-scheduled-date').value || null,
-    })).filter((l) => l.title);
-    const assetUpdates = [...document.querySelectorAll('.au-row')].map((row) => ({
-      targetField: row.querySelector('.au-field').value, newValue: row.querySelector('.au-value').value,
-    })).filter((r) => r.newValue.trim());
+    if (grid.hasErrors()) { toast("Some imported cells didn't match — fix the red cells first"); return; }
+    const jobLines = grid.getSaveLines();
     const woScheduledDate = fd.get('scheduledDate');
     const datesToCheck = [...new Set([woScheduledDate, ...jobLines.map((l) => l.scheduledDate)].filter(Boolean))];
     if (!await confirmVisitorConflicts(datesToCheck.map((date) => ({ date, assetId: finalAssetId })))) return;
     try {
       const result = await api('/api/pg/work-orders', { method: 'POST', body: JSON.stringify({
         title, assetId: Number(finalAssetId), priority: fd.get('priority'), description: fd.get('description'),
-        scheduledDate: fd.get('scheduledDate') || undefined, jobLines, assetUpdates,
+        scheduledDate: woScheduledDate || undefined, jobLines,
+        assetUpdates: [...document.querySelectorAll('.au-row')].map((row) => ({
+          targetField: row.querySelector('.au-field').value, newValue: row.querySelector('.au-value').value,
+        })).filter((r) => r.newValue.trim()),
+        cascadeConfig: grid.getCascadeConfig(),
       }) });
+      grid.clearDraft();
       toast('Work order created');
+      await maybePromptReview(result.workOrderId, result.reviewPrompt);
       go('workOrderDetail', { id: result.workOrderId }, { replace: true });
+    } catch (err) { toast(err.message); }
+  });
+}
+
+function formatDraftAge(savedAt) {
+  const mins = Math.round((Date.now() - (savedAt || 0)) / 60000);
+  if (mins < 1) return 'moments ago';
+  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  return formatDateNice(new Date(savedAt).toISOString());
+}
+
+// The grid as an edit surface for a work order that already exists (§2). The
+// WO's detail page keeps its card view for reading; this is where the whole
+// line set gets reshaped at once.
+async function renderEditWorkOrderLines({ id }) {
+  setChrome({ title: 'Edit Job Lines', showBack: true, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  const [detail, gridCtx] = await Promise.all([api(`/api/pg/work-orders/${id}`), loadGridContext()]);
+  const wo = detail.workOrder;
+  const jobLines = detail.jobLines;
+
+  setApp(`
+    <div class="card">
+      <h3>WO ${escapeHtml(wo.WoNumber || wo.Id)} — ${escapeHtml(wo.Title)}</h3>
+      <p class="muted">Edit every line at once. Lines you remove here are deleted when you save; the card view keeps notes, photos, crew and split.</p>
+      <div id="woGrid"></div>
+      <div class="btn-row">
+        <button class="btn btn-primary" type="button" id="saveLinesBtn">Save Job Lines</button>
+        <button class="btn btn-secondary" type="button" id="cancelLinesBtn">Cancel</button>
+      </div>
+    </div>`);
+
+  const draftKey = jlgDraftKey(id);
+  const gridHost = document.getElementById('woGrid');
+  let grid = null;
+  const build = (initialRows, cascadeConfig) => {
+    grid = mountJobLineGrid(gridHost, {
+      woId: id,
+      jobLineStatuses: gridCtx.jobLineStatuses,
+      fundingOptions: gridCtx.fundingOptions,
+      globalCascadeDefaults: gridCtx.globalCascadeDefaults,
+      cascadeConfig: cascadeConfig !== undefined ? cascadeConfig : wo.CascadeConfig,
+      initialRows,
+      draftKey,
+      // The per-WO cascade override is a property of the work order, so it
+      // persists the moment it's toggled rather than waiting for a save.
+      onCascadeConfigChange: (cfg) => api(`/api/pg/work-orders/${id}/cascade-config`, {
+        method: 'PATCH', body: JSON.stringify({ cascadeConfig: cfg }),
+      }).catch((err) => toast(err.message)),
+    });
+  };
+
+  const saved = jlgRowsFromJobLines(jobLines);
+  const draft = jlgReadDraft(draftKey);
+  if (draft && await confirmDialog(
+    `You have unsaved changes to these job lines from ${formatDraftAge(draft.savedAt)}. Restore them?`,
+    { confirmLabel: 'Restore draft', cancelLabel: 'Discard', danger: false })) {
+    build(draft.rows, draft.cascadeConfig);
+    toast('Draft restored');
+  } else {
+    if (draft) jlgClearDraft(draftKey);
+    build(saved);
+  }
+
+  document.getElementById('cancelLinesBtn').addEventListener('click', () => {
+    grid.clearDraft();
+    go('workOrderDetail', { id }, { replace: true });
+  });
+  document.getElementById('saveLinesBtn').addEventListener('click', async () => {
+    if (grid.hasErrors()) { toast("Some cells didn't match — fix the red cells first"); return; }
+    const lines = grid.getSaveLines();
+    const removed = grid.knownLineIds.filter((lineId) => !lines.some((l) => l.id === lineId));
+    if (removed.length && !await confirmDialog(
+      `${removed.length} job line${removed.length === 1 ? '' : 's'} will be deleted, along with their crew assignments and photos. Save anyway?`,
+      { confirmLabel: 'Save and delete' })) return;
+    const datesToCheck = [...new Set(lines.map((l) => l.scheduledDate).filter(Boolean))];
+    if (wo.Asset?.Id && !await confirmVisitorConflicts(datesToCheck.map((date) => ({ date, assetId: wo.Asset.Id })))) return;
+    try {
+      const result = await api(`/api/pg/work-orders/${id}/job-lines`, {
+        method: 'PUT', body: JSON.stringify({ lines, knownLineIds: grid.knownLineIds }),
+      });
+      grid.clearDraft();
+      toast('Job lines saved');
+      await maybePromptReview(id, result.reviewPrompt);
+      go('workOrderDetail', { id }, { replace: true });
     } catch (err) { toast(err.message); }
   });
 }
@@ -8450,12 +9713,13 @@ async function renderNewWorkOrder({ assetId, assetName }) {
 const FUNDING_SOURCE_LABELS = {
   operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other', fund: 'Fund',
 };
-// The old WO-level funding combobox (search/inline-create) was retired with
-// Phase 1 — funding now lives per-line via a plain <select> populated from
-// fundingEntities (see jobLineRowHtml/jobLineCardHtml). Creating a brand new
-// Capital Campaign Project / Cabin-Holder / Other category happens on the
-// Capital Plan page (renderCapitalPlan), which already has full CRUD for
-// all three — a job line just picks from what exists there.
+// Funding lives per-line. Source and ref are two columns in Postgres but one
+// decision to a person, so both the grid's Funding Source column and the job
+// line card present them as a single searchable list — buildFundingOptions
+// flattens all five sources into it. Creating a brand new Capital Campaign
+// Project / Cabin-Holder / Other category happens on the Capital Plan page
+// (renderCapitalPlan), which already has full CRUD for all three — a job
+// line just picks from what exists there.
 
 // One job line's full edit surface — title/responsibility/funding/hours/cost/
 // schedule up top (the 1.7 creation fields, still editable after), then
@@ -8464,9 +9728,7 @@ const FUNDING_SOURCE_LABELS = {
 // close-gate logic are Phase 2), then its own crew and photos. Collapsed by
 // default (<details>) so N lines on one WO doesn't turn the page into an
 // unreadable wall on a phone.
-function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }) {
-  const fundingSource = jl.FundingSource || 'operating_budget';
-  const fundingRefOptions = (fundingEntities[fundingSource] || []).map((e) => `<option value="${e.Id}" ${e.Id === jl.FundingRefId ? 'selected' : ''}>${escapeHtml(e.Name)}</option>`).join('');
+function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
   const selectedCauseIds = new Set((jl.Causes || []).map((c) => c.Id));
   const summaryBits = [
     RESPONSIBILITY_CLASS_LABELS[jl.ResponsibilityClass] || jl.ResponsibilityClass,
@@ -8498,11 +9760,7 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }
         <select class="jl-e-resp">${Object.entries(RESPONSIBILITY_CLASS_LABELS).map(([k, v]) => `<option value="${k}" ${jl.ResponsibilityClass === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
       </div>
       <div class="field-row"><label>Funding Source</label>
-        <select class="jl-e-funding-source">${Object.entries(FUNDING_SOURCE_LABELS).map(([k, v]) => `<option value="${k}" ${fundingSource === k ? 'selected' : ''}>${v}</option>`).join('')}</select>
-      </div>
-      <div class="field-row jl-e-funding-ref-row" ${fundingSource === 'operating_budget' ? 'hidden' : ''}>
-        <label>${escapeHtml(FUNDING_SOURCE_LABELS[fundingSource] || '')}</label>
-        <select class="jl-e-funding-ref">${fundingRefOptions}</select>
+        <div class="jl-e-funding" data-value="${escapeHtml(fundingOptionValue(jl.FundingSource, jl.FundingRefId))}"></div>
       </div>
       <div class="field-row"><label>Estimated Hours</label><input class="jl-e-est-hours" type="number" step="any" min="0" value="${jl.EstimatedHours ?? ''}" /></div>
       <div class="field-row"><label>Actual Hours</label><input class="jl-e-act-hours" type="number" step="any" min="0" value="${jl.ActualHours ?? ''}" /></div>
@@ -8539,10 +9797,9 @@ function jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses }
       ${(jl.volunteers || []).map((v) => `<div class="list-item" style="cursor:default"><span>👷 ${escapeHtml(v.Name)}</span><button class="btn btn-secondary jl-unassign-vol" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('')}
       ${(jl.vendors || []).map((v) => `<div class="list-item" style="cursor:default"><span>🔧 ${escapeHtml(v.Name)}</span><button class="btn btn-secondary jl-unassign-ven" data-id="${v.Id}" data-name="${escapeHtml(v.Name)}">Remove</button></div>`).join('')}
       ${!(jl.volunteers || []).length && !(jl.vendors || []).length ? '<p class="muted">None assigned.</p>' : ''}
-      <div class="field-row"><select class="jl-assign-picker"><option value="">— assign volunteer or vendor —</option>
-        ${(state._allVolunteers || []).filter((v) => !(jl.volunteers || []).some((a) => a.Id === v.Id)).map((v) => `<option value="vol:${v.Id}">👷 ${escapeHtml(v.Name)}</option>`).join('')}
-        ${(state._allVendors || []).filter((v) => !(jl.vendors || []).some((a) => a.Id === v.Id)).map((v) => `<option value="ven:${v.Id}">🔧 ${escapeHtml(v.Name)}</option>`).join('')}
-      </select></div>
+      <div class="field-row"><div class="jl-assign-picker"
+        data-exclude-vol="${(jl.volunteers || []).map((v) => v.Id).join(',')}"
+        data-exclude-ven="${(jl.vendors || []).map((v) => v.Id).join(',')}"></div></div>
     </div>
 
     <div style="margin-top:14px" id="jlPhotos-${jl.Id}"></div>
@@ -8560,7 +9817,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
   ]);
   const allSkills = skillsRes.skills.map((s) => s.Name);
   const checklistTemplates = tplRes.templates;
-  const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items, fund: fundsRes.funds };
+  const fundingOptions = buildFundingOptions({ capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items, fund: fundsRes.funds });
   const causesCatalog = causesRes.causes;
   const { workOrder: wo, rollup, crewRoster, closeGate, assetUpdates, jobLines, checklist, logEntries, crewSessions } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
@@ -8579,7 +9836,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
   // below its use) stayed invisible until a work order actually had a job
   // line on it. Found live, 2026-09-14, while smoke-testing this file's own
   // schedule-time fields.
-  const jobLineRows = jobLines.map((jl) => jobLineCardHtml(jl, { fundingEntities, causesCatalog, jobLineStatuses })).join('')
+  const jobLineRows = jobLines.map((jl) => jobLineCardHtml(jl, { causesCatalog, jobLineStatuses })).join('')
     || '<p class="muted">No job lines yet — add the scope of work below.</p>';
   const logRows = logEntries.map((e) => `
     <div class="list-item" style="cursor:default;flex-wrap:wrap;align-items:flex-start">
@@ -8665,6 +9922,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <button class="btn btn-primary" id="completeWoBtn" ${wo.StatusIsTerminal ? 'disabled' : ''}>${wo.StatusIsTerminal ? wo.Status : 'Complete Work Order'}</button>
         <a class="btn btn-secondary" href="/api/pg/work-orders/${id}/scope-pdf" target="_blank" rel="noopener" title="A printable job description to hand a vendor or volunteer — no cost figures included">🖨️ Scope of Work (PDF)</a>
         <button class="btn btn-secondary" id="duplicateWoBtn">Duplicate</button>
+        <button class="btn btn-secondary" id="saveAsTemplateBtn" title="Snapshot these job lines as a reusable template — no statuses, no dates">Save as Template</button>
         <button class="btn btn-secondary" id="familyBtn">Family</button>
       </div>
       <div id="familyPanel" hidden></div>
@@ -8681,7 +9939,11 @@ async function renderWorkOrderDetail({ id }, container = app) {
     <div class="card">
       <h3>Job Lines</h3>
       <p class="muted">The unit of work — hours, cost, funding, responsibility, and scope all live on the line. A vendor on the roof, volunteers on the deck, one work order. Check lines above and use Split to move them into a new sibling work order (e.g. the roof needs a specialist, the deck doesn't).</p>
-      ${!wo.StatusIsTerminal ? `<div class="btn-row"><button type="button" class="btn btn-secondary" id="splitLinesBtn">Split Selected Lines Into New WO</button></div>` : ''}
+      <div class="btn-row">
+        ${!wo.StatusIsTerminal ? `<button type="button" class="btn btn-secondary" id="editLinesBtn" ${window.innerWidth < GRID_MIN_WIDTH ? 'hidden' : ''}>✎ Edit lines in grid</button>` : ''}
+        ${jobLines.length > 1 ? `<button type="button" class="btn btn-secondary" id="reorderLinesBtn">↕ Reorder</button>` : ''}
+        ${!wo.StatusIsTerminal ? `<button type="button" class="btn btn-secondary" id="splitLinesBtn">Split Selected Lines Into New WO</button>` : ''}
+      </div>
       ${jobLineRows}
       <div class="card" style="margin-top:10px;background:transparent;border:1px dashed var(--border,#ccc)">
         <h4 style="margin-top:0">+ Add Job Line</h4>
@@ -8788,6 +10050,58 @@ async function renderWorkOrderDetail({ id }, container = app) {
     go('calendar', { month: d.getMonth(), year: d.getFullYear(), date: isoDate(d), fromWorkOrderId: id, fromWorkOrderTitle: wo.Title });
   });
 
+  container.querySelector('#editLinesBtn')?.addEventListener('click', () => go('editWorkOrderLines', { id }));
+
+  // §7's mobile reorder: titles only, one row each, big arrow buttons, no
+  // touch drag — and one request on Done rather than a write per tap.
+  container.querySelector('#reorderLinesBtn')?.addEventListener('click', () => {
+    let order = jobLines.map((jl) => ({ Id: jl.Id, Title: jl.Title }));
+    const sheet = document.createElement('div');
+    sheet.className = 'reorder-sheet';
+    const draw = () => {
+      sheet.innerHTML = `
+        <div class="reorder-head">
+          <button type="button" class="reorder-cancel" aria-label="Cancel">✕</button>
+          <h3>Reorder job lines</h3>
+          <button type="button" class="btn btn-primary btn-small reorder-done">Done</button>
+        </div>
+        <div class="reorder-list">
+          ${order.map((l, i) => `<div class="reorder-row">
+            <span class="reorder-title">${escapeHtml(l.Title)}</span>
+            <button type="button" class="reorder-move" data-dir="-1" data-i="${i}" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button>
+            <button type="button" class="reorder-move" data-dir="1" data-i="${i}" ${i === order.length - 1 ? 'disabled' : ''} aria-label="Move down">↓</button>
+          </div>`).join('')}
+        </div>`;
+      sheet.querySelectorAll('.reorder-move').forEach((btn) => btn.addEventListener('click', () => {
+        const i = Number(btn.dataset.i);
+        const j = i + Number(btn.dataset.dir);
+        if (j < 0 || j >= order.length) return;
+        [order[i], order[j]] = [order[j], order[i]];
+        draw();
+      }));
+      sheet.querySelector('.reorder-cancel').addEventListener('click', () => sheet.remove());
+      sheet.querySelector('.reorder-done').addEventListener('click', async () => {
+        try {
+          await api(`/api/pg/work-orders/${id}/job-lines/reorder`, { method: 'POST', body: JSON.stringify({ orderedIds: order.map((l) => l.Id) }) });
+          sheet.remove();
+          toast('Order saved');
+          renderWorkOrderDetail({ id }, container);
+        } catch (err) { toast(err.message); }
+      });
+    };
+    draw();
+    document.body.appendChild(sheet);
+  });
+
+  container.querySelector('#saveAsTemplateBtn')?.addEventListener('click', async () => {
+    const name = window.prompt('Name this template', wo.Title || '');
+    if (name == null || !name.trim()) return;
+    try {
+      const { template } = await api(`/api/pg/work-orders/${id}/save-as-template`, { method: 'POST', body: JSON.stringify({ name: name.trim() }) });
+      toast(`Saved template "${template.Name}" — ${template.Lines.length} line${template.Lines.length === 1 ? '' : 's'}`);
+    } catch (err) { toast(err.message); }
+  });
+
   container.querySelector('#splitLinesBtn')?.addEventListener('click', async () => {
     const jobLineIds = [...container.querySelectorAll('.jl-split-select:checked')].map((el) => Number(el.value));
     if (!jobLineIds.length) { toast('Check at least one job line first'); return; }
@@ -8848,14 +10162,16 @@ async function renderWorkOrderDetail({ id }, container = app) {
     statusSelect.addEventListener('change', syncStatusNoteVisibility);
     syncStatusNoteVisibility();
 
-    const fundingSourceSelect = card.querySelector('.jl-e-funding-source');
-    const fundingRefRow = card.querySelector('.jl-e-funding-ref-row');
-    fundingSourceSelect.addEventListener('change', () => {
-      const source = fundingSourceSelect.value;
-      if (source === 'operating_budget') { fundingRefRow.hidden = true; return; }
-      fundingRefRow.hidden = false;
-      fundingRefRow.querySelector('label').textContent = FUNDING_SOURCE_LABELS[source];
-      fundingRefRow.querySelector('select').innerHTML = (fundingEntities[source] || []).map((ent) => `<option value="${ent.Id}">${escapeHtml(ent.Name)}</option>`).join('');
+    // §9: one searchable list across all five funding sources, same component
+    // and same option set the grid's Funding Source column uses — the two
+    // stacked selects it replaces made picking one of ~300 cabin holders a
+    // scroll rather than a search.
+    const fundingMount = card.querySelector('.jl-e-funding');
+    const fundingCbx = mountCombobox(fundingMount, {
+      options: fundingOptions,
+      value: fundingMount.dataset.value,
+      placeholder: 'Operating Budget',
+      emptyText: 'No funding source matches',
     });
 
     card.querySelectorAll('.jl-e-cause').forEach((cb) => cb.addEventListener('change', () => {
@@ -8882,8 +10198,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
           title: card.querySelector('.jl-e-title').value.trim(),
           statusId: Number(statusSelect.value), statusNote: card.querySelector('.jl-e-status-note').value,
           responsibilityClass: card.querySelector('.jl-e-resp').value,
-          fundingSource: fundingSourceSelect.value,
-          fundingRefId: fundingRefRow.hidden ? '' : (fundingRefRow.querySelector('select').value || ''),
+          fundingSource: parseFundingOptionValue(fundingCbx.getValue() || fundingMount.dataset.value).source,
+          fundingRefId: parseFundingOptionValue(fundingCbx.getValue() || fundingMount.dataset.value).refId ?? '',
           estimatedHours: card.querySelector('.jl-e-est-hours').value,
           actualHours: card.querySelector('.jl-e-act-hours').value,
           estimatedCost: card.querySelector('.jl-e-est-cost').value,
@@ -8908,14 +10224,26 @@ async function renderWorkOrderDetail({ id }, container = app) {
       catch (err) { toast(err.message); }
     });
 
-    card.querySelector('.jl-assign-picker').addEventListener('change', async (e) => {
-      const [kind, entId] = e.target.value.split(':');
-      if (!kind) return;
-      try {
-        if (kind === 'vol') await api(`/api/pg/job-lines/${jlId}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: Number(entId) }) });
-        else await api(`/api/pg/job-lines/${jlId}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: Number(entId) }) });
-        renderWorkOrderDetail({ id }, container);
-      } catch (err) { toast(err.message); }
+    const assignMount = card.querySelector('.jl-assign-picker');
+    const excluded = (attr) => new Set(assignMount.dataset[attr].split(',').filter(Boolean));
+    const excludedVol = excluded('excludeVol');
+    const excludedVen = excluded('excludeVen');
+    mountCombobox(assignMount, {
+      options: [
+        ...(state._allVolunteers || []).filter((v) => !excludedVol.has(String(v.Id))).map((v) => ({ value: `vol:${v.Id}`, label: `👷 ${v.Name}` })),
+        ...(state._allVendors || []).filter((v) => !excludedVen.has(String(v.Id))).map((v) => ({ value: `ven:${v.Id}`, label: `🔧 ${v.Name}` })),
+      ],
+      placeholder: '— assign volunteer or vendor —',
+      emptyText: 'Nobody matches',
+      onSelect: async (opt) => {
+        if (!opt) return;
+        const [kind, entId] = String(opt.value).split(':');
+        try {
+          if (kind === 'vol') await api(`/api/pg/job-lines/${jlId}/volunteers`, { method: 'POST', body: JSON.stringify({ volunteerId: Number(entId) }) });
+          else await api(`/api/pg/job-lines/${jlId}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: Number(entId) }) });
+          renderWorkOrderDetail({ id }, container);
+        } catch (err) { toast(err.message); }
+      },
     });
     card.querySelectorAll('.jl-unassign-vol').forEach((btn) => btn.addEventListener('click', async () => {
       if (!await confirmDialog(`Remove ${btn.dataset.name} from this line?`)) return;
