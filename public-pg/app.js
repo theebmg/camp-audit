@@ -493,6 +493,11 @@ async function api(path, opts = {}) {
   }
   const body = await res.json().catch(() => ({}));
   if (!res.ok || body.ok === false) throw new Error(body.error || `Request failed (${res.status})`);
+  // Any successful write is a save. Clearing here means a save handler that
+  // navigates on success (the common shape in this app) doesn't get asked
+  // "you have unsaved changes" about the very thing it just persisted —
+  // without every one of those handlers having to remember to say so.
+  if (opts.method && opts.method.toUpperCase() !== 'GET') formDirty = false;
   return body;
 }
 
@@ -708,23 +713,57 @@ function setChrome({ title, showBack, showLogout }) {
 }
 
 // beforeunload only fires on a real page unload (tab close, reload, external
-// link). An SPA view swap is not an unload, so the grid's guard could never
-// catch "clicked another nav item with unsaved lines" — that path is here.
-// Every navigation in the app funnels through go()/goBack(), so this is the
-// one place it needs to live.
-async function confirmLeaveDirtyGrid() {
+// link). An SPA view swap is not an unload, so a per-screen beforeunload guard
+// can never catch "clicked another nav item with unsaved work" — that path is
+// here. Every navigation funnels through go()/goBack(), so this is the one
+// place it needs to live.
+//
+// formDirty is set by genuine user interaction only: programmatic assignment
+// (el.value = x) fires neither input nor change, so screens that populate
+// themselves from an async fetch after render never trip it. That property is
+// why this tracks events rather than diffing a snapshot of the DOM.
+let formDirty = false;
+
+// A field counts as real work if it lives inside a <form>, or is a textarea
+// (typed prose is the most painful thing to lose). Search boxes, filter
+// selects and sort controls all sit outside <form> in this app, so they are
+// excluded structurally rather than by maintaining a list of ids. Anything
+// that needs to opt out explicitly can carry data-no-guard.
+function isGuardedField(el) {
+  if (!el || !el.matches) return false;
+  if (!el.matches('input, textarea, select')) return false;
+  if (el.type === 'hidden' || el.type === 'search' || el.disabled) return false;
+  if (el.closest('[data-no-guard]')) return false;
+  return !!el.closest('form') || el.tagName === 'TEXTAREA' || !!el.closest('[data-guard]');
+}
+
+app.addEventListener('input', (e) => { if (isGuardedField(e.target)) formDirty = true; }, true);
+app.addEventListener('change', (e) => { if (isGuardedField(e.target)) formDirty = true; }, true);
+
+async function confirmLeaveUnsaved() {
   const grid = activeJobLineGrid;
-  if (!grid || !grid.isDirty()) return true;
-  const n = grid.lineCount();
-  return confirmDialog(
-    `You have ${n} unsaved job line${n === 1 ? '' : 's'}. Leaving keeps them as a draft you can restore, but they won't be attached to the work order until you save.`,
-    { confirmLabel: 'Leave', cancelLabel: 'Stay on this page', danger: true }
-  );
+  if (grid && grid.isDirty()) {
+    const n = grid.lineCount();
+    return confirmDialog(
+      `You have ${n} unsaved job line${n === 1 ? '' : 's'}. Leaving keeps them as a draft you can restore, but they won't be attached to the work order until you save.`,
+      { confirmLabel: 'Leave', cancelLabel: 'Stay on this page', danger: true }
+    );
+  }
+  // If nothing editable is left on screen, whatever was typed was in a form the
+  // user already dismissed (an inline Add row removed, a panel closed). Don't
+  // ask about work that no longer exists.
+  if (formDirty && app.querySelector('form, textarea')) {
+    return confirmDialog(
+      'You have unsaved changes on this screen. Leaving will discard them.',
+      { confirmLabel: 'Leave', cancelLabel: 'Stay on this page', danger: true }
+    );
+  }
+  return true;
 }
 
 async function go(view, params, opts = {}) {
   // opts.skipGuard: goBack() has already asked, so don't ask twice.
-  if (!opts.skipGuard && !(await confirmLeaveDirtyGrid())) return;
+  if (!opts.skipGuard && !(await confirmLeaveUnsaved())) return;
   // opts.reset: jumping to a top-level section (sidebar nav, a dashboard
   // quick-link, an admin tool list) starts a fresh breadcrumb trail rather
   // than extending whatever drill-down path was already on the stack —
@@ -745,7 +784,7 @@ async function go(view, params, opts = {}) {
 async function goBack() {
   // Confirm before popping: bailing out after the pops would leave the
   // breadcrumb stack one entry short of where the user actually still is.
-  if (!(await confirmLeaveDirtyGrid())) return;
+  if (!(await confirmLeaveUnsaved())) return;
   state.stack.pop();
   const prev = state.stack.pop();
   if (prev) go(prev.view, prev.params, { skipGuard: true });
@@ -755,7 +794,7 @@ async function goBack() {
 backBtn.addEventListener('click', goBack);
 logoutBtn.addEventListener('click', async () => {
   // Ask before the fetch — once the session is gone, staying isn't an option.
-  if (!(await confirmLeaveDirtyGrid())) return;
+  if (!(await confirmLeaveUnsaved())) return;
   await fetch('/logout', { method: 'POST' });
   state.user = null; state.stack = [];
   render('login');
@@ -1087,6 +1126,7 @@ async function render(view, params = {}) {
     // window-level listener (the grid's unsaved-changes guard, its autosave
     // timer) has to be torn down here rather than waiting to be garbage.
     destroyActiveJobLineGrid();
+    formDirty = false;   // new screen, nothing typed on it yet
     if (view === 'login') { await renderLogin(); return fadeInApp(); }
     if (!state.user) { await renderLogin(); return fadeInApp(); }
     if (!state.options) state.options = await api('/api/pg/options');
