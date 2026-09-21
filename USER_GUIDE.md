@@ -74,18 +74,62 @@ everything happens**: hours, cost, who's funding it, who's doing it, the
 schedule, the photos of the actual work, and its own status.
 
 ### Creating a work order
-From an asset's page, tap **New Work Order**. Give it a title, then tap
-**+ Add job line** for each piece of work — a roof repair and a deck repair
-on the same cabin are two lines on one work order, not two work orders.
-For each line, set:
+From an asset's page, tap **New Work Order**. Give it a title, then fill in
+the **job line grid** — one row per piece of work. A roof repair and a deck
+repair on the same cabin are two rows on one work order, not two work
+orders. Each row has:
+- **Title**, **Est. Hours**, **Est. Cost** — always typed per line.
 - **Responsibility** — Self, Volunteer, Vendor, or Cabin-Holder
 - **Funding source** — Operating Budget, Capital Campaign, Cabin-Holder,
-  Fund, or Other (and which specific campaign/holder/fund/category)
-- **Estimated hours/cost**, and a scheduled date (defaults to the work
-  order's date, but you can move one line independently — the vendor comes
-  Tuesday, the volunteers come Saturday). A start time and duration are
-  optional — leave them blank for an all-day entry ("sometime Tuesday" is a
-  real answer), or set both if it's an actual appointment.
+  Fund, or Other (and which specific campaign/holder/fund/category). Type
+  to search it: any part of a name matches, so "green" and "walt" both find
+  "Greenawalt, Ben".
+- **Status** — normally left at Not Started, but you can enter work that is
+  already finished by setting it here (see *Entering work after the fact*).
+- **Scheduled date** — defaults to the work order's date, but you can move
+  one line independently: the vendor comes Tuesday, the volunteers come
+  Saturday. (Start time and duration stay on the job line card, after the
+  work order is saved — leave them blank for an all-day entry.)
+
+The grid always keeps one empty row at the bottom; typing in it adds the
+next. Rows you leave without a title are simply ignored when you save. The
+bar underneath counts as you go — `6 lines · 14 hrs · $4,200` — and splits
+the total per funding source when more than one is in play.
+
+**Row 1 sets the defaults.** Rows below it show row 1's responsibility,
+funding, status and date in grey italics, meaning "same as row 1" — change
+row 1 and they all follow. The moment you type your own value into one it
+turns solid and stops following. Clearing it again puts it back to
+following. Which columns behave this way is up to you: **⚙ Cascade
+settings** on the grid sets it for that work order, and Admin sets the
+default for new ones.
+
+Keyboard, for entering a lot at once:
+- **Enter** — new line (it never submits the work order)
+- **Ctrl+Shift+D** — duplicate this line
+- **Alt+↑ / Alt+↓** — move this line up or down
+- **Ctrl/Cmd+V** — paste a range copied out of a spreadsheet
+
+The same shortcuts are listed along the bottom of the grid.
+
+#### Importing lines from a spreadsheet
+**⬆ Import lines** takes a CSV, and you can also paste a copied range
+straight from Google Sheets into any cell. Either way the rows land in the
+grid for you to look over — nothing is saved until you press Create.
+
+If the first row looks like column headings (Title, Hours, Cost,
+Responsibility, Funding, Status, Date — any capitalisation) it's used to map
+the columns; otherwise they're read in the order the grid shows them. Cells
+that have a value keep it; cells left blank follow row 1, so a file of
+nothing but titles picks up everything else from the first row. Anything
+that doesn't match a real responsibility, funding source or status turns the
+cell red, and save is blocked until you fix it — pick a value, or clear the
+cell to follow row 1.
+
+#### If you get interrupted
+The grid saves what you've typed in your browser as you go. Come back to the
+screen and it offers to restore it; closing the tab with unsaved work warns
+you first. Deleting a row offers **Undo** for a few seconds.
 
 **Actual Cost** on a job line is two things added together: whatever you
 type into the field directly (for a vendor invoice paid straight by camp, or
@@ -111,6 +155,32 @@ Open the work order, tap a job line to expand it. You can:
 - Mark it **Blocked** with a reason if it's stuck on something — this
   doesn't change its status, it's a separate flag that shows up as a 🚧 on
   the work order.
+
+### Reordering and editing lines later
+A saved work order shows its lines as cards — that's the reading view, where
+statuses, notes, photos, crew and splitting live. To reshape the whole set
+at once, use **Edit Job Lines** to get the grid back. On a phone, **↕
+Reorder** opens a simple list with up/down arrows per line.
+
+### Work order templates
+A set of lines you raise over and over — spring opening on a cabin, annual
+furnace service — can be saved once and reused.
+- **Save as Template** on a work order snapshots its lines: titles,
+  responsibility, funding, hours and costs. Deliberately *not* statuses and
+  *not* dates, because a template says what work is done, never when.
+- **New Work Order → Start from Template** fills the grid from it. Every
+  line arrives in the normal starting status with no date, and you edit
+  freely before saving.
+- Templates are renamed, edited and deleted under **Admin → Work Order
+  Templates**.
+
+### Entering work after the fact
+Work that's already finished goes in the same way: set each line's **Status**
+to Done (or Not Needed, or whatever fits) as you enter it. Statuses that
+normally ask for a note when you change to them don't ask here — you're
+recording history, not making a decision. Once every line on a work order is
+resolved, saving asks whether to move the work order to **Review**. It only
+ever asks; nothing closes itself, and closing stays a deliberate step.
 
 ### Closing a work order
 A banner appears once every job line is finished (or marked Not Needed/

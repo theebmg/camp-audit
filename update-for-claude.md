@@ -1,3 +1,131 @@
+# Runbook: Job line grid, CSV import, WO templates, combobox (2026-09-21)
+
+Two commits: `b67c0a3` (schema + API) and `4ee0239` (UI). The stacked
+per-line form on New/Edit Work Order is replaced by a grid; a saved WO's
+detail page keeps its card view, because cards are for reading (statuses,
+notes, split, attachments) and the grid is for entering.
+
+**Checked before adding anything.** Two things the brief asked for already
+existed under other names, and were extended rather than duplicated:
+- `job_lines.sort_order` (migration 0001) already IS the brief's
+  `sort_index` — it's what `listJobLines`, `getWorkOrderDetail`, the Scope
+  PDF and the reports all order by. A second ordering column would leave two
+  columns both claiming to say which line comes first. Reorder persists into
+  `sort_order`; read "sort_index" in the brief as `sort_order` here.
+- `work_order_templates` (0008, reshaped by 0039) is already the app's
+  template concept — it backs New WO's "Start from Template", the admin
+  screen, and `calendar_events.work_order_template_id`. A parallel
+  `wo_templates` would mean two template lists in admin. 0071 extends it
+  instead and gives it the real lines table.
+
+**Migration 0070**: `job_lines.pinned_fields jsonb` (rendering only),
+`work_orders.cascade_config jsonb` (NULL = follow the global default),
+`display_settings.cascade_defaults jsonb` (alongside the existing
+`wo_progress_weighting` / `report_image_cap` / `nav_layout`), and
+`work_order_statuses.is_review` plus a seeded non-terminal **Review** status
+at sort_order 45. §10's prompt targets the flag, not the name, so renaming
+Review to "Awaiting Sign-off" doesn't silently break it.
+
+**Migration 0071**: `work_order_templates.description` and
+`work_order_template_lines` (template_id, sort_index, title,
+responsibility_class, funding_source, funding_ref_id, estimated_hours,
+estimated_cost — deliberately **no date column**). Backfilled from the
+`job_line_defaults` JSONB, which handles both shapes it holds (a bare title
+string and `{title, responsibilityClass}`). That column is left in place
+per the additive-only guardrail but is now dormant; nothing reads it.
+
+**Save semantics, the part that matters.** Every line stamps its fully
+resolved, *displayed* values. No nulls-meaning-inherit, no runtime
+resolution against a parent. `pinned_fields` rides along only so reopening
+the grid can redraw which cells were following. A report reading these rows
+years from now never has to know cascade existed, and changing the cascade
+config later cannot reach a line that is already saved.
+
+**API**: `PUT /work-orders/:id/job-lines` takes the whole line set in one
+request. Existing lines keep their id, and so keep their crew, photos,
+expenses and log history. Only lines the grid actually loaded
+(`knownLineIds`) are eligible for deletion, so a stale payload can't destroy
+a line someone added elsewhere meanwhile. Also
+`POST /work-orders/:id/job-lines/reorder`, `PATCH .../cascade-config`,
+`GET .../review-prompt`, `POST .../save-as-template`,
+`POST /work-orders/from-template` (with `dryRun` so the grid's prefill and
+the future scheduler's create share one resolver), and `GET /assets-all`
+for the client-side combobox.
+
+**requires_note is a transition rule, not a status rule.** A line may now be
+CREATED directly into any status — arrears entry, manual or bulk — without
+tripping it. Changing a *saved* line's status still routes through
+`changeJobLineStatus`, which enforces it and writes the work-log row. The
+grid asks for the note at the moment of the change rather than letting the
+whole save fail later.
+
+**Cascade, in the UI (`mountJobLineGrid`).** Row 1 IS the template; there is
+no hidden template object. Every structural change — insert, duplicate,
+move, drag, delete, import — goes through `withTemplateStability`, which
+keeps the screen saying what it said a moment ago: the row arriving at the
+top stamps what it was displaying, and the row leaving the top pins what it
+was supplying, rather than suddenly following its replacement. Toggling a
+column off freezes cells at their displayed values; `touched` keeps being
+tracked underneath regardless of toggles, so toggling back on resumes
+following only for cells never directly edited.
+
+**Import** (`ingestMatrix`): CSV upload and a pasted Sheets range land in
+the same ingest, so they can't drift apart. Header detected when most of the
+first row is recognisable — one stray cell called "Status" in a data row
+doesn't eat that row. One cascade rule throughout: a cell with data arrives
+pinned, a blank one follows row 1. Unmatched dropdown text sets a per-cell
+error that turns it red and blocks save rather than guessing.
+
+**Combobox (§9)**: `mountCombobox` is now behind the asset picker, cabin
+holder, attachment vendor, admin template funding, the grid's funding
+column, the job line card's funding, and job-line crew assignment. Substring
+match anywhere, so "green" and "walt" both find "Greenawalt, Ben" — a
+prefix-only match finds neither when the roster is stored surname-first.
+This also removed the old debounced `/assets-search` round-trip per
+keystroke. A box can display a value it doesn't own (a cell following row
+1); it keeps displaying it when focused and blurred without a choice,
+instead of reverting to its own empty selection and blanking a cell nobody
+edited.
+
+**Verified live**, via the db functions in the container against the real
+database, on scratch work orders since deleted (there is no delete-WO
+feature in the app; the scratch rows were removed with SQL):
+- created a WO with grid-shaped lines; values, pinned_fields, hours, costs
+  and per-WO cascade_config all stored as sent
+- the bulk PUT kept both existing line ids, edited them, dropped one and
+  added one
+- review prompt returned ShouldPrompt false with one line still open, true
+  once every line was resolved
+- reorder, cascade-config set and clear, save-as-template, from-template
+  dryRun and real create: the created WO's lines came out in the initial
+  status with the requested date and no statuses carried over
+- arrears: lines created directly into "Waiting on Parts" (requires_note)
+  needed no note, both on create and through the bulk PUT, while a saved
+  line transitioning into it was still refused without one and accepted with
+
+## Known gaps / follow-ups
+- **The grid's browser-side behaviour has not been exercised in a real
+  browser** — no headless browser on this host. The cascade rendering,
+  keyboard handling, paste, drag-reorder, undo toast and draft restore are
+  verified by reading the code and by a module-evaluation smoke test only.
+  Worth a pass by hand on a scratch WO.
+- Scheduler/calendar integration is deliberately out of scope;
+  `POST /work-orders/from-template` is built and used by the UI's "new from
+  template" so that phase plugs in with no rework.
+- No Ctrl+Z history — only the single-level row-delete undo toast.
+- **Mobile New Work Order still gets the grid.** `GRID_MIN_WIDTH` (900px)
+  only hides the "Edit lines in grid" button on a saved WO's detail page, so
+  editing an existing WO on a phone correctly stays on the card view plus the
+  arrows-only reorder sheet. But `renderNewWorkOrder` mounts the grid at any
+  width, so *creating* a WO on a phone means a table with a 900px min-width
+  scrolling sideways inside `.jlg-scroll`. Workable, not good — and this is a
+  field app. The brief put "any mobile version of the grid" out of scope and
+  didn't say what phone WO creation should use instead, so this is left as a
+  decision rather than guessed at: either accept the sideways scroll, or give
+  narrow screens a stacked single-line entry fallback on New WO only.
+
+---
+
 # Runbook: Administrative tasks (2026-09-16)
 
 **Checked before adding anything: there is no `tasks` table to reuse.**
