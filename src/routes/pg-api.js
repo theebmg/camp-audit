@@ -33,7 +33,10 @@ import {
   adminListWorkOrderStatuses, adminCreateWorkOrderStatus, adminUpdateWorkOrderStatus, adminDeleteWorkOrderStatus,
   adminListJobLineStatuses, adminCreateJobLineStatus, adminUpdateJobLineStatus, adminDeleteJobLineStatus,
   getDisplaySettings, updateDisplaySettings,
-  listWorkOrderTemplates, createWorkOrderTemplate, updateWorkOrderTemplate, deleteWorkOrderTemplate,
+  listWorkOrderTemplates, getWorkOrderTemplate, createWorkOrderTemplate, updateWorkOrderTemplate, deleteWorkOrderTemplate,
+  createWorkOrderFromTemplate, saveWorkOrderAsTemplate,
+  replaceWorkOrderJobLines, reorderJobLines, setWorkOrderCascadeConfig, getWorkOrderReviewPrompt,
+  listAllAssetsForPicker,
   addAssetUpdateToWorkOrder, deleteAssetUpdate, completeWorkOrder,
   listJobLines, getJobLine, createJobLine, updateJobLine, deleteJobLine,
   assignVolunteerToJobLine, unassignVolunteerFromJobLine, assignVendorToJobLine, unassignVendorFromJobLine,
@@ -1540,15 +1543,15 @@ router.get('/admin/work-order-statuses', async (req, res, next) => {
 });
 router.post('/admin/work-order-statuses', async (req, res, next) => {
   try {
-    const { name, sortOrder, color, isTerminal } = req.body || {};
+    const { name, sortOrder, color, isTerminal, isReview } = req.body || {};
     if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'Name is required' });
-    res.json({ ok: true, status: await adminCreateWorkOrderStatus({ name: name.trim(), sortOrder, color, isTerminal }) });
+    res.json({ ok: true, status: await adminCreateWorkOrderStatus({ name: name.trim(), sortOrder, color, isTerminal, isReview }) });
   } catch (e) { next(e); }
 });
 router.patch('/admin/work-order-statuses/:id', async (req, res, next) => {
   try {
-    const { name, sortOrder, color, isTerminal, active } = req.body || {};
-    const status = await adminUpdateWorkOrderStatus(req.params.id, { name, sortOrder, color, isTerminal, active });
+    const { name, sortOrder, color, isTerminal, isReview, active } = req.body || {};
+    const status = await adminUpdateWorkOrderStatus(req.params.id, { name, sortOrder, color, isTerminal, isReview, active });
     if (!status) return res.status(404).json({ ok: false, error: 'Not found' });
     res.json({ ok: true, status });
   } catch (e) { next(e); }
@@ -1597,20 +1600,94 @@ router.get('/display-settings', async (req, res, next) => {
 });
 router.put('/display-settings', async (req, res, next) => {
   try {
-    const { woProgressWeighting, reportImageCap, navLayout } = req.body || {};
+    const { woProgressWeighting, reportImageCap, navLayout, cascadeDefaults } = req.body || {};
     if (woProgressWeighting !== undefined && !['cost', 'count'].includes(woProgressWeighting)) return res.status(400).json({ ok: false, error: 'woProgressWeighting must be "cost" or "count"' });
     if (reportImageCap !== undefined && (!Number.isInteger(reportImageCap) || reportImageCap < 1)) return res.status(400).json({ ok: false, error: 'reportImageCap must be a positive integer' });
     if (navLayout !== undefined && navLayout !== null && !isValidNavLayout(navLayout)) return res.status(400).json({ ok: false, error: 'navLayout must be null or an array of { header: string|null, items: string[] }' });
-    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout }) });
+    if (cascadeDefaults !== undefined && (!cascadeDefaults || typeof cascadeDefaults !== 'object' || Array.isArray(cascadeDefaults))) {
+      return res.status(400).json({ ok: false, error: 'cascadeDefaults must be an object of { column: boolean }' });
+    }
+    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout, cascadeDefaults }) });
   } catch (e) { next(e); }
 });
 
 router.post('/work-orders', async (req, res, next) => {
   try {
-    const { title, assetId, locationId, priority, description, scheduledDate, assetUpdates, jobLines } = req.body || {};
+    const { title, assetId, locationId, priority, description, scheduledDate, assetUpdates, jobLines, cascadeConfig } = req.body || {};
     if (!title) return res.status(400).json({ ok: false, error: 'title is required' });
-    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates, jobLines });
+    const result = await createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates, jobLines, cascadeConfig });
+    // §10: the caller decides what to do with this — the prompt is a prompt,
+    // never an automatic status move.
+    res.json({ ok: true, ...result, reviewPrompt: await getWorkOrderReviewPrompt(result.workOrderId) });
+  } catch (e) { next(e); }
+});
+
+// ---- Job Line Grid (grid save / reorder / cascade / review / templates) ----
+
+// §8's scheduler-ready endpoint. Called for real it creates and returns a
+// work order; called with dryRun it resolves the template's lines — pinned
+// state included — for the grid to prefill without writing anything.
+router.post('/work-orders/from-template', async (req, res, next) => {
+  try {
+    const { templateId, scheduledDate, assetId, locationId, overrides, dryRun } = req.body || {};
+    if (!templateId) return res.status(400).json({ ok: false, error: 'templateId is required' });
+    const result = await createWorkOrderFromTemplate(templateId, {
+      assetId: assetId == null || assetId === '' ? undefined : Number(assetId),
+      locationId: locationId == null || locationId === '' ? undefined : Number(locationId),
+      scheduledDate: scheduledDate || undefined,
+      overrides: overrides || {},
+      dryRun: !!dryRun,
+    });
+    if (dryRun) return res.json({ ok: true, ...result });
+    const detail = await getWorkOrderDetail(result);
+    res.json({ ok: true, workOrderId: result, ...detail });
+  } catch (e) { next(e); }
+});
+
+// Bulk save from the grid — the whole line set for one WO in one request.
+// See replaceWorkOrderJobLines for why knownLineIds matters.
+router.put('/work-orders/:id/job-lines', async (req, res, next) => {
+  try {
+    const { lines, knownLineIds } = req.body || {};
+    if (!Array.isArray(lines)) return res.status(400).json({ ok: false, error: 'lines must be an array' });
+    const jobLines = await replaceWorkOrderJobLines(req.params.id, lines, {
+      knownLineIds: Array.isArray(knownLineIds) ? knownLineIds : null,
+    });
+    if (!jobLines) return res.status(404).json({ ok: false, error: 'Work Order not found' });
+    res.json({ ok: true, jobLines, reviewPrompt: await getWorkOrderReviewPrompt(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+router.post('/work-orders/:id/job-lines/reorder', async (req, res, next) => {
+  try {
+    const { orderedIds } = req.body || {};
+    if (!Array.isArray(orderedIds)) return res.status(400).json({ ok: false, error: 'orderedIds must be an array' });
+    res.json({ ok: true, jobLines: await reorderJobLines(req.params.id, orderedIds) });
+  } catch (e) { next(e); }
+});
+
+// null cascadeConfig clears the per-WO override and falls back to the global
+// default (§3.7).
+router.patch('/work-orders/:id/cascade-config', async (req, res, next) => {
+  try {
+    const result = await setWorkOrderCascadeConfig(req.params.id, req.body?.cascadeConfig ?? null);
+    if (!result) return res.status(404).json({ ok: false, error: 'Work Order not found' });
     res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
+router.get('/work-orders/:id/review-prompt', async (req, res, next) => {
+  try {
+    const prompt = await getWorkOrderReviewPrompt(req.params.id);
+    if (!prompt) return res.status(404).json({ ok: false, error: 'Work Order not found' });
+    res.json({ ok: true, ...prompt });
+  } catch (e) { next(e); }
+});
+
+router.post('/work-orders/:id/save-as-template', async (req, res, next) => {
+  try {
+    const { name, description } = req.body || {};
+    res.json({ ok: true, template: await saveWorkOrderAsTemplate(req.params.id, { name, description }) });
   } catch (e) { next(e); }
 });
 
@@ -1726,6 +1803,11 @@ router.post('/skills', async (req, res, next) => {
 // in the app. Always hits the DB fresh (no cached list), so an asset added
 // anywhere shows up in every picker immediately. ----
 
+// The whole asset list, for the client-side searchable combobox (§9).
+router.get('/assets-all', async (req, res, next) => {
+  try { res.json({ assets: await listAllAssetsForPicker() }); } catch (e) { next(e); }
+});
+
 router.get('/assets-search', async (req, res, next) => {
   try {
     const q = (req.query.q || '').trim();
@@ -1747,17 +1829,24 @@ router.post('/assets', async (req, res, next) => {
 router.get('/work-order-templates', async (req, res, next) => {
   try { res.json({ templates: await listWorkOrderTemplates() }); } catch (e) { next(e); }
 });
+router.get('/work-order-templates/:id', async (req, res, next) => {
+  try {
+    const template = await getWorkOrderTemplate(req.params.id);
+    if (!template) return res.status(404).json({ ok: false, error: 'Template not found' });
+    res.json({ ok: true, template });
+  } catch (e) { next(e); }
+});
 router.post('/work-order-templates', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds } = req.body || {};
+    const { name, description, defaultTitle, defaultPriority, defaultDescription, lines, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
-    res.json({ ok: true, template: await createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds }) });
+    res.json({ ok: true, template: await createWorkOrderTemplate({ name, description, defaultTitle, defaultPriority, defaultDescription, lines, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds }) });
   } catch (e) { next(e); }
 });
 router.patch('/work-order-templates/:id', async (req, res, next) => {
   try {
-    const { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds } = req.body || {};
-    const template = await updateWorkOrderTemplate(req.params.id, { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds });
+    const { name, description, defaultTitle, defaultPriority, defaultDescription, lines, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds } = req.body || {};
+    const template = await updateWorkOrderTemplate(req.params.id, { name, description, defaultTitle, defaultPriority, defaultDescription, lines, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds });
     if (!template) return res.status(404).json({ ok: false, error: 'Template not found' });
     res.json({ ok: true, template });
   } catch (e) { next(e); }

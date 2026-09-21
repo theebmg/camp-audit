@@ -1517,6 +1517,8 @@ export async function getWorkOrderDetail(woId) {
       Description: w.description,
       BoardFocus: w.board_focus,
       WoNumber: w.wo_number, ParentWoId: w.parent_wo_id, SplitRootId: w.split_root_id,
+      // null = this WO follows the global cascade default (§3.7).
+      CascadeConfig: normalizeCascadeConfig(w.cascade_config),
       Asset: w.asset_id ? { Id: w.asset_id, Name: w.asset_name, LodgeHolder: w.asset_lodge_holder } : null,
       Location: w.location_id ? { Id: w.location_id, Name: w.location_name } : null,
     },
@@ -1561,7 +1563,7 @@ const today = () => new Date().toISOString().slice(0, 10);
 //    editable, read by the frontend instead of a hardcoded list. ───────────
 export async function listWorkOrderStatuses() {
   const { rows } = await pool.query('SELECT * FROM work_order_statuses WHERE active ORDER BY sort_order, name');
-  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Color: r.color, IsTerminal: r.is_terminal }));
+  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Color: r.color, IsTerminal: r.is_terminal, IsReview: r.is_review }));
 }
 export async function listJobLineStatuses() {
   const { rows } = await pool.query('SELECT * FROM job_line_statuses WHERE active ORDER BY sort_order, name');
@@ -1576,22 +1578,23 @@ export async function listJobLineStatuses() {
 //    still references, deactivate instead. ────────────────────────────────
 export async function adminListWorkOrderStatuses() {
   const { rows } = await pool.query('SELECT * FROM work_order_statuses ORDER BY sort_order, name');
-  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Color: r.color, IsTerminal: r.is_terminal, Active: r.active }));
+  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Color: r.color, IsTerminal: r.is_terminal, IsReview: r.is_review, Active: r.active }));
 }
-export async function adminCreateWorkOrderStatus({ name, sortOrder = 100, color = '#888888', isTerminal = false }) {
+export async function adminCreateWorkOrderStatus({ name, sortOrder = 100, color = '#888888', isTerminal = false, isReview = false }) {
   const { rows } = await pool.query(
-    'INSERT INTO work_order_statuses (name, sort_order, color, is_terminal) VALUES ($1,$2,$3,$4) RETURNING *',
-    [name, sortOrder, color, !!isTerminal]
+    'INSERT INTO work_order_statuses (name, sort_order, color, is_terminal, is_review) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+    [name, sortOrder, color, !!isTerminal, !!isReview]
   );
   await logActivity({ action: 'created', entityType: 'work_order_status', entityId: rows[0].id, entityLabel: rows[0].name });
   return rows[0];
 }
-export async function adminUpdateWorkOrderStatus(id, { name, sortOrder, color, isTerminal, active }) {
+export async function adminUpdateWorkOrderStatus(id, { name, sortOrder, color, isTerminal, isReview, active }) {
   const { rows } = await pool.query(
     `UPDATE work_order_statuses SET name = COALESCE($2,name), sort_order = COALESCE($3,sort_order),
-       color = COALESCE($4,color), is_terminal = COALESCE($5,is_terminal), active = COALESCE($6,active)
+       color = COALESCE($4,color), is_terminal = COALESCE($5,is_terminal), active = COALESCE($6,active),
+       is_review = COALESCE($7,is_review)
      WHERE id = $1 RETURNING *`,
-    [id, name ?? null, sortOrder ?? null, color ?? null, isTerminal ?? null, active ?? null]
+    [id, name ?? null, sortOrder ?? null, color ?? null, isTerminal ?? null, active ?? null, isReview ?? null]
   );
   if (rows[0]) await logActivity({ action: 'updated', entityType: 'work_order_status', entityId: rows[0].id, entityLabel: rows[0].name });
   return rows[0] || null;
@@ -1640,24 +1643,50 @@ export async function adminDeleteJobLineStatus(id) {
 
 // ── Display settings (2.6) — single admin-wide toggle for now: whether the
 //    WO grid's progress bar defaults to cost-weighted or line-count-weighted. ─
+// The cascade-capable grid columns (§3.7). Every one of these is exposed as
+// a toggle in admin/settings and in the per-WO cascade popover; the names are
+// the job_lines column names, which is also what pinned_fields stores.
+export const CASCADE_COLUMNS = ['responsibility_class', 'funding_source', 'status_id', 'scheduled_date'];
+export const CASCADE_DEFAULTS = { responsibility_class: true, funding_source: true, status_id: true, scheduled_date: true };
+// Anything not a known column, or not a boolean, is dropped rather than
+// trusted — a stale config from an older build can't smuggle in a column.
+export function normalizeCascadeConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return null;
+  const out = {};
+  for (const col of CASCADE_COLUMNS) if (typeof cfg[col] === 'boolean') out[col] = cfg[col];
+  return Object.keys(out).length ? out : null;
+}
+
 export async function getDisplaySettings() {
-  const { rows } = await pool.query('SELECT wo_progress_weighting, report_image_cap, nav_layout FROM display_settings ORDER BY id LIMIT 1');
-  return { WoProgressWeighting: rows[0]?.wo_progress_weighting || 'cost', ReportImageCap: rows[0]?.report_image_cap ?? 4, NavLayout: rows[0]?.nav_layout ?? null };
+  const { rows } = await pool.query('SELECT wo_progress_weighting, report_image_cap, nav_layout, cascade_defaults FROM display_settings ORDER BY id LIMIT 1');
+  return {
+    WoProgressWeighting: rows[0]?.wo_progress_weighting || 'cost',
+    ReportImageCap: rows[0]?.report_image_cap ?? 4,
+    NavLayout: rows[0]?.nav_layout ?? null,
+    CascadeDefaults: { ...CASCADE_DEFAULTS, ...(normalizeCascadeConfig(rows[0]?.cascade_defaults) || {}) },
+  };
 }
 // navLayout: undefined = leave alone, null = reset to the built-in default
 // (COALESCE can't express that, hence the separate $4 flag).
-export async function updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout }) {
+export async function updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout, cascadeDefaults }) {
+  // cascadeDefaults is merged onto the current value rather than replacing
+  // it, so a settings screen that only knows about three of the four columns
+  // can't silently wipe the fourth.
+  const mergedCascade = cascadeDefaults === undefined
+    ? null
+    : JSON.stringify({ ...CASCADE_DEFAULTS, ...((await getDisplaySettings()).CascadeDefaults), ...(normalizeCascadeConfig(cascadeDefaults) || {}) });
   await pool.query(
     `UPDATE display_settings SET
        wo_progress_weighting = COALESCE($1, wo_progress_weighting),
        report_image_cap = COALESCE($2, report_image_cap),
-       nav_layout = CASE WHEN $4 THEN $3::jsonb ELSE nav_layout END
+       nav_layout = CASE WHEN $4 THEN $3::jsonb ELSE nav_layout END,
+       cascade_defaults = COALESCE($5::jsonb, cascade_defaults)
      WHERE id = (SELECT id FROM display_settings ORDER BY id LIMIT 1)`,
-    [woProgressWeighting || null, reportImageCap ?? null, navLayout ? JSON.stringify(navLayout) : null, navLayout !== undefined]
+    [woProgressWeighting || null, reportImageCap ?? null, navLayout ? JSON.stringify(navLayout) : null, navLayout !== undefined, mergedCascade]
   );
   // Nav reorders save on every move — don't flood the activity feed with them.
-  if (woProgressWeighting !== undefined || reportImageCap !== undefined) {
-    await logActivity({ action: 'updated', entityType: 'display_settings', entityLabel: 'display settings', details: `weighting=${woProgressWeighting || '—'} imageCap=${reportImageCap ?? '—'}` });
+  if (woProgressWeighting !== undefined || reportImageCap !== undefined || cascadeDefaults !== undefined) {
+    await logActivity({ action: 'updated', entityType: 'display_settings', entityLabel: 'display settings', details: `weighting=${woProgressWeighting || '—'} imageCap=${reportImageCap ?? '—'}${cascadeDefaults !== undefined ? ' cascadeDefaults changed' : ''}` });
   }
   return getDisplaySettings();
 }
@@ -1720,7 +1749,7 @@ async function changeWorkOrderStatus(client, woId, newStatusId, { deferredReason
 // estimatedHours, estimatedCost, scheduledDate }] — the WO creation flow
 // (1.7) captures a full job line per "+ Add job line" row; scheduledDate
 // defaults to the WO's own date when a line doesn't set its own (1.4).
-export async function createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates = [], jobLines = [] }) {
+export async function createWorkOrder({ title, assetId, locationId, priority, description, scheduledDate, assetUpdates = [], jobLines = [], cascadeConfig }) {
   const propertyFields = await getAssetPropertyFields();
   const byLabel = new Map(propertyFields.map((f) => [f.title, f]));
 
@@ -1734,9 +1763,10 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
     const { rows: idRows } = await client.query(`SELECT nextval(pg_get_serial_sequence('work_orders','id')) AS id`);
     const woId = Number(idRows[0].id);
     const { rows } = await client.query(
-      `INSERT INTO work_orders (id, title, asset_id, location_id, priority, status_id, description, date_reported, wo_number, split_root_id)
-       VALUES ($1,$2,$3,$4,$5,(SELECT id FROM work_order_statuses WHERE name = 'Reported'),$6,$7,$8,$1) RETURNING id`,
-      [woId, title, assetId || null, locationId || null, priority || 'Medium', description || null, today(), String(woId)]
+      `INSERT INTO work_orders (id, title, asset_id, location_id, priority, status_id, description, date_reported, wo_number, split_root_id, cascade_config)
+       VALUES ($1,$2,$3,$4,$5,(SELECT id FROM work_order_statuses WHERE name = 'Reported'),$6,$7,$8,$1,$9) RETURNING id`,
+      [woId, title, assetId || null, locationId || null, priority || 'Medium', description || null, today(), String(woId),
+        normalizeCascadeConfig(cascadeConfig) ? JSON.stringify(normalizeCascadeConfig(cascadeConfig)) : null]
     );
     const created = [];
     for (const u of assetUpdates) {
@@ -1751,13 +1781,26 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
     for (const line of jobLines) {
       const lineTitle = (typeof line === 'string' ? line : line?.title || '').trim();
       if (!lineTitle) continue;
-      await client.query(
-        `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, scheduled_date, status_id)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT id FROM job_line_statuses WHERE name = 'Not Started'))`,
+      // A line can be CREATED already sitting in any status — that's arrears
+      // entry (recording work that already happened). requires_note from the
+      // status config governs lifecycle TRANSITIONS on saved lines
+      // (changeJobLineStatus), never creation, so nothing prompts here.
+      const statusId = await resolveInitialJobLineStatus(client, line.statusId);
+      const { rows: lineRows } = await client.query(
+        `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id,
+           estimated_hours, estimated_cost, scheduled_date, status_id, pinned_fields, completed_date)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+           CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN CURRENT_DATE ELSE NULL END)
+         RETURNING id, scheduled_date`,
         [woId, lineTitle, sortOrder++,
           line.responsibilityClass || 'self', line.fundingSource || 'operating_budget', line.fundingRefId || null,
-          line.estimatedHours ?? null, line.estimatedCost ?? null, line.scheduledDate || scheduledDate || null]
+          line.estimatedHours ?? null, line.estimatedCost ?? null, line.scheduledDate || scheduledDate || null,
+          statusId, JSON.stringify(sanitizePinnedFields(line.pinnedFields))]
       );
+      // Same reason createJobLine queues one (see its header comment): a line
+      // born with a date needs to reach the calendar sync worker on day one,
+      // not wait for someone to edit it later.
+      if (lineRows[0].scheduled_date) await queueGcalSync(client, 'job_line', lineRows[0].id);
     }
     await client.query('COMMIT');
     await logActivity({ action: 'created', entityType: 'work_order', entityId: woId, entityLabel: title });
@@ -1920,76 +1963,125 @@ function templateRowShape(r) {
   return {
     Id: r.id, Name: r.name, DefaultTitle: r.default_title, DefaultPriority: r.default_priority,
     DefaultDescription: r.default_description,
-    // job_line_defaults now holds partial job-line objects (title/
-    // responsibilityClass/fundingSource/fundingRefId/estimatedHours/
-    // estimatedCost) — see migration 0038/0039. asset_update_defaults is the
-    // older, separate "also update an asset field" blueprint, unrelated to
-    // job lines.
-    JobLineDefaults: r.job_line_defaults, AssetUpdateDefaults: r.asset_update_defaults,
+    // The template's own blurb ("when to reach for this one"), distinct
+    // from DefaultDescription, which fills the created WO's description.
+    Description: r.description,
+    // Template lines live in work_order_template_lines as of migration 0071
+    // and are attached as `Lines` by listWorkOrderTemplates/getWorkOrderTemplate.
+    // job_line_defaults is the dormant pre-0071 column — kept on disk, never
+    // read. asset_update_defaults is the older, separate "also update an
+    // asset field" blueprint, unrelated to job lines.
+    AssetUpdateDefaults: r.asset_update_defaults,
     DefaultResponsibilityClass: r.default_responsibility_class,
     PresetVolunteerIds: r.preset_volunteer_ids, PresetVendorIds: r.preset_vendor_ids,
   };
 }
 export async function listWorkOrderTemplates() {
   const { rows } = await pool.query('SELECT * FROM work_order_templates ORDER BY name');
-  return rows.map(templateRowShape);
+  return Promise.all(rows.map(async (r) => ({ ...templateRowShape(r), Lines: await templateLines(r.id) })));
 }
-export async function createWorkOrderTemplate({ name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults = [], assetUpdateDefaults = [], defaultResponsibilityClass, presetVolunteerIds = [], presetVendorIds = [] }) {
-  const { rows } = await pool.query(
-    `INSERT INTO work_order_templates (name, default_title, default_priority, default_description, job_line_defaults, asset_update_defaults, default_responsibility_class, preset_volunteer_ids, preset_vendor_ids)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-    [name, defaultTitle || null, defaultPriority || null, defaultDescription || null, JSON.stringify(jobLineDefaults), JSON.stringify(assetUpdateDefaults),
-      defaultResponsibilityClass || null, presetVolunteerIds, presetVendorIds]
-  );
-  await logActivity({ action: 'created', entityType: 'work_order_template', entityId: rows[0].id, entityLabel: rows[0].name });
-  return templateRowShape(rows[0]);
+export async function getWorkOrderTemplate(id) {
+  const { rows } = await pool.query('SELECT * FROM work_order_templates WHERE id = $1', [id]);
+  if (!rows[0]) return null;
+  return { ...templateRowShape(rows[0]), Lines: await templateLines(rows[0].id) };
 }
-export async function updateWorkOrderTemplate(id, { name, defaultTitle, defaultPriority, defaultDescription, jobLineDefaults, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds }) {
-  const { rows } = await pool.query(
-    `UPDATE work_order_templates SET
-       name = COALESCE($2,name), default_title = COALESCE($3,default_title),
-       default_priority = COALESCE($4,default_priority), default_description = COALESCE($5,default_description),
-       job_line_defaults = COALESCE($6,job_line_defaults), asset_update_defaults = COALESCE($7,asset_update_defaults),
-       default_responsibility_class = COALESCE($8,default_responsibility_class), preset_volunteer_ids = COALESCE($9,preset_volunteer_ids),
-       preset_vendor_ids = COALESCE($10,preset_vendor_ids)
-     WHERE id = $1 RETURNING *`,
-    [id, name ?? null, defaultTitle ?? null, defaultPriority ?? null, defaultDescription ?? null,
-      jobLineDefaults ? JSON.stringify(jobLineDefaults) : null, assetUpdateDefaults ? JSON.stringify(assetUpdateDefaults) : null,
-      defaultResponsibilityClass ?? null, presetVolunteerIds ?? null, presetVendorIds ?? null]
-  );
-  if (rows[0]) await logActivity({ action: 'updated', entityType: 'work_order_template', entityId: rows[0].id, entityLabel: rows[0].name });
-  return rows[0] ? templateRowShape(rows[0]) : null;
+export async function createWorkOrderTemplate({ name, description, defaultTitle, defaultPriority, defaultDescription, lines = [], assetUpdateDefaults = [], defaultResponsibilityClass, presetVolunteerIds = [], presetVendorIds = [] }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO work_order_templates (name, description, default_title, default_priority, default_description, asset_update_defaults, default_responsibility_class, preset_volunteer_ids, preset_vendor_ids)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [name, description || null, defaultTitle || null, defaultPriority || null, defaultDescription || null, JSON.stringify(assetUpdateDefaults),
+        defaultResponsibilityClass || null, presetVolunteerIds, presetVendorIds]
+    );
+    await writeTemplateLines(client, rows[0].id, lines);
+    await client.query('COMMIT');
+    await logActivity({ action: 'created', entityType: 'work_order_template', entityId: rows[0].id, entityLabel: rows[0].name });
+    return { ...templateRowShape(rows[0]), Lines: await templateLines(rows[0].id) };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+export async function updateWorkOrderTemplate(id, { name, description, defaultTitle, defaultPriority, defaultDescription, lines, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `UPDATE work_order_templates SET
+         name = COALESCE($2,name), default_title = COALESCE($3,default_title),
+         default_priority = COALESCE($4,default_priority), default_description = COALESCE($5,default_description),
+         asset_update_defaults = COALESCE($6,asset_update_defaults),
+         default_responsibility_class = COALESCE($7,default_responsibility_class), preset_volunteer_ids = COALESCE($8,preset_volunteer_ids),
+         preset_vendor_ids = COALESCE($9,preset_vendor_ids),
+         description = CASE WHEN $11 THEN $10 ELSE description END
+       WHERE id = $1 RETURNING *`,
+      [id, name ?? null, defaultTitle ?? null, defaultPriority ?? null, defaultDescription ?? null,
+        assetUpdateDefaults ? JSON.stringify(assetUpdateDefaults) : null,
+        defaultResponsibilityClass ?? null, presetVolunteerIds ?? null, presetVendorIds ?? null,
+        description ?? null, description !== undefined]
+    );
+    if (!rows[0]) { await client.query('ROLLBACK'); return null; }
+    // undefined = leave the lines alone; [] = the user really did remove them all.
+    if (lines !== undefined) await writeTemplateLines(client, rows[0].id, lines || []);
+    await client.query('COMMIT');
+    await logActivity({ action: 'updated', entityType: 'work_order_template', entityId: rows[0].id, entityLabel: rows[0].name });
+    return { ...templateRowShape(rows[0]), Lines: await templateLines(rows[0].id) };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 export async function deleteWorkOrderTemplate(id) {
   const { rows } = await pool.query('DELETE FROM work_order_templates WHERE id = $1 RETURNING name', [id]);
   if (rows[0]) await logActivity({ action: 'deleted', entityType: 'work_order_template', entityId: Number(id), entityLabel: rows[0].name });
 }
 
-// Instantiates a template into a real Work Order — used by PM auto-generation
-// (see generateDueWorkOrdersForRange) where there's no browser session to do
-// the client-side prefill renderNewWorkOrder does. job_line_defaults/
-// asset_update_defaults are already in createWorkOrder's jobLines/assetUpdates
-// shape (same arrays the New Work Order form builds from a template pick), so
-// no reshaping needed — default_responsibility_class fills in any line that
-// doesn't specify its own. Preset crew attaches to every line created, since
-// assignment is per-line now (1.2), not per-WO.
-export async function createWorkOrderFromTemplate(templateId, { assetId, locationId, scheduledDate } = {}) {
+// Preset crew attaches to every line created, since assignment is per-line
+// now (1.2), not per-WO. default_responsibility_class fills in any template
+// line that doesn't specify its own.
+//
+// Instantiates a template. Two callers, one resolver:
+//   * PM auto-generation (generateDueWorkOrdersForRange) and the future
+//     scheduler call it for real and get back a created work order id.
+//   * The grid's "New WO from template" calls it with dryRun, which resolves
+//     the same line set — pinned/following state included — and hands it
+//     straight to the grid WITHOUT writing anything. That's what keeps §8's
+//     "pre-populates the grid ... saves normally" and "the UI uses this same
+//     endpoint" from being two different code paths, and stops an abandoned
+//     template pick from leaving a stray work order behind.
+// `overrides` sets WO-level fields (title/priority/description) on top of the
+// template's own defaults.
+export async function createWorkOrderFromTemplate(templateId, { assetId, locationId, scheduledDate, overrides = {}, dryRun = false } = {}) {
   const { rows } = await pool.query('SELECT * FROM work_order_templates WHERE id = $1', [templateId]);
   const tpl = rows[0];
-  if (!tpl) throw new Error(`Work Order Template #${templateId} not found`);
-  const jobLines = (tpl.job_line_defaults || []).map((l) => ({
-    ...(typeof l === 'string' ? { title: l } : l),
-    responsibilityClass: (typeof l === 'object' && l.responsibilityClass) || tpl.default_responsibility_class || 'self',
-  }));
-  const { workOrderId } = await createWorkOrder({
-    title: tpl.default_title || tpl.name,
+  if (!tpl) { const e = new Error(`Work Order Template #${templateId} not found`); e.status = 404; throw e; }
+  const jobLines = resolveTemplateLines(await templateLines(tpl.id), { defaultResponsibilityClass: tpl.default_responsibility_class });
+  const woFields = {
+    title: overrides.title || tpl.default_title || tpl.name,
     assetId, locationId,
-    priority: tpl.default_priority,
-    description: tpl.default_description,
+    priority: overrides.priority || tpl.default_priority,
+    description: overrides.description !== undefined ? overrides.description : tpl.default_description,
     scheduledDate,
     assetUpdates: tpl.asset_update_defaults || [],
     jobLines,
-  });
+  };
+  if (dryRun) {
+    return {
+      dryRun: true,
+      template: { ...templateRowShape(tpl), Lines: await templateLines(tpl.id) },
+      workOrder: { title: woFields.title, priority: woFields.priority, description: woFields.description, assetId: assetId ?? null, scheduledDate: scheduledDate ?? null },
+      jobLines,
+      presetVolunteerIds: tpl.preset_volunteer_ids || [],
+      presetVendorIds: tpl.preset_vendor_ids || [],
+    };
+  }
+  const { workOrderId } = await createWorkOrder(woFields);
   if (tpl.preset_volunteer_ids?.length || tpl.preset_vendor_ids?.length) {
     const { rows: lineRows } = await pool.query('SELECT id FROM job_lines WHERE work_order_id = $1', [workOrderId]);
     const client = await pool.connect();
@@ -2642,6 +2734,18 @@ export async function searchAssetsLive(q) {
   return rows.map((r) => ({ Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: r.location_name, holderName: r.lodge_holder, onMap: r.on_map }));
 }
 
+// §9: the searchable combobox filters client-side, so the asset picker needs
+// the whole list once per page rather than a server round-trip per keystroke.
+// ~340 rows — small enough that paging it would cost more than it saves, and
+// it's the same shape searchAssetsLive returns so both feed one component.
+export async function listAllAssetsForPicker() {
+  const { rows } = await pool.query(
+    `SELECT a.id, a.name, a.asset_type, a.location_id, l.name AS location_name, a.lodge_holder, (a.map_x IS NOT NULL) AS on_map
+     FROM assets a LEFT JOIN locations l ON l.id = a.location_id ORDER BY a.name`
+  );
+  return rows.map((r) => ({ Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: r.location_name, holderName: r.lodge_holder, onMap: r.on_map }));
+}
+
 export async function createAssetQuick({ name, locationId, assetType }) {
   const { rows } = await pool.query(
     `INSERT INTO assets (name, location_id, asset_type) VALUES ($1,$2,$3) RETURNING id, name, location_id, asset_type`,
@@ -2892,6 +2996,10 @@ function jobLineRowShape(r) {
     Complaint: r.complaint, CauseNote: r.cause_note, Correction: r.correction,
     BlockedReason: r.blocked_reason, BlockedSince: r.blocked_since, CompletedDate: r.completed_date,
     ConditionFindingId: r.condition_finding_id,
+    // Grid-only rendering metadata (§3): which cascade columns this line had
+    // PINNED when it was last saved. The real columns above are always fully
+    // stamped, so nothing outside the grid ever needs to read this.
+    PinnedFields: Array.isArray(r.pinned_fields) ? r.pinned_fields : [],
   };
 }
 
@@ -3115,6 +3223,282 @@ export async function deleteJobLine(id) {
   await queueGcalDelete(rows[0].gcal_event_id);
   await pool.query('DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2', ['job_line', Number(id)]);
   await logActivity({ action: 'deleted', entityType: 'job_line', entityId: Number(id), entityLabel: rows[0].title, details: `On Work Order #${rows[0].work_order_id}` });
+}
+
+// ── Job Line Grid (Build Brief: grid / CSV import / templates) ────────────
+//
+// The grid is an ENTRY surface, not a storage model. Everything it does with
+// cascade/pin state resolves to fully stamped column values before it ever
+// reaches Postgres (§3's save semantics) — a report, a PDF, or a five-year-old
+// work order never has to know cascade exists. pinned_fields is carried along
+// purely so reopening the same WO in the grid can redraw which cells were
+// following and which were pinned.
+
+// pinned_fields is rendering metadata, so it gets the same treatment as any
+// other client-supplied blob: only known cascade column names survive.
+function sanitizePinnedFields(fields) {
+  if (!Array.isArray(fields)) return [];
+  return [...new Set(fields.filter((f) => CASCADE_COLUMNS.includes(f)))];
+}
+
+// A line may be created directly into any status (arrears entry). Falls back
+// to the catalog's first non-terminal status rather than the literal name
+// 'Not Started', which is admin-renameable like every other status.
+async function resolveInitialJobLineStatus(queryable, statusId) {
+  if (statusId != null && statusId !== '') {
+    const { rows } = await queryable.query('SELECT id FROM job_line_statuses WHERE id = $1', [Number(statusId)]);
+    if (rows[0]) return rows[0].id;
+  }
+  const { rows } = await queryable.query(
+    `SELECT id FROM job_line_statuses WHERE active ORDER BY is_terminal, sort_order, id LIMIT 1`
+  );
+  if (!rows[0]) { const e = new Error('No active job line status is configured'); e.status = 500; throw e; }
+  return rows[0].id;
+}
+
+const GRID_LINE_COLUMNS = {
+  title: 'title', responsibilityClass: 'responsibility_class', fundingSource: 'funding_source',
+  fundingRefId: 'funding_ref_id', estimatedHours: 'estimated_hours', estimatedCost: 'estimated_cost',
+  scheduledDate: 'scheduled_date',
+};
+
+// Grid save for an EXISTING work order. One transaction: lines the grid knew
+// about but no longer sends are deleted, lines with an id are updated in
+// place (keeping their crew, photos, expenses and log history), lines without
+// one are inserted, and sort_order is rewritten to the grid's row order.
+//
+// `knownLineIds` is what the grid loaded when it opened. Only lines in that
+// set are eligible for deletion — a line added from the card view in another
+// tab while the grid sat open is left alone instead of being silently
+// destroyed by a stale payload.
+export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds = null } = {}) {
+  const client = await pool.connect();
+  const gcalDeletes = [];
+  const gcalSyncs = [];
+  try {
+    await client.query('BEGIN');
+    const { rows: woRows } = await client.query('SELECT id FROM work_orders WHERE id = $1', [woId]);
+    if (!woRows.length) { await client.query('ROLLBACK'); return null; }
+
+    const { rows: existingRows } = await client.query(
+      'SELECT id, status_id, scheduled_date, scheduled_start_time, scheduled_duration_hours FROM job_lines WHERE work_order_id = $1', [woId]
+    );
+    const existing = new Map(existingRows.map((r) => [r.id, r]));
+    const keptIds = new Set(lines.map((l) => Number(l.id)).filter((n) => Number.isInteger(n)));
+    const deletable = knownLineIds ? new Set(knownLineIds.map(Number)) : new Set(existing.keys());
+
+    for (const row of existingRows) {
+      if (keptIds.has(row.id) || !deletable.has(row.id)) continue;
+      const { rows: delRows } = await client.query(
+        'DELETE FROM job_lines WHERE id = $1 RETURNING title, gcal_event_id', [row.id]
+      );
+      await client.query('DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2', ['job_line', row.id]);
+      if (delRows[0]?.gcal_event_id) gcalDeletes.push(delRows[0].gcal_event_id);
+      await logActivity({ action: 'deleted', entityType: 'job_line', entityId: row.id, entityLabel: delRows[0]?.title, details: `On Work Order #${woId}` });
+    }
+
+    let sortOrder = 0;
+    for (const line of lines) {
+      const title = String(line?.title ?? '').trim();
+      if (!title) continue; // §2: rows with an empty title are silently dropped
+      const pinned = JSON.stringify(sanitizePinnedFields(line.pinnedFields));
+      const id = Number.isInteger(Number(line.id)) && existing.has(Number(line.id)) ? Number(line.id) : null;
+
+      if (id == null) {
+        const statusId = await resolveInitialJobLineStatus(client, line.statusId);
+        const { rows } = await client.query(
+          `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id,
+             estimated_hours, estimated_cost, scheduled_date, status_id, pinned_fields, completed_date)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+             CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN CURRENT_DATE ELSE NULL END)
+           RETURNING id, scheduled_date`,
+          [woId, title, sortOrder++, line.responsibilityClass || 'self', line.fundingSource || 'operating_budget',
+            numOrNull(line.fundingRefId), numOrNull(line.estimatedHours), numOrNull(line.estimatedCost),
+            line.scheduledDate || null, statusId, pinned]
+        );
+        await logActivity({ action: 'created', entityType: 'job_line', entityId: rows[0].id, entityLabel: title, details: `On Work Order #${woId}` });
+        if (rows[0].scheduled_date) gcalSyncs.push(rows[0].id);
+        continue;
+      }
+
+      const prev = existing.get(id);
+      await client.query(
+        `UPDATE job_lines SET title = $2, responsibility_class = $3, funding_source = $4, funding_ref_id = $5,
+           estimated_hours = $6, estimated_cost = $7, scheduled_date = $8, sort_order = $9, pinned_fields = $10
+         WHERE id = $1`,
+        [id, title, line.responsibilityClass || 'self', line.fundingSource || 'operating_budget',
+          numOrNull(line.fundingRefId), numOrNull(line.estimatedHours), numOrNull(line.estimatedCost),
+          line.scheduledDate || null, sortOrder++, pinned]
+      );
+      // A saved line's status change IS a lifecycle transition, so it goes
+      // through changeJobLineStatus — requires_note is enforced and the work
+      // log gets its row, exactly as it would from the card view (§2).
+      if (line.statusId != null && Number(line.statusId) !== prev.status_id) {
+        await changeJobLineStatus(client, id, Number(line.statusId), { statusNote: line.statusNote });
+      }
+      if (String(prev.scheduled_date ?? '') !== String(line.scheduledDate || '')) gcalSyncs.push(id);
+    }
+
+    for (const lineId of gcalSyncs) await queueGcalSync(client, 'job_line', lineId);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  for (const eventId of gcalDeletes) await queueGcalDelete(eventId);
+  return listJobLines(woId);
+}
+
+const numOrNull = (v) => (v === '' || v == null || Number.isNaN(Number(v)) ? null : Number(v));
+
+// §7: drag/Alt-arrow reorder from the grid, and the mobile reorder sheet,
+// both land here. Ids not on this WO are ignored; any line the caller left
+// out keeps its relative position after the ones it did send.
+export async function reorderJobLines(woId, orderedIds = []) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT id FROM job_lines WHERE work_order_id = $1 ORDER BY sort_order, id', [woId]);
+    const valid = new Set(rows.map((r) => r.id));
+    const ordered = orderedIds.map(Number).filter((id) => valid.has(id));
+    const rest = rows.map((r) => r.id).filter((id) => !ordered.includes(id));
+    const final = [...ordered, ...rest];
+    for (let i = 0; i < final.length; i++) {
+      await client.query('UPDATE job_lines SET sort_order = $2 WHERE id = $1', [final[i], i]);
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  return listJobLines(woId);
+}
+
+export async function setWorkOrderCascadeConfig(woId, cascadeConfig) {
+  const normalized = normalizeCascadeConfig(cascadeConfig);
+  const { rows } = await pool.query(
+    'UPDATE work_orders SET cascade_config = $2 WHERE id = $1 RETURNING cascade_config',
+    [woId, normalized ? JSON.stringify(normalized) : null]
+  );
+  if (!rows[0]) return null;
+  return { CascadeConfig: normalizeCascadeConfig(rows[0].cascade_config) };
+}
+
+// §10: after a save, should we offer to move this WO to Review? Yes when
+// every line is in a resolved (is_terminal) status and the WO itself is
+// neither already in review nor already terminal. This only ever produces a
+// PROMPT — nothing here changes a status, and closing stays manual.
+export async function getWorkOrderReviewPrompt(woId) {
+  const [gate, woRes, reviewRes] = await Promise.all([
+    workOrderCloseGate(woId),
+    pool.query(
+      `SELECT ws.name AS status_name, ws.is_terminal, ws.is_review
+       FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`, [woId]
+    ),
+    pool.query('SELECT id, name FROM work_order_statuses WHERE is_review AND active ORDER BY sort_order, id LIMIT 1'),
+  ]);
+  const wo = woRes.rows[0];
+  const review = reviewRes.rows[0];
+  if (!wo) return null;
+  return {
+    AllLinesResolved: gate.ReadyToClose,
+    LineCount: gate.LineCount,
+    ReviewStatus: review ? { Id: review.id, Name: review.name } : null,
+    ShouldPrompt: !!(gate.ReadyToClose && review && !wo.is_review && !wo.is_terminal),
+  };
+}
+
+// ── Work Order template lines (§8) ───────────────────────────────────────
+//
+// work_order_template_lines replaced the old job_line_defaults JSONB in
+// migration 0071 (see its header). Templates deliberately carry NO dates —
+// a template says what work is done, never when.
+
+async function templateLines(templateId) {
+  const { rows } = await pool.query(
+    'SELECT * FROM work_order_template_lines WHERE template_id = $1 ORDER BY sort_index, id', [templateId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, SortIndex: r.sort_index, Title: r.title,
+    ResponsibilityClass: r.responsibility_class, FundingSource: r.funding_source, FundingRefId: r.funding_ref_id,
+    EstimatedHours: r.estimated_hours != null ? Number(r.estimated_hours) : null,
+    EstimatedCost: r.estimated_cost != null ? Number(r.estimated_cost) : null,
+  }));
+}
+
+async function writeTemplateLines(client, templateId, lines) {
+  await client.query('DELETE FROM work_order_template_lines WHERE template_id = $1', [templateId]);
+  let i = 0;
+  for (const line of lines) {
+    const title = String(line?.title ?? '').trim();
+    if (!title) continue;
+    await client.query(
+      `INSERT INTO work_order_template_lines (template_id, sort_index, title, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [templateId, i++, title, line.responsibilityClass || null, line.fundingSource || null,
+        numOrNull(line.fundingRefId), numOrNull(line.estimatedHours), numOrNull(line.estimatedCost)]
+    );
+  }
+}
+
+// Turns a template into the exact line set the grid (or the scheduler) should
+// get. §8's rule, identical to import's (§5): a template cell WITH a value
+// arrives pinned; a blank one follows row 1. Dates are never in a template,
+// so scheduled_date always follows.
+function resolveTemplateLines(lines, { defaultResponsibilityClass } = {}) {
+  return lines.map((l) => {
+    const responsibilityClass = l.ResponsibilityClass || defaultResponsibilityClass || null;
+    const pinnedFields = [];
+    if (responsibilityClass) pinnedFields.push('responsibility_class');
+    if (l.FundingSource) pinnedFields.push('funding_source');
+    return {
+      title: l.Title,
+      responsibilityClass: responsibilityClass || 'self',
+      fundingSource: l.FundingSource || 'operating_budget',
+      fundingRefId: l.FundingRefId ?? null,
+      estimatedHours: l.EstimatedHours, estimatedCost: l.EstimatedCost,
+      scheduledDate: null,
+      pinnedFields,
+    };
+  });
+}
+
+// §8's "Save as template": snapshots a WO's lines. Statuses and dates are
+// deliberately NOT captured — a template describes work, not its progress or
+// its calendar.
+export async function saveWorkOrderAsTemplate(woId, { name, description } = {}) {
+  const { rows: woRows } = await pool.query('SELECT title, priority, description FROM work_orders WHERE id = $1', [woId]);
+  const wo = woRows[0];
+  if (!wo) { const e = new Error('Work Order not found'); e.status = 404; throw e; }
+  const { rows: lineRows } = await pool.query(
+    `SELECT title, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost
+     FROM job_lines WHERE work_order_id = $1 ORDER BY sort_order, id`, [woId]
+  );
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO work_order_templates (name, description, default_title, default_priority, default_description)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [String(name || '').trim() || wo.title, description || null, wo.title, wo.priority, wo.description]
+    );
+    await writeTemplateLines(client, rows[0].id, lineRows.map((r) => ({
+      title: r.title, responsibilityClass: r.responsibility_class, fundingSource: r.funding_source,
+      fundingRefId: r.funding_ref_id, estimatedHours: r.estimated_hours, estimatedCost: r.estimated_cost,
+    })));
+    await client.query('COMMIT');
+    await logActivity({ action: 'created', entityType: 'work_order_template', entityId: rows[0].id, entityLabel: rows[0].name, details: `Saved from Work Order #${woId}` });
+    return { ...templateRowShape(rows[0]), Lines: await templateLines(rows[0].id) };
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
 }
 
 // ── Causes catalog (1.6) — admin-editable dropdown that gets counted.
