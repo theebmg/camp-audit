@@ -740,6 +740,16 @@ function isGuardedField(el) {
 app.addEventListener('input', (e) => { if (isGuardedField(e.target)) formDirty = true; }, true);
 app.addEventListener('change', (e) => { if (isGuardedField(e.target)) formDirty = true; }, true);
 
+// The grid registers its own beforeunload while dirty; this covers the other
+// 35 forms, so closing the tab or hitting reload with unsaved work warns too.
+// Browsers show their own generic wording here and ignore ours — the in-app
+// dialog above is the one that can actually explain what's at stake.
+window.addEventListener('beforeunload', (e) => {
+  if (!formDirty || !app.querySelector('form, textarea')) return;
+  e.preventDefault();
+  e.returnValue = '';
+});
+
 async function confirmLeaveUnsaved() {
   const grid = activeJobLineGrid;
   if (grid && grid.isDirty()) {
