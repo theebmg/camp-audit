@@ -707,7 +707,24 @@ function setChrome({ title, showBack, showLogout }) {
   globalSearchWrap.hidden = !showLogout;
 }
 
-function go(view, params, opts = {}) {
+// beforeunload only fires on a real page unload (tab close, reload, external
+// link). An SPA view swap is not an unload, so the grid's guard could never
+// catch "clicked another nav item with unsaved lines" — that path is here.
+// Every navigation in the app funnels through go()/goBack(), so this is the
+// one place it needs to live.
+async function confirmLeaveDirtyGrid() {
+  const grid = activeJobLineGrid;
+  if (!grid || !grid.isDirty()) return true;
+  const n = grid.lineCount();
+  return confirmDialog(
+    `You have ${n} unsaved job line${n === 1 ? '' : 's'}. Leaving keeps them as a draft you can restore, but they won't be attached to the work order until you save.`,
+    { confirmLabel: 'Leave', cancelLabel: 'Stay on this page', danger: true }
+  );
+}
+
+async function go(view, params, opts = {}) {
+  // opts.skipGuard: goBack() has already asked, so don't ask twice.
+  if (!opts.skipGuard && !(await confirmLeaveDirtyGrid())) return;
   // opts.reset: jumping to a top-level section (sidebar nav, a dashboard
   // quick-link, an admin tool list) starts a fresh breadcrumb trail rather
   // than extending whatever drill-down path was already on the stack —
@@ -725,14 +742,20 @@ function go(view, params, opts = {}) {
   }
   render(view, params);
 }
-function goBack() {
+async function goBack() {
+  // Confirm before popping: bailing out after the pops would leave the
+  // breadcrumb stack one entry short of where the user actually still is.
+  if (!(await confirmLeaveDirtyGrid())) return;
   state.stack.pop();
   const prev = state.stack.pop();
-  if (prev) go(prev.view, prev.params); else go('dashboard', {}, { replace: true });
+  if (prev) go(prev.view, prev.params, { skipGuard: true });
+  else go('dashboard', {}, { replace: true, skipGuard: true });
 }
 
 backBtn.addEventListener('click', goBack);
 logoutBtn.addEventListener('click', async () => {
+  // Ask before the fetch — once the session is gone, staying isn't an option.
+  if (!(await confirmLeaveDirtyGrid())) return;
   await fetch('/logout', { method: 'POST' });
   state.user = null; state.stack = [];
   render('login');
@@ -9309,7 +9332,14 @@ function mountJobLineGrid(container, {
   }
 
   function destroy() {
+    // The debounced writeDraft may still be pending (markDirty schedules it
+    // 2s out, and every keystroke pushes it back). Cancelling the timer
+    // without flushing silently discarded everything typed since the last
+    // idle pause — which is the whole session if you never paused. Flush
+    // first, then tear down. clearDraft() already set dirty=false on a
+    // successful save, so this never resurrects a draft that was just cleared.
     clearTimeout(saveTimer);
+    if (dirty) writeDraft();
     window.removeEventListener('beforeunload', beforeUnload);
   }
 
