@@ -789,7 +789,7 @@ async function go(view, params, opts = {}) {
     const isDuplicate = top && top.view === view && JSON.stringify(top.params) === JSON.stringify(params);
     if (!isDuplicate) state.stack.push({ view, params });
   }
-  render(view, params);
+  render(view, params, { guarded: true });
 }
 async function goBack() {
   // Confirm before popping: bailing out after the pops would leave the
@@ -1130,13 +1130,26 @@ function renderBreadcrumbs() {
   }));
 }
 
-async function render(view, params = {}) {
+let currentView = null;
+
+async function render(view, params = {}, opts = {}) {
+  // Guarding go()/goBack() alone missed anything that calls render() directly
+  // — breadcrumb links do, and so would any future caller. render() is the one
+  // funnel every view change passes through, so the backstop lives here.
+  // Skipped when: go()/goBack() already asked (opts.guarded), the view isn't
+  // actually changing (a resize re-render or a post-save refresh of the same
+  // screen), or we're being thrown to login by a 401, where there's nothing to
+  // stay on.
+  if (!opts.guarded && view !== 'login' && view !== currentView) {
+    if (!(await confirmLeaveUnsaved())) return;
+  }
   try {
     // #app is replaced wholesale on every view swap, so anything holding a
     // window-level listener (the grid's unsaved-changes guard, its autosave
     // timer) has to be torn down here rather than waiting to be garbage.
     destroyActiveJobLineGrid();
     formDirty = false;   // new screen, nothing typed on it yet
+    currentView = view;
     if (view === 'login') { await renderLogin(); return fadeInApp(); }
     if (!state.user) { await renderLogin(); return fadeInApp(); }
     if (!state.options) state.options = await api('/api/pg/options');
@@ -8671,7 +8684,38 @@ function destroyActiveJobLineGrid() {
   if (activeJobLineGrid) { activeJobLineGrid.destroy(); activeJobLineGrid = null; }
 }
 
-function jlgDraftKey(woId) { return woId ? `wo-draft-${woId}` : 'wo-draft-new'; }
+// Editing an existing WO keeps one slot keyed to that WO — there's only one
+// thing it can be a draft OF. New work orders are different: each attempt is a
+// separate unfinished thing, so they get their own slot and accumulate until
+// the user decides. 'wo-draft-new' (the old single slot) is still read so a
+// draft saved by the previous build isn't stranded.
+const WO_NEW_DRAFT_PREFIX = 'wo-draft-new:';
+const WO_NEW_DRAFT_LEGACY = 'wo-draft-new';
+
+function jlgDraftKey(woId) { return woId ? `wo-draft-${woId}` : newWoDraftKey(); }
+function newWoDraftKey() {
+  return `${WO_NEW_DRAFT_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+// Snapshot the key list before reading: discarding mutates localStorage, and
+// index-based iteration over a collection you're editing skips entries.
+function listNewWoDrafts() {
+  const keys = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k === WO_NEW_DRAFT_LEGACY || (k && k.startsWith(WO_NEW_DRAFT_PREFIX))) keys.push(k);
+    }
+  } catch { return []; }
+  return keys
+    .map((key) => ({ key, draft: jlgReadDraft(key) }))
+    .filter((d) => d.draft)
+    .sort((a, b) => (b.draft.savedAt || 0) - (a.draft.savedAt || 0));
+}
+
+function draftLineTitles(draft) {
+  return (draft.rows || []).map((r) => String(r.title || '').trim()).filter(Boolean);
+}
 
 function mountJobLineGrid(container, {
   woId = null,
@@ -9335,9 +9379,12 @@ function mountJobLineGrid(container, {
     };
   }
 
-  function writeDraft() {
+  function writeDraft(force = false) {
     try {
-      if (rows.every(rowIsEmpty)) { localStorage.removeItem(key); return; }
+      // Autosave drops an all-empty grid rather than leaving a useless slot.
+      // An explicit Save draft click forces the write: the user may have filled
+      // only the header so far and still wants it kept.
+      if (!force && rows.every(rowIsEmpty)) { localStorage.removeItem(key); return; }
       localStorage.setItem(key, JSON.stringify(serializeDraft()));
     } catch { /* private mode / quota — the grid still works, it just won't survive a reload */ }
   }
@@ -9406,6 +9453,14 @@ function mountJobLineGrid(container, {
     lineCount: () => liveRows().length,
     hasErrors: () => rows.some((r) => r.errors.size),
     isDirty: () => dirty,
+    // Write now and go clean — the work is safely stored, so the leave-guard
+    // has nothing left to warn about until the next edit. Unlike clearDraft(),
+    // the stored draft stays put; that's the whole point of the button.
+    saveDraftNow: () => {
+      clearTimeout(saveTimer);
+      writeDraft(true);
+      if (dirty) { dirty = false; window.removeEventListener('beforeunload', beforeUnload); onDirtyChange(false); }
+    },
     clearDraft,
     destroy,
     focusFirst: () => focusRow(rows[0]),
@@ -9485,7 +9540,11 @@ function jlgReadDraft(key) {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
     const draft = JSON.parse(raw);
-    return Array.isArray(draft?.rows) && draft.rows.some((r) => String(r.title || '').trim()) ? draft : null;
+    // A header with a title and no lines yet is still work worth offering back
+    // — it's exactly what an explicit "Save draft" click produces.
+    const hasLines = Array.isArray(draft?.rows) && draft.rows.some((r) => String(r.title || '').trim());
+    const hasHeader = String(draft?.extra?.title || '').trim() !== '';
+    return hasLines || hasHeader ? draft : null;
   } catch { return null; }
 }
 function jlgClearDraft(key) { try { localStorage.removeItem(key); } catch { /* ignore */ } }
@@ -9550,6 +9609,17 @@ async function renderNewWorkOrder({ assetId, assetName, templateId }) {
   const [{ templates }, gridCtx] = await Promise.all([api('/api/pg/work-order-templates'), loadGridContext()]);
   const fieldTitles = state.options.propertyFields.map((f) => f.title);
 
+  // Drafts are offered before the form is painted: if the user picks one up we
+  // want to build the form already populated, not flash an empty one first.
+  const savedDrafts = listNewWoDrafts();
+  let chosenDraft = null;
+  if (savedDrafts.length && !templateId) {
+    const review = await confirmDialog(
+      `${savedDrafts.length} saved draft${savedDrafts.length === 1 ? '' : 's'} found. Would you like to use one?`,
+      { confirmLabel: 'Review drafts', cancelLabel: 'Create new work order', danger: false });
+    if (review) chosenDraft = await pickWoDraft(savedDrafts);
+  }
+
   const assetUpdateRowHtml = (row = {}) => `<div class="inline-add-row au-row" style="align-items:center">
     <select class="au-field" style="flex:1">${fieldTitles.map((t) => `<option ${row.targetField === t ? 'selected' : ''}>${escapeHtml(t)}</option>`).join('')}</select>
     <input class="au-value" placeholder="Value" value="${escapeHtml(row.newValue || '')}" style="flex:1" />
@@ -9586,6 +9656,7 @@ async function renderNewWorkOrder({ assetId, assetName, templateId }) {
         </details>
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Create Work Order</button>
+          <button class="btn btn-secondary" type="button" id="saveWoDraftBtn">Save draft</button>
           <button class="btn btn-secondary" type="button" id="cancelWoBtn">Cancel</button>
         </div>
       </form>
@@ -9595,7 +9666,9 @@ async function renderNewWorkOrder({ assetId, assetName, templateId }) {
   let assetPicker = null;
   if (!assetId) assetPicker = mountAssetCombobox(document.getElementById('woAssetPicker'));
 
-  const draftKey = jlgDraftKey(null);
+  // Resuming edits the slot it came from; starting fresh gets its own, so a new
+  // attempt never overwrites a draft the user chose to leave alone.
+  const draftKey = chosenDraft ? chosenDraft.key : newWoDraftKey();
   const gridHost = document.getElementById('woGrid');
   let grid = null;
 
@@ -9622,10 +9695,9 @@ async function renderNewWorkOrder({ assetId, assetName, templateId }) {
 
   // §6: a draft found on arrival is offered, never silently applied — the
   // previous attempt might have been abandoned on purpose.
-  const draft = jlgReadDraft(draftKey);
-  if (draft && await confirmDialog(
-    `You have an unsaved work order draft from ${formatDraftAge(draft.savedAt)} (${draft.rows.filter((r) => String(r.title || '').trim()).length} lines). Restore it?`,
-    { confirmLabel: 'Restore draft', cancelLabel: 'Discard', danger: false })) {
+  // The choice was already made on the picker screen — just apply it.
+  const draft = chosenDraft ? chosenDraft.draft : null;
+  if (draft) {
     buildGrid({ initialRows: draft.rows, cascadeConfig: draft.cascadeConfig });
     if (draft.extra) {
       form.title.value = draft.extra.title || '';
@@ -9635,7 +9707,6 @@ async function renderNewWorkOrder({ assetId, assetName, templateId }) {
     }
     toast('Draft restored');
   } else {
-    if (draft) jlgClearDraft(draftKey);
     buildGrid();
   }
 
@@ -9674,6 +9745,17 @@ async function renderNewWorkOrder({ assetId, assetName, templateId }) {
   if (templateId) await applyTemplate(templateId);
 
   document.getElementById('cancelWoBtn').addEventListener('click', goBack);
+
+  // Explicit save, for when you know you're stopping. Autosave already runs on
+  // a 2s debounce and flushes on the way out, so this is about certainty rather
+  // than mechanism — it writes immediately and says so. headerState() rides
+  // along via draftExtra, so a title with no lines yet still persists.
+  document.getElementById('saveWoDraftBtn').addEventListener('click', () => {
+    grid.saveDraftNow();
+    // Saved is saved: don't warn about it on the way out.
+    formDirty = false;
+    toast('Draft saved — find it next time you open New Work Order');
+  });
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -9699,6 +9781,77 @@ async function renderNewWorkOrder({ assetId, assetName, templateId }) {
       await maybePromptReview(result.workOrderId, result.reviewPrompt);
       go('workOrderDetail', { id: result.workOrderId }, { replace: true });
     } catch (err) { toast(err.message); }
+  });
+}
+
+// Shows every saved new-WO draft with its job lines visible, so the choice is
+// made by looking at the work rather than at a timestamp. Resolves with the
+// chosen {key, draft}, or null for "start a fresh one". Drafts not acted on
+// are left exactly where they are.
+function pickWoDraft(initialDrafts) {
+  return new Promise((resolve) => {
+    let drafts = initialDrafts;
+
+    const draftCard = ({ key, draft }) => {
+      const lines = draftLineTitles(draft);
+      const title = String(draft.extra?.title || '').trim();
+      const shown = lines.slice(0, 12);
+      return `
+        <div class="card draft-card" data-key="${escapeHtml(key)}" style="margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap">
+            <strong>${escapeHtml(title || '(no title yet)')}</strong>
+            <span class="muted" style="font-size:0.85rem">saved ${escapeHtml(formatDraftAge(draft.savedAt))}</span>
+          </div>
+          ${draft.extra?.priority || draft.extra?.scheduledDate ? `<p class="muted" style="margin:4px 0 0;font-size:0.85rem">
+            ${draft.extra?.priority ? `Priority: ${escapeHtml(draft.extra.priority)}` : ''}
+            ${draft.extra?.scheduledDate ? ` · Scheduled: ${escapeHtml(draft.extra.scheduledDate)}` : ''}
+          </p>` : ''}
+          <p class="muted" style="margin:8px 0 4px">${lines.length} job line${lines.length === 1 ? '' : 's'}</p>
+          ${lines.length ? `<ul style="margin:0 0 10px 18px;padding:0">
+            ${shown.map((t) => `<li>${escapeHtml(t)}</li>`).join('')}
+            ${lines.length > shown.length ? `<li class="muted">…and ${lines.length - shown.length} more</li>` : ''}
+          </ul>` : '<p class="muted" style="margin:0 0 10px">No job lines yet — header only.</p>'}
+          <div class="btn-row">
+            <button class="btn btn-primary draft-use" type="button">Use this draft</button>
+            <button class="btn btn-secondary draft-discard" type="button">Discard</button>
+          </div>
+        </div>`;
+    };
+
+    const paint = () => {
+      setApp(`
+        <div class="screen">
+          <h2>Saved drafts</h2>
+          <p class="muted">${drafts.length} unfinished work order${drafts.length === 1 ? '' : 's'}. Pick one up, discard it, or start fresh — anything you leave alone stays here.</p>
+          ${drafts.map(draftCard).join('')}
+          <div class="btn-row" style="margin-top:16px">
+            <button class="btn btn-primary" type="button" id="draftCreateNew">Create new work order</button>
+          </div>
+        </div>`);
+
+      document.getElementById('draftCreateNew').addEventListener('click', () => resolve(null));
+
+      app.querySelectorAll('.draft-card').forEach((card) => {
+        const key = card.dataset.key;
+        card.querySelector('.draft-use').addEventListener('click', () => {
+          resolve(drafts.find((d) => d.key === key) || null);
+        });
+        card.querySelector('.draft-discard').addEventListener('click', async () => {
+          const entry = drafts.find((d) => d.key === key);
+          const n = entry ? draftLineTitles(entry.draft).length : 0;
+          if (!await confirmDialog(
+            `Discard this draft${n ? ` and its ${n} job line${n === 1 ? '' : 's'}` : ''}? This can't be undone.`,
+            { confirmLabel: 'Discard draft', cancelLabel: 'Keep it', danger: true })) return;
+          jlgClearDraft(key);
+          drafts = drafts.filter((d) => d.key !== key);
+          if (!drafts.length) { toast('Draft discarded'); resolve(null); return; }
+          toast('Draft discarded');
+          paint();
+        });
+      });
+    };
+
+    paint();
   });
 }
 
