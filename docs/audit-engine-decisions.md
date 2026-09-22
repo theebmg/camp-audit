@@ -138,3 +138,48 @@ the answer that raised it — the direction that did *not* exist.
   required-checks filter server-side rather than trusting the client's view.
 - **`UNIQUE (form_id, question_key)`** plus a standalone index on `question_key`:
   unique within a form, joinable across forms and eras.
+
+---
+
+# OPEN QUESTION — blocking Phase 1 completion
+
+Raised 2026-09-20, restated here 2026-09-22 because it was never answered and
+should not live only in a terminal transcript.
+
+**Status: the schema is live (0072–0074). The seed form is not started. All audit
+tables are at 0 rows. Phase 2 (runner) cannot begin without a form to run.**
+
+## The question
+
+Decisions §4 says the Phase 1 fixture is the migrated old-audit form. That migration
+splits in two, and only half of it is mechanical.
+
+**Mechanical — no input needed.** The 8 `asset_property_fields` and 11
+`component_type_catalog` entries become questions with their options;
+`asset_property_dependencies` and `component_prompt_dependencies` become `show_if`
+chains; `question_applicability` becomes `audit_question_building_types`. Keys
+preserved per §5.
+
+**Not mechanical.** The old audit has **no flag semantics and no remedies**. It let a
+human type one free-text finding per audit. So:
+
+- which answers mean "there's a problem" (`audit_question_options.flag`), and
+- what fix each flagged leaf implies (`audit_remedies`: title template,
+  responsibility, funding, hours, cost)
+
+exist only in Ben's head. Nothing in the database encodes either one.
+
+## The three ways forward
+
+1. **Seed mechanically with `flag` unset and no remedies**, then hand-author flags and
+   remedies for the roof / siding / interior subset only — enough to build and test the
+   runner against. Everything else gets marked up later in the builder.
+   *Recommended:* unblocks Phase 2 immediately and commits to no guesses about the
+   buildings.
+2. **Pull a minimal builder forward from Phase 4** so the flags and remedies can be
+   authored in-app before the runner exists.
+3. **Ben supplies the flag/remedy rules** for the seed questions and they're encoded
+   faithfully.
+
+Answering this unblocks Phase 2 of the audit engine. It does not block the board
+report / purchases work, which proceeds on its own branch.
