@@ -142,3 +142,103 @@ Migration volume is trivial. The design questions are not.
 4. **`condition_findings.board_focus`** is a third flag level the brief omits.
 5. **Sending.** `/reports/board/send` emails a freshly-built report. Draft/publish has
    to decide what "send" means.
+
+---
+
+# Phase 1 Investigation — Purchases, Savings, Event Types, Forward Focus, Projection
+
+Added 2026-09-22 for the Unified Board Report / Purchases brief (§1).
+
+## 1.1 Expenses — schema and UI
+
+`expenses` (0053), soft-deleted via `deleted_at`:
+
+| Field | Note |
+|---|---|
+| `vendor`, `amount`, `purchase_date` | the receipt basics |
+| `tax_amount`, `tax_charged_in_error` | camp is tax-exempt; flags when charged anyway |
+| `category_id` → expense_categories, `fund_id` → funds | accounting attribution |
+| `work_order_id`, `job_line_id`, `asset_id` | **already attributable to a job line** |
+| `triage_status` | `inbox \| triaged \| void` — an actual inbox workflow |
+| `batch_id` → attachment_batches, `source` (`manual \| email`), `parsed_confidence` | **email ingestion pipeline** |
+| `notes`, `created_by`, `created_at` | |
+
+Receipts are attachments: `attachment_links.entity_type = 'expense'`, role `Receipt`. No second file store.
+Cost rolls into job lines through `JOB_LINE_EXPENSE_COST_SQL`, joined per line in the WO and board queries.
+UI: `renderExpenses`, `renderExpenseDetail`, `renderAllExpensesTab`, plus `src/routes/receipt-inbound.js`.
+
+**Live data — this is the decisive part:**
+
+```
+expenses 11 (0 deleted) · from email 10 · manual 1
+with work_order_id 0 · with job_line_id 0 · triage inbox 0
+```
+
+Ten of eleven expenses arrived by **email**. Zero are attached to a work order or job line.
+
+## 1.2 Savings
+
+One column: `admin_tasks.recurring_monthly_savings numeric(12,2)` (0066). 1 row populated.
+
+- Stored **monthly**, not annually.
+- There is **no one-time savings concept anywhere**.
+- No savings on expenses, WOs, or job lines.
+
+Rendered in exactly one place: `adminWorkSectionHtml` / `adminWorkSectionText` in `reportRender.js`,
+fed by `reportDataPg.js:134-142` which computes `monthlySavings`, `annualizedSavings`,
+`savingsTaskCount`. Already displays both "$X/month · $Y/year", so the brief's annualized
+presentation is a formatting change, not a data change.
+
+## 1.3 Calendar event types — they exist
+
+`calendar_event_types` (0061): `id`, `name`, `sort_order`, `gcal_color_id`, `active`.
+Seeded: Constituent Visitation, Volunteer Workday, Group Rental, Board Meeting, Camp Session, Other.
+`calendar_events.type_id` is **NOT NULL** — every event already has a real type.
+
+**§5 needs one additive column** (`show_on_board_report boolean NOT NULL DEFAULT false`).
+No new table, no backfill.
+
+## 1.4 Forward Focus — smaller than expected
+
+`getBoardFocusItems()` → two queries, `work_orders.board_focus = true` and
+`condition_findings.board_focus = true`. **No other inclusion rule.** No sections.
+
+Rendered as one flat table: Type / Item / Asset / Est. Cost.
+Routes `/reports/forward-focus/preview` and `/send`; reachable as a tab via `REPORT_TABS`.
+
+**One behavior worth preserving on merge:** cost falls back to `historicalAvgActualCost(templateId)`
+for PM-recurring WOs, labeled "(hist. avg)". A forward-looking cost grounded in what the job has
+actually cost before, rather than a stale estimate. Coming Up should keep this.
+
+## 1.5 Recurrence projection — yes, and it already solves the dedupe
+
+`listCalendarEventOccurrences(fromDate, toDate)` is a **pure read**. It expands recurrence over any
+range and LEFT-joins `calendar_event_generated_wo`, building `genByKey` so each occurrence knows
+whether a real WO already exists for it.
+
+The cap at today lives in `generateDueWorkOrdersForRange`, **not** in the lister. Asking for a future
+range returns projected occurrences and writes nothing.
+
+So §5's "projected occurrences that never duplicate once materialized" is close to free: render the
+real WO where `gen` is present, a projection where it isn't.
+
+Caveat: **0 calendar events currently recur** (`recurrence_type <> 'none'` → 0 rows), so this path has
+no live data. Testing needs a fixture.
+
+## Findings that force a choice
+
+**`purchases` vs `expenses` — see the decision request.** The brief introduces a `purchases` entity
+(vendor, date, total paid, regular price, receipt attachment, line items). `expenses` already *is*
+that entity, plus tax handling, fund/category attribution, a triage inbox, and an email-ingestion
+pipeline that produced 10 of the 11 rows in the system. Building `purchases` beside it would create
+a second receipt table and a second ingestion story.
+
+Secondary, non-blocking, logged here:
+
+- **Savings unit.** Brief says "recurring (annual)"; the column is monthly. Recommend one
+  `savings_entries` read model (kind `recurring | one_time`, amount, basis) with the admin-task
+  column migrated in and the task form writing through it — keeping the column *and* adding a
+  general table would be the dual-source pattern we've been removing.
+- **"Migrate existing WO expenses" has nothing to migrate** — 0 expenses link to a WO or job line.
+  The migration is real but empty; allocations should still prefer `job_line_id` over
+  `work_order_id` when a future row has both.
