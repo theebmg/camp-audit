@@ -242,3 +242,44 @@ Secondary, non-blocking, logged here:
 - **"Migrate existing WO expenses" has nothing to migrate** — 0 expenses link to a WO or job line.
   The migration is real but empty; allocations should still prefer `job_line_id` over
   `work_order_id` when a future row has both.
+
+---
+
+# The five original leans, and how the brief resolved them
+
+The Unified Board Report brief says it "supersedes docs/board-report-decisions.md."
+That file never existed — these five points were raised in conversation on 2026-09-22
+after the current-state analysis above, and answered by the brief. Recorded here so the
+supersedes line points at something real.
+
+| # | Question raised | My lean | How the brief resolved it |
+|---|---|---|---|
+| 1 | Forward Focus owns `board_focus`. Leave it alone, fold it in, or retire it? | Leave it alone — separate report, separate purpose | **Reversed.** Forward Focus merges into the Board Report's Coming Up section and is retired; `board_focus` is kept and relabeled "Feature on board report" (§2) |
+| 2 | Admin tasks are opt-out (default true); an explicit checked set is opt-in. What happens to that semantic? | *No lean — flagged as the one I couldn't call* | Existing semantics preserved: admin tasks in the period pre-checked when `include_in_board_report` is true, unchecked when false (§5) |
+| 3 | Over half the report is aggregates with nothing to toggle. Snapshot without making them toggleable? | Snapshot at publish, not toggleable | Confirmed: publish freezes all aggregates — counts, money, savings, backlog, visitor activity (§3); toggling applies to items (§5) |
+| 4 | `condition_findings.board_focus` is a third flag level the brief omitted. In scope? | Leave to Forward Focus | **Reversed.** In scope — the findings flag pulls items into Coming Up, and the same flag is added at job-line level (§2) |
+| 5 | `/reports/board/send` emails a freshly-built report. Does send work on drafts, published, or both? | Both, labeled | Confirmed and extended: every send is stored permanently with its exact content; draft sends require a confirm and are prefixed "DRAFT" (§3) |
+
+Net: two reversed (1, 4), two confirmed (3, 5), one answered where I had no lean (2).
+
+## Phase 2 decisions (from the reply to the §1 investigation)
+
+- **Extend `expenses`; do not build `purchases`.** Add `regular_price`,
+  `expense_line_items`, `expense_allocations`. Tax, funds, triage and email ingestion
+  keep working exactly as they do. "Purchase" is the UI label for an expense that has
+  line items.
+- **Line items are optional.** An emailed receipt with no line items is still
+  splittable as a whole, **by dollar amount**. Splitting never requires itemizing.
+- **Drop the expense-migration step** — 0 expenses link to a WO or job line, so there
+  is nothing to migrate.
+- **One `savings_entries` table**, kind `recurring | one_time`.
+  `admin_tasks.recurring_monthly_savings` moves into it and **the old column is
+  retired** — not kept alongside. Recurring entries store amount and period; the report
+  presents them annualized. Purchase discounts (regular − paid) write `one_time`
+  entries when the expense is recorded.
+- **Event types:** one additive `show_on_board_report` column, default off.
+- **Projection:** use `listCalendarEventOccurrences`; real WO where one exists,
+  projection where it doesn't. A recurring-event fixture is needed to test the path,
+  since no live recurring events exist.
+- **Keep the historical-average cost** for recurring WOs in Coming Up, labeled
+  "(hist. avg)".
