@@ -538,8 +538,11 @@ overlay** per material, and two prompts that appear inside existing flows.
 
 - **Balance and history are the same screen**, because a balance is only trustworthy if
   you can see the movements behind it. Corrections appear as their own rows.
-- **A correction is signed on purpose** — enter `-1` when you counted one fewer than the
-  system says. The UI says so rather than guessing direction from context.
+- **A correction asks for the count, not the change.** Nobody standing in a shed works
+  out "that's minus one" — they can see there are three. The prompt shows what the system
+  thinks, takes the actual count, and stores the *difference* as the movement, so the log
+  still adds up to the balance. Tossed/damaged stays its own action and asks how many are
+  unusable, since that is the thing being counted rather than a new total.
 - **The WO-close prompt is asked BEFORE completing**, not after. A closed work order with
   its leftovers unrecorded is the state nobody goes back to fix. It returns immediately
   when the WO bought no tracked materials, so an ordinary close is untouched, and blank

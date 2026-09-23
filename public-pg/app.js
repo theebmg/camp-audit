@@ -8878,13 +8878,7 @@ async function openMaterialHistory(materialId, { onClose } = {}) {
   overlay.querySelector('.modal-cancel').addEventListener('click', close);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
-  async function movement(kind, prompt_, noteWanted) {
-    const qtyStr = await promptDialog(prompt_, { placeholder: 'quantity', confirmLabel: 'Record' });
-    if (qtyStr === null || !qtyStr.trim()) return;
-    const quantity = Number(qtyStr);
-    if (!Number.isFinite(quantity) || quantity === 0) return toast('Enter a number', 4000);
-    let note = null;
-    if (noteWanted) note = await promptDialog('Why? (optional)', { confirmLabel: 'Record', multiline: true });
+  async function record(kind, quantity, note) {
     try {
       await api(`/api/pg/materials/${materialId}/movements`, {
         method: 'POST', body: JSON.stringify({ kind, quantity, note: note || null }),
@@ -8892,9 +8886,40 @@ async function openMaterialHistory(materialId, { onClose } = {}) {
       toast('Recorded'); overlay.remove(); openMaterialHistory(materialId, { onClose });
     } catch (e) { toast(e.message, 5000); }
   }
-  // A correction is signed on purpose: -1 when you counted one fewer than the system says.
-  overlay.querySelector('#matCorrect').addEventListener('click', () => movement('correction', `Correction for ${m.Name} — use a negative number if there's less than recorded`, true));
-  overlay.querySelector('#matToss').addEventListener('click', () => movement('tossed', `How many ${m.Unit} of ${m.Name} are unusable?`, true));
+
+  // Ask for the count, not the change. Nobody standing in a shed works out "that's
+  // minus one" — they can see there are three. The system does the subtraction and
+  // stores the difference, so the movement log still adds up to the balance.
+  overlay.querySelector('#matCorrect').addEventListener('click', async () => {
+    const countStr = await promptDialog(
+      `${m.Name}: the system says ${m.Balance} ${m.Unit}. How many do you actually have?`,
+      { value: String(m.Balance), placeholder: String(m.Balance), confirmLabel: 'Next' }
+    );
+    if (countStr === null || !countStr.trim()) return;
+    const actual = Number(countStr);
+    if (!Number.isFinite(actual) || actual < 0) return toast('Enter a count', 4000);
+    const delta = Math.round((actual - Number(m.Balance)) * 100) / 100;
+    if (delta === 0) return toast('That matches what was recorded — nothing to correct');
+    const note = await promptDialog(
+      `Recording ${delta > 0 ? '+' : ''}${delta} ${m.Unit} to make the balance ${actual}. Why? (optional)`,
+      { confirmLabel: 'Record correction', multiline: true, placeholder: 'e.g. two sheets were damaged in storage' }
+    );
+    if (note === null) return;   // cancelled at the note step
+    await record('correction', delta, note);
+  });
+
+  // Its own action, and still a quantity: "how many are unusable" is the thing being
+  // counted, not a new total.
+  overlay.querySelector('#matToss').addEventListener('click', async () => {
+    const qtyStr = await promptDialog(`How many ${m.Unit} of ${m.Name} are unusable?`, { confirmLabel: 'Next' });
+    if (qtyStr === null || !qtyStr.trim()) return;
+    const quantity = Number(qtyStr);
+    if (!Number.isFinite(quantity) || quantity <= 0) return toast('Enter a quantity', 4000);
+    if (quantity > Number(m.Balance)) return toast(`Only ${m.Balance} ${m.Unit} on hand`, 4000);
+    const note = await promptDialog('What happened? (optional)', { confirmLabel: 'Record', multiline: true });
+    if (note === null) return;
+    await record('tossed', quantity, note);
+  });
 }
 
 // Prompt at work-order close (§10). Skipped entirely when the WO bought no tracked
