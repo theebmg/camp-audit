@@ -40,8 +40,8 @@ rolled-back transaction against the live schema, 30+ assertions in total.
 
 ### Waiting on you
 
-**Q1 below (funding per allocation) is the only thing blocking further backend work.**
-Q2 and Q3 are informational. The seed-form fixture question you answered is recorded in
+**Q1 (funding: stamped) and Q2 (cabin-holder key) are both resolved and deployed.**
+Q3 is informational. The seed-form fixture question you answered is recorded in
 `docs/audit-engine-decisions.md`; the audit engine resumes after this branch merges.
 
 ### One defect worth knowing about
@@ -85,7 +85,20 @@ this. Full write-up in `docs/board-report-analysis.md`.
 
 ---
 
-## Q2 — The cabin-holder ↔ cabin relationship is a string join
+## Q2 — RESOLVED 2026-09-23: replaced with a real foreign key
+
+`assets.cabin_holder_id` (0085), backfilled 174 of 174 with **zero unmatched and no
+duplicate holder names**. `syncCabinHoldersFromAssets` now maintains the key as well as
+the roster, so a `lodge_holder` typed today gets its key on the next read. Every read
+join moved onto the key and returns identical results (174 vs 174). `lodge_holder` is
+kept as the display/legacy column and was not touched.
+
+Backfill rule was exactly-one-match or nothing — an ambiguous name is left NULL and
+reported rather than guessed. None occurred.
+
+The investigation that led here follows.
+
+### Original question
 
 **Investigated** for addendum §5b, which asked me to report rather than invent.
 

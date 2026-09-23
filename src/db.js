@@ -218,6 +218,7 @@ function assetRowToNocoShape(a) {
     Notes: a.notes,
     Description: a.description,
     'Lodge Holder': a.lodge_holder,
+    CabinHolderId: a.cabin_holder_id ?? null,
     'Has Key': a.has_key,
     'Key Fits Lock': a.key_fits_lock,
     'Free Standing Building': a.free_standing_building,
@@ -1207,6 +1208,25 @@ export async function syncCabinHoldersFromAssets() {
     WHERE lodge_holder IS NOT NULL AND trim(lodge_holder) != ''
     ON CONFLICT (name) DO NOTHING
   `);
+  // Now that assets.cabin_holder_id exists (0085), the same sync maintains it: a
+  // lodge_holder typed today gets its key on the next read, so the FK never falls
+  // behind the text it was derived from. Exactly one match or nothing — a name
+  // matching two holders is ambiguous, and guessing would attach a cabin to the wrong
+  // person silently.
+  await pool.query(`
+    UPDATE assets a
+    SET cabin_holder_id = m.holder_id
+    FROM (
+      SELECT a2.id AS asset_id, min(ch.id) AS holder_id
+      FROM assets a2
+      JOIN cabin_holders ch ON lower(trim(ch.name)) = lower(trim(a2.lodge_holder))
+      WHERE a2.lodge_holder IS NOT NULL AND trim(a2.lodge_holder) <> ''
+      GROUP BY a2.id
+      HAVING count(ch.id) = 1
+    ) m
+    WHERE a.id = m.asset_id
+      AND (a.cabin_holder_id IS NULL OR a.cabin_holder_id <> m.holder_id)
+  `);
 }
 
 export async function listCabinHolders() {
@@ -1215,7 +1235,7 @@ export async function listCabinHolders() {
     SELECT ch.id, ch.name, ch.notes AS description,
       COALESCE(json_agg(json_build_object('Id', a.id, 'Name', a.name)) FILTER (WHERE a.id IS NOT NULL), '[]') AS linked_assets
     FROM cabin_holders ch
-    LEFT JOIN assets a ON lower(trim(a.lodge_holder)) = lower(ch.name)
+    LEFT JOIN assets a ON a.cabin_holder_id = ch.id
     GROUP BY ch.id, ch.name, ch.notes
     ORDER BY ch.name
   `);
@@ -6203,7 +6223,7 @@ async function applyCabinHolderVisitDefaults({ cabin_holder_id, visitor_name, as
   if (!out.cabin_holder_id || (visitor_name !== undefined && asset_id !== undefined)) return out;
   const { rows } = await pool.query(
     `SELECT ch.name, COALESCE(json_agg(a.id ORDER BY a.name) FILTER (WHERE a.id IS NOT NULL), '[]') AS asset_ids
-     FROM cabin_holders ch LEFT JOIN assets a ON lower(trim(a.lodge_holder)) = lower(ch.name)
+     FROM cabin_holders ch LEFT JOIN assets a ON a.cabin_holder_id = ch.id
      WHERE ch.id = $1 GROUP BY ch.id`,
     [out.cabin_holder_id]
   );
