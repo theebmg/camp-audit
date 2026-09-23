@@ -7,9 +7,9 @@
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
-import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
+import { buildCapitalPlanPg, buildBoardReportPg, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
 import {
-  renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText, renderPlainEmailHtml,
+  renderBoardReportHtml, renderBoardReportText, renderPlainEmailHtml,
   renderWorkPerformedHtml, renderWorkPerformedText, renderDeferredBacklogHtml, renderDeferredBacklogText,
   renderVisitorActivityHtml, renderVisitorActivityText,
 } from '../reportRender.js';
@@ -86,6 +86,7 @@ import {
   listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
   getExpensesReportRawData,
   getOrCreateDraftBoardReport,
+  refreshBoardReportSuggestions,
   getBoardReport,
   listBoardReports,
   updateBoardReport,
@@ -1102,30 +1103,10 @@ router.post('/reports/board/send', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/reports/forward-focus/preview', async (req, res, next) => {
-  try {
-    const data = await buildForwardFocusReportPg();
-    res.json({ title: 'Forward Focus', html: renderForwardFocusHtml(data), text: renderForwardFocusText(data) });
-  } catch (e) { next(e); }
-});
-
-router.post('/reports/forward-focus/send', async (req, res, next) => {
-  try {
-    const { recipient, subject } = req.body || {};
-    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
-    const data = await buildForwardFocusReportPg();
-    await sendMail({
-      to: recipient,
-      subject: subject || 'Camp Sychar — Forward Focus',
-      html: renderForwardFocusHtml(data),
-      text: renderForwardFocusText(data),
-    });
-    res.json({ ok: true });
-  } catch (e) { next(e); }
-});
-
-// ---- Work Performed / Deferred Backlog — named reports (Build Brief v2 Phase 6) ----
-
+// Forward Focus retired (Build Brief §2): its content is the Coming Up section of the
+// unified board report now, and board_focus is relabelled "Feature on board report".
+// getBoardFocusItems stays in db.js — the flags it reads are still the flags Coming Up
+// suggests from.
 router.get('/reports/work-performed/preview', async (req, res, next) => {
   try {
     const { from, to } = req.query;
@@ -2054,6 +2035,16 @@ router.patch('/board-reports/:id/items/:itemId', async (req, res, next) => {
     }
     if (!items) return res.status(404).json({ ok: false, error: 'Not found' });
     res.json({ ok: true, items });
+  } catch (e) { next(e); }
+});
+
+// Re-runs every suggestion rule. Safe to call whenever the period changes — upserts
+// refresh the snapshots but never undo an explicit include/exclude.
+router.post('/board-reports/:id/refresh', async (req, res, next) => {
+  try {
+    const result = await refreshBoardReportSuggestions(req.params.id);
+    if (!result) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
 

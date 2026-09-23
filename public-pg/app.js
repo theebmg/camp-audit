@@ -4725,7 +4725,6 @@ function reportPresets(entity) {
 const REPORT_TABS = [
   { key: 'explorer', label: 'Data Explorer' },
   { key: 'board', label: 'Board Report' },
-  { key: 'forwardFocus', label: 'Forward Focus' },
   { key: 'workPerformed', label: 'Work Performed' },
   { key: 'deferredBacklog', label: 'Deferred Backlog' },
   { key: 'visitorActivity', label: 'Visitor Activity' },
@@ -4747,7 +4746,6 @@ function wireReportsTabs(container = app) {
 async function renderReports(params = {}) {
   const mode = REPORT_TABS.some((t) => t.key === params.mode) ? params.mode : 'explorer';
   if (mode === 'board') return renderBoardReport();
-  if (mode === 'forwardFocus') return renderForwardFocusReport();
   if (mode === 'workPerformed') return renderWorkPerformedReport();
   if (mode === 'deferredBacklog') return renderDeferredBacklogReport();
   if (mode === 'visitorActivity') return renderVisitorActivityReport();
@@ -5131,35 +5129,6 @@ async function renderBoardReport() {
     periodEnd = document.getElementById('boardTo').value || periodEnd;
     generating = true; draw();
     try { report = await api(`/api/pg/reports/board/preview?periodStart=${periodStart}&periodEnd=${periodEnd}`); }
-    catch (err) { toast(err.message); }
-    generating = false; draw();
-  }
-
-  draw();
-}
-
-async function renderForwardFocusReport() {
-  setChrome({ title: 'Reports', showBack: false, showLogout: true });
-  let report = null;
-  let generating = false;
-
-  function draw() {
-    setApp(`
-      ${reportsTabsHtml('forwardFocus')}
-      <div class="card">
-        <h3>Forward Focus</h3>
-        <p class="muted">Work Orders and Condition Findings flagged for board focus, sorted by cost — a recurring PM item shows the historical average actual cost of past instances instead of its estimate.</p>
-        <div class="btn-row"><button type="button" class="btn btn-primary" id="ffGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
-      </div>
-      ${reportPreviewAreaHtml(report)}`);
-    wireReportsTabs();
-    document.getElementById('ffGenBtn').addEventListener('click', generate);
-    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/forward-focus/send', sendBody: () => ({}) });
-  }
-
-  async function generate() {
-    generating = true; draw();
-    try { report = await api('/api/pg/reports/forward-focus/preview'); }
     catch (err) { toast(err.message); }
     generating = false; draw();
   }

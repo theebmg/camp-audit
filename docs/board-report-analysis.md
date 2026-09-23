@@ -415,3 +415,30 @@ once stamp-vs-resolve is settled.
   deliberately unchecked.
 - **Draft sends are allowed but never silent**: the API requires `confirmDraft` and
   prefixes both subject and body with DRAFT.
+
+---
+
+# Phase 5 decisions logged (suggestions, projections, Forward Focus retirement)
+
+- **`job_lines.board_focus` added** (0081). The WO-level and finding-level flags are
+  kept and only relabelled; the line-level flag is new because inclusion moved to line
+  level — flagging a whole WO to surface one line is the blunt instrument this replaces.
+- **Overdue is derived in the suggestion pass, never stored.** A line whose scheduled
+  date has passed lands in the `overdue` section instead of `coming_up`; nothing writes
+  an overdue status, so it clears itself when the work completes.
+- **Admin tasks arrive unchecked rather than absent** when `include_in_board_report` is
+  false. An excluded task is then visible as a decision on the screen instead of
+  silently missing, and the existing opt-out semantic is preserved exactly.
+- **Projection dedupe comes free from the existing guard table.**
+  `listCalendarEventOccurrences` overrides `WorkOrderId` with the generated one when
+  `calendar_event_generated_wo` has a row, so for a PM occurrence a set `WorkOrderId`
+  means "already materialized" — the real work order becomes the item and the
+  projection is never written beside it.
+- **Forward Focus's historical-average cost is preserved**: an unmaterialized PM
+  projection is priced from `historicalAvgActualCost` and labelled "hist. avg", because
+  a forward cost grounded in what the job actually cost beats a stale estimate.
+- **Forward Focus retired**: both routes, the reports tab, the screen function and the
+  now-unused imports are gone. `getBoardFocusItems` stays in db.js — the flags it reads
+  are still the flags Coming Up suggests from.
+- **A recurring-event fixture was needed to test projections at all**, since zero
+  calendar events currently recur. Verified in a rolled-back transaction.

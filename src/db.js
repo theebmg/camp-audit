@@ -4319,6 +4319,178 @@ export async function unvoidExpense(id) {
   if (rows[0]) await logActivity({ action: 'unvoided', entityType: 'expense', entityId: rows[0].id, entityLabel: rows[0].vendor || 'Expense' });
 }
 
+// ── Board report suggestions (Build Brief §5) ────────────────────────────
+// Everything here is a SUGGESTION. Each pass upserts rows pre-checked, and
+// upsertBoardReportItem never overwrites an explicit include/exclude, so re-running
+// after a date change can't undo a decision. Nothing is ever force-included.
+
+// Done: job lines resolved inside the backward period — line level, so a work order
+// with 2 of 5 lines finished contributes those 2 and not itself.
+async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
+  const { rows } = await pool.query(
+    `SELECT jl.id, jl.title, jl.completed_date::text AS completed_date, jl.actual_hours,
+            COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost,
+            w.id AS work_order_id, w.title AS wo_title, a.name AS asset_name, s.name AS status_name
+     FROM job_lines jl
+     JOIN job_line_statuses s ON s.id = jl.status_id
+     JOIN work_orders w ON w.id = jl.work_order_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+     WHERE s.counts_as_work_performed AND jl.completed_date BETWEEN $1 AND $2
+     ORDER BY jl.completed_date DESC, jl.id`,
+    [periodStart, periodEnd]
+  );
+  const woSeen = new Set();
+  for (const [i, r] of rows.entries()) {
+    // The WO rides along as the grouping header the screen expands.
+    if (!woSeen.has(r.work_order_id)) {
+      woSeen.add(r.work_order_id);
+      await upsertBoardReportItem(reportId, {
+        itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
+        snapTitle: r.wo_title, snapAssetName: r.asset_name,
+      });
+    }
+    await upsertBoardReportItem(reportId, {
+      itemType: 'job_line', itemId: r.id, section: 'done', sortIndex: i,
+      snapTitle: r.title, snapSubtitle: r.wo_title, snapAssetName: r.asset_name,
+      snapStatus: r.status_name, snapDate: r.completed_date,
+      snapHours: r.actual_hours, snapCost: r.cost,
+    });
+  }
+  return rows.length;
+}
+
+// Admin work: existing opt-out semantics preserved exactly — flagged tasks arrive
+// pre-checked, unflagged ones arrive unchecked rather than absent, so an excluded task
+// is visible as a decision instead of vanishing.
+async function suggestAdminTasks(reportId, { periodStart, periodEnd }) {
+  const { rows } = await pool.query(
+    `${ADMIN_TASK_SELECT} WHERE s.counts_as_work_performed AND t.task_date BETWEEN $1 AND $2
+     ORDER BY t.task_date, t.id`,
+    [periodStart, periodEnd]
+  );
+  for (const [i, r] of rows.entries()) {
+    const t = adminTaskRowShape(r);
+    await upsertBoardReportItem(reportId, {
+      itemType: 'admin_task', itemId: t.Id, section: 'admin_work', sortIndex: i,
+      included: t.IncludeInBoardReport,
+      snapTitle: t.Title, snapSubtitle: t.CategoryName, snapStatus: t.StatusName,
+      snapDate: t.TaskDate, snapHours: t.Hours,
+    });
+  }
+  return rows.length;
+}
+
+// Coming Up: scheduled inside the forward window, plus anything flagged regardless of
+// date, plus overdue. Overdue is computed, never a stored status, so it clears itself.
+async function suggestComingUp(reportId, { forwardStart, forwardEnd }) {
+  const todayStr = today();
+  const { rows } = await pool.query(
+    `SELECT jl.id, jl.title, jl.scheduled_date::text AS scheduled_date, jl.estimated_cost,
+            jl.board_focus, w.id AS work_order_id, w.title AS wo_title, w.board_focus AS wo_focus,
+            a.name AS asset_name, s.is_terminal
+     FROM job_lines jl
+     JOIN job_line_statuses s ON s.id = jl.status_id
+     JOIN work_orders w ON w.id = jl.work_order_id
+     JOIN work_order_statuses ws ON ws.id = w.status_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     WHERE NOT s.is_terminal AND NOT ws.is_terminal
+       AND (jl.scheduled_date BETWEEN $1 AND $2 OR jl.board_focus OR w.board_focus
+            OR jl.scheduled_date < $3)
+     ORDER BY jl.scheduled_date NULLS LAST, jl.id`,
+    [forwardStart, forwardEnd, todayStr]
+  );
+  for (const [i, r] of rows.entries()) {
+    const overdue = r.scheduled_date && r.scheduled_date < todayStr;
+    await upsertBoardReportItem(reportId, {
+      itemType: 'job_line', itemId: r.id, section: overdue ? 'overdue' : 'coming_up', sortIndex: i,
+      snapTitle: r.title, snapSubtitle: r.wo_title, snapAssetName: r.asset_name,
+      snapDate: r.scheduled_date, snapCost: r.estimated_cost,
+    });
+  }
+  return rows.length;
+}
+
+// Findings flagged "Feature on board report" — no date at all, which is the point:
+// a deferred finding belongs in front of the board precisely because nothing is
+// scheduled for it.
+async function suggestFeaturedFindings(reportId) {
+  const { rows } = await pool.query(
+    `SELECT cf.id, cf.title, cf.estimated_cost, cf.severity, cf.status, a.name AS asset_name
+     FROM condition_findings cf LEFT JOIN assets a ON a.id = cf.asset_id
+     WHERE cf.board_focus = true ORDER BY cf.id DESC`
+  );
+  for (const [i, r] of rows.entries()) {
+    await upsertBoardReportItem(reportId, {
+      itemType: 'condition_finding', itemId: r.id, section: 'coming_up', sortIndex: 1000 + i,
+      snapTitle: r.title, snapSubtitle: r.severity, snapAssetName: r.asset_name,
+      snapStatus: r.status, snapCost: r.estimated_cost,
+    });
+  }
+  return rows.length;
+}
+
+// Calendar events whose TYPE is opted in, plus scheduler occurrences projected from
+// the recurrence machinery. listCalendarEventOccurrences is a pure read that already
+// reports which occurrences are materialized, so a projection is replaced by its real
+// work order rather than duplicated alongside it.
+async function suggestCalendarAndProjections(reportId, { forwardStart, forwardEnd }) {
+  const occurrences = await listCalendarEventOccurrences(forwardStart, forwardEnd);
+  const { rows: typeRows } = await pool.query(
+    'SELECT id FROM calendar_event_types WHERE show_on_board_report'
+  );
+  const showTypes = new Set(typeRows.map((t) => t.id));
+  let n = 0;
+  for (const [i, occ] of occurrences.entries()) {
+    const isPm = !!occ.WorkOrderTemplateId;
+    if (!isPm && !showTypes.has(occ.TypeId)) continue;
+    // listCalendarEventOccurrences overrides WorkOrderId with the generated one when
+    // calendar_event_generated_wo has a row for this occurrence, so for a PM occurrence
+    // a set WorkOrderId means "already materialized". That's the dedupe: the real work
+    // order becomes the item and the projection is never written beside it.
+    if (isPm && occ.WorkOrderId) {
+      await upsertBoardReportItem(reportId, {
+        itemType: 'work_order', itemId: occ.WorkOrderId, section: 'coming_up', sortIndex: 2000 + i,
+        snapTitle: occ.WorkOrderTitle || occ.Title, snapDate: occ.OccurrenceDate,
+      });
+    } else {
+      const cost = isPm ? await historicalAvgActualCost(occ.WorkOrderTemplateId) : null;
+      await upsertBoardReportItem(reportId, {
+        itemType: 'projected_occurrence', itemId: occ.Id, itemDate: occ.OccurrenceDate,
+        section: 'coming_up', sortIndex: 2000 + i,
+        snapTitle: occ.Title, snapDate: occ.OccurrenceDate, snapCost: cost,
+        // Forward Focus's cost basis, preserved on merge: a projection priced from what
+        // the job has actually cost before beats a stale estimate.
+        snapSubtitle: cost != null ? 'hist. avg' : null,
+      });
+    }
+    n += 1;
+  }
+  return n;
+}
+
+// One pass over every rule. Safe to re-run — that's what makes changing the period on
+// the screen cheap, and why upsert never clobbers a decision.
+export async function refreshBoardReportSuggestions(reportId) {
+  const report = await getBoardReport(reportId);
+  if (!report) return null;
+  if (report.Status === 'published') {
+    const e = new Error('Published reports are read-only'); e.status = 409; throw e;
+  }
+  const periods = {
+    periodStart: report.PeriodStart, periodEnd: report.PeriodEnd,
+    forwardStart: report.ForwardStart, forwardEnd: report.ForwardEnd,
+  };
+  const counts = {
+    done: await suggestDoneJobLines(reportId, periods),
+    adminWork: await suggestAdminTasks(reportId, periods),
+    comingUp: await suggestComingUp(reportId, periods),
+    featured: await suggestFeaturedFindings(reportId),
+    calendar: await suggestCalendarAndProjections(reportId, periods),
+  };
+  return { counts, items: await listBoardReportItems(reportId) };
+}
+
 // ── Board reports as entities (Build Brief §3/§4) ────────────────────────
 // Draft -> publish, with every send kept. Publishing freezes both the items and the
 // aggregates, because until now only the completed section was period-bounded and
