@@ -1512,8 +1512,13 @@ async function renderDashboard() {
     return html;
   }
 
+  // Fetched once per dashboard load; renders nothing when nothing is late.
+  let overdueHtml = '';
+  try { overdueHtml = await overdueStripHtml(); } catch { /* dashboard still works */ }
+
   function draw() {
     setApp(`
+      ${overdueHtml}
       <div class="card">
         <h3>Welcome${state.user ? `, ${escapeHtml(state.user)}` : ''}</h3>
         <p class="muted" style="margin-top:-4px">${today.toLocaleDateString('default', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
@@ -1547,7 +1552,8 @@ async function renderDashboard() {
     function wireWeekSummaryLinks(root) {
       root.querySelectorAll('.cal-strip-event-link').forEach((el) => el.addEventListener('click', () => go('calendarEventDetail', { id: el.dataset.eventId })));
       root.querySelectorAll('.cal-strip-wo-link').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
-    }
+      wireOverdueStrip();
+  }
     function selectWeekDate(dateKey) {
       selectedWeekDate = dateKey;
       document.getElementById('weekDaySelect').value = dateKey;
@@ -9217,6 +9223,37 @@ async function openSplitEditor(expenseId, { onClose } = {}) {
   const close = () => { overlay.remove(); if (onClose) onClose(); };
   overlay.querySelector('.modal-cancel').addEventListener('click', close);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+}
+
+// Overdue strip (Build Brief §6). Sits at the top of the dashboard and says nothing at
+// all when nothing is late — a permanent empty banner trains people to ignore the spot
+// where the real warning will appear.
+async function overdueStripHtml() {
+  let d;
+  try { d = await api('/api/pg/overdue'); } catch { return ''; }
+  const items = [
+    ...d.WorkOrders.map((w) => ({ label: `${w.Title} (${w.DaysOver}d)`, view: 'workOrderDetail', id: w.Id })),
+    ...d.Rounds.map((r) => ({ label: `${r.Name} ${r.Percent}% done (${r.DaysOver}d)`, view: 'auditRound', id: r.Id })),
+    ...d.DeferredRevisits.map((f) => ({ label: `Revisit: ${f.Title} (${f.DaysOver}d)`, view: null, id: f.Id })),
+  ];
+  if (!items.length) return '';
+  return `
+    <div class="card" style="background:#fff5f5;border-color:#f0c8c8">
+      <div style="font-weight:700;margin-bottom:4px">⚠ Overdue</div>
+      <div style="display:flex;flex-direction:column;gap:3px">
+        ${items.slice(0, 8).map((i) => i.view
+          ? `<a href="#" class="overdue-link" data-view="${i.view}" data-id="${i.id}" style="font-size:0.9rem">${escapeHtml(i.label)}</a>`
+          : `<span style="font-size:0.9rem">${escapeHtml(i.label)}</span>`).join('')}
+        ${items.length > 8 ? `<span class="muted" style="font-size:0.82rem">…and ${items.length - 8} more</span>` : ''}
+      </div>
+    </div>`;
+}
+
+function wireOverdueStrip(container = app) {
+  container.querySelectorAll('.overdue-link').forEach((el) => el.addEventListener('click', (e) => {
+    e.preventDefault();
+    go(el.dataset.view, { id: el.dataset.id });
+  }));
 }
 
 // ── Audit data screen (Build Brief §8) ───────────────────────────────────

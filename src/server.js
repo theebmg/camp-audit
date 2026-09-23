@@ -4,7 +4,7 @@ import cookieParser from 'cookie-parser';
 import { fileURLToPath } from 'url';
 import path from 'path';
 
-import { pingDb, verifyUserCredentials } from './db.js';
+import { pingDb, verifyUserCredentials, startAuditScheduler} from './db.js';
 import { requestContext } from './requestContext.js';
 import pgApiRouter from './routes/pg-api.js';
 import requestPortalRouter from './routes/request-portal.js';
@@ -120,6 +120,10 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, () => {
   console.log(`camp-audit listening on :${PORT}`);
+  // Daily materialization of recurring work orders and audit rounds. Until now this
+  // only ran when someone opened the calendar, so a scheduled item could sit undone
+  // simply because nobody looked. The guard tables make repeat runs harmless.
+  startAuditScheduler();
   // Email-fed triage inbox (Build Brief v2.1 Part 1) is now the Mailgun
   // webhook at /api/pg/mail-inbound (routes/mail-inbound.js) — nothing to
   // start here. The old IMAP poll interval is gone along with mailIngest.js.
