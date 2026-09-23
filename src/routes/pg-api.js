@@ -105,6 +105,11 @@ import {
   createExpenseAllocation,
   deleteExpenseAllocation,
   getExpenseSplitSummary,
+  listAssetTypeIcons,
+  setAssetTypeIcon,
+  setAssetProfilePhoto,
+  getAssetFace,
+  getAssetFaces,
   listMaterials,
   getMaterial,
   createMaterial,
@@ -681,7 +686,13 @@ router.patch('/locations/:id', async (req, res, next) => {
 
 router.get('/locations/:id/assets', async (req, res, next) => {
   try {
-    res.json({ assets: await listAssetsByLocation(req.params.id) });
+    const assets = await listAssetsByLocation(req.params.id);
+    // Faces come back with the list rather than per row, so the page renders in one
+    // round trip and never flashes an icon before the photo arrives (Addendum §5a).
+    const faces = await getAssetFaces(assets.map((a) => a.Id));
+    res.json({
+      assets: assets.map((a) => ({ ...a, Face: faces.get(a.Id) || null })),
+    });
   } catch (e) { next(e); }
 });
 
@@ -2164,6 +2175,37 @@ router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) 
       allocations: await listExpenseAllocations(req.params.id),
       summary: await getExpenseSplitSummary(req.params.id),
     });
+  } catch (e) { next(e); }
+});
+
+// ── Asset icons and profile photos (Addendum §5a) ────────────────────────
+router.get('/asset-type-icons', async (req, res, next) => {
+  try { res.json({ types: await listAssetTypeIcons() }); } catch (e) { next(e); }
+});
+
+// Keyed by the asset_type string itself, which is what assets actually carry.
+router.put('/asset-type-icons', async (req, res, next) => {
+  try {
+    const { assetType, icon } = req.body || {};
+    if (!assetType) return res.status(400).json({ ok: false, error: 'assetType is required' });
+    res.json({ ok: true, type: await setAssetTypeIcon(assetType, icon || null) });
+  } catch (e) { next(e); }
+});
+
+router.get('/assets/:id/face', async (req, res, next) => {
+  try {
+    const face = await getAssetFace(req.params.id);
+    if (!face) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ face });
+  } catch (e) { next(e); }
+});
+
+// Designates one already-attached photo as the asset's face. null clears it and the
+// type icon takes over again.
+router.put('/assets/:id/profile-photo', async (req, res, next) => {
+  try {
+    const face = await setAssetProfilePhoto(req.params.id, (req.body || {}).attachmentId || null);
+    res.json({ ok: true, face });
   } catch (e) { next(e); }
 });
 

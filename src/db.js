@@ -4996,6 +4996,95 @@ export async function getExpenseSplitSummary(expenseId) {
   };
 }
 
+// ── Asset icons and profile photos (Addendum §5a) ────────────────────────
+// An asset's face is its own photo when it has one, and its type's icon otherwise, so
+// a list of 340 buildings never reads as identical rows.
+//
+// Icons key off assets.asset_type, NOT building_types: 338 of 340 assets have a NULL
+// building_type_id while asset_type is populated on all but 2 (see docs/asset-profile-5a.md).
+
+export async function listAssetTypeIcons() {
+  const { rows } = await pool.query(
+    `SELECT t.asset_type, i.icon, COALESCE(i.sort_order, 999) AS sort_order, t.count
+     FROM (SELECT asset_type, count(*)::int AS count FROM assets
+           WHERE asset_type IS NOT NULL AND trim(asset_type) <> '' GROUP BY asset_type) t
+     FULL OUTER JOIN asset_type_icons i ON i.asset_type = t.asset_type
+     ORDER BY sort_order, t.asset_type`
+  );
+  return rows.map((r) => ({
+    AssetType: r.asset_type, Icon: r.icon || null,
+    AssetCount: r.count != null ? Number(r.count) : 0,
+    SortOrder: Number(r.sort_order),
+  }));
+}
+
+export async function setAssetTypeIcon(assetType, icon) {
+  if (!icon) {
+    await pool.query('DELETE FROM asset_type_icons WHERE asset_type = $1', [assetType]);
+    return { AssetType: assetType, Icon: null };
+  }
+  const { rows } = await pool.query(
+    `INSERT INTO asset_type_icons (asset_type, icon) VALUES ($1,$2)
+     ON CONFLICT (asset_type) DO UPDATE SET icon = EXCLUDED.icon, updated_at = now()
+     RETURNING asset_type, icon`,
+    [assetType, icon]
+  );
+  return { AssetType: rows[0].asset_type, Icon: rows[0].icon };
+}
+
+// Designates an existing attachment as the asset's face. The attachment must already be
+// linked to this asset — this never moves or copies a file, it only points at one.
+export async function setAssetProfilePhoto(assetId, attachmentId) {
+  if (attachmentId) {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM attachment_links
+       WHERE entity_type = 'asset' AND entity_id = $1 AND attachment_id = $2`,
+      [assetId, attachmentId]
+    );
+    if (!rows[0]) {
+      const e = new Error('That photo is not attached to this asset'); e.status = 400; throw e;
+    }
+  }
+  await pool.query('UPDATE assets SET profile_attachment_id = $2 WHERE id = $1', [assetId, attachmentId || null]);
+  return getAssetFace(assetId);
+}
+
+// One shape used by the asset header, asset lists and search results, so the same
+// building looks the same everywhere it appears.
+export async function getAssetFace(assetId) {
+  const { rows } = await pool.query(
+    `SELECT a.id, a.name, a.asset_type, i.icon, at.thumb_url, at.url, a.profile_attachment_id
+     FROM assets a
+     LEFT JOIN asset_type_icons i ON i.asset_type = a.asset_type
+     LEFT JOIN attachments at ON at.id = a.profile_attachment_id AND at.deleted_at IS NULL
+     WHERE a.id = $1`,
+    [assetId]
+  );
+  if (!rows[0]) return null;
+  const r = rows[0];
+  return {
+    AssetId: r.id, Name: r.name, AssetType: r.asset_type,
+    PhotoUrl: r.thumb_url || r.url || null,
+    ProfileAttachmentId: r.profile_attachment_id,
+    Icon: r.icon || '🏢',
+  };
+}
+
+// Bulk form for lists: one query per page rather than one per row. At 340 assets the
+// per-row version would be the whole page's cost.
+export async function getAssetFaces(assetIds = []) {
+  if (!assetIds.length) return new Map();
+  const { rows } = await pool.query(
+    `SELECT a.id, i.icon, at.thumb_url, at.url
+     FROM assets a
+     LEFT JOIN asset_type_icons i ON i.asset_type = a.asset_type
+     LEFT JOIN attachments at ON at.id = a.profile_attachment_id AND at.deleted_at IS NULL
+     WHERE a.id = ANY($1::int[])`,
+    [assetIds]
+  );
+  return new Map(rows.map((r) => [r.id, { PhotoUrl: r.thumb_url || r.url || null, Icon: r.icon || '🏢' }]));
+}
+
 // ── Materials & leftovers (Build Brief §10) ──────────────────────────────
 // Deliberately not an inventory system. One list, one balance each, and the
 // balance is always the sum of movements — never a stored number that could

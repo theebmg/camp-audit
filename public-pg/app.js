@@ -1225,6 +1225,7 @@ async function render(view, params = {}, opts = {}) {
       adminWorkOrderStatuses: () => renderAdminWorkOrderStatuses(),
       adminJobLineStatuses: () => renderAdminJobLineStatuses(),
       adminAttachmentRoles: () => renderAdminAttachmentRoles(),
+      adminAssetTypeIcons: () => renderAdminAssetTypeIcons(),
       adminMapCalibration: () => renderAdminMapCalibration(),
       adminJobLineTemplates: () => renderAdminJobLineTemplates(),
       calendar: () => renderCalendar(params),
@@ -1618,6 +1619,7 @@ const ADMIN_LEAF_RENDERERS = {
   adminWorkOrderStatuses: (params, container) => renderAdminWorkOrderStatuses(container),
   adminJobLineStatuses: (params, container) => renderAdminJobLineStatuses(container),
   adminAttachmentRoles: (params, container) => renderAdminAttachmentRoles(container),
+  adminAssetTypeIcons: (params, container) => renderAdminAssetTypeIcons(container),
   adminMapCalibration: (params, container) => renderAdminMapCalibration(container),
   adminJobLineTemplates: (params, container) => renderAdminJobLineTemplates(container),
   adminChecklistTemplates: (params, container) => renderAdminChecklistTemplates(container),
@@ -1771,10 +1773,12 @@ async function renderAssetsInLocation({ id, name }, container = app, { onOpenAss
   let selectedAssetId = null;
   const draw = () => {
     container.innerHTML = assets.length ? assets.map((a) => `
-      <div class="list-item ${onOpenAsset && selectedAssetId === a.Id ? 'cal-strip-selected' : ''}" data-id="${a.Id}" data-name="${escapeHtml(a.Name)}">
+      <div class="list-item ${onOpenAsset && selectedAssetId === a.Id ? 'cal-strip-selected' : ''}" data-id="${a.Id}" data-name="${escapeHtml(a.Name)}" style="display:flex;align-items:center;gap:11px">
+        ${assetFaceHtml(a.Face, 34)}
+        <div style="flex:1;min-width:0">
         <span>🏚️ ${escapeHtml(a.Name)}</span>
         <span class="pill">${escapeHtml(a['Asset type'] || '')}</span>
-      </div>`).join('') : '<p class="muted">No assets in this location yet — add one from the asset search box when starting an audit or creating a work order (type a new name and choose "Add new asset").</p>';
+      </div></div>`).join('') : '<p class="muted">No assets in this location yet — add one from the asset search box when starting an audit or creating a work order (type a new name and choose "Add new asset").</p>';
     container.querySelectorAll('.list-item').forEach((el) => el.addEventListener('click', () => {
       if (onOpenAsset) { selectedAssetId = Number(el.dataset.id); draw(); onOpenAsset(el.dataset.id); }
       else go('assetDetail', { id: el.dataset.id, name: el.dataset.name });
@@ -1867,11 +1871,22 @@ async function renderAssetDetail({ id }, container = app) {
       </div>
     </div>`).join('') || '<p class="muted">No notes yet — add one below.</p>';
 
+  // The face is fetched alongside the asset so the header never flashes an icon and
+  // then swaps to the photo a moment later.
+  let assetFace = null;
+  try { assetFace = (await api(`/api/pg/assets/${id}/face`)).face; } catch { /* icon fallback */ }
+
   container.innerHTML = `
     <div class="card">
-      <h3>${escapeHtml(asset.Name)}</h3>
-      <div class="muted">${escapeHtml(asset['Asset type'] || '')} · Condition: ${escapeHtml(asset.Condition || 'Unknown')}</div>
-      ${asset['Lodge Holder'] ? `<div class="muted">🏠 Cabin/Lodge Holder: ${escapeHtml(asset['Lodge Holder'])}</div>` : ''}
+      <div style="display:flex;gap:14px;align-items:flex-start">
+        <button type="button" id="assetFaceBtn" title="Set profile photo"
+                style="border:none;background:none;padding:0;cursor:pointer">${assetFaceHtml(assetFace, 64)}</button>
+        <div style="flex:1;min-width:0">
+          <h3 style="margin:0">${escapeHtml(asset.Name)}</h3>
+          <div class="muted">${escapeHtml(asset['Asset type'] || '')} · Condition: ${escapeHtml(asset.Condition || 'Unknown')}</div>
+          ${asset['Lodge Holder'] ? `<div class="muted">🏠 Cabin/Lodge Holder: ${escapeHtml(asset['Lodge Holder'])}</div>` : ''}
+        </div>
+      </div>
       <div class="field-row" style="margin-top:12px">
         <label>Building Type</label>
         <select id="buildingTypeSelect"><option value="">— unset —</option>${buildingTypeOptions}</select>
@@ -1943,6 +1958,13 @@ async function renderAssetDetail({ id }, container = app) {
   container.querySelector('#editAssetBtn').addEventListener('click', () => go('editAsset', { id }));
   container.querySelector('#newWoBtn').addEventListener('click', () => go('newWorkOrder', { assetId: id, assetName: asset.Name }));
   container.querySelectorAll('[data-wo-id]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.woId })));
+  container.querySelector('#assetFaceBtn')?.addEventListener('click', async () => {
+    // Uses whatever is already attached to this asset; the API refuses anything else.
+    let atts = [];
+    try { atts = (await api(`/api/pg/attachments?entityType=asset&entityId=${id}`)).attachments || []; } catch { /* none */ }
+    openProfilePhotoPicker(id, atts, { onDone: () => renderAssetDetail({ id }, container) });
+  });
+
   container.querySelector('#buildingTypeSelect').addEventListener('change', async (e) => {
     const label = e.target.options[e.target.selectedIndex].text;
     if (!await confirmDialog(`Change building type to "${label}"? This affects which questions apply to this asset.`)) {
@@ -5654,6 +5676,7 @@ const ADMIN_CATEGORIES = {
       { view: 'adminWorkOrderStatuses', icon: '🚦', label: 'Work Order Statuses' },
       { view: 'adminJobLineStatuses', icon: '🚦', label: 'Job Line Statuses' },
       { view: 'adminAttachmentRoles', icon: '📎', label: 'Attachment Roles' },
+      { view: 'adminAssetTypeIcons', icon: '🛖', label: 'Asset Type Icons' },
     ],
   },
   expenses: {
@@ -9151,6 +9174,90 @@ async function openSplitEditor(expenseId, { onClose } = {}) {
   const close = () => { overlay.remove(); if (onClose) onClose(); };
   overlay.querySelector('.modal-cancel').addEventListener('click', close);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+}
+
+// ── Asset face: photo, or the type's icon (Addendum §5a) ─────────────────
+// One helper everywhere an asset appears, so the same building looks the same in the
+// header, in a list and in search results.
+function assetFaceHtml(face, size = 34) {
+  if (!face) return '';
+  const box = `width:${size}px;height:${size}px;border-radius:${Math.round(size / 5)}px;flex:0 0 ${size}px;`;
+  return face.PhotoUrl
+    ? `<img src="${escapeHtml(face.PhotoUrl)}" alt="" style="${box}object-fit:cover;background:#eef0f6" />`
+    : `<div style="${box}display:flex;align-items:center;justify-content:center;background:#f2f3f8;font-size:${Math.round(size * 0.55)}px" aria-hidden="true">${face.Icon || '🏢'}</div>`;
+}
+
+// Settings screen for the icons (Addendum §5a). Lists every asset_type actually in use
+// alongside any configured icon, so a type that appears later shows up here on its own
+// rather than needing a migration.
+async function renderAdminAssetTypeIcons(container = app) {
+  let types = [];
+  async function load() { types = (await api('/api/pg/asset-type-icons')).types || []; }
+  function draw() {
+    setApp(`
+      <div class="card">
+        <h3>Asset Type Icons</h3>
+        <p class="muted">The fallback shown for any asset without its own photo. Paste any emoji. Types come from the assets themselves, so anything new appears here automatically.</p>
+      </div>
+      <div class="card">
+        ${types.map((t) => `
+          <div class="list-item" style="display:flex;align-items:center;gap:12px">
+            <div style="width:34px;height:34px;border-radius:7px;display:flex;align-items:center;justify-content:center;background:#f2f3f8;font-size:19px">${t.Icon || '🏢'}</div>
+            <div style="flex:1">
+              <div><strong>${escapeHtml(t.AssetType || '(no type set)')}</strong></div>
+              <div class="muted" style="font-size:0.82rem">${t.AssetCount} asset(s)${t.Icon ? '' : ' · using the default'}</div>
+            </div>
+            <input type="text" class="icon-input" data-type="${escapeHtml(t.AssetType || '')}" value="${escapeHtml(t.Icon || '')}" placeholder="🏢" style="width:64px;text-align:center;font-size:19px" ${t.AssetType ? '' : 'disabled'} />
+          </div>`).join('')}
+      </div>`, container);
+    container.querySelectorAll('.icon-input').forEach((i) => i.addEventListener('change', async () => {
+      try {
+        await api('/api/pg/asset-type-icons', {
+          method: 'PUT', body: JSON.stringify({ assetType: i.dataset.type, icon: i.value.trim() || null }),
+        });
+        toast('Saved'); await load(); draw();
+      } catch (e) { toast(e.message, 5000); }
+    }));
+  }
+  await load();
+  draw();
+}
+
+// Lets an asset's existing photos be promoted to its face. Only offers photos already
+// attached to this asset — the API refuses anything else, so the picker shouldn't
+// pretend otherwise.
+async function openProfilePhotoPicker(assetId, attachments = [], { onDone } = {}) {
+  const photos = (attachments || []).filter((a) => (a.Kind || '').startsWith('image'));
+  if (!photos.length) return toast('Attach a photo to this asset first', 4000);
+  const face = (await api(`/api/pg/assets/${assetId}/face`)).face;
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:520px;width:95%;max-height:84vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">Profile photo</h3>
+      <button type="button" class="btn btn-secondary modal-cancel">Done</button>
+    </div>
+    <p class="muted" style="margin:10px 0">Pick the photo that best shows this building. It appears here and in every list.</p>
+    <div style="display:flex;flex-wrap:wrap;gap:10px">
+      ${photos.map((a) => `
+        <button type="button" class="pf-pick" data-id="${a.Id}" style="border:${String(face?.ProfileAttachmentId) === String(a.Id) ? '3px solid #3b5bdb' : '1px solid #e5e7f0'};border-radius:10px;padding:0;background:none;cursor:pointer">
+          <img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:110px;height:110px;object-fit:cover;border-radius:8px;display:block" />
+        </button>`).join('')}
+    </div>
+    ${face?.ProfileAttachmentId ? '<div class="btn-row" style="margin-top:12px"><button type="button" class="btn btn-secondary" id="pfClear">Use the type icon instead</button></div>' : ''}
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => { overlay.remove(); if (onDone) onDone(); };
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  const set = async (attachmentId) => {
+    try {
+      await api(`/api/pg/assets/${assetId}/profile-photo`, { method: 'PUT', body: JSON.stringify({ attachmentId }) });
+      toast(attachmentId ? 'Profile photo set' : 'Back to the type icon'); close();
+    } catch (e) { toast(e.message, 5000); }
+  };
+  overlay.querySelectorAll('.pf-pick').forEach((b) => b.addEventListener('click', () => set(Number(b.dataset.id))));
+  overlay.querySelector('#pfClear')?.addEventListener('click', () => set(null));
 }
 
 function mountCombobox(container, {
