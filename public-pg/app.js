@@ -5253,7 +5253,7 @@ async function renderBoardReport() {
       <div class="list-item br-row" data-item="${it.Id}" style="${indent ? 'padding-left:30px;' : ''}display:flex;align-items:flex-start;gap:10px">
         <input type="checkbox" class="br-check" data-item="${it.Id}" ${it.Included ? 'checked' : ''} style="margin-top:3px" />
         <div style="flex:1;min-width:0">
-          <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${it.SnapSubtitle ? ` <span class="muted">— ${escapeHtml(it.SnapSubtitle)}</span>` : ''}</div>
+          <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${it.SnapSubtitle ? ` <span class="muted">— ${escapeHtml(it.SnapSubtitle)}</span>` : ''}${it.ManuallyAdded ? ' <span class="muted" style="font-size:0.75rem">· added by hand</span>' : ''}</div>
           ${bits ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(bits)}</div>` : ''}
           ${it.ReportNote
             ? `<div style="font-size:0.9rem;margin-top:3px">${escapeHtml(it.ReportNote)} <a href="#" class="br-note" data-item="${it.Id}">edit</a></div>`
@@ -5344,7 +5344,11 @@ async function renderBoardReport() {
           </div>
           <p class="muted" style="margin-top:2px;font-size:0.8rem">Defaults to the same length as the period covered.</p>
         </div>
-        ${published ? '' : `<div class="btn-row"><button type="button" class="btn btn-secondary" id="brRefresh" ${busy ? 'disabled' : ''}>${busy ? 'Working…' : 'Refresh suggestions'}</button></div>`}
+        ${published ? '' : `<div class="btn-row">
+          <button type="button" class="btn btn-secondary" id="brRefresh" ${busy ? 'disabled' : ''}>${busy ? 'Working…' : 'Refresh suggestions'}</button>
+          <button type="button" class="btn btn-secondary" id="brAddItem">＋ Add item</button>
+        </div>
+        <p class="muted" style="margin:6px 0 0;font-size:0.82rem">Add anything the rules didn't propose — any status, any date.</p>`}
       </div>
 
       ${moneyHtml()}
@@ -5419,6 +5423,10 @@ async function renderBoardReport() {
   }
 
   function wire(published) {
+    document.getElementById('brAddItem')?.addEventListener('click', () => openAddReportItem(report.Id, async () => {
+      const d = await api(`/api/pg/board-reports/${report.Id}`);
+      items = d.items; aggregates = d.aggregates; draw();
+    }));
     document.getElementById('brPreview').addEventListener('click', async () => {
       const res = await output('manual', {});   // previewing pins nothing extra beyond the copy
       if (res) showHtmlModal(res.html);
@@ -5511,6 +5519,50 @@ async function renderBoardReport() {
     try { const d = await api(`/api/pg/board-reports/${report.Id}`); aggregates = d.aggregates || []; } catch { /* ignore */ }
   }
   draw();
+}
+
+// Add anything to the draft, whatever its status or date (§3). The suggestion rules
+// decide what gets PROPOSED; this is the escape hatch that stops a rule from keeping
+// something off a report that belongs on it.
+async function openAddReportItem(reportId, onDone) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:560px;width:95%;max-height:84vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">Add an item</h3>
+      <button type="button" class="btn btn-secondary modal-cancel">Done</button>
+    </div>
+    <p class="muted" style="margin:10px 0">Work orders, job lines, findings and admin tasks — any status, any date.</p>
+    <input type="search" id="addQ" placeholder="Search…" style="width:100%" />
+    <div id="addResults" style="margin-top:10px"></div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => { overlay.remove(); if (onDone) onDone(); };
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+
+  const KIND = { work_order: 'WO', job_line: 'Line', condition_finding: 'Finding', admin_task: 'Task' };
+  let timer;
+  const search = async () => {
+    const q = overlay.querySelector('#addQ').value.trim();
+    if (q.length < 2) { overlay.querySelector('#addResults').innerHTML = '<p class="muted">Type at least two characters.</p>'; return; }
+    const { candidates } = await api(`/api/pg/board-reports/candidates?q=${encodeURIComponent(q)}`);
+    overlay.querySelector('#addResults').innerHTML = candidates.length ? candidates.map((c, i) => `
+      <div class="list-item add-cand" data-i="${i}" style="cursor:pointer">
+        <div><span class="muted" style="font-size:0.78rem">${KIND[c.ItemType] || c.ItemType}</span> <strong>${escapeHtml(c.Title)}</strong></div>
+        <div class="muted" style="font-size:0.82rem">${escapeHtml([c.Subtitle, c.Status, c.Date].filter(Boolean).join(' · '))}</div>
+      </div>`).join('') : '<p class="muted">Nothing matches.</p>';
+    overlay.querySelectorAll('.add-cand').forEach((el) => el.addEventListener('click', async () => {
+      try {
+        await api(`/api/pg/board-reports/${reportId}/items`, {
+          method: 'POST', body: JSON.stringify({ item: candidates[Number(el.dataset.i)] }),
+        });
+        toast('Added to the draft');
+        el.style.opacity = '0.4';
+      } catch (e) { toast(e.message, 5000); }
+    }));
+  };
+  overlay.querySelector('#addQ').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(search, 250); });
+  setTimeout(() => overlay.querySelector('#addQ').focus(), 0);
 }
 
 // Shows rendered report HTML in an overlay. Used for Preview and for opening any past
@@ -9022,8 +9074,14 @@ async function openMaterialHistory(materialId, { onClose } = {}) {
 // is closing without typing anything.
 async function promptLeftoversOnClose(workOrderId) {
   let used = [];
+  let recorded = [];
   try { const d = await api(`/api/pg/work-orders/${workOrderId}/materials-used`); used = d.materials || []; }
   catch { return true; }
+  // What a previous close already banked. On a re-close the prompt starts from those
+  // numbers and files the DIFFERENCE, so stock is adjusted rather than doubled (§1).
+  try { const r = await api(`/api/pg/work-orders/${workOrderId}/recorded-leftovers`); recorded = r.leftovers || []; }
+  catch { /* first close */ }
+  const priorBy = new Map(recorded.map((r) => [r.MaterialId, r]));
   if (!used.length) return true;
 
   return new Promise((resolve) => {
@@ -9032,10 +9090,13 @@ async function promptLeftoversOnClose(workOrderId) {
     overlay.innerHTML = `<div class="modal-box" style="max-width:520px;width:95%">
       <h3 style="margin:0 0 4px">Any materials left over?</h3>
       <p class="muted" style="margin:0 0 12px">Leave blank for anything fully used. What you enter goes to stock at the price this job paid.</p>
-      ${used.map((u) => `
-        <div class="field-row"><label>${escapeHtml(u.Name)} <span class="muted">(${escapeHtml(u.Unit)}${u.UnitPrice != null ? ` · $${u.UnitPrice.toFixed(2)} each` : ''})</span></label>
-          <input type="number" step="0.01" min="0" class="leftover-qty" data-material="${u.MaterialId}" data-price="${u.UnitPrice ?? ''}" placeholder="used ${u.QuantityUsed}" />
-        </div>`).join('')}
+      ${used.map((u) => {
+        const prior = priorBy.get(u.MaterialId);
+        return `<div class="field-row"><label>${escapeHtml(u.Name)} <span class="muted">(${escapeHtml(u.Unit)}${u.UnitPrice != null ? ` · $${u.UnitPrice.toFixed(2)} each` : ''})</span></label>
+          <input type="number" step="0.01" min="0" class="leftover-qty" data-material="${u.MaterialId}" data-price="${u.UnitPrice ?? ''}" value="${prior ? prior.Recorded : ''}" placeholder="used ${u.QuantityUsed}" />
+          ${prior ? `<p class="muted" style="margin-top:2px;font-size:0.8rem">${prior.Recorded} recorded at the last close — change this and the difference is logged as a correction.</p>` : ''}
+        </div>`;
+      }).join('')}
       <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
         <button type="button" class="btn btn-secondary modal-skip">Nothing left over</button>
         <button type="button" class="btn btn-primary modal-ok">Save</button>
@@ -9049,7 +9110,13 @@ async function promptLeftoversOnClose(workOrderId) {
         .map((i) => ({ materialId: Number(i.dataset.material), quantity: Number(i.value), unitPrice: i.dataset.price === '' ? null : Number(i.dataset.price) }))
         .filter((l) => Number.isFinite(l.quantity) && l.quantity > 0);
       try {
-        if (leftovers.length) {
+        if (recorded.length) {
+          // Re-close: reconcile against what was already banked.
+          const r = await api(`/api/pg/work-orders/${workOrderId}/leftovers/reconcile`, {
+            method: 'POST', body: JSON.stringify({ leftovers }),
+          });
+          if (r.changes.length) toast(`${r.changes.length} leftover(s) adjusted`);
+        } else if (leftovers.length) {
           const r = await api(`/api/pg/work-orders/${workOrderId}/leftovers`, { method: 'POST', body: JSON.stringify({ leftovers }) });
           toast(`${r.recorded} material(s) added to stock`);
         }
@@ -11995,6 +12062,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       </form>
       <div class="btn-row">
         <button class="btn btn-primary" id="completeWoBtn" ${wo.StatusIsTerminal ? 'disabled' : ''}>${wo.StatusIsTerminal ? wo.Status : 'Complete Work Order'}</button>
+        ${wo.StatusIsTerminal ? '<button class="btn btn-secondary" id="reopenWoBtn">Reopen</button>' : ''}
         <a class="btn btn-secondary" href="/api/pg/work-orders/${id}/scope-pdf" target="_blank" rel="noopener" title="A printable job description to hand a vendor or volunteer — no cost figures included">🖨️ Scope of Work (PDF)</a>
         <button class="btn btn-secondary" id="duplicateWoBtn">Duplicate</button>
         <button class="btn btn-secondary" id="saveAsTemplateBtn" title="Snapshot these job lines as a reusable template — no statuses, no dates">Save as Template</button>
@@ -12394,6 +12462,18 @@ async function renderWorkOrderDetail({ id }, container = app) {
     try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderWorkOrderDetail({ id }, container); }
     catch (err) { toast(err.message); }
   }));
+
+  container.querySelector('#reopenWoBtn')?.addEventListener('click', async () => {
+    if (!await confirmDialog('Reopen this work order? It moves to Review so it can be edited. Job line statuses are left exactly as they are.',
+      { confirmLabel: 'Reopen', cancelLabel: 'Cancel', danger: false })) return;
+    const reason = await promptDialog('Why are you reopening it? (optional)', { multiline: true, confirmLabel: 'Reopen' });
+    if (reason === null) return;
+    try {
+      await api(`/api/pg/work-orders/${id}/reopen`, { method: 'POST', body: JSON.stringify({ reason: reason || null }) });
+      toast('Reopened — now in Review');
+      renderWorkOrderDetail({ id }, container);
+    } catch (err) { toast(err.message, 5000); }
+  });
 
   container.querySelector('#completeWoBtn').addEventListener('click', async () => {
     if (!await confirmDialog(`Complete this Work Order? Any pending "asset field update" entries will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;

@@ -128,6 +128,11 @@ import {
   listAuditQuestionKeys,
   getAuditRoundReport,
   getOverdueStrip,
+  reopenWorkOrder,
+  getRecordedLeftovers,
+  reconcileLeftoversOnReclose,
+  searchBoardReportCandidates,
+  addBoardReportItemManually,
   generateDueAuditRoundsForRange,
   createAuditRound,
   getAuditRound,
@@ -1746,7 +1751,12 @@ router.patch('/work-orders/:id', async (req, res, next) => {
     if (body.assetId !== undefined) fields.asset_id = body.assetId === '' ? null : Number(body.assetId);
     if (body.dateReported !== undefined) fields.date_reported = body.dateReported;
     if (body.dateCompleted !== undefined) fields.date_completed = body.dateCompleted;
-    if (body.boardFocus !== undefined) fields.board_focus = !!body.boardFocus;
+    if (body.boardFocus !== undefined) {
+      fields.board_focus = !!body.boardFocus;
+      // Stamped when set, cleared when unset, so "featured since March" has a date and
+      // a re-feature doesn't inherit the old one.
+      fields.board_focus_set_at = body.boardFocus ? new Date() : null;
+    }
     const detail = await updateWorkOrder(req.params.id, fields);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
     res.json({ ok: true, ...detail });
@@ -2210,6 +2220,51 @@ router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) 
       allocations: await listExpenseAllocations(req.params.id),
       summary: await getExpenseSplitSummary(req.params.id),
     });
+  } catch (e) { next(e); }
+});
+
+// Reopen a completed/closed work order (§1). Moves to Review, never back to open, and
+// leaves job line statuses alone.
+router.post('/work-orders/:id/reopen', async (req, res, next) => {
+  try {
+    const wo = await reopenWorkOrder(req.params.id, { reason: (req.body || {}).reason || null });
+    if (!wo) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, workOrder: wo });
+  } catch (e) { next(e); }
+});
+
+// What was already banked as left over, so re-closing adjusts rather than doubles.
+router.get('/work-orders/:id/recorded-leftovers', async (req, res, next) => {
+  try { res.json({ leftovers: await getRecordedLeftovers(req.params.id) }); } catch (e) { next(e); }
+});
+
+router.post('/work-orders/:id/leftovers/reconcile', async (req, res, next) => {
+  try {
+    const { leftovers } = req.body || {};
+    if (!Array.isArray(leftovers)) return res.status(400).json({ ok: false, error: 'leftovers must be an array' });
+    const changes = await reconcileLeftoversOnReclose(req.params.id, leftovers, { createdBy: req.user?.username || null });
+    res.json({ ok: true, changes });
+  } catch (e) { next(e); }
+});
+
+// Anything that can go on a report, any status, any date.
+router.get('/board-reports/candidates', async (req, res, next) => {
+  try {
+    const q = (req.query.q || '').trim();
+    if (q.length < 2) return res.json({ candidates: [] });
+    res.json({ candidates: await searchBoardReportCandidates(q) });
+  } catch (e) { next(e); }
+});
+
+router.post('/board-reports/:id/items', async (req, res, next) => {
+  try {
+    const { item } = req.body || {};
+    if (!item || !item.ItemType || !item.ItemId) {
+      return res.status(400).json({ ok: false, error: 'item with ItemType and ItemId is required' });
+    }
+    const items = await addBoardReportItemManually(req.params.id, item);
+    if (!items) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, items });
   } catch (e) { next(e); }
 });
 
