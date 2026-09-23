@@ -196,3 +196,64 @@ exist only in Ben's head. Nothing in the database encodes either one.
 
 Answering this unblocks Phase 2 of the audit engine. It does not block the board
 report / purchases work, which proceeds on its own branch.
+
+---
+
+# Seed form — RESOLVED 2026-09-23
+
+Option 1 **plus the hand-authored subset**: seed mechanically, then author flags and
+remedies for roof / siding / interior only, so the generation chain (flagged answer →
+remedy → job line → finding) can be tested as soon as the runner exists rather than
+waiting for the Phase 4 builder.
+
+## Conditions
+
+1. **Everything authored is labelled test data.** Each authored flag and remedy carries
+   a fixture marker, and every one is listed in this document. To be reviewed and
+   replaced in the builder before any real audit round runs.
+2. **Obvious defaults only.** `Poor` and `Fair` rating options flag. `No` flags on
+   yes/no questions where no means a problem. Remedy hours and costs stay round and
+   plainly placeholder — $100, 1 hour — so nobody mistakes them for estimates.
+3. **Flags and remedies are form-level, set once in the builder, never during an
+   audit.** The runner only records answers. Per-building adjustment happens on the
+   review screen before WO creation, and changes that building's generated lines only —
+   never the form's rules.
+
+## Runner addition: "Flag something else"
+
+Every section gets a **Flag something else** control: free-text description, optional
+photo, optional hand-typed remedy (title, responsibility, funding, hours, cost).
+It creates a finding, and a generated job line when a remedy was entered — the same
+path a flagged answer takes.
+
+Stored as an **answer tied to the section, not a question**, so ad-hoc flags stay
+queryable alongside everything else. A free-text flag that keeps recurring across
+buildings is the signal to add a real question in the builder.
+
+## Two schema additions this implies (not yet built)
+
+The 0072–0074 schema is already live, so both need a migration when the audit engine
+resumes after the board-report branch merges.
+
+**1. Section-tied answers.** `audit_answers.question_id` is currently NOT NULL with
+`UNIQUE (instance_id, question_id)`. Ad-hoc flags need:
+- `question_id` made nullable, `section_id` added (nullable FK to `audit_sections`)
+- a CHECK that exactly one of the two is set
+- the existing unique constraint still works — Postgres treats NULLs as distinct, so a
+  building can carry several ad-hoc flags per section
+
+**2. Ad-hoc remedies.** `audit_answer_remedies` currently requires `remedy_id`, which an
+ad-hoc remedy has no template for. Proposal: make `remedy_id` nullable and add the
+inline fields (`title`, `responsibility`, `funding_source`, `funding_ref_id`,
+`est_hours`, `est_cost`) to the same table, so one row either points at a template
+remedy or carries its own values, and generation reads one table either way.
+
+**3. Fixture marking.** `audit_question_options.flag` is a bare boolean and
+`audit_remedies` has no note field, so there is nowhere to record "this is test data."
+Proposal: `is_fixture boolean NOT NULL DEFAULT false` on both, which makes
+"show me everything still marked fixture" a query the builder can surface as a warning
+before a real round runs.
+
+## Sequencing
+
+After the board-report branch merges. Then: seed form, then runner, per the build order.
