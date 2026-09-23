@@ -60,3 +60,63 @@ The flags and remedies are **placeholders**, listed in `docs/audit-engine-decisi
   condition status are not built. §5a (icons and photos) is.
 - **Photos per answer** aren't wired into the runner yet; `allows_photo` is stored and
   the attachments pipeline exists.
+
+---
+
+# Phases 4–6 and the addendum — added 2026-09-23, all deployed
+
+## Form builder (Phase 4) — do this before a real round
+
+- [ ] Audit Rounds → **Edit "Building Audit"**.
+- [ ] The **⚠ placeholder warning** lists everything still marked as a fixture (33
+      options + 3 fixes at the time of writing).
+- [ ] Untick "problem" on an answer you disagree with → the warning count drops.
+      Editing clears the fixture mark, so the list shrinks as real decisions replace mine.
+- [ ] **"severe"** only enables once "problem" is ticked — severe drives the building's
+      condition to Poor, and a non-problem can't be severe.
+- [ ] **+ fix** on an answer → title, hours, cost. `{asset}` is replaced with the
+      building name at generation.
+- [ ] **+ follow-up** on an answer → a question that only appears when that answer is
+      given, rendered indented underneath it.
+- [ ] Edit a question's wording → the key underneath it **does not change** (that key is
+      what joins its answers across years).
+- [ ] Delete a question with answers → it says **archive**, not delete, and greys out.
+
+## Query surfaces (Phase 6)
+
+- [ ] Reports → **Audit Data**. Pick a question, type an answer (`Poor`), see every
+      building that matches, with counts per answer.
+- [ ] **Export CSV** downloads the same rows.
+- [ ] A round screen → **Round report**: completion, flags by question, and the work
+      orders generated with total hours and cost.
+- [ ] An audited building's page shows **Condition history** — the same question across
+      rounds as one line, with the WO it produced.
+
+## Asset condition (§5d)
+
+- [ ] An asset with nothing open reads **Good**.
+- [ ] One with an open finding reads **Needs attention**, with the reason listed.
+- [ ] One with an overdue WO, or an unresolved severe flag in its latest audit, reads
+      **Poor** — always with reasons, never a bare score.
+- [ ] A never-audited building says **"not yet audited"** rather than passing as Good.
+- [ ] Complete the work → the status changes on its own. It is computed, never stored.
+
+## Scheduler and overdue (Phase 5)
+
+- [ ] Boot log says `scheduler: daily materialization armed`.
+- [ ] Attach an audit form and a building scope to a recurring calendar event, then
+      `POST /api/pg/audit-rounds/materialize` — a round appears with its instances.
+- [ ] Run it twice — **no duplicate round**. The guard table is keyed on (event, occurrence).
+- [ ] Give a round a past due date with work outstanding → the **⚠ Overdue** strip
+      appears at the top of the dashboard with its progress.
+- [ ] Complete the round → the strip entry disappears by itself.
+- [ ] With nothing late, the dashboard shows **no strip at all** — a permanent empty
+      banner trains you to ignore the spot where the real warning appears.
+
+## Still not built
+
+- **Photos per answer** in the runner. `allows_photo` is stored and the attachments
+  pipeline exists, but the capture button isn't wired into the runner yet.
+- **Checklist editor on WO templates** (board-report brief §7) — the checklist tables
+  gained a `section` column but there is no editing screen.
+- Drag reordering in the builder (arrows/drag); ordering is by `sort_index` today.
