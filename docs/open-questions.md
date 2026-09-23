@@ -1,8 +1,24 @@
 # Open Questions
 
-## Status — 2026-09-23
+## Status — 2026-09-23 (later: everything below is DEPLOYED)
 
-### Done, on branch `board-report-purchases` (10 commits, nothing merged, nothing deployed)
+### DEPLOYED to audit.fracturedrv.com
+
+Migrations `0075`–`0088` are applied. Backup taken before the column drops
+(`sychar-2026-09-23-1755.dump.gz`, copied to Dropbox).
+
+Shipped and live: the whole board-report/purchases brief, asset type icons and profile
+photos (§5a), the cabin-holder foreign key, the audit engine's seed form, and the audit
+runner end to end — rounds, the walkthrough, review and generation.
+
+Two bugs were found by deploying that rolled-back tests could not have caught:
+report spend counted allocations so unsplit receipts read as $0, and audit-generated
+work orders violated the `split_root_id` FK because `currval()` pointed at the wrong
+number. Both fixed and redeployed.
+
+Test checklists: `docs/board-report-test-checklist.md`, `docs/audit-engine-test-checklist.md`.
+
+### Original status (superseded)
 
 All six build-brief phases have their **schema and backend** complete, plus the report
 screen. Eight migrations, `0075`–`0082`, **none applied** — every one verified in a
