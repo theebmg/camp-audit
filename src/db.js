@@ -1839,7 +1839,7 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
 }
 
 export async function updateWorkOrder(woId, fields) {
-  const allowed = ['title', 'description', 'priority', 'date_reported', 'date_completed', 'asset_id', 'board_focus'];
+  const allowed = ['title', 'description', 'priority', 'date_reported', 'date_completed', 'asset_id', 'board_focus', 'board_focus_set_at'];
   const setCols = [];
   const vals = [];
   let i = 1;
@@ -2165,7 +2165,9 @@ export async function deleteAssetUpdate(auId) {
 // field they need for now: the Forward Focus board flag.
 export async function updateConditionFinding(id, { boardFocus }) {
   const { rows } = await pool.query(
-    'UPDATE condition_findings SET board_focus = $2 WHERE id = $1 RETURNING id, title, board_focus',
+    `UPDATE condition_findings SET board_focus = $2,
+       board_focus_set_at = CASE WHEN $2 THEN COALESCE(board_focus_set_at, now()) ELSE NULL END
+     WHERE id = $1 RETURNING id, title, board_focus`,
     [id, !!boardFocus]
   );
   if (!rows[0]) return null;
@@ -2434,6 +2436,97 @@ export async function getBoardReportRawData({ periodStart, periodEnd, todayStr }
   };
 }
 
+// Reopen (§1). Moves to Review rather than back to open: the work happened, the record
+// needs adjusting, and dropping it into the open queue would misrepresent that.
+//
+// Deliberately does NOT touch job line statuses — a reopen is about editing the record,
+// not undoing the work. Changing a line back to an unresolved status is a separate act
+// and reopens its finding through the ordinary path.
+//
+// date_completed is KEPT. Clearing it would mean a re-close stamps today's date onto
+// work that happened weeks ago — the same misdating §3 exists to prevent. The board
+// report's Done rule keys on STATUS as well as date, so a reopened WO drops out of Done
+// on status alone while its real completion date survives.
+export async function reopenWorkOrder(woId, { reason } = {}) {
+  const { rows: cur } = await pool.query(
+    `SELECT w.id, w.title, w.date_completed::text AS date_completed, ws.name AS status, ws.is_terminal, ws.is_review
+     FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
+    [woId]
+  );
+  if (!cur[0]) return null;
+  if (!cur[0].is_terminal && !cur[0].is_review) {
+    const e = new Error('That work order is already open'); e.status = 400; throw e;
+  }
+  const { rows: review } = await pool.query(
+    `SELECT id FROM work_order_statuses WHERE is_review ORDER BY sort_order LIMIT 1`
+  );
+  if (!review[0]) { const e = new Error('No Review status is configured'); e.status = 400; throw e; }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await changeWorkOrderStatus(client, woId, review[0].id, {});
+    await client.query(
+      `INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)`,
+      [woId, `Reopened from ${cur[0].status}${cur[0].date_completed ? ` (completed ${cur[0].date_completed})` : ''}${reason ? ` — ${reason}` : ''}`, currentUsername()]
+    );
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  await logActivity({ action: 'reopened', entityType: 'work_order', entityId: Number(woId), entityLabel: cur[0].title });
+  return getWorkOrder(woId);
+}
+
+// What was already recorded as left over at the last close, so re-closing ADJUSTS those
+// numbers instead of adding a second "in" movement on top of them (§1).
+export async function getRecordedLeftovers(workOrderId) {
+  const { rows } = await pool.query(
+    `SELECT m.material_id, mt.name, mt.unit,
+            SUM(m.quantity) AS recorded,
+            (SELECT unit_price FROM material_movements
+             WHERE material_id = m.material_id AND work_order_id = $1 AND unit_price IS NOT NULL
+             ORDER BY created_at DESC LIMIT 1) AS unit_price
+     FROM material_movements m
+     JOIN materials mt ON mt.id = m.material_id
+     WHERE m.work_order_id = $1 AND m.kind IN ('wo_close','correction')
+     GROUP BY m.material_id, mt.name, mt.unit`,
+    [workOrderId]
+  );
+  return rows.map((r) => ({
+    MaterialId: r.material_id, Name: r.name, Unit: r.unit,
+    Recorded: Number(r.recorded),
+    UnitPrice: r.unit_price != null ? Number(r.unit_price) : null,
+  }));
+}
+
+// Re-close: the difference between what was recorded before and what is being recorded
+// now is filed as a CORRECTION, so the balance ends up right and the history says why
+// it moved — rather than a second wo_close doubling the stock.
+export async function reconcileLeftoversOnReclose(workOrderId, leftovers, { createdBy } = {}) {
+  const prior = new Map((await getRecordedLeftovers(workOrderId)).map((l) => [l.MaterialId, l]));
+  const results = [];
+  for (const l of leftovers) {
+    const materialId = Number(l.materialId);
+    const want = Number(l.quantity);
+    if (!Number.isFinite(want) || want < 0) continue;
+    const already = prior.get(materialId)?.Recorded ?? 0;
+    const delta = Math.round((want - already) * 100) / 100;
+    if (delta === 0) continue;
+    await recordMaterialMovement({
+      materialId,
+      kind: already > 0 ? 'correction' : 'wo_close',
+      quantity: delta,
+      unitPrice: l.unitPrice ?? prior.get(materialId)?.UnitPrice ?? null,
+      workOrderId,
+      note: already > 0
+        ? `Adjusted at re-close: ${already} → ${want}`
+        : 'Left over at work order close',
+      createdBy,
+    });
+    results.push({ MaterialId: materialId, From: already, To: want, Delta: delta });
+  }
+  return results;
+}
+
 // Completing a WO: apply every pending Asset Update to its target field (real
 // column or EAV, resolved the same way submitAudit does), mark each applied,
 // then close the WO. One transaction.
@@ -2470,6 +2563,7 @@ export async function completeWorkOrder(woId) {
       appliedIds.push(u.id);
     }
     await changeWorkOrderStatus(client, woId, await resolveWorkOrderStatusId('Done'), {});
+    await clearBoardFocusOnResolve(client, 'work_order', woId);
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK');
@@ -3095,6 +3189,44 @@ export async function createJobLine(woId, {
 // to it — automatic, no note, because linking IS the decision (something is
 // now going to happen to it). Only fires from Open; a finding already
 // Resolved/Deferred/Dismissed doesn't get silently reopened by a later link.
+// A featured flag clears itself the moment the thing stops being outstanding (§2).
+// Recorded in the work order's log where there is one, so the flag disappearing is
+// explained rather than just noticed.
+async function clearBoardFocusOnResolve(client, kind, id) {
+  if (kind === 'job_line') {
+    const { rows } = await client.query(
+      `UPDATE job_lines SET board_focus = false, board_focus_set_at = NULL
+       WHERE id = $1 AND board_focus RETURNING work_order_id, title`, [id]
+    );
+    if (rows[0]) {
+      await client.query(
+        `INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)`,
+        [rows[0].work_order_id, `Board feature cleared automatically — "${rows[0].title}" was completed`, currentUsername()]
+      );
+    }
+    return;
+  }
+  if (kind === 'work_order') {
+    const { rows } = await client.query(
+      `UPDATE work_orders SET board_focus = false, board_focus_set_at = NULL
+       WHERE id = $1 AND board_focus RETURNING id`, [id]
+    );
+    if (rows[0]) {
+      await client.query(
+        `INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)`,
+        [id, 'Board feature cleared automatically — work order completed', currentUsername()]
+      );
+    }
+    return;
+  }
+  if (kind === 'finding') {
+    await client.query(
+      `UPDATE condition_findings SET board_focus = false, board_focus_set_at = NULL
+       WHERE id = $1 AND board_focus`, [id]
+    );
+  }
+}
+
 async function autoScheduleFindingIfLinked(queryable, findingId) {
   await queryable.query(`UPDATE condition_findings SET status = 'Scheduled' WHERE id = $1 AND status = 'Open'`, [findingId]);
 }
@@ -3109,6 +3241,7 @@ async function autoResolveLinkedFinding(client, jobLineId) {
   const { rows } = await client.query('SELECT condition_finding_id FROM job_lines WHERE id = $1', [jobLineId]);
   const findingId = rows[0]?.condition_finding_id;
   if (!findingId) return;
+  await clearBoardFocusOnResolve(client, 'finding', findingId);
   const { rows: curRows } = await client.query('SELECT status, gcal_event_id FROM condition_findings WHERE id = $1', [findingId]);
   const cur = curRows[0];
   await client.query(`UPDATE condition_findings SET status = 'Resolved' WHERE id = $1`, [findingId]);
@@ -3151,11 +3284,21 @@ async function changeJobLineStatus(client, jobLineId, newStatusId, { statusNote 
   }
   const setCols = ['status_id = $2'];
   const vals = [jobLineId, newStatusId];
+  // completed_at is when the STATUS changed, which is not the same fact as when the
+  // work happened — it exists so a line entered in arrears with the date left blank
+  // still has something to order and include by (§3).
+  if (newStatus.counts_as_work_performed) setCols.push('completed_at = COALESCE(completed_at, now())');
   if (newStatus.counts_as_work_performed && !cur.completed_date) {
     setCols.push('completed_date = CURRENT_DATE');
   }
   await client.query(`UPDATE job_lines SET ${setCols.join(', ')} WHERE id = $1`, vals);
-  if (newStatus.counts_as_work_performed) await autoResolveLinkedFinding(client, jobLineId);
+  if (newStatus.counts_as_work_performed) {
+    await autoResolveLinkedFinding(client, jobLineId);
+    // The featured flag means "the board should see this because it is outstanding".
+    // Once it is done it stops being outstanding and appears in Done through the
+    // ordinary rule, so the flag clears itself rather than lingering (§2).
+    await clearBoardFocusOnResolve(client, 'job_line', jobLineId);
+  }
   const noteText = statusNote?.trim()
     ? `Job line "${cur.title}" → ${newStatus.name}: ${statusNote.trim()}`
     : `Job line "${cur.title}" status: ${cur.old_name} → ${newStatus.name}`;
@@ -4438,6 +4581,73 @@ export async function computeBoardReportAggregates(reportId) {
   return listBoardReportAggregates(reportId);
 }
 
+// Search for anything that can go on a report, regardless of status or date (§3). The
+// suggestion rules decide what is PROPOSED; this exists so no rule can keep something
+// off a report that belongs on it.
+export async function searchBoardReportCandidates(q, limit = 30) {
+  const like = `%${q}%`;
+  const [wos, lines, findings, tasks] = await Promise.all([
+    pool.query(
+      `SELECT w.id, w.title, ws.name AS status, a.name AS asset_name
+       FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id
+       LEFT JOIN assets a ON a.id = w.asset_id
+       WHERE w.title ILIKE $1 ORDER BY w.id DESC LIMIT $2`, [like, limit]),
+    pool.query(
+      `SELECT jl.id, jl.title, s.name AS status, w.id AS work_order_id, w.title AS wo_title,
+              COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date,
+              (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
+              jl.actual_hours, jl.estimated_cost, a.name AS asset_name
+       FROM job_lines jl JOIN job_line_statuses s ON s.id = jl.status_id
+       JOIN work_orders w ON w.id = jl.work_order_id
+       LEFT JOIN assets a ON a.id = w.asset_id
+       WHERE jl.title ILIKE $1 ORDER BY jl.id DESC LIMIT $2`, [like, limit]),
+    pool.query(
+      `SELECT cf.id, cf.title, cf.status, cf.estimated_cost, a.name AS asset_name
+       FROM condition_findings cf LEFT JOIN assets a ON a.id = cf.asset_id
+       WHERE cf.title ILIKE $1 ORDER BY cf.id DESC LIMIT $2`, [like, limit]),
+    pool.query(
+      `${ADMIN_TASK_SELECT} WHERE t.title ILIKE $1 ORDER BY t.id DESC LIMIT $2`, [like, limit]),
+  ]);
+  return [
+    ...wos.rows.map((r) => ({ ItemType: 'work_order', ItemId: r.id, Title: r.title,
+      Subtitle: r.asset_name, Status: r.status })),
+    ...lines.rows.map((r) => ({ ItemType: 'job_line', ItemId: r.id, Title: r.title,
+      Subtitle: r.date_inferred ? `${r.wo_title} · date not recorded` : r.wo_title,
+      Status: r.status, ParentWorkOrderId: r.work_order_id, AssetName: r.asset_name,
+      Date: r.completed_date, Hours: r.actual_hours, Cost: r.estimated_cost })),
+    ...findings.rows.map((r) => ({ ItemType: 'condition_finding', ItemId: r.id, Title: r.title,
+      Subtitle: r.asset_name, Status: r.status, Cost: r.estimated_cost })),
+    ...tasks.rows.map((r) => { const t = adminTaskRowShape(r); return {
+      ItemType: 'admin_task', ItemId: t.Id, Title: t.Title, Subtitle: t.CategoryName,
+      Status: t.StatusName, Date: t.TaskDate, Hours: t.Hours }; }),
+  ];
+}
+
+// Adds a searched item to the draft. Marked manually_added AND user_touched, so a
+// suggestion refresh can neither remove it nor pretend it proposed it.
+export async function addBoardReportItemManually(reportId, item) {
+  const report = await getBoardReport(reportId);
+  if (!report) return null;
+  if (report.Status === 'published') {
+    const e = new Error('Published reports are read-only'); e.status = 409; throw e;
+  }
+  const section = item.section || (item.ItemType === 'admin_task' ? 'admin_work' : 'done');
+  await upsertBoardReportItem(reportId, {
+    itemType: item.ItemType, itemId: item.ItemId, section,
+    included: true, sortIndex: 0,
+    parentWorkOrderId: item.ParentWorkOrderId ?? null,
+    snapTitle: item.Title, snapSubtitle: item.Subtitle, snapAssetName: item.AssetName ?? null,
+    snapStatus: item.Status, snapDate: item.Date ?? null,
+    snapHours: item.Hours ?? null, snapCost: item.Cost ?? null,
+  });
+  await pool.query(
+    `UPDATE board_report_items SET manually_added = true, user_touched = true
+     WHERE report_id = $1 AND item_type = $2 AND item_id = $3`,
+    [reportId, item.ItemType, item.ItemId]
+  );
+  return listBoardReportItems(reportId);
+}
+
 // ── Board report suggestions (Build Brief §5) ────────────────────────────
 // Everything here is a SUGGESTION. Each pass upserts rows pre-checked, and
 // upsertBoardReportItem never overwrites an explicit include/exclude, so re-running
@@ -4446,8 +4656,15 @@ export async function computeBoardReportAggregates(reportId) {
 // Done: job lines resolved inside the backward period — line level, so a work order
 // with 2 of 5 lines finished contributes those 2 and not itself.
 async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
+  // Falls back to completed_at — when the line was MARKED done — so work entered in
+  // arrears with the date left blank still reaches the report (§3). The fallback is
+  // reported back so the UI can say "date not recorded" rather than passing a status
+  // timestamp off as the day the work happened.
   const { rows } = await pool.query(
-    `SELECT jl.id, jl.title, jl.completed_date::text AS completed_date, jl.actual_hours,
+    `SELECT jl.id, jl.title,
+            COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date,
+            (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
+            jl.actual_hours,
             COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost,
             w.id AS work_order_id, w.title AS wo_title, a.name AS asset_name, s.name AS status_name
      FROM job_lines jl
@@ -4455,8 +4672,9 @@ async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
      JOIN work_orders w ON w.id = jl.work_order_id
      LEFT JOIN assets a ON a.id = w.asset_id
      LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
-     WHERE s.counts_as_work_performed AND jl.completed_date BETWEEN $1 AND $2
-     ORDER BY jl.completed_date DESC, jl.id`,
+     WHERE s.counts_as_work_performed
+       AND COALESCE(jl.completed_date, jl.completed_at::date) BETWEEN $1 AND $2
+     ORDER BY COALESCE(jl.completed_date, jl.completed_at::date) DESC, jl.id`,
     [periodStart, periodEnd]
   );
   const woSeen = new Set();
@@ -4472,7 +4690,9 @@ async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
     await upsertBoardReportItem(reportId, {
       itemType: 'job_line', itemId: r.id, section: 'done', sortIndex: i,
       parentWorkOrderId: r.work_order_id,
-      snapTitle: r.title, snapSubtitle: r.wo_title, snapAssetName: r.asset_name,
+      snapTitle: r.title,
+      snapSubtitle: r.date_inferred ? `${r.wo_title} · date not recorded` : r.wo_title,
+      snapAssetName: r.asset_name,
       snapStatus: r.status_name, snapDate: r.completed_date,
       snapHours: r.actual_hours, snapCost: r.cost,
     });
@@ -4507,7 +4727,8 @@ async function suggestComingUp(reportId, { forwardStart, forwardEnd }) {
   const todayStr = today();
   const { rows } = await pool.query(
     `SELECT jl.id, jl.title, jl.scheduled_date::text AS scheduled_date, jl.estimated_cost,
-            jl.board_focus, w.id AS work_order_id, w.title AS wo_title, w.board_focus AS wo_focus,
+            jl.board_focus, COALESCE(jl.board_focus_set_at, w.board_focus_set_at) AS focus_since,
+            w.id AS work_order_id, w.title AS wo_title, w.board_focus AS wo_focus,
             a.name AS asset_name, s.is_terminal
      FROM job_lines jl
      JOIN job_line_statuses s ON s.id = jl.status_id
@@ -4525,7 +4746,12 @@ async function suggestComingUp(reportId, { forwardStart, forwardEnd }) {
     await upsertBoardReportItem(reportId, {
       itemType: 'job_line', itemId: r.id, section: overdue ? 'overdue' : 'coming_up', sortIndex: i,
       parentWorkOrderId: r.work_order_id,
-      snapTitle: r.title, snapSubtitle: r.wo_title, snapAssetName: r.asset_name,
+      snapTitle: r.title,
+      // "Featured since March" — a stale flag should be visible as stale.
+      snapSubtitle: (r.board_focus || r.wo_focus) && r.focus_since
+        ? `${r.wo_title} · featured since ${new Date(r.focus_since).toLocaleDateString('en-US', { month: 'long', year: 'numeric' })}`
+        : r.wo_title,
+      snapAssetName: r.asset_name,
       snapDate: r.scheduled_date, snapCost: r.estimated_cost,
     });
   }
@@ -4731,6 +4957,7 @@ export async function listBoardReportItems(reportId) {
     SnapProgress: r.snap_progress,
     ParentWorkOrderId: r.parent_work_order_id,
     UserTouched: r.user_touched,
+    ManuallyAdded: r.manually_added,
   }));
 }
 

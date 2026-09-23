@@ -118,3 +118,49 @@ The highest-value tests, because these touch retired columns.
 - The **audit engine** resumes after this merges; its tables are live but empty.
 - **`docs/open-questions.md` Q2 and Q3** are still open (cabin-holder foreign key,
   `expenses.asset_id`). Neither blocks this branch.
+
+---
+
+# Reopen, featured-flag expiry, arrears — 2026-09-23, deployed
+
+## Reopen a work order
+
+- [ ] Open a **completed** WO → a **Reopen** button sits next to the status. It only
+      appears on terminal work orders.
+- [ ] Reopen with a reason → it lands in **Review**, not back in the open queue.
+- [ ] **Job line statuses are untouched** — a Done line is still Done.
+- [ ] The WO history shows the reopen, its reason, and the date it had been completed.
+- [ ] Set a line back to an unresolved status → its linked condition finding reopens.
+- [ ] Edit, then complete again. **Leftovers must not double:** the prompt is pre-filled
+      with what the last close banked, and changing 4 to 3 files a **correction of −1**,
+      not a second entry. Check Materials → the material's history shows one `wo_close`
+      and one `correction`.
+- [ ] A **published** board report containing that WO is unchanged. The current draft
+      reflects the new state.
+- [ ] The WO does not reappear as a new scheduler occurrence.
+
+## Featured-flag expiry
+
+- [ ] Feature a WO or job line ("Feature on board report") → on the draft report it shows
+      **"featured since \<month\>"**.
+- [ ] Complete it → the flag clears **by itself**, and the WO history records the
+      auto-clear. It now appears in **Done** through the ordinary rule.
+- [ ] **Reopen it → the flag stays off.** You re-check it if you want it.
+- [ ] Uncheck a featured item on a draft → it leaves **that draft only**. The flag is
+      still set, and the next draft proposes it again.
+
+## Arrears — completion date left blank
+
+- [ ] Mark a job line done, then clear its completion date.
+- [ ] It still appears in the current draft's **Done** section, marked
+      **"date not recorded"** — the fallback is the moment it was marked complete, and it
+      is never passed off as the work date.
+- [ ] Enter a real completion date → the marker disappears and the real date is used.
+
+## "Add item" on the draft
+
+- [ ] **＋ Add item** → search. Results span work orders, job lines, findings and admin
+      tasks, **any status and any date** — including things far outside the period.
+- [ ] Add one → it appears in the draft marked **"added by hand"**.
+- [ ] It is toggleable, takes a note, and respects summary/itemized like any other item.
+- [ ] **Refresh suggestions → it survives.** A suggestion rule can never remove it.

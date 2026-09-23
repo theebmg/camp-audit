@@ -1,5 +1,27 @@
 # Open Questions
 
+## Q5 — Reopen keeps `date_completed`. Confirm that's what you want.
+
+Decided 2026-09-23 while building reopen; logged rather than asked, since either
+behaviour is defensible and the work didn't depend on it.
+
+**What it does:** reopening a work order moves it to Review and **leaves
+`date_completed` alone**. The original date is also written into the WO's log.
+
+**Why:** clearing it would mean a re-close stamps *today* onto work that happened weeks
+ago — the exact misdating §3 of this brief exists to prevent. `changeWorkOrderStatus`
+uses `COALESCE(date_completed, CURRENT_DATE)`, so keeping it means a re-close preserves
+the real completion date. The board report's Done rule keys on **status as well as
+date**, so a reopened WO drops out of Done on status alone while the true date survives.
+
+**The cost:** an open work order carries a completion date, which reads oddly if you
+look at the raw column. Nothing consumes it that way today.
+
+**The alternative:** clear it on reopen and let a re-close stamp the new date. Simpler
+to explain, but it silently rewrites when the work happened. Say the word and it's a
+one-line change.
+
+
 ## Q4 — RESOLVED 2026-09-23: yes, and the prompt chain became a real form
 
 Photos on ad-hoc flags shipped. The prompt sequence was replaced with a single form —
