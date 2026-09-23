@@ -574,10 +574,15 @@ const JOB_LINE_SESSION_HOURS_SQL = `
 // presented as a rollup/total; the job-line EDIT FORM's Actual Cost input
 // deliberately stays on the raw column (jobLineRowShape/hydrateJobLine) —
 // same reasoning as the Actual Hours input, see its comment.
+// Reads allocations (0078), not expenses.job_line_id — a split receipt contributes
+// only its share to each line, which the old single pointer could not express. The
+// triage/deleted filters stay on the expense: a voided receipt allocates nothing.
 const JOB_LINE_EXPENSE_COST_SQL = `
-  SELECT job_line_id, SUM(amount) AS expense_cost
-  FROM expenses WHERE job_line_id IS NOT NULL AND amount IS NOT NULL AND triage_status != 'void' AND deleted_at IS NULL
-  GROUP BY job_line_id
+  SELECT ea.dest_id AS job_line_id, SUM(ea.amount) AS expense_cost
+  FROM expense_allocations ea
+  JOIN expenses e ON e.id = ea.expense_id
+  WHERE ea.dest_type = 'job_line' AND e.triage_status != 'void' AND e.deleted_at IS NULL
+  GROUP BY ea.dest_id
 `;
 // NULL only when there's truly nothing recorded either way, so an
 // untouched line still reads as "—" instead of a misleading $0 — same
@@ -3017,7 +3022,10 @@ async function hydrateJobLine(row) {
     // column (jobLineRowShape above) — same as Actual Hours — but the edit
     // form still needs to show what's linked, so it's surfaced separately
     // here rather than folded into ActualCost itself.
-    pool.query(`SELECT count(*) AS n, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE job_line_id = $1 AND amount IS NOT NULL AND triage_status != 'void' AND deleted_at IS NULL`, [row.id]),
+    pool.query(`SELECT count(*) AS n, COALESCE(SUM(ea.amount), 0) AS total
+                FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
+                WHERE ea.dest_type = 'job_line' AND ea.dest_id = $1
+                  AND e.triage_status != 'void' AND e.deleted_at IS NULL`, [row.id]),
   ]);
   const s = statusRows.rows[0] || {};
   return {
@@ -4066,10 +4074,11 @@ function expenseRowToApi(r) {
   return {
     Id: r.id, Vendor: r.vendor, Amount: r.amount != null ? Number(r.amount) : null, PurchaseDate: r.purchase_date,
     TaxAmount: r.tax_amount != null ? Number(r.tax_amount) : null, TaxChargedInError: r.tax_charged_in_error,
+    RegularPrice: r.regular_price != null ? Number(r.regular_price) : null,
     CategoryId: r.category_id, CategoryName: r.category_name || null,
     FundId: r.fund_id, FundName: r.fund_name || null,
-    JobLineId: r.job_line_id, JobLineTitle: r.job_line_title || null,
-    WorkOrderId: r.work_order_id, WorkOrderTitle: r.work_order_title || null,
+    JobLineId: r.job_line_title != null ? r.dest_id : null, JobLineTitle: r.job_line_title || null,
+    WorkOrderId: r.work_order_title != null ? r.dest_id : null, WorkOrderTitle: r.work_order_title || null,
     AssetId: r.asset_id, AssetName: r.asset_name || null,
     Notes: r.notes, TriageStatus: r.triage_status, Source: r.source, ParsedConfidence: r.parsed_confidence,
     CreatedBy: r.created_by, CreatedAt: r.created_at,
@@ -4086,15 +4095,23 @@ function expenseRowToApi(r) {
 // plain-text alone is unreliable); plain text stays available as a
 // fallback toggle in the UI.
 const EXPENSE_SELECT = `
-  SELECT e.*, ec.name AS category_name, f.name AS fund_name,
+  SELECT e.*, ec.name AS category_name, f.name AS fund_name, d.dest_id,
          jl.title AS job_line_title, wo.title AS work_order_title, a.name AS asset_name,
          b.subject AS batch_subject, b.sender_email AS batch_sender_email, b.received_at AS batch_received_at,
          b.body_text AS batch_body_text, b.body_html AS batch_body_html
   FROM expenses e
   LEFT JOIN expense_categories ec ON ec.id = e.category_id
   LEFT JOIN funds f ON f.id = e.fund_id
-  LEFT JOIN job_lines jl ON jl.id = e.job_line_id
-  LEFT JOIN work_orders wo ON wo.id = e.work_order_id
+  -- The destination is an allocation now. The row shape still exposes a single
+  -- JobLineId/WorkOrderId, which is the unsplit case; a split receipt reports its
+  -- destinations through Allocations instead, and these read as the first one.
+  LEFT JOIN LATERAL (
+    SELECT ea.dest_type, ea.dest_id FROM expense_allocations ea
+    WHERE ea.expense_id = e.id AND ea.dest_type IN ('job_line','work_order')
+    ORDER BY ea.id LIMIT 1
+  ) d ON true
+  LEFT JOIN job_lines jl ON d.dest_type = 'job_line' AND jl.id = d.dest_id
+  LEFT JOIN work_orders wo ON d.dest_type = 'work_order' AND wo.id = d.dest_id
   LEFT JOIN assets a ON a.id = e.asset_id
   LEFT JOIN attachment_batches b ON b.id = e.batch_id`;
 
@@ -4145,8 +4162,8 @@ export async function listExpenses({
   if (fundId) add('e.fund_id = $N', Number(fundId));
   if (categoryId) add('e.category_id = $N', Number(categoryId));
   if (vendor) add('e.vendor ILIKE $N', `%${vendor}%`);
-  if (jobLineId) add('e.job_line_id = $N', Number(jobLineId));
-  if (workOrderId) add('e.work_order_id = $N', Number(workOrderId));
+  if (jobLineId) add(`EXISTS (SELECT 1 FROM expense_allocations ea WHERE ea.expense_id = e.id AND ea.dest_type = 'job_line' AND ea.dest_id = $N)`, Number(jobLineId));
+  if (workOrderId) add(`EXISTS (SELECT 1 FROM expense_allocations ea WHERE ea.expense_id = e.id AND ea.dest_type = 'work_order' AND ea.dest_id = $N)`, Number(workOrderId));
   if (assetId) add('e.asset_id = $N', Number(assetId));
   if (dateFrom) add('e.purchase_date >= $N', dateFrom);
   if (dateTo) add('e.purchase_date <= $N', dateTo);
@@ -4187,24 +4204,68 @@ async function inheritedFundId(jobLineId, fundId) {
 }
 
 export async function createExpense({
-  vendor, amount, purchaseDate, taxAmount, taxChargedInError, categoryId, fundId, jobLineId, workOrderId, assetId, notes, createdBy,
+  vendor, amount, purchaseDate, taxAmount, taxChargedInError, categoryId, fundId, jobLineId, workOrderId, assetId, notes, regularPrice, createdBy,
 }) {
   const resolvedFundId = await inheritedFundId(jobLineId, fundId);
   const { rows } = await pool.query(
-    `INSERT INTO expenses (vendor, amount, purchase_date, tax_amount, tax_charged_in_error, category_id, fund_id, job_line_id, work_order_id, asset_id, notes, triage_status, source, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'triaged','manual',$12) RETURNING id`,
+    `INSERT INTO expenses (vendor, amount, purchase_date, tax_amount, tax_charged_in_error, category_id, fund_id, asset_id, notes, regular_price, triage_status, source, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'triaged','manual',$11) RETURNING id`,
     [vendor || null, amount ?? null, purchaseDate || null, taxAmount ?? null, !!taxChargedInError, categoryId || null,
-      resolvedFundId ?? null, jobLineId || null, workOrderId || null, assetId || null, notes || null, createdBy || null]
+      resolvedFundId ?? null, assetId || null, notes || null, regularPrice ?? null, createdBy || null]
   );
-  await logActivity({ action: 'created', entityType: 'expense', entityId: rows[0].id, entityLabel: vendor || 'Expense' });
-  return getExpense(rows[0].id);
+  const id = rows[0].id;
+  // The ordinary form's single destination is just a one-way split — written here so
+  // allocations are the only place a destination ever lives (0078).
+  await setExpenseDestination(id, { jobLineId, workOrderId, amount });
+  await writeExpenseDiscountSaving(id, { amount, regularPrice, purchaseDate });
+  await logActivity({ action: 'created', entityType: 'expense', entityId: id, entityLabel: vendor || 'Expense' });
+  return getExpense(id);
+}
+
+// The unsplit case: at most one job_line/work_order allocation, carrying the whole
+// amount. Leaves any leftover/admin_task rows and any line-item splits alone — those
+// are managed by the split editor, not by picking a destination on the main form.
+export async function setExpenseDestination(expenseId, { jobLineId, workOrderId, amount }) {
+  if (jobLineId === undefined && workOrderId === undefined) return;
+  await pool.query(
+    `DELETE FROM expense_allocations
+     WHERE expense_id = $1 AND line_item_id IS NULL AND dest_type IN ('job_line','work_order')`,
+    [expenseId]
+  );
+  const destType = jobLineId ? 'job_line' : (workOrderId ? 'work_order' : null);
+  const destId = jobLineId || workOrderId || null;
+  if (!destType) return;
+  const { rows } = await pool.query('SELECT amount FROM expenses WHERE id = $1', [expenseId]);
+  const total = amount ?? (rows[0]?.amount != null ? Number(rows[0].amount) : 0);
+  await pool.query(
+    `INSERT INTO expense_allocations (expense_id, dest_type, dest_id, amount) VALUES ($1,$2,$3,$4)`,
+    [expenseId, destType, destId, total ?? 0]
+  );
+}
+
+// regular_price - amount is a one-time saving, counted ONCE at the purchase on the
+// full receipt. Allocation distributes each destination's share of it; it never
+// creates more. Re-recorded from scratch on every write so editing the price down
+// doesn't leave a stale saving behind.
+export async function writeExpenseDiscountSaving(expenseId, { amount, regularPrice, purchaseDate } = {}) {
+  await pool.query(`DELETE FROM savings_entries WHERE source_type = 'expense' AND source_id = $1`, [expenseId]);
+  const paid = amount == null ? null : Number(amount);
+  const regular = regularPrice == null ? null : Number(regularPrice);
+  if (paid == null || regular == null || !(regular > paid)) return;
+  await pool.query(
+    `INSERT INTO savings_entries (kind, amount, source_type, source_id, occurred_on, note)
+     VALUES ('one_time', $1, 'expense', $2, COALESCE($3::date, CURRENT_DATE), 'Regular price less paid price')`,
+    [Math.round((regular - paid) * 100) / 100, expenseId, purchaseDate || null]
+  );
 }
 
 const EXPENSE_UPDATE_COLUMNS = {
   vendor: 'vendor', amount: 'amount', purchaseDate: 'purchase_date', taxAmount: 'tax_amount',
-  taxChargedInError: 'tax_charged_in_error', categoryId: 'category_id', jobLineId: 'job_line_id',
-  workOrderId: 'work_order_id', assetId: 'asset_id', notes: 'notes',
+  taxChargedInError: 'tax_charged_in_error', categoryId: 'category_id',
+  assetId: 'asset_id', notes: 'notes', regularPrice: 'regular_price',
 };
+// jobLineId/workOrderId are deliberately absent — they're allocations now (0078),
+// written by setExpenseDestination below.
 // Triage/edit — same row for "complete an inbox row" and "edit an existing
 // expense," same as attachment triage. Moves triage_status to 'triaged' on
 // any save from the inbox unless the caller explicitly voids instead. Only
@@ -4221,6 +4282,19 @@ export async function updateExpense(id, fields) {
   }
   const resolvedFundId = await inheritedFundId(fields.jobLineId, fields.fundId);
   if (resolvedFundId !== undefined) { setCols.push(`fund_id = $${i++}`); vals.push(resolvedFundId); }
+  // Destination and discount live outside the column set now, so they're applied even
+  // when nothing on the expense row itself changed.
+  await setExpenseDestination(id, { jobLineId: fields.jobLineId, workOrderId: fields.workOrderId, amount: fields.amount });
+  if ('regularPrice' in fields || 'amount' in fields) {
+    const cur = await getExpense(id);
+    if (cur) {
+      await writeExpenseDiscountSaving(id, {
+        amount: 'amount' in fields ? fields.amount : cur.Amount,
+        regularPrice: 'regularPrice' in fields ? fields.regularPrice : cur.RegularPrice,
+        purchaseDate: fields.purchaseDate ?? cur.PurchaseDate,
+      });
+    }
+  }
   if (!setCols.length) return getExpense(id);
   setCols.push(`triage_status = CASE WHEN triage_status = 'inbox' THEN 'triaged' ELSE triage_status END`);
   const { rows } = await pool.query(
@@ -4254,8 +4328,13 @@ export async function getExpensesReportRawData() {
     FROM expenses e
     LEFT JOIN expense_categories ec ON ec.id = e.category_id
     LEFT JOIN funds f ON f.id = e.fund_id
-    LEFT JOIN job_lines jl ON jl.id = e.job_line_id
-    LEFT JOIN work_orders wo ON wo.id = e.work_order_id
+    LEFT JOIN LATERAL (
+      SELECT ea.dest_type, ea.dest_id FROM expense_allocations ea
+      WHERE ea.expense_id = e.id AND ea.dest_type IN ('job_line','work_order')
+      ORDER BY ea.id LIMIT 1
+    ) d ON true
+    LEFT JOIN job_lines jl ON d.dest_type = 'job_line' AND jl.id = d.dest_id
+    LEFT JOIN work_orders wo ON d.dest_type = 'work_order' AND wo.id = d.dest_id
     LEFT JOIN assets a ON a.id = e.asset_id
     LEFT JOIN locations l ON l.id = a.location_id
     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
@@ -4916,8 +4995,13 @@ const CALENDAR_EVENT_SELECT = `
   SELECT e.*, w.title AS wo_title, jl.title AS job_line_title, t.name AS type_name, t.gcal_color_id AS type_gcal_color_id,
          a.name AS asset_name, ch.name AS cabin_holder_name
   FROM calendar_events e
-  LEFT JOIN work_orders w ON w.id = e.work_order_id
-  LEFT JOIN job_lines jl ON jl.id = e.job_line_id
+  LEFT JOIN LATERAL (
+    SELECT ea.dest_type, ea.dest_id FROM expense_allocations ea
+    WHERE ea.expense_id = e.id AND ea.dest_type IN ('job_line','work_order')
+    ORDER BY ea.id LIMIT 1
+  ) d ON true
+  LEFT JOIN work_orders w ON d.dest_type = 'work_order' AND w.id = d.dest_id
+  LEFT JOIN job_lines jl ON d.dest_type = 'job_line' AND jl.id = d.dest_id
   LEFT JOIN calendar_event_types t ON t.id = e.type_id
   LEFT JOIN assets a ON a.id = e.asset_id
   LEFT JOIN cabin_holders ch ON ch.id = e.cabin_holder_id`;
