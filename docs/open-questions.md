@@ -1,5 +1,59 @@
 # Open Questions
 
+## Status — 2026-09-23
+
+### Done, on branch `board-report-purchases` (10 commits, nothing merged, nothing deployed)
+
+All six build-brief phases have their **schema and backend** complete, plus the report
+screen. Eight migrations, `0075`–`0082`, **none applied** — every one verified in a
+rolled-back transaction against the live schema, 30+ assertions in total.
+
+| Phase | State |
+|---|---|
+| 2 — purchases, splits, savings | Backend + routes ✅ · **split UI not built** |
+| 3 — materials, leftovers | Backend + 9 routes ✅ · **materials screens not built** |
+| 4 — report entities, publish, saved copies | Complete ✅ |
+| 5 — suggestions, projections, Forward Focus retired | Complete ✅ |
+| 6 — report screen, money header | Complete ✅ |
+
+### What to test first, once it's merged and deployed
+
+1. **Admin task savings still work.** `0076` drops `recurring_monthly_savings` and moves
+   it to `savings_entries`. The row shape is unchanged, so the admin task form and the
+   Work Performed report should behave exactly as before. If a saving vanished, that's
+   the migration to look at.
+2. **Expense destinations.** `0078` drops `expenses.work_order_id` / `job_line_id`;
+   picking a work order on the expense form now writes an allocation behind the scenes.
+   Check that a new expense still attaches, and that WO cost rollups still add up.
+3. **The board report screen.** Open Reports → Board Report. It creates a draft, fills
+   it with suggestions, and everything is toggleable. The old any-date-range generator
+   is gone.
+4. **Publish, then send.** Publish should freeze the report; re-opening it months later
+   must render identically. Every email/download/save is recorded in History.
+
+### Not built, and buildable without me
+
+- The **split editor UI** (§9) — backend and routes exist; the screen does not.
+- **Materials screens** (§10) — "Materials on hand", the WO-close leftover prompt, and
+  the point-of-use reminder. All three have working endpoints behind them.
+- Addendum **§5a** (asset type icons, profile photos) — not started, own branch.
+
+### Waiting on you
+
+**Q1 below (funding per allocation) is the only thing blocking further backend work.**
+Q2 and Q3 are informational. The seed-form fixture question you answered is recorded in
+`docs/audit-engine-decisions.md`; the audit engine resumes after this branch merges.
+
+### One defect worth knowing about
+
+I introduced it in Phase 4 and fixed it in Phase 6: the send route rendered from the old
+*live* query, so sending would have ignored every toggle and a published report would
+have re-rendered from current data — making the freeze cosmetic. It now renders the
+report's own rows. Called out because it's the kind of bug that looks like it works.
+
+---
+
+
 Decisions needed from Ben. Each entry: the question, the options, and my lean.
 Anything logged here was **skipped, not guessed at** — work that didn't depend on it
 continued.
