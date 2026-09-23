@@ -4985,7 +4985,10 @@ export async function upsertBoardReportItem(reportId, {
         parent_work_order_id, suggested_at)
      VALUES ($1,$2,$3,$4,$5,COALESCE($6,true),COALESCE($7,'summary'),$8,COALESCE($9,0),
              $10,$11,$12,$13,$14,$15,$16,$17,$18,now())
-     ON CONFLICT (report_id, item_type, item_id, item_date) DO UPDATE SET
+     -- Matches the expression index from 0092: item_date is nullable, and NULL is
+     -- DISTINCT from NULL in a plain unique constraint, so a bare column list here
+     -- could never find the existing row and every pass inserted a duplicate.
+     ON CONFLICT (report_id, item_type, item_id, (COALESCE(item_date, DATE '1900-01-01'))) DO UPDATE SET
        section      = EXCLUDED.section,
        included     = COALESCE($6, board_report_items.included),
        display_mode = COALESCE($7, board_report_items.display_mode),
