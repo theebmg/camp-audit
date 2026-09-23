@@ -261,3 +261,67 @@ before a real round runs.
 ## Sequencing
 
 After the board-report branch merges. Then: seed form, then runner, per the build order.
+
+---
+
+# Seed form — BUILT 2026-09-23 (migrations 0086, 0087)
+
+## Mechanical migration (no judgment)
+
+| Old | New |
+|---|---|
+| `asset_property_fields` (8, active) | questions, **keys preserved** |
+| `component_type_catalog` (11) | questions, keys prefixed `component_` |
+| `asset_property_dependencies` | `show_if` — `has_key = Yes` reveals `key_fits_lock` |
+| `component_prompt_dependencies` | `show_if` — Roof/Siding/Foundation gated on `free_standing_building = Yes` |
+| `question_applicability` | `audit_question_building_types` |
+
+Result: **19 questions, 86 options, 4 show_if chains.**
+
+## ⚠️ FIXTURES — placeholders, not rules. Review before any real round.
+
+Every row below is marked `is_fixture = true`. Query them with:
+
+```sql
+SELECT q.question_key, o.label, o.flag, o.severe
+FROM audit_question_options o JOIN audit_questions q ON q.id = o.question_id
+WHERE o.is_fixture;
+
+SELECT title_template, est_hours, est_cost FROM audit_remedies WHERE is_fixture;
+```
+
+**Flags — 33 options across the 11 rating questions**, plus one yes/no:
+
+- Every `rating` question: **Fair**, **Poor**, **Failed** flag.
+  `Failed` is included although the instruction said "Poor and Fair" — it is strictly
+  worse than Poor, and flagging Poor while ignoring Failed would be indefensible.
+- **21 marked `severe`** (Poor and Failed only). Severe is what drives an asset's
+  condition to Poor in §5d; Fair is worth a work order, not a verdict on the building.
+- `key_fits_lock = "No"` flags — the yes/no rule.
+
+**Remedies — three, all `$100` / `1 hour`, deliberately round:**
+
+| Question | Answer | Title template |
+|---|---|---|
+| `component_roof` | Poor | `Repair roof — {asset}` |
+| `component_siding` | Poor | `Repair siding — {asset}` |
+| `key_fits_lock` | No | `Re-key or replace lock — {asset}` |
+
+### Deviation: "interior" has no condition question to attach to
+
+The instruction named roof, siding and **interior**. Roof and Siding are component
+conditions and take the rating rule cleanly. There is no interior *condition* question
+in the old audit — `interior_finish` records construction (`Finished` / `Open Studs`),
+not a defect, and flagging a building for having open studs would be a claim about these
+buildings I have no basis to make.
+
+The third remedy therefore hangs off `key_fits_lock = "No"`, which is unambiguously the
+yes/no case the instruction describes: a key that does not fit its lock is a problem.
+If an interior condition question is wanted, it is a new question in the builder rather
+than a reinterpretation of an existing one.
+
+### Note on building-type applicability
+
+`question_applicability` has 2 rows, and **338 of 340 assets have a NULL
+`building_type_id`** — so applicability will filter almost nothing until building types
+are populated. The mechanism is built and correct; it simply has little to act on today.
