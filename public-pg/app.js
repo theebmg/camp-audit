@@ -1242,6 +1242,7 @@ async function render(view, params = {}, opts = {}) {
       auditRound: () => renderAuditRound(params),
       auditRunner: () => renderAuditRunner(params),
       auditReview: () => renderAuditReview(params),
+      auditFormBuilder: () => renderAuditFormBuilder(params),
       crew: () => renderCrew(),
       crewHours: () => renderCrewHours(),
       adminUsers: () => renderAdminUsers(),
@@ -9181,6 +9182,209 @@ async function openSplitEditor(expenseId, { onClose } = {}) {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 }
 
+// ── Form builder (Build Brief §7) ────────────────────────────────────────
+// Plain and functional — one author. Follow-ups render indented under the option that
+// triggers them, so the tree IS the documentation and there's no separate logic screen.
+async function renderAuditFormBuilder({ id }) {
+  setChrome({ title: 'Audit Form', showBack: true, showLogout: true });
+  let d = await api(`/api/pg/audit-forms/${id}/full`);
+
+  const reload = async () => { d = await api(`/api/pg/audit-forms/${id}/full`); draw(); };
+  const optById = () => {
+    const m = new Map();
+    for (const q of d.Questions) for (const o of q.Options) m.set(o.Id, { o, q });
+    return m;
+  };
+
+  // A question gated on exactly one option renders under it. Anything with a more
+  // complex condition stays at the top level with its rule spelled out, rather than
+  // being drawn somewhere that implies a simpler rule than it has.
+  function gateOf(q) {
+    if (!q.ShowIf || !Array.isArray(q.ShowIf) || q.ShowIf.length !== 1) return null;
+    const c = q.ShowIf[0];
+    if (!c.option_ids || c.option_ids.length !== 1) return null;
+    return Number(c.option_ids[0]);
+  }
+
+  function remedyHtml(o) {
+    return o.Remedies.map((r) => `
+      <div class="list-item" style="padding:5px 0 5px 12px;border-left:2px solid #e5e7f0">
+        <div style="font-size:0.88rem">🔧 ${escapeHtml(r.TitleTemplate)}${r.IsFixture ? ' <span style="color:#b4690e">fixture</span>' : ''}</div>
+        <div class="muted" style="font-size:0.78rem">${escapeHtml(r.Responsibility || 'self')} · ${escapeHtml(r.FundingSource || 'operating_budget')}${r.EstHours ? ` · ${r.EstHours}h` : ''}${r.EstCost ? ` · $${r.EstCost}` : ''}
+          <a href="#" class="rm-edit" data-id="${r.Id}">edit</a> ·
+          <a href="#" class="rm-del" data-id="${r.Id}">remove</a></div>
+      </div>`).join('');
+  }
+
+  function optionHtml(o, followUps) {
+    return `
+      <div style="padding:4px 0 4px 10px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.9rem">
+          <span style="flex:1">${escapeHtml(o.Label)}${o.IsFixture ? ' <span style="color:#b4690e;font-size:0.78rem">fixture</span>' : ''}</span>
+          <label class="muted" style="font-size:0.78rem"><input type="checkbox" class="o-flag" data-id="${o.Id}" ${o.Flag ? 'checked' : ''} /> problem</label>
+          <label class="muted" style="font-size:0.78rem"><input type="checkbox" class="o-sev" data-id="${o.Id}" ${o.Severe ? 'checked' : ''} ${o.Flag ? '' : 'disabled'} /> severe</label>
+          <a href="#" class="o-remedy muted" data-id="${o.Id}" style="font-size:0.78rem">+ fix</a>
+          <a href="#" class="o-follow muted" data-id="${o.Id}" style="font-size:0.78rem">+ follow-up</a>
+        </label>
+        ${remedyHtml(o)}
+        ${followUps.map((fq) => questionHtml(fq, true)).join('')}
+      </div>`;
+  }
+
+  function questionHtml(q, nested = false) {
+    const byOpt = new Map();
+    for (const other of d.Questions) {
+      const g = gateOf(other);
+      if (g != null) { if (!byOpt.has(g)) byOpt.set(g, []); byOpt.get(g).push(other); }
+    }
+    return `
+      <div class="list-item" style="${nested ? 'margin-left:14px;border-left:2px solid #eef0f6;padding-left:10px;' : ''}${q.Archived ? 'opacity:0.5;' : ''}">
+        <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">
+          <div><strong>${escapeHtml(q.Prompt)}</strong>
+            <span class="muted" style="font-size:0.78rem">${escapeHtml(q.QuestionKey)} · ${escapeHtml(q.Type)}${q.Required ? ' · required' : ''}${q.AnswerCount ? ` · ${q.AnswerCount} answer(s)` : ''}${q.Archived ? ' · archived' : ''}</span>
+          </div>
+          <div style="white-space:nowrap">
+            <a href="#" class="q-edit" data-id="${q.Id}">edit</a> ·
+            <a href="#" class="q-del" data-id="${q.Id}">${q.AnswerCount ? 'archive' : 'delete'}</a>
+          </div>
+        </div>
+        ${q.MapsTo ? `<div class="muted" style="font-size:0.78rem">↳ writes to ${escapeHtml(q.MapsTo.kind === 'component' ? `component: ${q.MapsTo.component_type}` : `asset field: ${q.MapsTo.field}`)}</div>` : ''}
+        ${q.ShowIf && !gateOf(q) ? `<div class="muted" style="font-size:0.78rem">↳ shown only when ${q.ShowIf.length} condition(s) are met</div>` : ''}
+        ${q.Options.map((o) => optionHtml(o, byOpt.get(o.Id) || [])).join('')}
+        ${q.Options.length ? `<a href="#" class="q-addopt muted" data-id="${q.Id}" style="font-size:0.8rem;margin-left:10px">+ answer</a>` : ''}
+      </div>`;
+  }
+
+  function draw() {
+    const nested = new Set();
+    for (const q of d.Questions) { const g = gateOf(q); if (g != null) nested.add(q.Id); }
+    const fixCount = d.Fixtures.Options.length + d.Fixtures.Remedies.length;
+    setApp(`
+      <div class="card">
+        <h3>${escapeHtml(d.Form.Name)}</h3>
+        <p class="muted">${escapeHtml(d.Form.Description || '')}</p>
+      </div>
+      ${fixCount ? `<div class="card" style="background:#fffdf5;border-color:#f0e6c8">
+        <h3 style="font-size:0.95rem;margin:0 0 6px">⚠ ${fixCount} placeholder(s) still in this form</h3>
+        <p class="muted" style="margin:0 0 8px">These flags and fixes were seeded so the chain could be tested. Review them before running a real round — editing one clears its mark.</p>
+        <div class="muted" style="font-size:0.82rem">
+          ${d.Fixtures.Options.slice(0, 6).map((o) => `${escapeHtml(o.Prompt)} → ${escapeHtml(o.Label)}`).join('<br>')}
+          ${d.Fixtures.Options.length > 6 ? `<br>…and ${d.Fixtures.Options.length - 6} more` : ''}
+          ${d.Fixtures.Remedies.length ? `<br><strong>Fixes:</strong> ${d.Fixtures.Remedies.map((r) => escapeHtml(r.Title)).join(', ')}` : ''}
+        </div>
+      </div>` : ''}
+      ${d.Sections.map((sec) => `
+        <div class="card">
+          <h3 style="font-size:1rem">${escapeHtml(sec.Name)}</h3>
+          ${d.Questions.filter((q) => q.SectionId === sec.Id && !nested.has(q.Id)).map((q) => questionHtml(q)).join('') || '<p class="muted">No questions yet.</p>'}
+          <div class="btn-row" style="margin-top:8px"><button type="button" class="btn btn-secondary add-q" data-sec="${sec.Id}">+ Question</button></div>
+        </div>`).join('')}
+      <div class="card"><div class="btn-row"><button type="button" class="btn btn-secondary" id="addSec">+ Section</button></div></div>`);
+    wire();
+  }
+
+  function wire() {
+    app.querySelectorAll('.o-flag').forEach((cb) => cb.addEventListener('change', async () => {
+      await api(`/api/pg/audit-options/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ flag: cb.checked, severe: cb.checked ? undefined : false }) });
+      reload();
+    }));
+    app.querySelectorAll('.o-sev').forEach((cb) => cb.addEventListener('change', async () => {
+      await api(`/api/pg/audit-options/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ severe: cb.checked }) });
+      reload();
+    }));
+    app.querySelectorAll('.o-remedy').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const title = await promptDialog('What does this answer mean needs doing?', { placeholder: 'Repair roof — {asset}', confirmLabel: 'Next' });
+      if (!title) return;
+      const hours = await promptDialog('Estimated hours (optional)', { confirmLabel: 'Next' });
+      const cost = await promptDialog('Estimated cost (optional)', { confirmLabel: 'Save' });
+      await api(`/api/pg/audit-options/${el.dataset.id}/remedies`, {
+        method: 'POST',
+        body: JSON.stringify({ titleTemplate: title, estHours: hours ? Number(hours) : null, estCost: cost ? Number(cost) : null }),
+      });
+      toast('Fix added'); reload();
+    }));
+    app.querySelectorAll('.rm-edit').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const title = await promptDialog('Fix title ({asset} is replaced with the building)', { confirmLabel: 'Next' });
+      if (title === null) return;
+      const hours = await promptDialog('Estimated hours', { confirmLabel: 'Next' });
+      const cost = await promptDialog('Estimated cost', { confirmLabel: 'Save' });
+      await api(`/api/pg/audit-remedies/${el.dataset.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ titleTemplate: title || undefined, estHours: hours ? Number(hours) : undefined, estCost: cost ? Number(cost) : undefined }),
+      });
+      toast('Saved'); reload();
+    }));
+    app.querySelectorAll('.rm-del').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      if (!await confirmDialog('Remove this fix? Work orders already generated from it are untouched.')) return;
+      await api(`/api/pg/audit-remedies/${el.dataset.id}`, { method: 'DELETE' });
+      reload();
+    }));
+    app.querySelectorAll('.o-follow').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const prompt = await promptDialog('Follow-up question, asked only when this answer is given', { confirmLabel: 'Next' });
+      if (!prompt) return;
+      const opts = await promptDialog('Answers, comma separated (blank for free text)', { placeholder: 'Partial, Full', confirmLabel: 'Create' });
+      if (opts === null) return;
+      const options = opts.split(',').map((x) => x.trim()).filter(Boolean).map((label) => ({ label }));
+      await api(`/api/pg/audit-options/${el.dataset.id}/follow-up`, {
+        method: 'POST',
+        body: JSON.stringify({ formId: d.Form.Id, prompt, type: options.length ? 'select' : 'text', options }),
+      });
+      toast('Follow-up added'); reload();
+    }));
+    app.querySelectorAll('.q-addopt').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const label = await promptDialog('New answer', { confirmLabel: 'Add' });
+      if (!label) return;
+      await api(`/api/pg/audit-questions/${el.dataset.id}/options`, { method: 'POST', body: JSON.stringify({ label }) });
+      reload();
+    }));
+    app.querySelectorAll('.q-edit').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const q = d.Questions.find((x) => String(x.Id) === el.dataset.id);
+      const prompt = await promptDialog('Question wording (the key stays the same, so history still joins up)', { value: q.Prompt, confirmLabel: 'Save' });
+      if (prompt === null) return;
+      await api(`/api/pg/audit-questions/${q.Id}`, { method: 'PATCH', body: JSON.stringify({ prompt }) });
+      reload();
+    }));
+    app.querySelectorAll('.q-del').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const q = d.Questions.find((x) => String(x.Id) === el.dataset.id);
+      const msg = q.AnswerCount
+        ? `This question has ${q.AnswerCount} answer(s), so it will be archived rather than deleted — the history stays readable.`
+        : 'Delete this question? Nothing has answered it.';
+      if (!await confirmDialog(msg, { confirmLabel: q.AnswerCount ? 'Archive' : 'Delete', danger: true })) return;
+      await api(`/api/pg/audit-questions/${q.Id}`, { method: 'DELETE' });
+      reload();
+    }));
+    app.querySelectorAll('.add-q').forEach((b) => b.addEventListener('click', async () => {
+      const prompt = await promptDialog('New question', { confirmLabel: 'Next' });
+      if (!prompt) return;
+      const opts = await promptDialog('Answers, comma separated (blank for free text)', { placeholder: 'Excellent, Good, Fair, Poor', confirmLabel: 'Create' });
+      if (opts === null) return;
+      const options = opts.split(',').map((x) => x.trim()).filter(Boolean).map((label) => ({ label }));
+      await api(`/api/pg/audit-forms/${d.Form.Id}/questions`, {
+        method: 'POST',
+        body: JSON.stringify({ sectionId: Number(b.dataset.sec), prompt, type: options.length ? 'select' : 'text', options }),
+      });
+      reload();
+    }));
+    document.getElementById('addSec').addEventListener('click', async () => {
+      const name = await promptDialog('New section', { confirmLabel: 'Add' });
+      if (!name) return;
+      await api(`/api/pg/audit-forms/${d.Form.Id}/sections`, {
+        method: 'POST', body: JSON.stringify({ name, sortIndex: (d.Sections.length + 1) * 10 }),
+      });
+      reload();
+    });
+  }
+
+  draw();
+}
+
 // ── The runner (Build Brief §3) ──────────────────────────────────────────
 // Phone-first, one section per screen. Every answer saves on its own, so a dropped
 // connection costs one field rather than a building — and anything that fails to send
@@ -9507,7 +9711,10 @@ async function renderAuditRounds() {
     <div class="card">
       <h3>Audit Rounds</h3>
       <p class="muted">A round runs one form over a set of buildings. Each building is walked once and ends either clean or with a work order.</p>
-      <div class="btn-row"><button type="button" class="btn btn-primary" id="newRoundBtn" ${forms.length ? '' : 'disabled'}>Start a round</button></div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary" id="newRoundBtn" ${forms.length ? '' : 'disabled'}>Start a round</button>
+        ${forms.map((f) => `<button type="button" class="btn btn-secondary edit-form" data-id="${f.Id}">Edit “${escapeHtml(f.Name)}”</button>`).join('')}
+      </div>
       ${forms.length ? '' : '<p class="muted">No audit form exists yet.</p>'}
     </div>
     <div class="card">
@@ -9525,6 +9732,7 @@ async function renderAuditRounds() {
     </div>`);
   app.querySelectorAll('.round-row').forEach((el) => el.addEventListener('click', () => go('auditRound', { id: el.dataset.id })));
   document.getElementById('newRoundBtn')?.addEventListener('click', () => openNewRoundDialog(forms));
+  app.querySelectorAll('.edit-form').forEach((b) => b.addEventListener('click', () => go('auditFormBuilder', { id: b.dataset.id })));
 }
 
 // Scope is picked as an explicit list of buildings, filtered by location or type —
