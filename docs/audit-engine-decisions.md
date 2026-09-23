@@ -1,5 +1,9 @@
 # Audit Engine — Decisions
 
+> See also **`docs/audit-engine-addendum.md`** — seed-form fixtures, ad-hoc flags,
+> note routing and the asset profile page. Open decisions live in
+> **`docs/open-questions.md`**.
+
 Answers to `docs/audit-engine-analysis.md`. Stated leans in the analysis are
 approved unless contradicted here. Implementation choices made under these
 decisions are logged at the bottom.
