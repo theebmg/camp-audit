@@ -5016,6 +5016,190 @@ export async function getExpenseSplitSummary(expenseId) {
   };
 }
 
+// ── Query surfaces (Build Brief §8) ──────────────────────────────────────
+// The proof the data isn't buried. All plain SQL over audit_answers, which is exactly
+// why answers are relational rows and not a JSON blob of each form.
+
+// Every audit answer ever recorded for one asset, newest round first, with the work it
+// produced interleaved — "Roof: Fair (2026) → Poor (2027) → Replaced (WO 1042)".
+export async function getAssetConditionHistory(assetId) {
+  const { rows } = await pool.query(
+    `SELECT an.id, an.question_key, an.value, an.note, an.kind,
+            q.prompt, o.flag, o.severe,
+            r.name AS round_name, i.completed_at, i.generated_wo_id,
+            w.title AS wo_title, cf.id AS finding_id, cf.status AS finding_status
+     FROM audit_answers an
+     JOIN audit_round_instances i ON i.id = an.instance_id
+     JOIN audit_rounds r ON r.id = i.round_id
+     LEFT JOIN audit_questions q ON q.id = an.question_id
+     LEFT JOIN audit_question_options o ON o.id = an.option_id
+     LEFT JOIN work_orders w ON w.id = i.generated_wo_id
+     LEFT JOIN condition_findings cf ON cf.audit_answer_id = an.id
+     WHERE i.asset_id = $1 AND an.active
+     ORDER BY i.completed_at DESC NULLS FIRST, an.question_key`,
+    [assetId]
+  );
+  // Grouped by question so the same key across years reads as one story.
+  const byKey = new Map();
+  for (const r of rows) {
+    const key = r.question_key;
+    if (!byKey.has(key)) byKey.set(key, { QuestionKey: key, Prompt: r.prompt || 'Flagged separately', Entries: [] });
+    byKey.get(key).Entries.push({
+      AnswerId: r.id, Value: r.value, Note: r.note, Kind: r.kind,
+      Flagged: !!r.flag, Severe: !!r.severe, RoundName: r.round_name,
+      CompletedAt: r.completed_at, WorkOrderId: r.generated_wo_id, WorkOrderTitle: r.wo_title,
+      FindingId: r.finding_id, FindingStatus: r.finding_status,
+    });
+  }
+  return [...byKey.values()];
+}
+
+// Asset condition status (§5d): three states, always WITH the reasons. Computed on
+// read, never stored, so it clears itself as work completes.
+export async function getAssetConditionStatus(assetId) {
+  const { rows } = await pool.query(
+    `SELECT
+       (SELECT count(*) FROM work_orders w
+          JOIN work_order_statuses ws ON ws.id = w.status_id
+        WHERE w.asset_id = $1 AND NOT ws.is_terminal AND w.due_date IS NOT NULL AND w.due_date < CURRENT_DATE) AS overdue_wos,
+       (SELECT count(*) FROM work_orders w
+          JOIN work_order_statuses ws ON ws.id = w.status_id
+        WHERE w.asset_id = $1 AND NOT ws.is_terminal) AS open_wos,
+       (SELECT count(*) FROM condition_findings cf
+        WHERE cf.asset_id = $1 AND cf.status IN ('Open','Scheduled','Deferred')) AS open_findings,
+       (SELECT max(i.completed_at) FROM audit_round_instances i
+        WHERE i.asset_id = $1 AND i.status = 'complete') AS last_audit`,
+    [assetId]
+  );
+  const m = rows[0];
+  // Severe = a flagged answer in the LATEST completed audit whose option is marked
+  // severe and whose finding hasn't been resolved. Fair is worth a work order; only
+  // Poor/Failed is worth calling the building poor.
+  const { rows: sev } = await pool.query(
+    `SELECT q.prompt, an.value, r.name AS round_name
+     FROM audit_round_instances i
+     JOIN audit_rounds r ON r.id = i.round_id
+     JOIN audit_answers an ON an.instance_id = i.id AND an.active
+     JOIN audit_question_options o ON o.id = an.option_id AND o.severe
+     LEFT JOIN audit_questions q ON q.id = an.question_id
+     LEFT JOIN condition_findings cf ON cf.audit_answer_id = an.id
+     WHERE i.asset_id = $1 AND i.status = 'complete'
+       AND i.completed_at = (SELECT max(completed_at) FROM audit_round_instances
+                             WHERE asset_id = $1 AND status = 'complete')
+       AND (cf.id IS NULL OR cf.status NOT IN ('Resolved','Dismissed'))`,
+    [assetId]
+  );
+
+  const reasons = [];
+  for (const sv of sev) reasons.push(`${sv.prompt || 'Flagged'}: ${sv.value} (${sv.round_name})`);
+  if (Number(m.overdue_wos)) reasons.push(`${m.overdue_wos} overdue work order(s)`);
+  if (Number(m.open_findings)) reasons.push(`${m.open_findings} open finding(s)`);
+  if (Number(m.open_wos)) reasons.push(`${m.open_wos} open work order(s)`);
+
+  let status;
+  if (Number(m.overdue_wos) > 0 || sev.length > 0) status = 'Poor';
+  else if (Number(m.open_findings) > 0 || Number(m.open_wos) > 0) status = 'Needs attention';
+  else status = 'Good';
+
+  return {
+    Status: status,
+    Reasons: reasons,
+    NeverAudited: !m.last_audit,
+    LastAuditAt: m.last_audit,
+  };
+}
+
+// The audit data screen (§8): form + question (+ round) -> asset x answer, filterable,
+// with counts. "All buildings where roof_condition = Poor" is a WHERE clause.
+export async function queryAuditAnswers({ formId, questionKey, value, roundId, limit = 500 }) {
+  const where = ['an.active']; const vals = [];
+  if (formId) { vals.push(formId); where.push(`r.form_id = $${vals.length}`); }
+  if (questionKey) { vals.push(questionKey); where.push(`an.question_key = $${vals.length}`); }
+  if (value) { vals.push(value); where.push(`an.value = $${vals.length}`); }
+  if (roundId) { vals.push(roundId); where.push(`r.id = $${vals.length}`); }
+  vals.push(limit);
+  const { rows } = await pool.query(
+    `SELECT a.id AS asset_id, a.name AS asset_name, l.name AS location_name,
+            an.question_key, an.value, an.note, o.flag, o.severe,
+            r.name AS round_name, i.completed_at, i.generated_wo_id
+     FROM audit_answers an
+     JOIN audit_round_instances i ON i.id = an.instance_id
+     JOIN audit_rounds r ON r.id = i.round_id
+     JOIN assets a ON a.id = i.asset_id
+     LEFT JOIN locations l ON l.id = a.location_id
+     LEFT JOIN audit_question_options o ON o.id = an.option_id
+     WHERE ${where.join(' AND ')}
+     ORDER BY a.name LIMIT $${vals.length}`,
+    vals
+  );
+  const counts = new Map();
+  for (const r of rows) counts.set(r.value, (counts.get(r.value) || 0) + 1);
+  return {
+    Rows: rows.map((r) => ({
+      AssetId: r.asset_id, AssetName: r.asset_name, LocationName: r.location_name,
+      QuestionKey: r.question_key, Value: r.value, Note: r.note,
+      Flagged: !!r.flag, Severe: !!r.severe, RoundName: r.round_name,
+      CompletedAt: r.completed_at, WorkOrderId: r.generated_wo_id,
+    })),
+    Counts: [...counts.entries()].map(([Value, Count]) => ({ Value, Count })).sort((a, b) => b.Count - a.Count),
+  };
+}
+
+// Distinct question keys in use, so the data screen offers the real vocabulary.
+export async function listAuditQuestionKeys(formId) {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT q.question_key, q.prompt FROM audit_questions q
+     WHERE ($1::int IS NULL OR q.form_id = $1::int) AND NOT q.archived
+     ORDER BY q.prompt`,
+    [formId || null]
+  );
+  return rows.map((r) => ({ QuestionKey: r.question_key, Prompt: r.prompt }));
+}
+
+// Round report (§8): completion, flags by question, and what it generated — the
+// budget-ask artifact.
+export async function getAuditRoundReport(roundId) {
+  const round = await getAuditRound(roundId);
+  if (!round) return null;
+  const [progress, flags, wos] = await Promise.all([
+    pool.query(
+      `SELECT count(*)::int total, count(*) FILTER (WHERE status = 'complete')::int complete,
+              count(*) FILTER (WHERE generated_wo_id IS NOT NULL)::int with_wo
+       FROM audit_round_instances WHERE round_id = $1`, [roundId]),
+    pool.query(
+      `SELECT COALESCE(q.prompt, 'Flagged separately') AS prompt, an.value, count(*)::int c
+       FROM audit_answers an
+       JOIN audit_round_instances i ON i.id = an.instance_id
+       LEFT JOIN audit_questions q ON q.id = an.question_id
+       LEFT JOIN audit_question_options o ON o.id = an.option_id
+       WHERE i.round_id = $1 AND an.active AND (o.flag OR an.kind = 'adhoc_flag')
+       GROUP BY 1, 2 ORDER BY c DESC`, [roundId]),
+    pool.query(
+      `SELECT w.id, w.title, a.name AS asset_name,
+              COALESCE(sum(jl.estimated_hours), 0) AS hours,
+              COALESCE(sum(jl.estimated_cost), 0) AS cost
+       FROM audit_round_instances i
+       JOIN work_orders w ON w.id = i.generated_wo_id
+       JOIN assets a ON a.id = i.asset_id
+       LEFT JOIN job_lines jl ON jl.work_order_id = w.id
+       WHERE i.round_id = $1
+       GROUP BY w.id, w.title, a.name ORDER BY cost DESC`, [roundId]),
+  ]);
+  const p = progress.rows[0];
+  return {
+    Round: round,
+    Total: p.total, Complete: p.complete, WithWorkOrder: p.with_wo,
+    Percent: p.total ? Math.round((p.complete / p.total) * 100) : 0,
+    FlagsByQuestion: flags.rows.map((r) => ({ Prompt: r.prompt, Value: r.value, Count: r.c })),
+    WorkOrders: wos.rows.map((r) => ({
+      Id: r.id, Title: r.title, AssetName: r.asset_name,
+      Hours: Number(r.hours), Cost: Number(r.cost),
+    })),
+    TotalHours: wos.rows.reduce((t, r) => t + Number(r.hours), 0),
+    TotalCost: wos.rows.reduce((t, r) => t + Number(r.cost), 0),
+  };
+}
+
 // ── Form builder (Build Brief §7) ────────────────────────────────────────
 // A question with answers is ARCHIVED, never deleted — history has to stay readable.
 

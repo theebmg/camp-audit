@@ -120,6 +120,11 @@ import {
   deleteAuditRemedy,
   addFollowUpQuestion,
   listAuditFixtures,
+  getAssetConditionHistory,
+  getAssetConditionStatus,
+  queryAuditAnswers,
+  listAuditQuestionKeys,
+  getAuditRoundReport,
   createAuditRound,
   getAuditRound,
   listAuditRounds,
@@ -2200,6 +2205,53 @@ router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) 
       allocations: await listExpenseAllocations(req.params.id),
       summary: await getExpenseSplitSummary(req.params.id),
     });
+  } catch (e) { next(e); }
+});
+
+// ── Query surfaces (§8) ──────────────────────────────────────────────────
+router.get('/assets/:id/condition-history', async (req, res, next) => {
+  try {
+    res.json({
+      history: await getAssetConditionHistory(req.params.id),
+      status: await getAssetConditionStatus(req.params.id),
+    });
+  } catch (e) { next(e); }
+});
+
+router.get('/audit-question-keys', async (req, res, next) => {
+  try { res.json({ keys: await listAuditQuestionKeys(req.query.formId || null) }); } catch (e) { next(e); }
+});
+
+// The proof the data isn't buried: filter by form, question, answer and round, get the
+// rows plus a count per answer, and export the same thing as CSV.
+router.get('/audit-data', async (req, res, next) => {
+  try {
+    const { formId, questionKey, value, roundId, format } = req.query;
+    const result = await queryAuditAnswers({
+      formId: formId ? Number(formId) : null,
+      questionKey: questionKey || null, value: value || null,
+      roundId: roundId ? Number(roundId) : null,
+    });
+    if (format === 'csv') {
+      const header = 'Asset,Location,Question,Answer,Flagged,Round,Completed,WorkOrder';
+      const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+      const body = result.Rows.map((r) => [
+        r.AssetName, r.LocationName, r.QuestionKey, r.Value, r.Flagged ? 'yes' : '',
+        r.RoundName, r.CompletedAt ? String(r.CompletedAt).slice(0, 10) : '', r.WorkOrderId || '',
+      ].map(esc).join(',')).join('\n');
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', 'attachment; filename="audit-data.csv"');
+      return res.send(`${header}\n${body}`);
+    }
+    res.json(result);
+  } catch (e) { next(e); }
+});
+
+router.get('/audit-rounds/:id/report', async (req, res, next) => {
+  try {
+    const report = await getAuditRoundReport(req.params.id);
+    if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json(report);
   } catch (e) { next(e); }
 });
 

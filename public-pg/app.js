@@ -1243,6 +1243,8 @@ async function render(view, params = {}, opts = {}) {
       auditRunner: () => renderAuditRunner(params),
       auditReview: () => renderAuditReview(params),
       auditFormBuilder: () => renderAuditFormBuilder(params),
+      auditData: () => renderAuditData(),
+      auditRoundReport: () => renderAuditRoundReport(params),
       crew: () => renderCrew(),
       crewHours: () => renderCrewHours(),
       adminUsers: () => renderAdminUsers(),
@@ -1882,6 +1884,37 @@ async function renderAssetDetail({ id }, container = app) {
   let assetFace = null;
   try { assetFace = (await api(`/api/pg/assets/${id}/face`)).face; } catch { /* icon fallback */ }
 
+  // Condition status and history, fetched with the asset so the header doesn't render
+  // a status and then change it (Addendum §5b/§5d).
+  let cond = null; let condHistory = [];
+  try {
+    const ch = await api(`/api/pg/assets/${id}/condition-history`);
+    cond = ch.status; condHistory = ch.history || [];
+  } catch { /* the rest of the page still works */ }
+
+  const CONDITION_COLOR = { Good: '#2e8b57', 'Needs attention': '#b4690e', Poor: '#c92a2a' };
+  const conditionHtml = cond ? `
+    <div class="card">
+      <h3 style="font-size:1rem;margin:0 0 4px">Condition —
+        <span style="color:${CONDITION_COLOR[cond.Status] || '#6b7086'}">${escapeHtml(cond.Status)}</span>
+        ${cond.NeverAudited ? '<span class="muted" style="font-weight:400;font-size:0.85rem"> · not yet audited</span>' : ''}
+      </h3>
+      ${cond.Reasons.length
+        ? `<div class="muted" style="font-size:0.88rem">${cond.Reasons.map(escapeHtml).join(' · ')}</div>`
+        : '<div class="muted" style="font-size:0.88rem">Nothing open against this building.</div>'}
+    </div>` : '';
+
+  // "Roof: Fair (2026) → Poor (2027)" — the same question across rounds, read as one line.
+  const historyHtml = condHistory.length ? `
+    <div class="card">
+      <h3 style="font-size:1rem">Condition history</h3>
+      ${condHistory.map((h) => `
+        <div class="list-item">
+          <div><strong>${escapeHtml(h.Prompt)}</strong></div>
+          <div class="muted" style="font-size:0.85rem">${h.Entries.map((e) => `${escapeHtml(e.Value ?? '—')}${e.Flagged ? ' ⚑' : ''} <span style="font-size:0.78rem">(${escapeHtml(e.RoundName)})</span>${e.WorkOrderId ? ` → WO ${e.WorkOrderId}` : ''}`).join(' → ')}</div>
+        </div>`).join('')}
+    </div>` : '';
+
   container.innerHTML = `
     <div class="card">
       <div style="display:flex;gap:14px;align-items:flex-start">
@@ -1906,6 +1939,8 @@ async function renderAssetDetail({ id }, container = app) {
       </div>
     </div>
 
+    ${conditionHtml}
+    ${historyHtml}
     <div class="card"><h3>Components</h3>${componentRows}</div>
 
     <div class="card" id="assetPhotosCard"></div>
@@ -4796,6 +4831,7 @@ const REPORT_TABS = [
   { key: 'workPerformed', label: 'Work Performed' },
   { key: 'deferredBacklog', label: 'Deferred Backlog' },
   { key: 'visitorActivity', label: 'Visitor Activity' },
+  { key: 'auditData', label: 'Audit Data' },
 ];
 function reportsTabsHtml(mode) {
   return `<div class="card">
@@ -4817,6 +4853,7 @@ async function renderReports(params = {}) {
   if (mode === 'workPerformed') return renderWorkPerformedReport();
   if (mode === 'deferredBacklog') return renderDeferredBacklogReport();
   if (mode === 'visitorActivity') return renderVisitorActivityReport();
+  if (mode === 'auditData') return renderAuditData();
   return renderReportsExplorer(params);
 }
 
@@ -9182,6 +9219,117 @@ async function openSplitEditor(expenseId, { onClose } = {}) {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 }
 
+// ── Audit data screen (Build Brief §8) ───────────────────────────────────
+// Pick a question, see every building's answer, with counts and a CSV export. This is
+// the screen that proves the answers aren't locked in a blob.
+async function renderAuditData() {
+  setChrome({ title: 'Audit Data', showBack: true, showLogout: true });
+  const [{ forms }, { rounds }] = await Promise.all([api('/api/pg/audit-forms'), api('/api/pg/audit-rounds')]);
+  let formId = forms[0]?.Id || null;
+  let keys = [];
+  let questionKey = '';
+  let value = '';
+  let roundId = '';
+  let result = { Rows: [], Counts: [] };
+
+  async function loadKeys() { keys = (await api(`/api/pg/audit-question-keys?formId=${formId || ''}`)).keys || []; }
+  async function run() {
+    const qs = new URLSearchParams();
+    if (formId) qs.set('formId', formId);
+    if (questionKey) qs.set('questionKey', questionKey);
+    if (value) qs.set('value', value);
+    if (roundId) qs.set('roundId', roundId);
+    result = await api(`/api/pg/audit-data?${qs}`);
+    draw();
+  }
+
+  function draw() {
+    setApp(`
+      ${reportsTabsHtml('auditData')}
+      <div class="card">
+        <h3>Audit Data</h3>
+        <p class="muted">Every answer ever recorded, filterable. "All buildings where the roof is Poor" is a filter, not a support request.</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <select id="adForm" style="flex:1;min-width:150px">${forms.map((f) => `<option value="${f.Id}" ${String(formId) === String(f.Id) ? 'selected' : ''}>${escapeHtml(f.Name)}</option>`).join('')}</select>
+          <select id="adKey" style="flex:1;min-width:170px"><option value="">Any question</option>${keys.map((k) => `<option value="${escapeHtml(k.QuestionKey)}" ${questionKey === k.QuestionKey ? 'selected' : ''}>${escapeHtml(k.Prompt)}</option>`).join('')}</select>
+          <input type="text" id="adVal" placeholder="Answer, e.g. Poor" value="${escapeHtml(value)}" style="flex:1;min-width:130px" />
+          <select id="adRound" style="flex:1;min-width:150px"><option value="">Any round</option>${rounds.map((r) => `<option value="${r.Id}" ${String(roundId) === String(r.Id) ? 'selected' : ''}>${escapeHtml(r.Name)}</option>`).join('')}</select>
+        </div>
+        <div class="btn-row" style="margin-top:10px">
+          <button type="button" class="btn btn-primary" id="adRun">Show</button>
+          <a class="btn btn-secondary" id="adCsv" href="#">Export CSV</a>
+        </div>
+      </div>
+      ${result.Counts.length ? `<div class="card">
+        <h3 style="font-size:1rem">Counts</h3>
+        <div style="display:flex;flex-wrap:wrap;gap:14px">
+          ${result.Counts.map((c) => `<div><strong>${escapeHtml(c.Value ?? '—')}</strong> <span class="muted">${c.Count}</span></div>`).join('')}
+        </div>
+      </div>` : ''}
+      <div class="card">
+        <h3 style="font-size:1rem">${result.Rows.length} row(s)</h3>
+        ${result.Rows.length ? result.Rows.map((r) => `
+          <div class="list-item" style="display:flex;justify-content:space-between;gap:10px">
+            <div>
+              <div><strong>${escapeHtml(r.AssetName)}</strong> <span class="muted">${escapeHtml(r.LocationName || '')}</span></div>
+              <div class="muted" style="font-size:0.82rem">${escapeHtml(r.QuestionKey)} = ${escapeHtml(r.Value ?? '')}${r.Flagged ? ' ⚑' : ''}${r.Note ? ` · ${escapeHtml(r.Note)}` : ''}</div>
+            </div>
+            <div class="muted" style="font-size:0.8rem;text-align:right">${escapeHtml(r.RoundName)}${r.WorkOrderId ? `<br>WO ${r.WorkOrderId}` : ''}</div>
+          </div>`).join('') : '<p class="muted">Nothing matches — or no audits have been completed yet.</p>'}
+      </div>`);
+    wireReportsTabs();
+    document.getElementById('adForm').addEventListener('change', async (e) => { formId = e.target.value; questionKey = ''; await loadKeys(); run(); });
+    document.getElementById('adKey').addEventListener('change', (e) => { questionKey = e.target.value; run(); });
+    document.getElementById('adVal').addEventListener('change', (e) => { value = e.target.value; run(); });
+    document.getElementById('adRound').addEventListener('change', (e) => { roundId = e.target.value; run(); });
+    document.getElementById('adRun').addEventListener('click', run);
+    const qs = new URLSearchParams({ format: 'csv' });
+    if (formId) qs.set('formId', formId);
+    if (questionKey) qs.set('questionKey', questionKey);
+    if (value) qs.set('value', value);
+    if (roundId) qs.set('roundId', roundId);
+    document.getElementById('adCsv').href = `/api/pg/audit-data?${qs}`;
+  }
+
+  await loadKeys();
+  await run();
+}
+
+// Round report (§8): completion, what got flagged, and the work it generated with total
+// hours and cost — the budget-ask artifact.
+async function renderAuditRoundReport({ id }) {
+  setChrome({ title: 'Round Report', showBack: true, showLogout: true });
+  const r = await api(`/api/pg/audit-rounds/${id}/report`);
+  setApp(`
+    <div class="card">
+      <h3>${escapeHtml(r.Round.Name)}</h3>
+      <div class="muted">${escapeHtml(r.Round.FormName)}</div>
+      <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:12px">
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Complete</div><div style="font-size:1.1rem;font-weight:700">${r.Complete}/${r.Total} · ${r.Percent}%</div></div>
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Buildings with work</div><div style="font-size:1.1rem;font-weight:700">${r.WithWorkOrder}</div></div>
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Estimated hours</div><div style="font-size:1.1rem;font-weight:700">${r.TotalHours}</div></div>
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Estimated cost</div><div style="font-size:1.1rem;font-weight:700">$${r.TotalCost.toLocaleString()}</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3 style="font-size:1rem">What got flagged</h3>
+      ${r.FlagsByQuestion.length ? r.FlagsByQuestion.map((f) => `
+        <div class="list-item" style="display:flex;justify-content:space-between">
+          <div>${escapeHtml(f.Prompt)} <span class="muted">— ${escapeHtml(f.Value ?? '')}</span></div>
+          <div><strong>${f.Count}</strong></div>
+        </div>`).join('') : '<p class="muted">Nothing flagged.</p>'}
+    </div>
+    <div class="card">
+      <h3 style="font-size:1rem">Work orders generated (${r.WorkOrders.length})</h3>
+      ${r.WorkOrders.length ? r.WorkOrders.map((w) => `
+        <div class="list-item wo-row" data-id="${w.Id}" style="display:flex;justify-content:space-between;cursor:pointer">
+          <div><strong>${escapeHtml(w.AssetName)}</strong> <span class="muted">WO ${w.Id}</span></div>
+          <div class="muted">${w.Hours ? `${w.Hours}h · ` : ''}$${w.Cost.toLocaleString()}</div>
+        </div>`).join('') : '<p class="muted">None yet.</p>'}
+    </div>`);
+  app.querySelectorAll('.wo-row').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.id })));
+}
+
 // ── Form builder (Build Brief §7) ────────────────────────────────────────
 // Plain and functional — one author. Follow-ups render indented under the option that
 // triggers them, so the tree IS the documentation and there's no separate logic screen.
@@ -9849,6 +9997,7 @@ async function renderAuditRound({ id }) {
         <div style="height:100%;width:${pct}%;background:#3b5bdb"></div>
       </div>
       <div class="muted" style="margin-top:6px">${done}/${instances.length} · ${pct}%</div>
+      <div class="btn-row" style="margin-top:10px"><button type="button" class="btn btn-secondary" id="roundReportBtn">Round report</button></div>
     </div>
     ${[...byLoc.entries()].map(([loc, list]) => `
       <div class="card">
@@ -9863,6 +10012,7 @@ async function renderAuditRound({ id }) {
           </div>`).join('')}
       </div>`).join('')}`);
   app.querySelectorAll('.inst-row').forEach((el) => el.addEventListener('click', () => go('auditRunner', { id: el.dataset.id })));
+  document.getElementById('roundReportBtn')?.addEventListener('click', () => go('auditRoundReport', { id }));
 }
 
 // ── Asset face: photo, or the type's icon (Addendum §5a) ─────────────────
