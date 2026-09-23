@@ -5016,6 +5016,126 @@ export async function getExpenseSplitSummary(expenseId) {
   };
 }
 
+// ── Scheduler: materializing audit rounds (Build Brief §6) ───────────────
+// Reuses the machinery that already generates PM work orders — recurrence expansion, a
+// guard table, an advisory lock — rather than a parallel scheduler. The one real gap
+// was that nothing ran unless someone opened the calendar; startAuditScheduler fixes
+// that without adding a dependency.
+
+export async function generateDueAuditRoundsForRange(fromDate, toDate) {
+  const todayStr = today();
+  const cappedTo = toDate < todayStr ? toDate : todayStr;
+  if (cappedTo < fromDate) return [];
+  const occurrences = (await listCalendarEventOccurrences(fromDate, cappedTo))
+    .filter((o) => o.AuditFormId);
+  const created = [];
+  for (const occ of occurrences) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Same lock the WO generator uses: two instances booting together must not both
+      // create the round.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`cegr:${occ.Id}:${occ.OccurrenceDate}`]);
+      const { rows: exists } = await client.query(
+        'SELECT 1 FROM calendar_event_generated_round WHERE calendar_event_id = $1 AND occurrence_date = $2',
+        [occ.Id, occ.OccurrenceDate]
+      );
+      if (exists[0]) { await client.query('ROLLBACK'); continue; }
+
+      const { rows: scope } = await client.query(
+        'SELECT asset_id FROM calendar_event_audit_scope WHERE calendar_event_id = $1', [occ.Id]
+      );
+      if (!scope.length) { await client.query('ROLLBACK'); continue; }
+
+      const dueDate = new Date(new Date(occ.OccurrenceDate).getTime() + (occ.AuditGraceDays ?? 14) * 86400000)
+        .toISOString().slice(0, 10);
+      const { rows: rr } = await client.query(
+        `INSERT INTO audit_rounds (form_id, name, scheduled_date, due_date) VALUES ($1,$2,$3,$4) RETURNING id`,
+        [occ.AuditFormId, `${occ.Title} — ${occ.OccurrenceDate}`, occ.OccurrenceDate, dueDate]
+      );
+      const roundId = rr[0].id;
+      for (const sc of scope) {
+        await client.query(
+          `INSERT INTO audit_round_instances (round_id, asset_id) VALUES ($1,$2)
+           ON CONFLICT (round_id, asset_id) DO NOTHING`, [roundId, sc.asset_id]
+        );
+      }
+      await client.query(
+        `INSERT INTO calendar_event_generated_round (calendar_event_id, occurrence_date, round_id)
+         VALUES ($1,$2,$3)`, [occ.Id, occ.OccurrenceDate, roundId]
+      );
+      await client.query('COMMIT');
+      created.push(roundId);
+    } catch (e) {
+      await client.query('ROLLBACK');
+      console.error('audit round materialization failed:', e.message);
+    } finally { client.release(); }
+  }
+  return created;
+}
+
+// The daily job. Until now materialization only happened when someone opened the
+// calendar, so a scheduled round could sit undone simply because nobody looked. A
+// boot-time interval is enough here — no new dependency, and the guard tables make
+// double-runs harmless.
+let auditSchedulerTimer = null;
+export function startAuditScheduler() {
+  if (auditSchedulerTimer) return;
+  const run = async () => {
+    try {
+      const from = new Date(Date.now() - 400 * 86400000).toISOString().slice(0, 10);
+      const to = today();
+      const wos = await generateDueWorkOrdersForRange(from, to);
+      const rounds = await generateDueAuditRoundsForRange(from, to);
+      if (wos.length || rounds.length) {
+        console.log(`scheduler: ${wos.length} work order(s), ${rounds.length} audit round(s) materialized`);
+      }
+    } catch (e) { console.error('scheduler run failed:', e.message); }
+  };
+  // A minute after boot so it never competes with startup, then daily.
+  setTimeout(run, 60_000);
+  auditSchedulerTimer = setInterval(run, 24 * 60 * 60 * 1000);
+  console.log('scheduler: daily materialization armed');
+}
+
+// Overdue is COMPUTED, never stored (§6), so it clears itself when work completes.
+// Includes deferred items whose revisit date has passed — surfacing those was already
+// owed before this brief.
+export async function getOverdueStrip() {
+  const [wos, rounds, revisits] = await Promise.all([
+    pool.query(
+      `SELECT w.id, w.title, w.due_date::text AS due_date,
+              (CURRENT_DATE - w.due_date) AS days_over
+       FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id
+       WHERE NOT ws.is_terminal AND w.due_date IS NOT NULL AND w.due_date < CURRENT_DATE
+       ORDER BY w.due_date LIMIT 20`),
+    pool.query(
+      `SELECT r.id, r.name, r.due_date::text AS due_date,
+              (CURRENT_DATE - r.due_date) AS days_over,
+              count(i.id)::int total,
+              count(i.id) FILTER (WHERE i.status = 'complete')::int complete
+       FROM audit_rounds r LEFT JOIN audit_round_instances i ON i.round_id = r.id
+       WHERE r.status = 'open' AND r.due_date IS NOT NULL AND r.due_date < CURRENT_DATE
+       GROUP BY r.id, r.name, r.due_date
+       HAVING count(i.id) FILTER (WHERE i.status = 'complete') < count(i.id)
+       ORDER BY r.due_date LIMIT 20`),
+    pool.query(
+      `SELECT cf.id, cf.title, cf.revisit_date::text AS revisit_date,
+              (CURRENT_DATE - cf.revisit_date) AS days_over
+       FROM condition_findings cf
+       WHERE cf.status = 'Deferred' AND cf.revisit_date IS NOT NULL AND cf.revisit_date < CURRENT_DATE
+       ORDER BY cf.revisit_date LIMIT 20`),
+  ]);
+  return {
+    WorkOrders: wos.rows.map((r) => ({ Id: r.id, Title: r.title, DueDate: r.due_date, DaysOver: Number(r.days_over) })),
+    Rounds: rounds.rows.map((r) => ({
+      Id: r.id, Name: r.name, DueDate: r.due_date, DaysOver: Number(r.days_over),
+      Percent: r.total ? Math.round((r.complete / r.total) * 100) : 0,
+    })),
+    DeferredRevisits: revisits.rows.map((r) => ({ Id: r.id, Title: r.title, RevisitDate: r.revisit_date, DaysOver: Number(r.days_over) })),
+  };
+}
+
 // ── Query surfaces (Build Brief §8) ──────────────────────────────────────
 // The proof the data isn't buried. All plain SQL over audit_answers, which is exactly
 // why answers are relational rows and not a JSON blob of each form.
@@ -6757,6 +6877,9 @@ function calendarEventRowShape(r) {
     WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title,
     JobLineId: r.job_line_id, JobLineTitle: r.job_line_title,
     WorkOrderTemplateId: r.work_order_template_id,
+    AuditFormId: r.audit_form_id ?? null,
+    AuditLeadDays: r.audit_lead_days ?? null,
+    AuditGraceDays: r.audit_grace_days ?? null,
     TypeId: r.type_id, TypeName: r.type_name, TypeGcalColorId: r.type_gcal_color_id,
     StartTime: r.start_time, EndTime: r.end_time, EndDate: r.end_date,
     VisitorName: r.visitor_name, VisitPurpose: r.visit_purpose, VisitorContact: r.visitor_contact,

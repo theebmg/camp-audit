@@ -125,6 +125,8 @@ import {
   queryAuditAnswers,
   listAuditQuestionKeys,
   getAuditRoundReport,
+  getOverdueStrip,
+  generateDueAuditRoundsForRange,
   createAuditRound,
   getAuditRound,
   listAuditRounds,
@@ -2205,6 +2207,21 @@ router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) 
       allocations: await listExpenseAllocations(req.params.id),
       summary: await getExpenseSplitSummary(req.params.id),
     });
+  } catch (e) { next(e); }
+});
+
+// ── Overdue (§6) ─────────────────────────────────────────────────────────
+// Computed every time, never stored, so it clears itself when the work completes.
+router.get('/overdue', async (req, res, next) => {
+  try { res.json(await getOverdueStrip()); } catch (e) { next(e); }
+});
+
+// "Materialize now" for testing a schedule without waiting a day.
+router.post('/audit-rounds/materialize', async (req, res, next) => {
+  try {
+    const from = new Date(Date.now() - 400 * 86400000).toISOString().slice(0, 10);
+    const to = new Date().toISOString().slice(0, 10);
+    res.json({ ok: true, created: await generateDueAuditRoundsForRange(from, to) });
   } catch (e) { next(e); }
 });
 
