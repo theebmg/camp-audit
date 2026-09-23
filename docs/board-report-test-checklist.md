@@ -164,3 +164,40 @@ The highest-value tests, because these touch retired columns.
 - [ ] Add one → it appears in the draft marked **"added by hand"**.
 - [ ] It is toggleable, takes a note, and respects summary/itemized like any other item.
 - [ ] **Refresh suggestions → it survives.** A suggestion rule can never remove it.
+
+---
+
+# "Already reported" — what stops an item being suggested again
+
+**Note:** before this change there was no never-suggest-again rule at all — every
+matching item was re-proposed on every draft, forever. This is the whole rule, not a
+tweak to an existing one.
+
+An item counts as reported **only if it was included (checked) in a report that was
+PUBLISHED.** That falls out of publishing already deleting unchecked rows, so whatever
+is still attached to a published report is exactly what the board saw.
+
+## The four cases
+
+- [ ] **Checked + published → gone.** On a draft, check item **A**. Publish. Start the
+      next draft — **A is not suggested**.
+- [ ] **Unchecked at publish → comes back.** On that same draft, uncheck item **B** before
+      publishing. On the next draft, **B is suggested again** under the normal rules.
+      (Unchecking means "not ready to show", not "never show me again".)
+- [ ] **Drafts never count.** Put item **C** on a draft, then **Save a copy** *and*
+      **Email** it — but do **not** publish. Start a fresh draft: **C is still suggested.**
+      Neither saved copies nor emailed drafts mark anything as reported.
+- [ ] **Hand-added follows the same rule.** Use **＋ Add item** to add **D**, then uncheck
+      it and publish. On the next draft, **D is suggested.** Add it, leave it checked,
+      publish — and it is not.
+
+## Related behaviour
+
+- [ ] A reported item that is later **reopened stays excluded**. Use **＋ Add item** to
+      put it back on a report.
+- [ ] A work order whose **header** was reported but which has **new lines this period**
+      still gets its grouping row — the header is only skipped when the header itself was
+      reported, not because some of its lines were.
+- [ ] A **published** report's items can no longer be checked or unchecked at all. The
+      route returns 409. That matters more now: editing a published report would rewrite
+      what the board saw *and* silently change what is eligible in future.
