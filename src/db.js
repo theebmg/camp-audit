@@ -5016,6 +5016,244 @@ export async function getExpenseSplitSummary(expenseId) {
   };
 }
 
+// ── Form builder (Build Brief §7) ────────────────────────────────────────
+// A question with answers is ARCHIVED, never deleted — history has to stay readable.
+
+export async function getAuditFormFull(formId) {
+  const [form, sections, questions, options, remedies, btypes] = await Promise.all([
+    pool.query('SELECT * FROM audit_forms WHERE id = $1', [formId]),
+    pool.query('SELECT * FROM audit_sections WHERE form_id = $1 ORDER BY sort_index, id', [formId]),
+    pool.query(
+      `SELECT q.*, (SELECT count(*) FROM audit_answers a WHERE a.question_id = q.id) AS answer_count
+       FROM audit_questions q WHERE q.form_id = $1 ORDER BY q.sort_index, q.id`, [formId]),
+    pool.query(
+      `SELECT o.* FROM audit_question_options o JOIN audit_questions q ON q.id = o.question_id
+       WHERE q.form_id = $1 ORDER BY o.sort_index, o.id`, [formId]),
+    pool.query(
+      `SELECT r.* FROM audit_remedies r JOIN audit_question_options o ON o.id = r.option_id
+       JOIN audit_questions q ON q.id = o.question_id WHERE q.form_id = $1 ORDER BY r.sort_index, r.id`, [formId]),
+    pool.query(
+      `SELECT b.*, bt.name FROM audit_question_building_types b
+       JOIN building_types bt ON bt.id = b.building_type_id
+       JOIN audit_questions q ON q.id = b.question_id WHERE q.form_id = $1`, [formId]),
+  ]);
+  if (!form.rows[0]) return null;
+
+  const remByOpt = new Map();
+  for (const r of remedies.rows) {
+    if (!remByOpt.has(r.option_id)) remByOpt.set(r.option_id, []);
+    remByOpt.get(r.option_id).push({
+      Id: r.id, TitleTemplate: r.title_template, Responsibility: r.responsibility,
+      FundingSource: r.funding_source, FundingRefId: r.funding_ref_id,
+      EstHours: r.est_hours != null ? Number(r.est_hours) : null,
+      EstCost: r.est_cost != null ? Number(r.est_cost) : null,
+      IsFixture: r.is_fixture,
+    });
+  }
+  const optByQ = new Map();
+  for (const o of options.rows) {
+    if (!optByQ.has(o.question_id)) optByQ.set(o.question_id, []);
+    optByQ.get(o.question_id).push({
+      Id: o.id, Label: o.label, Value: o.value, SortIndex: o.sort_index,
+      Flag: o.flag, Severe: o.severe, Archived: o.archived, IsFixture: o.is_fixture,
+      Remedies: remByOpt.get(o.id) || [],
+    });
+  }
+  const btByQ = new Map();
+  for (const b of btypes.rows) {
+    if (!btByQ.has(b.question_id)) btByQ.set(b.question_id, []);
+    btByQ.get(b.question_id).push({ Id: b.building_type_id, Name: b.name });
+  }
+
+  return {
+    Form: { Id: form.rows[0].id, Name: form.rows[0].name, Description: form.rows[0].description,
+      TargetNote: form.rows[0].target_note, Active: form.rows[0].active },
+    Sections: sections.rows.map((x) => ({ Id: x.id, Name: x.name, SortIndex: x.sort_index })),
+    Questions: questions.rows.map((q) => ({
+      Id: q.id, SectionId: q.section_id, QuestionKey: q.question_key, Prompt: q.prompt,
+      Type: q.type, Required: q.required, AllowsPhoto: q.allows_photo, SortIndex: q.sort_index,
+      Archived: q.archived, ShowIf: q.show_if, MapsTo: q.maps_to,
+      AnswerCount: Number(q.answer_count),
+      Options: optByQ.get(q.id) || [], BuildingTypes: btByQ.get(q.id) || [],
+    })),
+  };
+}
+
+export async function createAuditForm({ name, description, targetNote }) {
+  const { rows } = await pool.query(
+    'INSERT INTO audit_forms (name, description, target_note) VALUES ($1,$2,$3) RETURNING id',
+    [name, description || null, targetNote || null]
+  );
+  await logActivity({ action: 'created', entityType: 'audit_form', entityId: rows[0].id, entityLabel: name });
+  return rows[0].id;
+}
+
+export async function createAuditSection(formId, { name, sortIndex }) {
+  const { rows } = await pool.query(
+    'INSERT INTO audit_sections (form_id, name, sort_index) VALUES ($1,$2,COALESCE($3,0)) RETURNING id',
+    [formId, name, sortIndex ?? null]
+  );
+  return rows[0].id;
+}
+
+export async function updateAuditSection(id, { name, sortIndex }) {
+  await pool.query(
+    'UPDATE audit_sections SET name = COALESCE($2,name), sort_index = COALESCE($3,sort_index) WHERE id = $1',
+    [id, name ?? null, sortIndex ?? null]
+  );
+}
+
+// question_key is generated from the prompt when not given, and then LEFT ALONE:
+// rewording a prompt keeps the key, because the key is what joins this question's
+// answers across years (§8).
+function slugifyKey(text) {
+  return String(text).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'question';
+}
+
+export async function createAuditQuestion(formId, {
+  sectionId, questionKey, prompt, type = 'select', required = false, allowsPhoto = false,
+  sortIndex, showIf = null, mapsTo = null, options = [],
+}) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let key = questionKey || slugifyKey(prompt);
+    // Keys are unique per form; a collision gets a numeric suffix rather than an error
+    // in the middle of someone building a form.
+    const { rows: clash } = await client.query(
+      'SELECT count(*)::int c FROM audit_questions WHERE form_id = $1 AND question_key = $2', [formId, key]
+    );
+    if (clash[0].c) key = `${key}_${Date.now().toString(36).slice(-4)}`;
+    const { rows } = await client.query(
+      `INSERT INTO audit_questions (form_id, section_id, question_key, prompt, type, required, allows_photo, sort_index, show_if, maps_to)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0),$9,$10) RETURNING id`,
+      [formId, sectionId || null, key, prompt, type, !!required, !!allowsPhoto, sortIndex ?? null,
+        showIf ? JSON.stringify(showIf) : null, mapsTo ? JSON.stringify(mapsTo) : null]
+    );
+    const qid = rows[0].id;
+    for (const [i, o] of options.entries()) {
+      await client.query(
+        'INSERT INTO audit_question_options (question_id, label, value, sort_index, flag, severe) VALUES ($1,$2,$3,$4,$5,$6)',
+        [qid, o.label, o.value ?? o.label, i, !!o.flag, !!o.severe]
+      );
+    }
+    await client.query('COMMIT');
+    return qid;
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+
+const QUESTION_COLUMNS = {
+  sectionId: 'section_id', prompt: 'prompt', type: 'type', required: 'required',
+  allowsPhoto: 'allows_photo', sortIndex: 'sort_index', archived: 'archived',
+};
+export async function updateAuditQuestion(id, fields) {
+  const set = []; const vals = []; let i = 2;
+  for (const [k, col] of Object.entries(QUESTION_COLUMNS)) {
+    if (fields[k] === undefined) continue;
+    set.push(`${col} = $${i++}`); vals.push(fields[k]);
+  }
+  if (fields.showIf !== undefined) { set.push(`show_if = $${i++}`); vals.push(fields.showIf ? JSON.stringify(fields.showIf) : null); }
+  if (fields.mapsTo !== undefined) { set.push(`maps_to = $${i++}`); vals.push(fields.mapsTo ? JSON.stringify(fields.mapsTo) : null); }
+  if (!set.length) return;
+  await pool.query(`UPDATE audit_questions SET ${set.join(', ')} WHERE id = $1`, [id, ...vals]);
+}
+
+// Archive, never delete, when answers exist. A question nobody ever answered is safe to
+// remove outright — keeping it would just be clutter with no history to protect.
+export async function removeAuditQuestion(id) {
+  const { rows } = await pool.query('SELECT count(*)::int c FROM audit_answers WHERE question_id = $1', [id]);
+  if (rows[0].c > 0) {
+    await pool.query('UPDATE audit_questions SET archived = true WHERE id = $1', [id]);
+    return { archived: true, answers: rows[0].c };
+  }
+  await pool.query('DELETE FROM audit_questions WHERE id = $1', [id]);
+  return { deleted: true };
+}
+
+export async function createAuditOption(questionId, { label, value, flag = false, severe = false, sortIndex }) {
+  const { rows } = await pool.query(
+    'INSERT INTO audit_question_options (question_id, label, value, flag, severe, sort_index) VALUES ($1,$2,$3,$4,$5,COALESCE($6,0)) RETURNING id',
+    [questionId, label, value ?? label, !!flag, !!severe, sortIndex ?? null]
+  );
+  return rows[0].id;
+}
+
+// Editing an option clears its fixture mark: once a human has decided, it is no longer
+// a placeholder, and the "show me everything still marked fixture" query should stop
+// reporting it.
+export async function updateAuditOption(id, { label, flag, severe, archived }) {
+  const set = []; const vals = []; let i = 2;
+  if (label !== undefined) { set.push(`label = $${i++}`); vals.push(label); }
+  if (flag !== undefined) { set.push(`flag = $${i++}`); vals.push(!!flag); }
+  if (severe !== undefined) { set.push(`severe = $${i++}`); vals.push(!!severe); }
+  if (archived !== undefined) { set.push(`archived = $${i++}`); vals.push(!!archived); }
+  if (!set.length) return;
+  set.push('is_fixture = false');
+  await pool.query(`UPDATE audit_question_options SET ${set.join(', ')} WHERE id = $1`, [id, ...vals]);
+}
+
+export async function createAuditRemedy(optionId, { titleTemplate, responsibility, fundingSource, fundingRefId, estHours, estCost }) {
+  const { rows } = await pool.query(
+    `INSERT INTO audit_remedies (option_id, title_template, responsibility, funding_source, funding_ref_id, est_hours, est_cost)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+    [optionId, titleTemplate, responsibility || null, fundingSource || null, fundingRefId || null, estHours ?? null, estCost ?? null]
+  );
+  return rows[0].id;
+}
+
+export async function updateAuditRemedy(id, fields) {
+  const map = { titleTemplate: 'title_template', responsibility: 'responsibility',
+    fundingSource: 'funding_source', fundingRefId: 'funding_ref_id', estHours: 'est_hours', estCost: 'est_cost' };
+  const set = []; const vals = []; let i = 2;
+  for (const [k, col] of Object.entries(map)) {
+    if (fields[k] === undefined) continue;
+    set.push(`${col} = $${i++}`); vals.push(fields[k]);
+  }
+  if (!set.length) return;
+  set.push('is_fixture = false');   // edited by a human, so no longer a placeholder
+  await pool.query(`UPDATE audit_remedies SET ${set.join(', ')} WHERE id = $1`, [id, ...vals]);
+}
+
+export async function deleteAuditRemedy(id) {
+  await pool.query('DELETE FROM audit_remedies WHERE id = $1', [id]);
+}
+
+// "Add follow-up" on an option: a new question whose show_if is pre-wired to it, which
+// is what makes the tree visible as structure instead of a separate logic screen (§7).
+export async function addFollowUpQuestion(formId, optionId, { prompt, type = 'select', options = [] }) {
+  const { rows } = await pool.query(
+    `SELECT o.question_id, q.section_id, q.sort_index FROM audit_question_options o
+     JOIN audit_questions q ON q.id = o.question_id WHERE o.id = $1`, [optionId]
+  );
+  if (!rows[0]) return null;
+  return createAuditQuestion(formId, {
+    sectionId: rows[0].section_id, prompt, type, options,
+    sortIndex: (rows[0].sort_index ?? 0) + 1,
+    showIf: [{ question_id: rows[0].question_id, option_ids: [Number(optionId)] }],
+  });
+}
+
+// Everything still marked as a placeholder. The builder surfaces this as a warning
+// before a real round runs, which is the whole point of the marker.
+export async function listAuditFixtures(formId) {
+  const [opts, rems] = await Promise.all([
+    pool.query(
+      `SELECT o.id, o.label, q.prompt, q.question_key FROM audit_question_options o
+       JOIN audit_questions q ON q.id = o.question_id
+       WHERE q.form_id = $1 AND o.is_fixture ORDER BY q.sort_index, o.sort_index`, [formId]),
+    pool.query(
+      `SELECT r.id, r.title_template, r.est_hours, r.est_cost, o.label, q.prompt FROM audit_remedies r
+       JOIN audit_question_options o ON o.id = r.option_id
+       JOIN audit_questions q ON q.id = o.question_id
+       WHERE q.form_id = $1 AND r.is_fixture ORDER BY r.id`, [formId]),
+  ]);
+  return {
+    Options: opts.rows.map((r) => ({ Id: r.id, Label: r.label, Prompt: r.prompt, QuestionKey: r.question_key })),
+    Remedies: rems.rows.map((r) => ({ Id: r.id, Title: r.title_template, OptionLabel: r.label, Prompt: r.prompt,
+      EstHours: r.est_hours != null ? Number(r.est_hours) : null, EstCost: r.est_cost != null ? Number(r.est_cost) : null })),
+  };
+}
+
 // ── Audit engine: rounds and the runner (Build Brief §3/§4/§5) ───────────
 
 export async function listAuditForms() {

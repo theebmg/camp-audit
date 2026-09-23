@@ -106,6 +106,20 @@ import {
   deleteExpenseAllocation,
   getExpenseSplitSummary,
   listAuditForms,
+  getAuditFormFull,
+  createAuditForm,
+  createAuditSection,
+  updateAuditSection,
+  createAuditQuestion,
+  updateAuditQuestion,
+  removeAuditQuestion,
+  createAuditOption,
+  updateAuditOption,
+  createAuditRemedy,
+  updateAuditRemedy,
+  deleteAuditRemedy,
+  addFollowUpQuestion,
+  listAuditFixtures,
   createAuditRound,
   getAuditRound,
   listAuditRounds,
@@ -2186,6 +2200,93 @@ router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) 
       allocations: await listExpenseAllocations(req.params.id),
       summary: await getExpenseSplitSummary(req.params.id),
     });
+  } catch (e) { next(e); }
+});
+
+// ── Form builder (§7) ────────────────────────────────────────────────────
+router.get('/audit-forms/:id/full', async (req, res, next) => {
+  try {
+    const form = await getAuditFormFull(req.params.id);
+    if (!form) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ...form, Fixtures: await listAuditFixtures(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+router.post('/audit-forms', async (req, res, next) => {
+  try {
+    const { name, description, targetNote } = req.body || {};
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+    res.json({ ok: true, formId: await createAuditForm({ name, description, targetNote }) });
+  } catch (e) { next(e); }
+});
+
+router.post('/audit-forms/:id/sections', async (req, res, next) => {
+  try {
+    const { name, sortIndex } = req.body || {};
+    if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
+    res.json({ ok: true, sectionId: await createAuditSection(req.params.id, { name, sortIndex }) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/audit-sections/:id', async (req, res, next) => {
+  try { await updateAuditSection(req.params.id, req.body || {}); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.post('/audit-forms/:id/questions', async (req, res, next) => {
+  try {
+    const { prompt } = req.body || {};
+    if (!prompt) return res.status(400).json({ ok: false, error: 'prompt is required' });
+    res.json({ ok: true, questionId: await createAuditQuestion(req.params.id, req.body) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/audit-questions/:id', async (req, res, next) => {
+  try { await updateAuditQuestion(req.params.id, req.body || {}); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// Archives when answers exist, deletes when none do — the response says which, because
+// "removed" meaning two different things silently would be worse than asking.
+router.delete('/audit-questions/:id', async (req, res, next) => {
+  try { res.json({ ok: true, ...(await removeAuditQuestion(req.params.id)) }); } catch (e) { next(e); }
+});
+
+router.post('/audit-questions/:id/options', async (req, res, next) => {
+  try {
+    const { label } = req.body || {};
+    if (!label) return res.status(400).json({ ok: false, error: 'label is required' });
+    res.json({ ok: true, optionId: await createAuditOption(req.params.id, req.body) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/audit-options/:id', async (req, res, next) => {
+  try { await updateAuditOption(req.params.id, req.body || {}); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.post('/audit-options/:id/remedies', async (req, res, next) => {
+  try {
+    const { titleTemplate } = req.body || {};
+    if (!titleTemplate) return res.status(400).json({ ok: false, error: 'titleTemplate is required' });
+    res.json({ ok: true, remedyId: await createAuditRemedy(req.params.id, req.body) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/audit-remedies/:id', async (req, res, next) => {
+  try { await updateAuditRemedy(req.params.id, req.body || {}); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+router.delete('/audit-remedies/:id', async (req, res, next) => {
+  try { await deleteAuditRemedy(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// Creates a question whose show_if is already wired to the option it hangs under, so
+// the tree is visible as structure rather than needing a separate logic screen.
+router.post('/audit-options/:id/follow-up', async (req, res, next) => {
+  try {
+    const { formId, prompt, type, options } = req.body || {};
+    if (!formId || !prompt) return res.status(400).json({ ok: false, error: 'formId and prompt are required' });
+    const qid = await addFollowUpQuestion(formId, req.params.id, { prompt, type, options });
+    if (!qid) return res.status(404).json({ ok: false, error: 'Option not found' });
+    res.json({ ok: true, questionId: qid });
   } catch (e) { next(e); }
 });
 
