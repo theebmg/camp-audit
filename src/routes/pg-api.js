@@ -105,6 +105,17 @@ import {
   createExpenseAllocation,
   deleteExpenseAllocation,
   getExpenseSplitSummary,
+  listAuditForms,
+  createAuditRound,
+  getAuditRound,
+  listAuditRounds,
+  listAuditRoundInstances,
+  getAuditInstance,
+  saveAuditAnswer,
+  addAdhocFlag,
+  chooseAnswerRemedy,
+  getAuditReview,
+  completeAuditInstance,
   listAssetTypeIcons,
   setAssetTypeIcon,
   setAssetProfilePhoto,
@@ -2175,6 +2186,95 @@ router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) 
       allocations: await listExpenseAllocations(req.params.id),
       summary: await getExpenseSplitSummary(req.params.id),
     });
+  } catch (e) { next(e); }
+});
+
+// ── Audit engine: rounds and the runner ──────────────────────────────────
+router.get('/audit-forms', async (req, res, next) => {
+  try { res.json({ forms: await listAuditForms() }); } catch (e) { next(e); }
+});
+
+router.get('/audit-rounds', async (req, res, next) => {
+  try { res.json({ rounds: await listAuditRounds() }); } catch (e) { next(e); }
+});
+
+router.post('/audit-rounds', async (req, res, next) => {
+  try {
+    const { formId, name, assetIds, scheduledDate, dueDate } = req.body || {};
+    if (!formId || !name) return res.status(400).json({ ok: false, error: 'formId and name are required' });
+    if (!Array.isArray(assetIds) || !assetIds.length) {
+      return res.status(400).json({ ok: false, error: 'Pick at least one building' });
+    }
+    res.json({ ok: true, round: await createAuditRound({ formId, name, assetIds, scheduledDate, dueDate }) });
+  } catch (e) { next(e); }
+});
+
+router.get('/audit-rounds/:id', async (req, res, next) => {
+  try {
+    const round = await getAuditRound(req.params.id);
+    if (!round) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ round, instances: await listAuditRoundInstances(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+// Everything the runner needs for one building in one call — the form, the answers so
+// far, and the asset's standing notes.
+router.get('/audit-instances/:id', async (req, res, next) => {
+  try {
+    const data = await getAuditInstance(req.params.id);
+    if (!data) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json(data);
+  } catch (e) { next(e); }
+});
+
+// One answer at a time, idempotent, so the client's retry queue can replay it safely
+// after a dropped connection without duplicating anything.
+router.put('/audit-instances/:id/answers', async (req, res, next) => {
+  try {
+    const { questionId, questionKey, value, optionId, note, noteDestination, active } = req.body || {};
+    if (!questionId || !questionKey) return res.status(400).json({ ok: false, error: 'questionId and questionKey are required' });
+    const id = await saveAuditAnswer(req.params.id, { questionId, questionKey, value, optionId, note, noteDestination, active });
+    res.json({ ok: true, answerId: id });
+  } catch (e) { next(e); }
+});
+
+router.post('/audit-instances/:id/adhoc-flags', async (req, res, next) => {
+  try {
+    const { sectionId, description, note, noteDestination, remedy } = req.body || {};
+    if (!sectionId || !description) return res.status(400).json({ ok: false, error: 'sectionId and description are required' });
+    const id = await addAdhocFlag(req.params.id, { sectionId, description, note, noteDestination, remedy });
+    res.json({ ok: true, answerId: id });
+  } catch (e) { next(e); }
+});
+
+router.post('/audit-answers/:answerId/remedies', async (req, res, next) => {
+  try {
+    const { remedyId } = req.body || {};
+    if (!remedyId) return res.status(400).json({ ok: false, error: 'remedyId is required' });
+    await chooseAnswerRemedy(req.params.answerId, remedyId);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+router.get('/audit-instances/:id/review', async (req, res, next) => {
+  try {
+    const review = await getAuditReview(req.params.id);
+    if (!review) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json(review);
+  } catch (e) { next(e); }
+});
+
+// Creates the findings, the work order and its lines, fires maps_to routing, and
+// delivers routed notes — one transaction, because a half-generated building would be
+// worse than none.
+router.post('/audit-instances/:id/complete', async (req, res, next) => {
+  try {
+    const { lines, strandedNoteChoices } = req.body || {};
+    const result = await completeAuditInstance(req.params.id, {
+      lines, strandedNoteChoices, createdBy: req.user?.username || null,
+    });
+    if (!result) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
 
