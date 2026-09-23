@@ -574,10 +574,15 @@ const JOB_LINE_SESSION_HOURS_SQL = `
 // presented as a rollup/total; the job-line EDIT FORM's Actual Cost input
 // deliberately stays on the raw column (jobLineRowShape/hydrateJobLine) —
 // same reasoning as the Actual Hours input, see its comment.
+// Reads allocations (0078), not expenses.job_line_id — a split receipt contributes
+// only its share to each line, which the old single pointer could not express. The
+// triage/deleted filters stay on the expense: a voided receipt allocates nothing.
 const JOB_LINE_EXPENSE_COST_SQL = `
-  SELECT job_line_id, SUM(amount) AS expense_cost
-  FROM expenses WHERE job_line_id IS NOT NULL AND amount IS NOT NULL AND triage_status != 'void' AND deleted_at IS NULL
-  GROUP BY job_line_id
+  SELECT ea.dest_id AS job_line_id, SUM(ea.amount) AS expense_cost
+  FROM expense_allocations ea
+  JOIN expenses e ON e.id = ea.expense_id
+  WHERE ea.dest_type = 'job_line' AND e.triage_status != 'void' AND e.deleted_at IS NULL
+  GROUP BY ea.dest_id
 `;
 // NULL only when there's truly nothing recorded either way, so an
 // untouched line still reads as "—" instead of a misleading $0 — same
@@ -3017,7 +3022,10 @@ async function hydrateJobLine(row) {
     // column (jobLineRowShape above) — same as Actual Hours — but the edit
     // form still needs to show what's linked, so it's surfaced separately
     // here rather than folded into ActualCost itself.
-    pool.query(`SELECT count(*) AS n, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE job_line_id = $1 AND amount IS NOT NULL AND triage_status != 'void' AND deleted_at IS NULL`, [row.id]),
+    pool.query(`SELECT count(*) AS n, COALESCE(SUM(ea.amount), 0) AS total
+                FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
+                WHERE ea.dest_type = 'job_line' AND ea.dest_id = $1
+                  AND e.triage_status != 'void' AND e.deleted_at IS NULL`, [row.id]),
   ]);
   const s = statusRows.rows[0] || {};
   return {
@@ -4017,9 +4025,26 @@ export async function deleteFund(id) {
 // Overage number the frontend renders in a warning color, never blocked.
 export async function getFundBalances() {
   const funds = await listFunds();
-  const { rows: spentRows } = await pool.query(
-    `SELECT fund_id, COALESCE(SUM(amount), 0) AS spent FROM expenses WHERE fund_id IS NOT NULL AND triage_status != 'void' AND deleted_at IS NULL GROUP BY fund_id`
-  );
+  // Two halves of the same money (0083): shares explicitly allocated to a fund, plus
+  // the part of each receipt nobody has split yet, which still draws on the fund the
+  // receipt was charged to. Summing only one half understates spend while a split is
+  // half-finished.
+  const { rows: spentRows } = await pool.query(`
+    SELECT fund_id, COALESCE(SUM(spent), 0) AS spent FROM (
+      SELECT ea.funding_ref_id AS fund_id, SUM(ea.amount) AS spent
+      FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
+      WHERE ea.funding_source = 'fund' AND ea.funding_ref_id IS NOT NULL
+        AND e.triage_status != 'void' AND e.deleted_at IS NULL
+      GROUP BY ea.funding_ref_id
+      UNION ALL
+      SELECT e.fund_id, GREATEST(COALESCE(e.amount, 0) - COALESCE(alloc.total, 0), 0) AS spent
+      FROM expenses e
+      LEFT JOIN (SELECT expense_id, SUM(amount) AS total FROM expense_allocations GROUP BY expense_id) alloc
+        ON alloc.expense_id = e.id
+      WHERE e.fund_id IS NOT NULL AND e.triage_status != 'void' AND e.deleted_at IS NULL
+    ) parts
+    GROUP BY fund_id
+  `);
   const spentByFund = new Map(spentRows.map((r) => [r.fund_id, Number(r.spent)]));
   const today = new Date();
   return funds.map((f) => {
@@ -4066,10 +4091,11 @@ function expenseRowToApi(r) {
   return {
     Id: r.id, Vendor: r.vendor, Amount: r.amount != null ? Number(r.amount) : null, PurchaseDate: r.purchase_date,
     TaxAmount: r.tax_amount != null ? Number(r.tax_amount) : null, TaxChargedInError: r.tax_charged_in_error,
+    RegularPrice: r.regular_price != null ? Number(r.regular_price) : null,
     CategoryId: r.category_id, CategoryName: r.category_name || null,
     FundId: r.fund_id, FundName: r.fund_name || null,
-    JobLineId: r.job_line_id, JobLineTitle: r.job_line_title || null,
-    WorkOrderId: r.work_order_id, WorkOrderTitle: r.work_order_title || null,
+    JobLineId: r.job_line_title != null ? r.dest_id : null, JobLineTitle: r.job_line_title || null,
+    WorkOrderId: r.work_order_title != null ? r.dest_id : null, WorkOrderTitle: r.work_order_title || null,
     AssetId: r.asset_id, AssetName: r.asset_name || null,
     Notes: r.notes, TriageStatus: r.triage_status, Source: r.source, ParsedConfidence: r.parsed_confidence,
     CreatedBy: r.created_by, CreatedAt: r.created_at,
@@ -4086,15 +4112,23 @@ function expenseRowToApi(r) {
 // plain-text alone is unreliable); plain text stays available as a
 // fallback toggle in the UI.
 const EXPENSE_SELECT = `
-  SELECT e.*, ec.name AS category_name, f.name AS fund_name,
+  SELECT e.*, ec.name AS category_name, f.name AS fund_name, d.dest_id,
          jl.title AS job_line_title, wo.title AS work_order_title, a.name AS asset_name,
          b.subject AS batch_subject, b.sender_email AS batch_sender_email, b.received_at AS batch_received_at,
          b.body_text AS batch_body_text, b.body_html AS batch_body_html
   FROM expenses e
   LEFT JOIN expense_categories ec ON ec.id = e.category_id
   LEFT JOIN funds f ON f.id = e.fund_id
-  LEFT JOIN job_lines jl ON jl.id = e.job_line_id
-  LEFT JOIN work_orders wo ON wo.id = e.work_order_id
+  -- The destination is an allocation now. The row shape still exposes a single
+  -- JobLineId/WorkOrderId, which is the unsplit case; a split receipt reports its
+  -- destinations through Allocations instead, and these read as the first one.
+  LEFT JOIN LATERAL (
+    SELECT ea.dest_type, ea.dest_id FROM expense_allocations ea
+    WHERE ea.expense_id = e.id AND ea.dest_type IN ('job_line','work_order')
+    ORDER BY ea.id LIMIT 1
+  ) d ON true
+  LEFT JOIN job_lines jl ON d.dest_type = 'job_line' AND jl.id = d.dest_id
+  LEFT JOIN work_orders wo ON d.dest_type = 'work_order' AND wo.id = d.dest_id
   LEFT JOIN assets a ON a.id = e.asset_id
   LEFT JOIN attachment_batches b ON b.id = e.batch_id`;
 
@@ -4145,8 +4179,8 @@ export async function listExpenses({
   if (fundId) add('e.fund_id = $N', Number(fundId));
   if (categoryId) add('e.category_id = $N', Number(categoryId));
   if (vendor) add('e.vendor ILIKE $N', `%${vendor}%`);
-  if (jobLineId) add('e.job_line_id = $N', Number(jobLineId));
-  if (workOrderId) add('e.work_order_id = $N', Number(workOrderId));
+  if (jobLineId) add(`EXISTS (SELECT 1 FROM expense_allocations ea WHERE ea.expense_id = e.id AND ea.dest_type = 'job_line' AND ea.dest_id = $N)`, Number(jobLineId));
+  if (workOrderId) add(`EXISTS (SELECT 1 FROM expense_allocations ea WHERE ea.expense_id = e.id AND ea.dest_type = 'work_order' AND ea.dest_id = $N)`, Number(workOrderId));
   if (assetId) add('e.asset_id = $N', Number(assetId));
   if (dateFrom) add('e.purchase_date >= $N', dateFrom);
   if (dateTo) add('e.purchase_date <= $N', dateTo);
@@ -4187,24 +4221,95 @@ async function inheritedFundId(jobLineId, fundId) {
 }
 
 export async function createExpense({
-  vendor, amount, purchaseDate, taxAmount, taxChargedInError, categoryId, fundId, jobLineId, workOrderId, assetId, notes, createdBy,
+  vendor, amount, purchaseDate, taxAmount, taxChargedInError, categoryId, fundId, jobLineId, workOrderId, assetId, notes, regularPrice, createdBy,
 }) {
   const resolvedFundId = await inheritedFundId(jobLineId, fundId);
   const { rows } = await pool.query(
-    `INSERT INTO expenses (vendor, amount, purchase_date, tax_amount, tax_charged_in_error, category_id, fund_id, job_line_id, work_order_id, asset_id, notes, triage_status, source, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'triaged','manual',$12) RETURNING id`,
+    `INSERT INTO expenses (vendor, amount, purchase_date, tax_amount, tax_charged_in_error, category_id, fund_id, asset_id, notes, regular_price, triage_status, source, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'triaged','manual',$11) RETURNING id`,
     [vendor || null, amount ?? null, purchaseDate || null, taxAmount ?? null, !!taxChargedInError, categoryId || null,
-      resolvedFundId ?? null, jobLineId || null, workOrderId || null, assetId || null, notes || null, createdBy || null]
+      resolvedFundId ?? null, assetId || null, notes || null, regularPrice ?? null, createdBy || null]
   );
-  await logActivity({ action: 'created', entityType: 'expense', entityId: rows[0].id, entityLabel: vendor || 'Expense' });
-  return getExpense(rows[0].id);
+  const id = rows[0].id;
+  // The ordinary form's single destination is just a one-way split — written here so
+  // allocations are the only place a destination ever lives (0078).
+  await setExpenseDestination(id, { jobLineId, workOrderId, amount });
+  await writeExpenseDiscountSaving(id, { amount, regularPrice, purchaseDate });
+  await logActivity({ action: 'created', entityType: 'expense', entityId: id, entityLabel: vendor || 'Expense' });
+  return getExpense(id);
+}
+
+// What funding does a new split inherit? A job line knows its own; a work order's lines
+// may disagree, so it only answers when they agree; everything else falls back to the
+// receipt's fund. Whatever this returns is COPIED onto the allocation and never
+// re-derived — that is what "stamped" means (0083).
+export async function resolveAllocationFunding({ destType, destId, fallbackFundId = null }) {
+  const fallback = fallbackFundId
+    ? { fundingSource: 'fund', fundingRefId: fallbackFundId }
+    : { fundingSource: 'operating_budget', fundingRefId: null };
+  if (destType === 'job_line' && destId) {
+    const { rows } = await pool.query('SELECT funding_source, funding_ref_id FROM job_lines WHERE id = $1', [destId]);
+    if (rows[0]) return { fundingSource: rows[0].funding_source, fundingRefId: rows[0].funding_ref_id };
+  }
+  if (destType === 'work_order' && destId) {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT funding_source, funding_ref_id FROM job_lines WHERE work_order_id = $1`, [destId]
+    );
+    // One answer only when the whole work order agrees — guessing on a mixed WO would
+    // stamp a number that was never true.
+    if (rows.length === 1) return { fundingSource: rows[0].funding_source, fundingRefId: rows[0].funding_ref_id };
+  }
+  return fallback;
+}
+
+// The unsplit case: at most one job_line/work_order allocation, carrying the whole
+// amount. Leaves any leftover/admin_task rows and any line-item splits alone — those
+// are managed by the split editor, not by picking a destination on the main form.
+export async function setExpenseDestination(expenseId, { jobLineId, workOrderId, amount }) {
+  if (jobLineId === undefined && workOrderId === undefined) return;
+  await pool.query(
+    `DELETE FROM expense_allocations
+     WHERE expense_id = $1 AND line_item_id IS NULL AND dest_type IN ('job_line','work_order')`,
+    [expenseId]
+  );
+  const destType = jobLineId ? 'job_line' : (workOrderId ? 'work_order' : null);
+  const destId = jobLineId || workOrderId || null;
+  if (!destType) return;
+  const { rows } = await pool.query('SELECT amount, fund_id FROM expenses WHERE id = $1', [expenseId]);
+  const total = amount ?? (rows[0]?.amount != null ? Number(rows[0].amount) : 0);
+  const funding = await resolveAllocationFunding({
+    destType, destId, fallbackFundId: rows[0]?.fund_id ?? null,
+  });
+  await pool.query(
+    `INSERT INTO expense_allocations (expense_id, dest_type, dest_id, amount, funding_source, funding_ref_id)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [expenseId, destType, destId, total ?? 0, funding.fundingSource, funding.fundingRefId]
+  );
+}
+
+// regular_price - amount is a one-time saving, counted ONCE at the purchase on the
+// full receipt. Allocation distributes each destination's share of it; it never
+// creates more. Re-recorded from scratch on every write so editing the price down
+// doesn't leave a stale saving behind.
+export async function writeExpenseDiscountSaving(expenseId, { amount, regularPrice, purchaseDate } = {}) {
+  await pool.query(`DELETE FROM savings_entries WHERE source_type = 'expense' AND source_id = $1`, [expenseId]);
+  const paid = amount == null ? null : Number(amount);
+  const regular = regularPrice == null ? null : Number(regularPrice);
+  if (paid == null || regular == null || !(regular > paid)) return;
+  await pool.query(
+    `INSERT INTO savings_entries (kind, amount, source_type, source_id, occurred_on, note)
+     VALUES ('one_time', $1, 'expense', $2, COALESCE($3::date, CURRENT_DATE), 'Regular price less paid price')`,
+    [Math.round((regular - paid) * 100) / 100, expenseId, purchaseDate || null]
+  );
 }
 
 const EXPENSE_UPDATE_COLUMNS = {
   vendor: 'vendor', amount: 'amount', purchaseDate: 'purchase_date', taxAmount: 'tax_amount',
-  taxChargedInError: 'tax_charged_in_error', categoryId: 'category_id', jobLineId: 'job_line_id',
-  workOrderId: 'work_order_id', assetId: 'asset_id', notes: 'notes',
+  taxChargedInError: 'tax_charged_in_error', categoryId: 'category_id',
+  assetId: 'asset_id', notes: 'notes', regularPrice: 'regular_price',
 };
+// jobLineId/workOrderId are deliberately absent — they're allocations now (0078),
+// written by setExpenseDestination below.
 // Triage/edit — same row for "complete an inbox row" and "edit an existing
 // expense," same as attachment triage. Moves triage_status to 'triaged' on
 // any save from the inbox unless the caller explicitly voids instead. Only
@@ -4221,6 +4326,19 @@ export async function updateExpense(id, fields) {
   }
   const resolvedFundId = await inheritedFundId(fields.jobLineId, fields.fundId);
   if (resolvedFundId !== undefined) { setCols.push(`fund_id = $${i++}`); vals.push(resolvedFundId); }
+  // Destination and discount live outside the column set now, so they're applied even
+  // when nothing on the expense row itself changed.
+  await setExpenseDestination(id, { jobLineId: fields.jobLineId, workOrderId: fields.workOrderId, amount: fields.amount });
+  if ('regularPrice' in fields || 'amount' in fields) {
+    const cur = await getExpense(id);
+    if (cur) {
+      await writeExpenseDiscountSaving(id, {
+        amount: 'amount' in fields ? fields.amount : cur.Amount,
+        regularPrice: 'regularPrice' in fields ? fields.regularPrice : cur.RegularPrice,
+        purchaseDate: fields.purchaseDate ?? cur.PurchaseDate,
+      });
+    }
+  }
   if (!setCols.length) return getExpense(id);
   setCols.push(`triage_status = CASE WHEN triage_status = 'inbox' THEN 'triaged' ELSE triage_status END`);
   const { rows } = await pool.query(
@@ -4245,6 +4363,795 @@ export async function unvoidExpense(id) {
   if (rows[0]) await logActivity({ action: 'unvoided', entityType: 'expense', entityId: rows[0].id, entityLabel: rows[0].vendor || 'Expense' });
 }
 
+// Money header and savings (Build Brief §7). Recurring and one-time savings are
+// reported SEPARATELY and never summed: $275/month secured forever and a $40 bulk
+// discount are not the same kind of number, and adding them produces a figure that
+// means nothing.
+export async function computeBoardReportAggregates(reportId) {
+  const report = await getBoardReport(reportId);
+  if (!report) return [];
+  const yearStart = `${String(report.PeriodEnd).slice(0, 4)}-01-01`;
+  const out = [];
+
+  // Spend comes from allocations, so a receipt split across jobs counts once per share
+  // rather than once per receipt.
+  const spend = await pool.query(
+    `SELECT COALESCE(SUM(ea.amount), 0) AS period,
+            COALESCE(SUM(ea.amount) FILTER (WHERE e.purchase_date >= $3), 0) AS ytd
+     FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND e.purchase_date BETWEEN $1 AND $2`,
+    [report.PeriodStart, report.PeriodEnd, yearStart]
+  );
+  const ytd = await pool.query(
+    `SELECT COALESCE(SUM(ea.amount), 0) AS ytd
+     FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND e.purchase_date BETWEEN $1 AND $2`,
+    [yearStart, report.PeriodEnd]
+  );
+  out.push({ groupKey: 'money', label: 'Spent this period', valueNumeric: Number(spend.rows[0].period) });
+  out.push({ groupKey: 'money', label: 'Spent year to date', valueNumeric: Number(ytd.rows[0].ytd) });
+
+  // Recurring is reported as an annual rate — that's how a monthly saving is worth
+  // understanding — while storage keeps the monthly figure that was negotiated.
+  const rec = await pool.query(
+    `SELECT COALESCE(SUM(CASE WHEN period = 'monthly' THEN amount * 12 ELSE amount END), 0) AS annualized
+     FROM savings_entries WHERE kind = 'recurring' AND occurred_on BETWEEN $1 AND $2`,
+    [report.PeriodStart, report.PeriodEnd]
+  );
+  const recAll = await pool.query(
+    `SELECT COALESCE(SUM(CASE WHEN period = 'monthly' THEN amount * 12 ELSE amount END), 0) AS annualized
+     FROM savings_entries WHERE kind = 'recurring' AND occurred_on <= $1`,
+    [report.PeriodEnd]
+  );
+  const one = await pool.query(
+    `SELECT COALESCE(SUM(amount), 0) AS total FROM savings_entries
+     WHERE kind = 'one_time' AND occurred_on BETWEEN $1 AND $2`,
+    [report.PeriodStart, report.PeriodEnd]
+  );
+  out.push({ groupKey: 'savings', label: 'Recurring savings secured this period (per year)', valueNumeric: Number(rec.rows[0].annualized) });
+  out.push({ groupKey: 'savings', label: 'Recurring savings secured to date (per year)', valueNumeric: Number(recAll.rows[0].annualized) });
+  out.push({ groupKey: 'savings', label: 'One-time savings this period', valueNumeric: Number(one.rows[0].total) });
+
+  await replaceBoardReportAggregates(reportId, out);
+  return listBoardReportAggregates(reportId);
+}
+
+// ── Board report suggestions (Build Brief §5) ────────────────────────────
+// Everything here is a SUGGESTION. Each pass upserts rows pre-checked, and
+// upsertBoardReportItem never overwrites an explicit include/exclude, so re-running
+// after a date change can't undo a decision. Nothing is ever force-included.
+
+// Done: job lines resolved inside the backward period — line level, so a work order
+// with 2 of 5 lines finished contributes those 2 and not itself.
+async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
+  const { rows } = await pool.query(
+    `SELECT jl.id, jl.title, jl.completed_date::text AS completed_date, jl.actual_hours,
+            COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost,
+            w.id AS work_order_id, w.title AS wo_title, a.name AS asset_name, s.name AS status_name
+     FROM job_lines jl
+     JOIN job_line_statuses s ON s.id = jl.status_id
+     JOIN work_orders w ON w.id = jl.work_order_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+     WHERE s.counts_as_work_performed AND jl.completed_date BETWEEN $1 AND $2
+     ORDER BY jl.completed_date DESC, jl.id`,
+    [periodStart, periodEnd]
+  );
+  const woSeen = new Set();
+  for (const [i, r] of rows.entries()) {
+    // The WO rides along as the grouping header the screen expands.
+    if (!woSeen.has(r.work_order_id)) {
+      woSeen.add(r.work_order_id);
+      await upsertBoardReportItem(reportId, {
+        itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
+        snapTitle: r.wo_title, snapAssetName: r.asset_name,
+      });
+    }
+    await upsertBoardReportItem(reportId, {
+      itemType: 'job_line', itemId: r.id, section: 'done', sortIndex: i,
+      parentWorkOrderId: r.work_order_id,
+      snapTitle: r.title, snapSubtitle: r.wo_title, snapAssetName: r.asset_name,
+      snapStatus: r.status_name, snapDate: r.completed_date,
+      snapHours: r.actual_hours, snapCost: r.cost,
+    });
+  }
+  return rows.length;
+}
+
+// Admin work: existing opt-out semantics preserved exactly — flagged tasks arrive
+// pre-checked, unflagged ones arrive unchecked rather than absent, so an excluded task
+// is visible as a decision instead of vanishing.
+async function suggestAdminTasks(reportId, { periodStart, periodEnd }) {
+  const { rows } = await pool.query(
+    `${ADMIN_TASK_SELECT} WHERE s.counts_as_work_performed AND t.task_date BETWEEN $1 AND $2
+     ORDER BY t.task_date, t.id`,
+    [periodStart, periodEnd]
+  );
+  for (const [i, r] of rows.entries()) {
+    const t = adminTaskRowShape(r);
+    await upsertBoardReportItem(reportId, {
+      itemType: 'admin_task', itemId: t.Id, section: 'admin_work', sortIndex: i,
+      included: t.IncludeInBoardReport,
+      snapTitle: t.Title, snapSubtitle: t.CategoryName, snapStatus: t.StatusName,
+      snapDate: t.TaskDate, snapHours: t.Hours,
+    });
+  }
+  return rows.length;
+}
+
+// Coming Up: scheduled inside the forward window, plus anything flagged regardless of
+// date, plus overdue. Overdue is computed, never a stored status, so it clears itself.
+async function suggestComingUp(reportId, { forwardStart, forwardEnd }) {
+  const todayStr = today();
+  const { rows } = await pool.query(
+    `SELECT jl.id, jl.title, jl.scheduled_date::text AS scheduled_date, jl.estimated_cost,
+            jl.board_focus, w.id AS work_order_id, w.title AS wo_title, w.board_focus AS wo_focus,
+            a.name AS asset_name, s.is_terminal
+     FROM job_lines jl
+     JOIN job_line_statuses s ON s.id = jl.status_id
+     JOIN work_orders w ON w.id = jl.work_order_id
+     JOIN work_order_statuses ws ON ws.id = w.status_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     WHERE NOT s.is_terminal AND NOT ws.is_terminal
+       AND (jl.scheduled_date BETWEEN $1 AND $2 OR jl.board_focus OR w.board_focus
+            OR jl.scheduled_date < $3)
+     ORDER BY jl.scheduled_date NULLS LAST, jl.id`,
+    [forwardStart, forwardEnd, todayStr]
+  );
+  for (const [i, r] of rows.entries()) {
+    const overdue = r.scheduled_date && r.scheduled_date < todayStr;
+    await upsertBoardReportItem(reportId, {
+      itemType: 'job_line', itemId: r.id, section: overdue ? 'overdue' : 'coming_up', sortIndex: i,
+      parentWorkOrderId: r.work_order_id,
+      snapTitle: r.title, snapSubtitle: r.wo_title, snapAssetName: r.asset_name,
+      snapDate: r.scheduled_date, snapCost: r.estimated_cost,
+    });
+  }
+  return rows.length;
+}
+
+// Findings flagged "Feature on board report" — no date at all, which is the point:
+// a deferred finding belongs in front of the board precisely because nothing is
+// scheduled for it.
+async function suggestFeaturedFindings(reportId) {
+  const { rows } = await pool.query(
+    `SELECT cf.id, cf.title, cf.estimated_cost, cf.severity, cf.status, a.name AS asset_name
+     FROM condition_findings cf LEFT JOIN assets a ON a.id = cf.asset_id
+     WHERE cf.board_focus = true ORDER BY cf.id DESC`
+  );
+  for (const [i, r] of rows.entries()) {
+    await upsertBoardReportItem(reportId, {
+      itemType: 'condition_finding', itemId: r.id, section: 'coming_up', sortIndex: 1000 + i,
+      snapTitle: r.title, snapSubtitle: r.severity, snapAssetName: r.asset_name,
+      snapStatus: r.status, snapCost: r.estimated_cost,
+    });
+  }
+  return rows.length;
+}
+
+// Calendar events whose TYPE is opted in, plus scheduler occurrences projected from
+// the recurrence machinery. listCalendarEventOccurrences is a pure read that already
+// reports which occurrences are materialized, so a projection is replaced by its real
+// work order rather than duplicated alongside it.
+async function suggestCalendarAndProjections(reportId, { forwardStart, forwardEnd }) {
+  const occurrences = await listCalendarEventOccurrences(forwardStart, forwardEnd);
+  const { rows: typeRows } = await pool.query(
+    'SELECT id FROM calendar_event_types WHERE show_on_board_report'
+  );
+  const showTypes = new Set(typeRows.map((t) => t.id));
+  let n = 0;
+  for (const [i, occ] of occurrences.entries()) {
+    const isPm = !!occ.WorkOrderTemplateId;
+    if (!isPm && !showTypes.has(occ.TypeId)) continue;
+    // listCalendarEventOccurrences overrides WorkOrderId with the generated one when
+    // calendar_event_generated_wo has a row for this occurrence, so for a PM occurrence
+    // a set WorkOrderId means "already materialized". That's the dedupe: the real work
+    // order becomes the item and the projection is never written beside it.
+    if (isPm && occ.WorkOrderId) {
+      await upsertBoardReportItem(reportId, {
+        itemType: 'work_order', itemId: occ.WorkOrderId, section: 'coming_up', sortIndex: 2000 + i,
+        snapTitle: occ.WorkOrderTitle || occ.Title, snapDate: occ.OccurrenceDate,
+      });
+    } else {
+      const cost = isPm ? await historicalAvgActualCost(occ.WorkOrderTemplateId) : null;
+      await upsertBoardReportItem(reportId, {
+        itemType: 'projected_occurrence', itemId: occ.Id, itemDate: occ.OccurrenceDate,
+        section: 'coming_up', sortIndex: 2000 + i,
+        snapTitle: occ.Title, snapDate: occ.OccurrenceDate, snapCost: cost,
+        // Forward Focus's cost basis, preserved on merge: a projection priced from what
+        // the job has actually cost before beats a stale estimate.
+        snapSubtitle: cost != null ? 'hist. avg' : null,
+      });
+    }
+    n += 1;
+  }
+  return n;
+}
+
+// One pass over every rule. Safe to re-run — that's what makes changing the period on
+// the screen cheap, and why upsert never clobbers a decision.
+export async function refreshBoardReportSuggestions(reportId) {
+  const report = await getBoardReport(reportId);
+  if (!report) return null;
+  if (report.Status === 'published') {
+    const e = new Error('Published reports are read-only'); e.status = 409; throw e;
+  }
+  const periods = {
+    periodStart: report.PeriodStart, periodEnd: report.PeriodEnd,
+    forwardStart: report.ForwardStart, forwardEnd: report.ForwardEnd,
+  };
+  // Stamp the pass so anything not re-suggested this time is identifiable as stale.
+  const passStartedAt = new Date();
+  const counts = {
+    done: await suggestDoneJobLines(reportId, periods),
+    adminWork: await suggestAdminTasks(reportId, periods),
+    comingUp: await suggestComingUp(reportId, periods),
+    featured: await suggestFeaturedFindings(reportId),
+    calendar: await suggestCalendarAndProjections(reportId, periods),
+  };
+  // Drop what the current period no longer suggests — but only where the user never
+  // decided anything about it. An unchecked row, a board note, or an itemized work
+  // order is a judgment, and a date change must not throw one away silently.
+  const { rows: pruned } = await pool.query(
+    `DELETE FROM board_report_items
+     WHERE report_id = $1 AND NOT user_touched AND suggested_at < $2
+     RETURNING id`,
+    [reportId, passStartedAt]
+  );
+  return {
+    counts,
+    prunedCount: pruned.length,
+    items: await listBoardReportItems(reportId),
+  };
+}
+
+// ── Board reports as entities (Build Brief §3/§4) ────────────────────────
+// Draft -> publish, with every send kept. Publishing freezes both the items and the
+// aggregates, because until now only the completed section was period-bounded and
+// every other figure silently moved as work continued.
+
+function boardReportRowShape(r) {
+  return {
+    Id: r.id, Title: r.title, Status: r.status,
+    PeriodStart: r.period_start_text || r.period_start,
+    PeriodEnd: r.period_end_text || r.period_end,
+    ForwardStart: r.forward_start_text || r.forward_start,
+    ForwardEnd: r.forward_end_text || r.forward_end,
+    SummaryNotes: r.summary_notes,
+    CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
+  };
+}
+
+const BOARD_REPORT_SELECT = `
+  SELECT r.*, r.period_start::text AS period_start_text, r.period_end::text AS period_end_text,
+         r.forward_start::text AS forward_start_text, r.forward_end::text AS forward_end_text
+  FROM board_reports r`;
+
+// §4: backward runs from the last PUBLISHED report's period_end (first ever: the start
+// of this month) through today. Forward defaults to the same length, so "last 30 days /
+// next 30 days" falls out rather than being a second thing to configure.
+export async function defaultBoardReportPeriods() {
+  const { rows } = await pool.query(
+    `SELECT period_end::text AS period_end FROM board_reports
+     WHERE status = 'published' ORDER BY period_end DESC, id DESC LIMIT 1`
+  );
+  const todayStr = today();
+  const start = rows[0]?.period_end || `${todayStr.slice(0, 7)}-01`;
+  const spanDays = Math.max(1, Math.round((new Date(todayStr) - new Date(start)) / 86400000));
+  const forwardEnd = new Date(new Date(todayStr).getTime() + spanDays * 86400000)
+    .toISOString().slice(0, 10);
+  return { periodStart: start, periodEnd: todayStr, forwardStart: todayStr, forwardEnd };
+}
+
+// One draft at a time — the partial unique index enforces it, this just makes the
+// screen idempotent: opening the report is "give me the draft," not "make one."
+export async function getOrCreateDraftBoardReport() {
+  const existing = await pool.query(`${BOARD_REPORT_SELECT} WHERE r.status = 'draft' LIMIT 1`);
+  if (existing.rows[0]) return boardReportRowShape(existing.rows[0]);
+  const p = await defaultBoardReportPeriods();
+  const title = new Date(p.periodEnd).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const { rows } = await pool.query(
+    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end)
+     VALUES ($1,'draft',$2,$3,$4,$5) RETURNING id`,
+    [title, p.periodStart, p.periodEnd, p.forwardStart, p.forwardEnd]
+  );
+  return getBoardReport(rows[0].id);
+}
+
+export async function getBoardReport(id) {
+  const { rows } = await pool.query(`${BOARD_REPORT_SELECT} WHERE r.id = $1`, [id]);
+  return rows[0] ? boardReportRowShape(rows[0]) : null;
+}
+
+export async function listBoardReports() {
+  const { rows } = await pool.query(
+    `${BOARD_REPORT_SELECT} ORDER BY COALESCE(r.published_at, r.created_at) DESC`
+  );
+  return rows.map(boardReportRowShape);
+}
+
+const BOARD_REPORT_UPDATE_COLUMNS = {
+  title: 'title', periodStart: 'period_start', periodEnd: 'period_end',
+  forwardStart: 'forward_start', forwardEnd: 'forward_end', summaryNotes: 'summary_notes',
+};
+// Published reports are read-only: a report the board has already seen must not change
+// underneath them, which is the entire point of publishing.
+export async function updateBoardReport(id, fields) {
+  const cur = await getBoardReport(id);
+  if (!cur) return null;
+  if (cur.Status === 'published') {
+    const e = new Error('Published reports are read-only'); e.status = 409; throw e;
+  }
+  const setCols = []; const vals = []; let i = 2;
+  for (const [key, col] of Object.entries(BOARD_REPORT_UPDATE_COLUMNS)) {
+    if (fields[key] === undefined) continue;
+    setCols.push(`${col} = $${i++}`); vals.push(fields[key]);
+  }
+  if (!setCols.length) return cur;
+  await pool.query(`UPDATE board_reports SET ${setCols.join(', ')} WHERE id = $1`, [id, ...vals]);
+  return getBoardReport(id);
+}
+
+export async function listBoardReportItems(reportId) {
+  const { rows } = await pool.query(
+    `SELECT *, item_date::text AS item_date_text, snap_date::text AS snap_date_text
+     FROM board_report_items WHERE report_id = $1 ORDER BY section, sort_index, id`,
+    [reportId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, ItemType: r.item_type, ItemId: r.item_id, ItemDate: r.item_date_text,
+    Section: r.section, Included: r.included, DisplayMode: r.display_mode,
+    ReportNote: r.report_note, SortIndex: r.sort_index,
+    SnapTitle: r.snap_title, SnapSubtitle: r.snap_subtitle, SnapAssetName: r.snap_asset_name,
+    SnapStatus: r.snap_status, SnapDate: r.snap_date_text,
+    SnapHours: r.snap_hours != null ? Number(r.snap_hours) : null,
+    SnapCost: r.snap_cost != null ? Number(r.snap_cost) : null,
+    SnapProgress: r.snap_progress,
+    ParentWorkOrderId: r.parent_work_order_id,
+    UserTouched: r.user_touched,
+  }));
+}
+
+// Upsert so the suggestion pass and a user's toggle write the same row. A suggestion
+// never overwrites a decision already made: included/display_mode/report_note are only
+// set on insert unless explicitly passed.
+export async function upsertBoardReportItem(reportId, {
+  itemType, itemId, itemDate = null, section, included, displayMode, reportNote, sortIndex,
+  snapTitle, snapSubtitle, snapAssetName, snapStatus, snapDate, snapHours, snapCost, snapProgress,
+  parentWorkOrderId = null,
+}) {
+  const { rows } = await pool.query(
+    `INSERT INTO board_report_items
+       (report_id, item_type, item_id, item_date, section, included, display_mode, report_note, sort_index,
+        snap_title, snap_subtitle, snap_asset_name, snap_status, snap_date, snap_hours, snap_cost, snap_progress,
+        parent_work_order_id, suggested_at)
+     VALUES ($1,$2,$3,$4,$5,COALESCE($6,true),COALESCE($7,'summary'),$8,COALESCE($9,0),
+             $10,$11,$12,$13,$14,$15,$16,$17,$18,now())
+     ON CONFLICT (report_id, item_type, item_id, item_date) DO UPDATE SET
+       section      = EXCLUDED.section,
+       included     = COALESCE($6, board_report_items.included),
+       display_mode = COALESCE($7, board_report_items.display_mode),
+       report_note  = COALESCE($8, board_report_items.report_note),
+       snap_title   = COALESCE(EXCLUDED.snap_title, board_report_items.snap_title),
+       snap_subtitle= COALESCE(EXCLUDED.snap_subtitle, board_report_items.snap_subtitle),
+       snap_asset_name = COALESCE(EXCLUDED.snap_asset_name, board_report_items.snap_asset_name),
+       snap_status  = COALESCE(EXCLUDED.snap_status, board_report_items.snap_status),
+       snap_date    = COALESCE(EXCLUDED.snap_date, board_report_items.snap_date),
+       snap_hours   = COALESCE(EXCLUDED.snap_hours, board_report_items.snap_hours),
+       snap_cost    = COALESCE(EXCLUDED.snap_cost, board_report_items.snap_cost),
+       snap_progress= COALESCE(EXCLUDED.snap_progress, board_report_items.snap_progress)
+     RETURNING id`,
+    [reportId, itemType, itemId, itemDate, section, included ?? null, displayMode ?? null,
+      reportNote ?? null, sortIndex ?? null, snapTitle ?? null, snapSubtitle ?? null,
+      snapAssetName ?? null, snapStatus ?? null, snapDate ?? null, snapHours ?? null,
+      snapCost ?? null, snapProgress ?? null, parentWorkOrderId]
+  );
+  return rows[0].id;
+}
+
+// Checking a work order is shorthand for checking all its lines (§6): the WO row is a
+// grouping header, so its own checkbox has to carry the lines with it or the tri-state
+// would lie.
+export async function setBoardReportItemIncluded(reportId, itemId, included) {
+  const { rows } = await pool.query(
+    `UPDATE board_report_items SET included = $3, user_touched = true
+     WHERE report_id = $1 AND id = $2 RETURNING item_type, item_id`,
+    [reportId, itemId, !!included]
+  );
+  if (!rows[0]) return null;
+  if (rows[0].item_type === 'work_order') {
+    await pool.query(
+      `UPDATE board_report_items SET included = $3, user_touched = true
+       WHERE report_id = $1 AND item_type = 'job_line'
+         AND item_id IN (SELECT id FROM job_lines WHERE work_order_id = $2)`,
+      [reportId, rows[0].item_id, !!included]
+    );
+  }
+  return listBoardReportItems(reportId);
+}
+
+export async function setBoardReportItemFields(reportId, itemId, { displayMode, reportNote }) {
+  const setCols = []; const vals = []; let i = 3;
+  if (displayMode !== undefined) { setCols.push(`display_mode = $${i++}`); vals.push(displayMode); }
+  if (reportNote !== undefined) { setCols.push(`report_note = $${i++}`); vals.push(reportNote); }
+  if (!setCols.length) return listBoardReportItems(reportId);
+  await pool.query(
+    `UPDATE board_report_items SET ${setCols.join(', ')}, user_touched = true
+     WHERE report_id = $1 AND id = $2`,
+    [reportId, itemId, ...vals]
+  );
+  return listBoardReportItems(reportId);
+}
+
+export async function replaceBoardReportAggregates(reportId, aggregates) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM board_report_aggregates WHERE report_id = $1', [reportId]);
+    for (const [idx, a] of aggregates.entries()) {
+      await client.query(
+        `INSERT INTO board_report_aggregates (report_id, group_key, label, value_numeric, value_text, sort_index)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [reportId, a.groupKey, a.label, a.valueNumeric ?? null, a.valueText ?? null, a.sortIndex ?? idx]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+
+export async function listBoardReportAggregates(reportId) {
+  const { rows } = await pool.query(
+    `SELECT * FROM board_report_aggregates WHERE report_id = $1 ORDER BY group_key, sort_index, id`,
+    [reportId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, GroupKey: r.group_key, Label: r.label,
+    ValueNumeric: r.value_numeric != null ? Number(r.value_numeric) : null,
+    ValueText: r.value_text, SortIndex: r.sort_index,
+  }));
+}
+
+// Publish: drop the items nobody checked, then freeze. Excluded rows are deleted rather
+// than kept as included=false, so a published report contains exactly what the board
+// saw — no shadow list of things that were considered and cut.
+export async function publishBoardReport(id) {
+  const cur = await getBoardReport(id);
+  if (!cur) return null;
+  if (cur.Status === 'published') return cur;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM board_report_items WHERE report_id = $1 AND NOT included', [id]);
+    await client.query(
+      `UPDATE board_reports SET status = 'published', published_at = now() WHERE id = $1`, [id]
+    );
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  await logActivity({ action: 'published', entityType: 'board_report', entityId: Number(id), entityLabel: cur.Title });
+  return getBoardReport(id);
+}
+
+// Every time a report leaves the app, a copy of exactly what left is kept. Email,
+// download and a deliberate "Save a copy" are the same event as far as the record is
+// concerned — the difference is only how it left.
+export async function recordBoardReportOutput(reportId, { kind, recipients, subject, wasDraft, html, text, createdBy }) {
+  const { rows } = await pool.query(
+    `INSERT INTO board_report_outputs (report_id, kind, recipients, subject, was_draft, snapshot_html, snapshot_text, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, created_at`,
+    [reportId, kind, recipients || null, subject, !!wasDraft, html, text, createdBy || null]
+  );
+  return { Id: rows[0].id, Kind: kind, CreatedAt: rows[0].created_at };
+}
+
+export async function listBoardReportOutputs(reportId = null) {
+  const { rows } = await pool.query(
+    reportId
+      ? `SELECT o.*, r.title FROM board_report_outputs o JOIN board_reports r ON r.id = o.report_id
+         WHERE o.report_id = $1 ORDER BY o.created_at DESC`
+      : `SELECT o.*, r.title FROM board_report_outputs o JOIN board_reports r ON r.id = o.report_id
+         ORDER BY o.created_at DESC`,
+    reportId ? [reportId] : []
+  );
+  return rows.map((r) => ({
+    Id: r.id, ReportId: r.report_id, ReportTitle: r.title, Kind: r.kind, CreatedAt: r.created_at,
+    Recipients: r.recipients, Subject: r.subject, WasDraft: r.was_draft, CreatedBy: r.created_by,
+  }));
+}
+
+export async function getBoardReportOutput(outputId) {
+  const { rows } = await pool.query(
+    `SELECT o.*, r.title FROM board_report_outputs o JOIN board_reports r ON r.id = o.report_id WHERE o.id = $1`,
+    [outputId]
+  );
+  if (!rows[0]) return null;
+  const r = rows[0];
+  return {
+    Id: r.id, ReportId: r.report_id, ReportTitle: r.title, Kind: r.kind, CreatedAt: r.created_at,
+    Recipients: r.recipients, Subject: r.subject, WasDraft: r.was_draft,
+    SnapshotHtml: r.snapshot_html, SnapshotText: r.snapshot_text, CreatedBy: r.created_by,
+  };
+}
+
+// ── Split editor: line items and allocations (Build Brief §9) ────────────
+
+export async function listExpenseLineItems(expenseId) {
+  const { rows } = await pool.query(
+    `SELECT li.*, m.name AS material_name, m.unit AS material_unit
+     FROM expense_line_items li LEFT JOIN materials m ON m.id = li.material_id
+     WHERE li.expense_id = $1 ORDER BY li.sort_index, li.id`,
+    [expenseId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, ExpenseId: r.expense_id, Description: r.description,
+    Quantity: r.quantity != null ? Number(r.quantity) : null, Unit: r.unit,
+    PaidAmount: r.paid_amount != null ? Number(r.paid_amount) : null,
+    RegularPrice: r.regular_price != null ? Number(r.regular_price) : null,
+    MaterialId: r.material_id, MaterialName: r.material_name || null, MaterialUnit: r.material_unit || null,
+    SortIndex: r.sort_index,
+  }));
+}
+
+export async function listExpenseAllocations(expenseId) {
+  const { rows } = await pool.query(
+    `SELECT ea.*, jl.title AS job_line_title, w.title AS work_order_title,
+            t.title AS admin_task_title, m.name AS material_name
+     FROM expense_allocations ea
+     LEFT JOIN job_lines jl ON ea.dest_type = 'job_line' AND jl.id = ea.dest_id
+     LEFT JOIN work_orders w ON ea.dest_type = 'work_order' AND w.id = ea.dest_id
+     LEFT JOIN admin_tasks t ON ea.dest_type = 'admin_task' AND t.id = ea.dest_id
+     LEFT JOIN materials m ON m.id = ea.material_id
+     WHERE ea.expense_id = $1 ORDER BY ea.id`,
+    [expenseId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, ExpenseId: r.expense_id, LineItemId: r.line_item_id,
+    DestType: r.dest_type, DestId: r.dest_id,
+    DestLabel: r.job_line_title || r.work_order_title || r.admin_task_title
+      || (r.dest_type === 'leftover' ? `Leftover stock${r.material_name ? ` — ${r.material_name}` : ''}` : null),
+    Quantity: r.quantity != null ? Number(r.quantity) : null,
+    Amount: Number(r.amount),
+    SavingsAmount: r.savings_amount != null ? Number(r.savings_amount) : 0,
+    MaterialId: r.material_id, MaterialName: r.material_name || null,
+    FundingSource: r.funding_source, FundingRefId: r.funding_ref_id,
+  }));
+}
+
+export async function createExpenseLineItem(expenseId, { description, quantity, unit, paidAmount, regularPrice, materialId, sortIndex }) {
+  const { rows } = await pool.query(
+    `INSERT INTO expense_line_items (expense_id, description, quantity, unit, paid_amount, regular_price, material_id, sort_index)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0)) RETURNING id`,
+    [expenseId, description, quantity ?? null, unit || null, paidAmount ?? null, regularPrice ?? null, materialId || null, sortIndex ?? null]
+  );
+  return rows[0].id;
+}
+
+export async function deleteExpenseLineItem(lineItemId) {
+  await pool.query('DELETE FROM expense_line_items WHERE id = $1', [lineItemId]);
+}
+
+// Savings follow the split proportionally and are never created by it: the receipt's
+// discount was counted once at purchase (§9), so each share carries its slice and the
+// slices add back up to the whole.
+async function distributeSavings(expenseId) {
+  const { rows: er } = await pool.query(
+    'SELECT amount, regular_price FROM expenses WHERE id = $1', [expenseId]
+  );
+  const paid = er[0]?.amount != null ? Number(er[0].amount) : null;
+  const regular = er[0]?.regular_price != null ? Number(er[0].regular_price) : null;
+  const discount = (paid != null && regular != null && regular > paid) ? regular - paid : 0;
+  const { rows: al } = await pool.query(
+    'SELECT id, amount FROM expense_allocations WHERE expense_id = $1 ORDER BY id', [expenseId]
+  );
+  const total = al.reduce((t, a) => t + Number(a.amount), 0);
+  for (const a of al) {
+    const share = (discount > 0 && total > 0) ? Math.round((discount * (Number(a.amount) / total)) * 100) / 100 : 0;
+    await pool.query('UPDATE expense_allocations SET savings_amount = $2 WHERE id = $1', [a.id, share]);
+  }
+}
+
+export async function createExpenseAllocation(expenseId, {
+  lineItemId, destType, destId, quantity, amount, materialId, fundingSource, fundingRefId,
+}) {
+  const { rows: er } = await pool.query('SELECT fund_id FROM expenses WHERE id = $1', [expenseId]);
+  // An explicit choice in the split editor wins; otherwise it inherits and is stamped.
+  const funding = (fundingSource !== undefined && fundingSource !== null)
+    ? { fundingSource, fundingRefId: fundingRefId ?? null }
+    : await resolveAllocationFunding({ destType, destId, fallbackFundId: er[0]?.fund_id ?? null });
+  const { rows } = await pool.query(
+    `INSERT INTO expense_allocations
+       (expense_id, line_item_id, dest_type, dest_id, quantity, amount, material_id, funding_source, funding_ref_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+    [expenseId, lineItemId || null, destType, destId || null, quantity ?? null,
+      amount ?? 0, materialId || null, funding.fundingSource, funding.fundingRefId]
+  );
+  await distributeSavings(expenseId);
+  return rows[0].id;
+}
+
+export async function deleteExpenseAllocation(allocationId) {
+  const { rows } = await pool.query(
+    'DELETE FROM expense_allocations WHERE id = $1 RETURNING expense_id', [allocationId]
+  );
+  if (rows[0]) await distributeSavings(rows[0].expense_id);
+}
+
+// What's left to split. The everyday single-destination case never shows this; it
+// exists so a partially split receipt says plainly how much is still unassigned.
+export async function getExpenseSplitSummary(expenseId) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(e.amount, 0) AS total,
+            COALESCE((SELECT SUM(amount) FROM expense_allocations WHERE expense_id = e.id), 0) AS allocated
+     FROM expenses e WHERE e.id = $1`,
+    [expenseId]
+  );
+  if (!rows[0]) return null;
+  const total = Number(rows[0].total);
+  const allocated = Number(rows[0].allocated);
+  return {
+    Total: total, Allocated: allocated,
+    Unallocated: Math.round((total - allocated) * 100) / 100,
+    FullyAllocated: Math.abs(total - allocated) < 0.005,
+  };
+}
+
+// ── Materials & leftovers (Build Brief §10) ──────────────────────────────
+// Deliberately not an inventory system. One list, one balance each, and the
+// balance is always the sum of movements — never a stored number that could
+// drift from the history explaining it.
+
+function materialRowShape(r) {
+  return {
+    Id: r.id, Name: r.name, Unit: r.unit, Active: r.active,
+    Balance: r.balance != null ? Number(r.balance) : 0,
+    LastUnitPrice: r.last_unit_price != null ? Number(r.last_unit_price) : null,
+    LastMovedAt: r.last_moved_at || null,
+  };
+}
+
+const MATERIAL_SELECT = `
+  SELECT m.*,
+         COALESCE(mv.balance, 0) AS balance,
+         mv.last_unit_price,
+         mv.last_moved_at
+  FROM materials m
+  LEFT JOIN LATERAL (
+    SELECT SUM(quantity) AS balance,
+           MAX(created_at) AS last_moved_at,
+           (SELECT unit_price FROM material_movements
+            WHERE material_id = m.id AND unit_price IS NOT NULL
+            ORDER BY created_at DESC LIMIT 1) AS last_unit_price
+    FROM material_movements WHERE material_id = m.id
+  ) mv ON true`;
+
+// Substring match, same shape the searchable combobox expects elsewhere.
+// withBalanceOnly backs the "Materials on hand" screen; the combobox wants
+// everything, including materials that are out of stock.
+export async function listMaterials({ q, withBalanceOnly = false, includeInactive = false } = {}) {
+  const where = []; const vals = [];
+  if (!includeInactive) where.push('m.active');
+  if (q) { vals.push(`%${q}%`); where.push(`m.name ILIKE $${vals.length}`); }
+  // The balance is a lateral aggregate, so it can't be filtered in the same WHERE —
+  // it goes in HAVING-equivalent position via a wrapping condition on the join output.
+  if (withBalanceOnly) where.push('COALESCE(mv.balance, 0) > 0');
+  const { rows } = await pool.query(
+    `${MATERIAL_SELECT}${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY m.name`,
+    vals
+  );
+  return rows.map(materialRowShape);
+}
+
+export async function getMaterial(id) {
+  const { rows } = await pool.query(`${MATERIAL_SELECT} WHERE m.id = $1`, [id]);
+  return rows[0] ? materialRowShape(rows[0]) : null;
+}
+
+// "Add new" inline from the combobox. Name+unit is the identity: "Drywall 1/2" in
+// sheets and in square feet are different things to count.
+export async function createMaterial({ name, unit }) {
+  const { rows } = await pool.query(
+    `INSERT INTO materials (name, unit) VALUES ($1,$2)
+     ON CONFLICT (name, unit) DO UPDATE SET active = true
+     RETURNING id`,
+    [String(name).trim(), String(unit).trim()]
+  );
+  await logActivity({ action: 'created', entityType: 'material', entityId: rows[0].id, entityLabel: name });
+  return getMaterial(rows[0].id);
+}
+
+// Every balance change is a row. Corrections included — that's the whole point:
+// "someone counted 3 and the system said 4" stays visible instead of being
+// silently overwritten.
+export async function recordMaterialMovement({
+  materialId, kind, quantity, unitPrice, workOrderId, jobLineId, note, createdBy,
+}) {
+  const qty = Number(quantity);
+  if (!Number.isFinite(qty) || qty === 0) {
+    const err = new Error('Movement quantity must be a non-zero number');
+    err.status = 400; throw err;
+  }
+  // Callers pass a magnitude; the kind decides the direction, so a UI can't
+  // accidentally file a removal that adds stock.
+  const signed = kind === 'correction' ? qty : (kind === 'wo_close' ? Math.abs(qty) : -Math.abs(qty));
+  const { rows } = await pool.query(
+    `INSERT INTO material_movements (material_id, kind, quantity, unit_price, work_order_id, job_line_id, note, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+    [materialId, kind, signed, unitPrice ?? null, workOrderId || null, jobLineId || null, note || null, createdBy || null]
+  );
+  return { Id: rows[0].id, MaterialId: materialId, Kind: kind, Quantity: signed };
+}
+
+export async function listMaterialMovements(materialId) {
+  const { rows } = await pool.query(
+    `SELECT mm.*, w.title AS work_order_title, jl.title AS job_line_title
+     FROM material_movements mm
+     LEFT JOIN work_orders w ON w.id = mm.work_order_id
+     LEFT JOIN job_lines jl ON jl.id = mm.job_line_id
+     WHERE mm.material_id = $1 ORDER BY mm.created_at DESC, mm.id DESC`,
+    [materialId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, Kind: r.kind, Quantity: Number(r.quantity),
+    UnitPrice: r.unit_price != null ? Number(r.unit_price) : null,
+    WorkOrderId: r.work_order_id, WorkOrderTitle: r.work_order_title || null,
+    JobLineId: r.job_line_id, JobLineTitle: r.job_line_title || null,
+    Note: r.note, CreatedBy: r.created_by, CreatedAt: r.created_at,
+  }));
+}
+
+// WO close (§10): which materials did this work order actually buy, and at what price?
+// Drives the "Any materials left over?" prompt — one row per material, blank meaning
+// none, so the fast path is closing the WO without typing anything.
+export async function getMaterialsUsedOnWorkOrder(workOrderId) {
+  const { rows } = await pool.query(
+    `SELECT m.id AS material_id, m.name, m.unit,
+            SUM(ea.quantity) AS quantity,
+            CASE WHEN SUM(ea.quantity) > 0 THEN SUM(ea.amount) / SUM(ea.quantity) ELSE NULL END AS unit_price
+     FROM expense_allocations ea
+     JOIN expense_line_items li ON li.id = ea.line_item_id
+     JOIN materials m ON m.id = li.material_id
+     JOIN expenses e ON e.id = ea.expense_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND ea.quantity IS NOT NULL AND ea.quantity > 0
+       AND (
+         (ea.dest_type = 'work_order' AND ea.dest_id = $1)
+         OR (ea.dest_type = 'job_line' AND ea.dest_id IN (SELECT id FROM job_lines WHERE work_order_id = $1))
+       )
+     GROUP BY m.id, m.name, m.unit
+     ORDER BY m.name`,
+    [workOrderId]
+  );
+  return rows.map((r) => ({
+    MaterialId: r.material_id, Name: r.name, Unit: r.unit,
+    QuantityUsed: Number(r.quantity),
+    UnitPrice: r.unit_price != null ? Math.round(Number(r.unit_price) * 100) / 100 : null,
+  }));
+}
+
+// Point-of-use reminder (§10): "You should have 4 sheets of Drywall 1/2 4x8 left."
+// Returns null rather than a zero so a caller can treat "nothing on hand" as "say
+// nothing" without checking a number.
+export async function getMaterialOnHand(materialId) {
+  const m = await getMaterial(materialId);
+  if (!m || !(m.Balance > 0)) return null;
+  return { MaterialId: m.Id, Name: m.Name, Unit: m.Unit, Balance: m.Balance, UnitPrice: m.LastUnitPrice };
+}
+
+// Drawing from stock moves cost at the price actually paid and is NOT a saving —
+// the saving was already counted once, when the material was bought (§10).
+export async function useMaterialFromStock({ materialId, quantity, jobLineId, workOrderId, createdBy }) {
+  const onHand = await getMaterialOnHand(materialId);
+  if (!onHand) { const e = new Error('No stock on hand for that material'); e.status = 400; throw e; }
+  const qty = Math.min(Math.abs(Number(quantity)), onHand.Balance);
+  await recordMaterialMovement({
+    materialId, kind: 'to_job', quantity: qty, unitPrice: onHand.UnitPrice,
+    workOrderId, jobLineId, note: 'Used from on-hand stock', createdBy,
+  });
+  return { MaterialId: materialId, QuantityUsed: qty, UnitPrice: onHand.UnitPrice,
+    Cost: onHand.UnitPrice != null ? Math.round(qty * onHand.UnitPrice * 100) / 100 : null };
+}
+
 export async function getExpensesReportRawData() {
   const { rows } = await pool.query(`
     SELECT e.*, ec.name AS category_name, f.name AS fund_name,
@@ -4254,8 +5161,13 @@ export async function getExpensesReportRawData() {
     FROM expenses e
     LEFT JOIN expense_categories ec ON ec.id = e.category_id
     LEFT JOIN funds f ON f.id = e.fund_id
-    LEFT JOIN job_lines jl ON jl.id = e.job_line_id
-    LEFT JOIN work_orders wo ON wo.id = e.work_order_id
+    LEFT JOIN LATERAL (
+      SELECT ea.dest_type, ea.dest_id FROM expense_allocations ea
+      WHERE ea.expense_id = e.id AND ea.dest_type IN ('job_line','work_order')
+      ORDER BY ea.id LIMIT 1
+    ) d ON true
+    LEFT JOIN job_lines jl ON d.dest_type = 'job_line' AND jl.id = d.dest_id
+    LEFT JOIN work_orders wo ON d.dest_type = 'work_order' AND wo.id = d.dest_id
     LEFT JOIN assets a ON a.id = e.asset_id
     LEFT JOIN locations l ON l.id = a.location_id
     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
@@ -4916,8 +5828,13 @@ const CALENDAR_EVENT_SELECT = `
   SELECT e.*, w.title AS wo_title, jl.title AS job_line_title, t.name AS type_name, t.gcal_color_id AS type_gcal_color_id,
          a.name AS asset_name, ch.name AS cabin_holder_name
   FROM calendar_events e
-  LEFT JOIN work_orders w ON w.id = e.work_order_id
-  LEFT JOIN job_lines jl ON jl.id = e.job_line_id
+  LEFT JOIN LATERAL (
+    SELECT ea.dest_type, ea.dest_id FROM expense_allocations ea
+    WHERE ea.expense_id = e.id AND ea.dest_type IN ('job_line','work_order')
+    ORDER BY ea.id LIMIT 1
+  ) d ON true
+  LEFT JOIN work_orders w ON d.dest_type = 'work_order' AND w.id = d.dest_id
+  LEFT JOIN job_lines jl ON d.dest_type = 'job_line' AND jl.id = d.dest_id
   LEFT JOIN calendar_event_types t ON t.id = e.type_id
   LEFT JOIN assets a ON a.id = e.asset_id
   LEFT JOIN cabin_holders ch ON ch.id = e.cabin_holder_id`;
@@ -5923,8 +6840,16 @@ function adminTaskRowShape(r) {
     CreatedBy: r.created_by, CreatedAt: r.created_at, UpdatedAt: r.updated_at,
   };
 }
+// savings moved out to savings_entries (0076) so purchases can record savings the
+// same way, but the shape callers see is unchanged: RecurringMonthlySavings still
+// comes back on the task, now read through this subquery rather than a column. One
+// recurring monthly entry per task is the invariant writeAdminTaskSaving maintains.
 const ADMIN_TASK_SELECT = `
   SELECT t.*, t.task_date::text AS task_date_text, s.name AS status_name, s.counts_as_work_performed AS status_counts_as_work_performed, c.name AS category_name,
+         (SELECT se.amount FROM savings_entries se
+          WHERE se.source_type = 'admin_task' AND se.source_id = t.id
+            AND se.kind = 'recurring' AND se.period = 'monthly'
+          ORDER BY se.id LIMIT 1) AS recurring_monthly_savings,
          (SELECT count(*) FROM attachment_links al JOIN attachments a ON a.id = al.attachment_id AND a.deleted_at IS NULL
           WHERE al.entity_type = 'admin_task' AND al.entity_id = t.id) AS attachment_count
   FROM admin_tasks t
@@ -5966,24 +6891,50 @@ async function resolveAdminTaskStatusId(statusId) {
 export async function createAdminTask({ title, description, taskDate, hours, statusId, categoryId, recurringMonthlySavings, includeInBoardReport = true, createdBy }) {
   const resolvedStatusId = await resolveAdminTaskStatusId(statusId);
   const { rows } = await pool.query(
-    `INSERT INTO admin_tasks (title, description, task_date, hours, status_id, category_id, recurring_monthly_savings, include_in_board_report, created_by)
-     VALUES ($1,$2,COALESCE($3::date, current_date),$4,$5,$6,$7,$8,$9) RETURNING id, title`,
-    [title, description || null, taskDate || null, hours ?? null, resolvedStatusId, categoryId || null, recurringMonthlySavings ?? null, includeInBoardReport !== false, createdBy || null]
+    `INSERT INTO admin_tasks (title, description, task_date, hours, status_id, category_id, include_in_board_report, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+    [title, description || null, taskDate || null, hours ?? null, resolvedStatusId, categoryId || null, includeInBoardReport !== false, createdBy || null]
   );
-  await logActivity({ action: 'created', entityType: 'admin_task', entityId: rows[0].id, entityLabel: rows[0].title });
+  await writeAdminTaskSaving(rows[0].id, recurringMonthlySavings ?? null, taskDate || null);
+  await logActivity({ action: 'created', entityType: 'admin_task', entityId: rows[0].id, entityLabel: title });
   return getAdminTask(rows[0].id);
 }
+
+// One recurring monthly savings entry per admin task. null/0 removes it, so clearing
+// the field clears the saving rather than leaving a stale row the report would keep
+// counting. occurredOn follows the task's date — when the saving was secured.
+export async function writeAdminTaskSaving(taskId, amount, taskDate) {
+  const n = amount == null || amount === '' ? null : Number(amount);
+  await pool.query(
+    `DELETE FROM savings_entries
+     WHERE source_type = 'admin_task' AND source_id = $1 AND kind = 'recurring' AND period = 'monthly'`,
+    [taskId]
+  );
+  if (n == null || !(n > 0)) return;
+  await pool.query(
+    `INSERT INTO savings_entries (kind, amount, period, source_type, source_id, occurred_on)
+     VALUES ('recurring', $1, 'monthly', 'admin_task', $2, COALESCE($3::date, CURRENT_DATE))`,
+    [n, taskId, taskDate || null]
+  );
+}
+
 const ADMIN_TASK_COLUMNS = {
   title: 'title', description: 'description', taskDate: 'task_date', hours: 'hours',
-  statusId: 'status_id', categoryId: 'category_id', recurringMonthlySavings: 'recurring_monthly_savings',
+  statusId: 'status_id', categoryId: 'category_id',
   includeInBoardReport: 'include_in_board_report',
 };
+// Not in ADMIN_TASK_COLUMNS on purpose — it lives in savings_entries now.
 export async function updateAdminTask(id, fields) {
   const setCols = []; const vals = [];
   for (const [key, col] of Object.entries(ADMIN_TASK_COLUMNS)) {
     if (!(key in fields)) continue;
     vals.push(fields[key]);
     setCols.push(`${col} = $${vals.length}`);
+  }
+  if ('recurringMonthlySavings' in fields) {
+    const cur = await getAdminTask(id);
+    if (!cur) return null;
+    await writeAdminTaskSaving(id, fields.recurringMonthlySavings, fields.taskDate ?? cur.TaskDate);
   }
   if (!setCols.length) return getAdminTask(id);
   vals.push(id);
@@ -6001,6 +6952,9 @@ export async function deleteAdminTask(id) {
   try {
     await client.query('BEGIN');
     await client.query(`DELETE FROM attachment_links WHERE entity_type = 'admin_task' AND entity_id = $1`, [id]);
+    // savings_entries is polymorphic, so no FK cascade reaches it — same reason the
+    // attachment links above have to be deleted by hand.
+    await client.query(`DELETE FROM savings_entries WHERE source_type = 'admin_task' AND source_id = $1`, [id]);
     const { rows } = await client.query('DELETE FROM admin_tasks WHERE id = $1 RETURNING title', [id]);
     await client.query('COMMIT');
     if (rows[0]) await logActivity({ action: 'deleted', entityType: 'admin_task', entityId: Number(id), entityLabel: rows[0].title });

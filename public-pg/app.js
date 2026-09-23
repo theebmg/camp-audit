@@ -133,6 +133,37 @@ function downloadBlob(content, filename, mime) {
 // In-page replacement for the browser's window.confirm — a floating modal
 // instead of native browser chrome. Resolves true/false the same way, so
 // every call site just becomes `await confirmDialog(...)`.
+// Text-input sibling of confirmDialog, same shape and styling. Native prompt() is the
+// only other way to ask for a string, and it looks nothing like the rest of this app —
+// and is suppressed outright in some embedded browsers.
+function promptDialog(message, { value = '', confirmLabel = 'Save', cancelLabel = 'Cancel', placeholder = '', multiline = false } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" role="dialog" aria-modal="true">
+        <p class="modal-message">${escapeHtml(message)}</p>
+        ${multiline
+          ? `<textarea class="modal-input" rows="3" placeholder="${escapeHtml(placeholder)}"></textarea>`
+          : `<input type="text" class="modal-input" placeholder="${escapeHtml(placeholder)}" />`}
+        <div class="btn-row" style="justify-content:flex-end;margin-top:18px">
+          <button type="button" class="btn btn-secondary modal-cancel">${escapeHtml(cancelLabel)}</button>
+          <button type="button" class="btn btn-primary modal-ok">${escapeHtml(confirmLabel)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const input = overlay.querySelector('.modal-input');
+    input.value = value || '';
+    input.style.width = '100%';
+    setTimeout(() => input.focus(), 0);
+    const done = (v) => { overlay.remove(); resolve(v); };
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => done(null));
+    overlay.querySelector('.modal-ok').addEventListener('click', () => done(input.value));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) done(null); });
+    if (!multiline) input.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(input.value); });
+  });
+}
+
 function confirmDialog(message, { confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = true } = {}) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
@@ -821,6 +852,7 @@ const NAV_ITEMS = [
   { icon: '📍', label: 'Locations', view: 'locations' },
   { icon: '🗒️', label: 'Notes', view: 'notes' },
   { icon: '💵', label: 'Expenses', view: 'expenses' },
+  { icon: '📦', label: 'Materials', view: 'materials' },
   { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '👷', label: 'Crew', view: 'crew' },
@@ -1203,6 +1235,7 @@ async function render(view, params = {}, opts = {}) {
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
       editWorkOrderLines: () => renderEditWorkOrderLines(params),
+      materials: () => renderMaterialsOnHand(),
       crew: () => renderCrew(),
       crewHours: () => renderCrewHours(),
       adminUsers: () => renderAdminUsers(),
@@ -4376,6 +4409,7 @@ async function renderExpenseDetail({ id } = {}) {
         <div class="field-row"><label>Notes</label><textarea name="notes">${escapeHtml(expense?.Notes || '')}</textarea></div>
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Save</button>
+          ${id ? '<button type="button" class="btn btn-secondary" id="splitExpenseBtn">Split this receipt…</button>' : ''}
           ${id ? '<button type="button" class="btn btn-secondary" id="voidExpenseBtn">Void</button>' : ''}
         </div>
       </form>
@@ -4441,6 +4475,12 @@ async function renderExpenseDetail({ id } = {}) {
         go('expenseDetail', { id: created.Id }, { replace: true });
       }
     } catch (err) { toast(err.message); }
+  });
+
+  // Opens only when asked. Saving the expense normally still writes its single
+  // destination behind the scenes, so nothing about the fast path changed.
+  document.getElementById('splitExpenseBtn')?.addEventListener('click', () => {
+    openSplitEditor(id, { onClose: () => go('expenseDetail', { id }, { replace: true }) });
   });
 
   document.getElementById('voidExpenseBtn')?.addEventListener('click', async () => {
@@ -4725,7 +4765,6 @@ function reportPresets(entity) {
 const REPORT_TABS = [
   { key: 'explorer', label: 'Data Explorer' },
   { key: 'board', label: 'Board Report' },
-  { key: 'forwardFocus', label: 'Forward Focus' },
   { key: 'workPerformed', label: 'Work Performed' },
   { key: 'deferredBacklog', label: 'Deferred Backlog' },
   { key: 'visitorActivity', label: 'Visitor Activity' },
@@ -4747,7 +4786,6 @@ function wireReportsTabs(container = app) {
 async function renderReports(params = {}) {
   const mode = REPORT_TABS.some((t) => t.key === params.mode) ? params.mode : 'explorer';
   if (mode === 'board') return renderBoardReport();
-  if (mode === 'forwardFocus') return renderForwardFocusReport();
   if (mode === 'workPerformed') return renderWorkPerformedReport();
   if (mode === 'deferredBacklog') return renderDeferredBacklogReport();
   if (mode === 'visitorActivity') return renderVisitorActivityReport();
@@ -5096,75 +5134,315 @@ function wireReportPreviewArea(report, { sendPath, sendBody }) {
   });
 }
 
+// Board Report draft editor (Build Brief §6/§7). Replaces the old ad-hoc range picker:
+// there is one report now, it is an entity, and everything on it is a decision you can
+// see and change. Suggestions arrive pre-checked; nothing is ever force-included.
 async function renderBoardReport() {
   setChrome({ title: 'Reports', showBack: false, showLogout: true });
-  const todayStr = isoDate(new Date());
-  const monthStartStr = isoDate(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
-  let periodStart = monthStartStr;
-  let periodEnd = todayStr;
-  let report = null;
-  let generating = false;
+  let report = null; let items = []; let aggregates = []; let outputs = [];
+  let busy = false;
+  const expanded = new Set();   // which work orders are showing their lines
+
+  async function load() {
+    const d = await api('/api/pg/board-reports/draft');
+    report = d.report; items = d.items || []; aggregates = d.aggregates || [];
+    const hist = await api('/api/pg/board-reports');
+    outputs = hist.outputs || [];
+  }
+
+  const linesOf = (woId) => items.filter((i) => i.ItemType === 'job_line' && i.ParentWorkOrderId === woId);
+
+  // Tri-state: all / some / none of a work order's lines are in (§6).
+  function woState(woId) {
+    const lines = linesOf(woId);
+    if (!lines.length) return 'none';
+    const on = lines.filter((l) => l.Included).length;
+    return on === lines.length ? 'all' : (on ? 'some' : 'none');
+  }
+
+  function itemRowHtml(it, indent = false) {
+    const bits = [it.SnapAssetName, it.SnapDate, it.SnapCost != null ? `$${Number(it.SnapCost).toLocaleString()}` : null]
+      .filter(Boolean).join(' · ');
+    return `
+      <div class="list-item br-row" data-item="${it.Id}" style="${indent ? 'padding-left:30px;' : ''}display:flex;align-items:flex-start;gap:10px">
+        <input type="checkbox" class="br-check" data-item="${it.Id}" ${it.Included ? 'checked' : ''} style="margin-top:3px" />
+        <div style="flex:1;min-width:0">
+          <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${it.SnapSubtitle ? ` <span class="muted">— ${escapeHtml(it.SnapSubtitle)}</span>` : ''}</div>
+          ${bits ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(bits)}</div>` : ''}
+          ${it.ReportNote
+            ? `<div style="font-size:0.9rem;margin-top:3px">${escapeHtml(it.ReportNote)} <a href="#" class="br-note" data-item="${it.Id}">edit</a></div>`
+            : `<a href="#" class="br-note muted" data-item="${it.Id}" style="font-size:0.82rem">+ add note</a>`}
+        </div>
+      </div>`;
+  }
+
+  function woRowHtml(it) {
+    const state = woState(it.ItemId);
+    const lines = linesOf(it.ItemId);
+    const open = expanded.has(it.ItemId);
+    return `
+      <div class="list-item br-row" data-item="${it.Id}" style="display:flex;align-items:flex-start;gap:10px">
+        <button type="button" class="btn-icon br-expand" data-wo="${it.ItemId}" style="background:none;border:none;cursor:pointer;padding:0 2px">${open ? '▾' : '▸'}</button>
+        <input type="checkbox" class="br-check" data-item="${it.Id}" ${it.Included ? 'checked' : ''} style="margin-top:3px" />
+        <div style="flex:1;min-width:0">
+          <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>
+            ${lines.length ? `<span class="muted" style="font-size:0.82rem"> — ${lines.filter((l) => l.Included).length} of ${lines.length} line(s)${state === 'some' ? ', partial' : ''}</span>` : ''}
+          </div>
+          ${it.SnapAssetName ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(it.SnapAssetName)}</div>` : ''}
+          <div style="margin-top:3px;font-size:0.82rem">
+            <label class="muted">Show as
+              <select class="br-mode" data-item="${it.Id}">
+                <option value="summary" ${it.DisplayMode === 'summary' ? 'selected' : ''}>Summary</option>
+                <option value="itemized" ${it.DisplayMode === 'itemized' ? 'selected' : ''}>Itemized</option>
+              </select>
+            </label>
+            ${it.ReportNote ? '' : `<a href="#" class="br-note muted" data-item="${it.Id}" style="margin-left:8px">+ add note</a>`}
+          </div>
+          ${it.ReportNote ? `<div style="font-size:0.9rem;margin-top:3px">${escapeHtml(it.ReportNote)} <a href="#" class="br-note" data-item="${it.Id}">edit</a></div>` : ''}
+        </div>
+      </div>
+      ${open ? lines.map((l) => itemRowHtml(l, true)).join('') : ''}`;
+  }
+
+  function sectionHtml(key, label) {
+    const rows = items.filter((i) => i.Section === key);
+    if (!rows.length) return '';
+    const wos = rows.filter((i) => i.ItemType === 'work_order');
+    const woIds = new Set(wos.map((w) => w.ItemId));
+    // Lines whose work order is in this section render underneath it, not twice.
+    const loose = rows.filter((i) => i.ItemType !== 'work_order'
+      && !(i.ItemType === 'job_line' && woIds.has(i.ParentWorkOrderId)));
+    const on = rows.filter((i) => i.Included).length;
+    return `
+      <div class="card">
+        <h3>${escapeHtml(label)} <span class="muted" style="font-weight:400;font-size:0.85rem">— ${on} of ${rows.length} included</span></h3>
+        ${wos.map(woRowHtml).join('')}
+        ${loose.map((i) => itemRowHtml(i)).join('')}
+      </div>`;
+  }
+
+  function moneyHtml() {
+    const g = (k) => aggregates.filter((a) => a.GroupKey === k);
+    if (!g('money').length && !g('savings').length) return '';
+    const tile = (a) => `
+      <div style="flex:1;min-width:150px">
+        <div class="muted" style="font-size:0.75rem;text-transform:uppercase">${escapeHtml(a.Label)}</div>
+        <div style="font-size:1.1rem;font-weight:700">${a.ValueNumeric != null ? `$${Number(a.ValueNumeric).toLocaleString()}` : escapeHtml(a.ValueText || '—')}</div>
+      </div>`;
+    return `
+      <div class="card">
+        <div style="display:flex;flex-wrap:wrap;gap:16px">${g('money').map(tile).join('')}</div>
+        ${g('savings').length ? `<div style="display:flex;flex-wrap:wrap;gap:16px;margin-top:12px;padding-top:12px;border-top:1px solid #eef0f6">${g('savings').map(tile).join('')}</div>` : ''}
+        <p class="muted" style="margin:10px 0 0;font-size:0.78rem">Figures reflect maintenance/operations tracking, not the camp's official books.</p>
+      </div>`;
+  }
 
   function draw() {
+    const published = report.Status === 'published';
     setApp(`
       ${reportsTabsHtml('board')}
       <div class="card">
-        <h3>Board Report</h3>
-        <p class="muted">Open Work Orders by status/priority, outstanding cost by funding source, completed items for the period below, and what's overdue/upcoming right now.</p>
-        <div class="field-row"><label>Period</label>
+        <h3>Board Report — ${escapeHtml(report.Title)} ${published ? '<span class="muted">(published)</span>' : '<span class="muted">(draft)</span>'}</h3>
+        <div class="field-row"><label>Period covered</label>
           <div class="report-date-range">
-            <input type="date" id="boardFrom" value="${periodStart}" />
+            <input type="date" id="brFrom" value="${report.PeriodStart}" ${published ? 'disabled' : ''} />
             <span class="muted">to</span>
-            <input type="date" id="boardTo" value="${periodEnd}" />
+            <input type="date" id="brTo" value="${report.PeriodEnd}" ${published ? 'disabled' : ''} />
           </div>
         </div>
-        <div class="btn-row"><button type="button" class="btn btn-primary" id="boardGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
+        <div class="field-row"><label>Looking ahead</label>
+          <div class="report-date-range">
+            <input type="date" id="brFwdFrom" value="${report.ForwardStart}" ${published ? 'disabled' : ''} />
+            <span class="muted">to</span>
+            <input type="date" id="brFwdTo" value="${report.ForwardEnd}" ${published ? 'disabled' : ''} />
+          </div>
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">Defaults to the same length as the period covered.</p>
+        </div>
+        ${published ? '' : `<div class="btn-row"><button type="button" class="btn btn-secondary" id="brRefresh" ${busy ? 'disabled' : ''}>${busy ? 'Working…' : 'Refresh suggestions'}</button></div>`}
       </div>
-      ${reportPreviewAreaHtml(report)}`);
+
+      ${moneyHtml()}
+
+      <div class="card">
+        <h3>Summary</h3>
+        <p class="muted">The narrative the board reads first. Saved as you type.</p>
+        <textarea id="brNotes" rows="5" ${published ? 'disabled' : ''} placeholder="What the board should know about this period…">${escapeHtml(report.SummaryNotes || '')}</textarea>
+      </div>
+
+      ${sectionHtml('done', 'Work Completed')}
+      ${sectionHtml('coming_up', 'Coming Up')}
+      ${sectionHtml('overdue', 'Overdue')}
+      ${sectionHtml('admin_work', 'Administrative Work')}
+
+      <div class="card">
+        <div class="btn-row">
+          <button type="button" class="btn btn-secondary" id="brPreview">Preview</button>
+          <button type="button" class="btn btn-secondary" id="brSave">Save a copy</button>
+          <button type="button" class="btn btn-secondary" id="brDownload">Download</button>
+          <button type="button" class="btn btn-secondary" id="brEmail">Email…</button>
+          ${published ? '' : '<button type="button" class="btn btn-primary" id="brPublish">Publish</button>'}
+        </div>
+        <p class="muted" style="margin:8px 0 0;font-size:0.82rem">Every copy that leaves the app is saved below, exactly as it went out.</p>
+      </div>
+
+      ${outputs.length ? `<div class="card">
+        <h3>History</h3>
+        ${outputs.map((o) => `<div class="list-item" style="display:flex;justify-content:space-between;gap:10px">
+          <div><strong>${escapeHtml(o.ReportTitle)}</strong> <span class="muted">— ${escapeHtml(o.Kind)}${o.WasDraft ? ' (draft)' : ''}${o.Recipients ? ` → ${escapeHtml(o.Recipients)}` : ''}</span></div>
+          <a href="#" class="br-open-output" data-id="${o.Id}">view</a>
+        </div>`).join('')}
+      </div>` : ''}
+    `);
     wireReportsTabs();
-    document.getElementById('boardGenBtn').addEventListener('click', generate);
-    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/board/send', sendBody: () => ({ periodStart, periodEnd }) });
+    wire(published);
   }
 
-  async function generate() {
-    periodStart = document.getElementById('boardFrom').value || periodStart;
-    periodEnd = document.getElementById('boardTo').value || periodEnd;
-    generating = true; draw();
-    try { report = await api(`/api/pg/reports/board/preview?periodStart=${periodStart}&periodEnd=${periodEnd}`); }
-    catch (err) { toast(err.message); }
-    generating = false; draw();
+  async function patchReport(fields) {
+    await api(`/api/pg/board-reports/${report.Id}`, { method: 'PATCH', body: JSON.stringify(fields) });
   }
 
+  async function refresh() {
+    busy = true; draw();
+    try {
+      const r = await api(`/api/pg/board-reports/${report.Id}/refresh`, { method: 'POST' });
+      items = r.items || [];
+      const d = await api(`/api/pg/board-reports/${report.Id}`);
+      aggregates = d.aggregates || [];
+      if (r.prunedCount) toast(`${r.prunedCount} item(s) no longer match this period`);
+    } catch (e) { toast(e.message, 5000); }
+    busy = false; draw();
+  }
+
+  async function output(kind, extra = {}) {
+    try {
+      const res = await api(`/api/pg/board-reports/${report.Id}/output`, {
+        method: 'POST', body: JSON.stringify({ kind, ...extra }),
+      });
+      return res;
+    } catch (e) {
+      // 409 = this is still a draft; ask once, then repeat with the confirmation.
+      if (/still a draft/i.test(e.message)) {
+        if (await confirmDialog('This report is still a draft. Send it anyway? It will be clearly marked DRAFT.',
+          { confirmLabel: 'Yes, mark it DRAFT', cancelLabel: 'Cancel', danger: false })) {
+          return output(kind, { ...extra, confirmDraft: true });
+        }
+        return null;
+      }
+      toast(e.message, 5000); return null;
+    }
+  }
+
+  function wire(published) {
+    document.getElementById('brPreview').addEventListener('click', async () => {
+      const res = await output('manual', {});   // previewing pins nothing extra beyond the copy
+      if (res) showHtmlModal(res.html);
+    });
+    document.getElementById('brSave').addEventListener('click', async () => {
+      const res = await output('manual', {});
+      if (res) { toast('Copy saved'); await load(); draw(); }
+    });
+    document.getElementById('brDownload').addEventListener('click', async () => {
+      const res = await output('download', {});
+      if (!res) return;
+      // Saves the exact bytes that were recorded, not a re-render.
+      const blob = new Blob([res.html], { type: 'text/html' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${res.subject.replace(/[^\w -]/g, '')}.html`;
+      document.body.appendChild(a); a.click(); a.remove();
+      toast('Downloaded and saved to history'); await load(); draw();
+    });
+    document.getElementById('brEmail').addEventListener('click', async () => {
+      const recipient = await promptDialog('Email the board report to:', { confirmLabel: 'Send', placeholder: 'name@example.org' });
+      if (!recipient || !recipient.trim()) return;
+      const res = await output('email', { recipient });
+      if (res) { toast(`Sent to ${recipient}`); await load(); draw(); }
+    });
+    const pub = document.getElementById('brPublish');
+    if (pub) pub.addEventListener('click', async () => {
+      const on = items.filter((i) => i.Included).length;
+      if (!await confirmDialog(`Publish this report with ${on} item(s)? Unchecked items are dropped and the report becomes read-only.`,
+        { confirmLabel: 'Publish', cancelLabel: 'Keep editing', danger: false })) return;
+      await api(`/api/pg/board-reports/${report.Id}/publish`, { method: 'POST' });
+      toast('Published'); await load(); draw();
+    });
+    app.querySelectorAll('.br-open-output').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const d = await api(`/api/pg/board-report-outputs/${el.dataset.id}`);
+      showHtmlModal(d.output.SnapshotHtml);
+    }));
+
+    if (published) return;
+
+    for (const [id, field] of [['brFrom', 'periodStart'], ['brTo', 'periodEnd'], ['brFwdFrom', 'forwardStart'], ['brFwdTo', 'forwardEnd']]) {
+      document.getElementById(id).addEventListener('change', async (e) => {
+        await patchReport({ [field]: e.target.value });
+        await refresh();
+      });
+    }
+    let notesTimer;
+    document.getElementById('brNotes').addEventListener('input', (e) => {
+      clearTimeout(notesTimer);
+      notesTimer = setTimeout(() => patchReport({ summaryNotes: e.target.value }), 700);
+    });
+    app.querySelectorAll('.br-expand').forEach((b) => b.addEventListener('click', () => {
+      const id = Number(b.dataset.wo);
+      if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
+      draw();
+    }));
+    app.querySelectorAll('.br-check').forEach((cb) => cb.addEventListener('change', async () => {
+      const r = await api(`/api/pg/board-reports/${report.Id}/items/${cb.dataset.item}`, {
+        method: 'PATCH', body: JSON.stringify({ included: cb.checked }),
+      });
+      items = r.items; draw();
+    }));
+    app.querySelectorAll('.br-mode').forEach((sel) => sel.addEventListener('change', async () => {
+      const r = await api(`/api/pg/board-reports/${report.Id}/items/${sel.dataset.item}`, {
+        method: 'PATCH', body: JSON.stringify({ displayMode: sel.value }),
+      });
+      items = r.items; draw();
+    }));
+    app.querySelectorAll('.br-note').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const it = items.find((x) => String(x.Id) === el.dataset.item);
+      const note = await promptDialog('Board-facing note for this item (leave blank to remove):', {
+        value: it?.ReportNote || '', multiline: true,
+        placeholder: 'Shown to the board — separate from the work order\'s own notes',
+      });
+      if (note === null) return;
+      const r = await api(`/api/pg/board-reports/${report.Id}/items/${el.dataset.item}`, {
+        method: 'PATCH', body: JSON.stringify({ reportNote: note }),
+      });
+      items = r.items; draw();
+    }));
+  }
+
+  await load();
+  // First open of a fresh draft has nothing in it yet; fill it before drawing so the
+  // screen never appears empty for no reason.
+  if (!items.length && report.Status === 'draft') {
+    try { const r = await api(`/api/pg/board-reports/${report.Id}/refresh`, { method: 'POST' }); items = r.items || []; } catch { /* draw empty */ }
+    try { const d = await api(`/api/pg/board-reports/${report.Id}`); aggregates = d.aggregates || []; } catch { /* ignore */ }
+  }
   draw();
 }
 
-async function renderForwardFocusReport() {
-  setChrome({ title: 'Reports', showBack: false, showLogout: true });
-  let report = null;
-  let generating = false;
-
-  function draw() {
-    setApp(`
-      ${reportsTabsHtml('forwardFocus')}
-      <div class="card">
-        <h3>Forward Focus</h3>
-        <p class="muted">Work Orders and Condition Findings flagged for board focus, sorted by cost — a recurring PM item shows the historical average actual cost of past instances instead of its estimate.</p>
-        <div class="btn-row"><button type="button" class="btn btn-primary" id="ffGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
-      </div>
-      ${reportPreviewAreaHtml(report)}`);
-    wireReportsTabs();
-    document.getElementById('ffGenBtn').addEventListener('click', generate);
-    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/forward-focus/send', sendBody: () => ({}) });
-  }
-
-  async function generate() {
-    generating = true; draw();
-    try { report = await api('/api/pg/reports/forward-focus/preview'); }
-    catch (err) { toast(err.message); }
-    generating = false; draw();
-  }
-
-  draw();
+// Shows rendered report HTML in an overlay. Used for Preview and for opening any past
+// copy out of history — same viewer either way, so what you preview and what was sent
+// look identical by construction.
+function showHtmlModal(html) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:760px;width:94%;max-height:86vh;overflow:auto">
+    <div style="display:flex;justify-content:flex-end"><button type="button" class="btn btn-secondary modal-cancel">Close</button></div>
+    <iframe style="width:100%;height:70vh;border:1px solid #eef0f6;border-radius:8px;margin-top:10px"></iframe>
+  </div>`;
+  document.body.appendChild(overlay);
+  const frame = overlay.querySelector('iframe');
+  frame.srcdoc = html;
+  const close = () => overlay.remove();
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 }
 
 // "Work Performed in a Date Range" (§6.2.1) — the fall-to-spring board
@@ -8516,6 +8794,365 @@ const RESPONSIBILITY_CLASS_LABELS = { self: 'Self', volunteer: 'Volunteer', vend
 //
 // options: [{ value, label, sublabel? }] — `value` is compared with String().
 // Returns { getValue, setValue, setOptions, focus, input }.
+// ── Materials on hand (Build Brief §10) ──────────────────────────────────
+// The ONLY materials screen. Not an inventory system: no counts to reconcile, no
+// reorder points, no locations. A list of what's left over and where each balance came
+// from, because the balance is only trustworthy if you can see the movements behind it.
+async function renderMaterialsOnHand() {
+  setChrome({ title: 'Materials on hand', showBack: true, showLogout: true });
+  let materials = [];
+  let showAll = false;
+
+  async function load() {
+    const d = await api(`/api/pg/materials${showAll ? '' : '?onHand=true'}`);
+    materials = d.materials || [];
+  }
+
+  function draw() {
+    setApp(`
+      <div class="card">
+        <h3>Materials on hand</h3>
+        <p class="muted">What's left over from finished jobs, at the price actually paid. Drawing from stock moves that cost onto the new job — it isn't counted as a saving, because the saving was already counted when it was bought.</p>
+        <div class="btn-row">
+          <button type="button" class="btn btn-secondary" id="matToggle">${showAll ? 'Only show what\'s in stock' : 'Show everything, including empty'}</button>
+          <button type="button" class="btn btn-primary" id="matAdd">Add material</button>
+        </div>
+      </div>
+      <div class="card">
+        ${materials.length ? materials.map((m) => `
+          <div class="list-item mat-row" data-id="${m.Id}" style="display:flex;justify-content:space-between;align-items:center;gap:10px;cursor:pointer">
+            <div>
+              <div><strong>${escapeHtml(m.Name)}</strong> <span class="muted">(${escapeHtml(m.Unit)})</span></div>
+              <div class="muted" style="font-size:0.82rem">${m.LastUnitPrice != null ? `$${Number(m.LastUnitPrice).toFixed(2)} per ${escapeHtml(m.Unit)}` : 'no price recorded'}${m.LastMovedAt ? ` · last moved ${String(m.LastMovedAt).slice(0, 10)}` : ''}</div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-weight:700;font-size:1.05rem">${m.Balance}</div>
+              <div class="muted" style="font-size:0.75rem">${escapeHtml(m.Unit)}</div>
+            </div>
+          </div>`).join('') : `<p class="muted">${showAll ? 'No materials yet.' : 'Nothing in stock right now.'}</p>`}
+      </div>`);
+    document.getElementById('matToggle').addEventListener('click', async () => { showAll = !showAll; await load(); draw(); });
+    document.getElementById('matAdd').addEventListener('click', async () => {
+      const name = await promptDialog('Material name', { placeholder: 'Drywall ½ 4×8' });
+      if (!name || !name.trim()) return;
+      const unit = await promptDialog(`Unit for "${name.trim()}"`, { placeholder: 'sheets', confirmLabel: 'Add' });
+      if (!unit || !unit.trim()) return;
+      try { await api('/api/pg/materials', { method: 'POST', body: JSON.stringify({ name, unit }) });
+        toast('Material added'); await load(); draw();
+      } catch (e) { toast(e.message, 5000); }
+    });
+    app.querySelectorAll('.mat-row').forEach((el) => el.addEventListener('click', () => openMaterialHistory(el.dataset.id, { onClose: async () => { await load(); draw(); } })));
+  }
+
+  await load();
+  draw();
+}
+
+// Balance = sum of movements, so the history IS the explanation. Corrections show up
+// here as their own rows rather than quietly changing a number.
+async function openMaterialHistory(materialId, { onClose } = {}) {
+  const d = await api(`/api/pg/materials/${materialId}`);
+  const m = d.material;
+  const KINDS = { wo_close: 'Left over at WO close', to_job: 'Used on a job', correction: 'Correction', tossed: 'Tossed / damaged' };
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:560px;width:95%;max-height:86vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">${escapeHtml(m.Name)} <span class="muted" style="font-weight:400">(${escapeHtml(m.Unit)})</span></h3>
+      <button type="button" class="btn btn-secondary modal-cancel">Done</button>
+    </div>
+    <p style="margin:10px 0"><strong style="font-size:1.2rem">${m.Balance}</strong> <span class="muted">${escapeHtml(m.Unit)} on hand</span></p>
+    <div class="btn-row">
+      <button type="button" class="btn btn-secondary" id="matCorrect">Correct the count</button>
+      <button type="button" class="btn btn-secondary" id="matToss">Tossed / damaged</button>
+    </div>
+    <h4 style="margin:16px 0 6px">Movements</h4>
+    ${(d.movements || []).length ? d.movements.map((mv) => `
+      <div class="list-item">
+        <div><strong>${mv.Quantity > 0 ? '+' : ''}${mv.Quantity}</strong> — ${escapeHtml(KINDS[mv.Kind] || mv.Kind)}</div>
+        <div class="muted" style="font-size:0.82rem">${String(mv.CreatedAt).slice(0, 10)}${mv.WorkOrderTitle ? ` · ${escapeHtml(mv.WorkOrderTitle)}` : ''}${mv.JobLineTitle ? ` · ${escapeHtml(mv.JobLineTitle)}` : ''}${mv.Note ? ` · ${escapeHtml(mv.Note)}` : ''}</div>
+      </div>`).join('') : '<p class="muted">No movements yet.</p>'}
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => { overlay.remove(); if (onClose) onClose(); };
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  async function record(kind, quantity, note) {
+    try {
+      await api(`/api/pg/materials/${materialId}/movements`, {
+        method: 'POST', body: JSON.stringify({ kind, quantity, note: note || null }),
+      });
+      toast('Recorded'); overlay.remove(); openMaterialHistory(materialId, { onClose });
+    } catch (e) { toast(e.message, 5000); }
+  }
+
+  // Ask for the count, not the change. Nobody standing in a shed works out "that's
+  // minus one" — they can see there are three. The system does the subtraction and
+  // stores the difference, so the movement log still adds up to the balance.
+  overlay.querySelector('#matCorrect').addEventListener('click', async () => {
+    const countStr = await promptDialog(
+      `${m.Name}: the system says ${m.Balance} ${m.Unit}. How many do you actually have?`,
+      { value: String(m.Balance), placeholder: String(m.Balance), confirmLabel: 'Next' }
+    );
+    if (countStr === null || !countStr.trim()) return;
+    const actual = Number(countStr);
+    if (!Number.isFinite(actual) || actual < 0) return toast('Enter a count', 4000);
+    const delta = Math.round((actual - Number(m.Balance)) * 100) / 100;
+    if (delta === 0) return toast('That matches what was recorded — nothing to correct');
+    const note = await promptDialog(
+      `Recording ${delta > 0 ? '+' : ''}${delta} ${m.Unit} to make the balance ${actual}. Why? (optional)`,
+      { confirmLabel: 'Record correction', multiline: true, placeholder: 'e.g. two sheets were damaged in storage' }
+    );
+    if (note === null) return;   // cancelled at the note step
+    await record('correction', delta, note);
+  });
+
+  // Its own action, and still a quantity: "how many are unusable" is the thing being
+  // counted, not a new total.
+  overlay.querySelector('#matToss').addEventListener('click', async () => {
+    const qtyStr = await promptDialog(`How many ${m.Unit} of ${m.Name} are unusable?`, { confirmLabel: 'Next' });
+    if (qtyStr === null || !qtyStr.trim()) return;
+    const quantity = Number(qtyStr);
+    if (!Number.isFinite(quantity) || quantity <= 0) return toast('Enter a quantity', 4000);
+    if (quantity > Number(m.Balance)) return toast(`Only ${m.Balance} ${m.Unit} on hand`, 4000);
+    const note = await promptDialog('What happened? (optional)', { confirmLabel: 'Record', multiline: true });
+    if (note === null) return;
+    await record('tossed', quantity, note);
+  });
+}
+
+// Prompt at work-order close (§10). Skipped entirely when the WO bought no tracked
+// materials, so closing an ordinary job is unchanged. Blank means none — the fast path
+// is closing without typing anything.
+async function promptLeftoversOnClose(workOrderId) {
+  let used = [];
+  try { const d = await api(`/api/pg/work-orders/${workOrderId}/materials-used`); used = d.materials || []; }
+  catch { return true; }
+  if (!used.length) return true;
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal-box" style="max-width:520px;width:95%">
+      <h3 style="margin:0 0 4px">Any materials left over?</h3>
+      <p class="muted" style="margin:0 0 12px">Leave blank for anything fully used. What you enter goes to stock at the price this job paid.</p>
+      ${used.map((u) => `
+        <div class="field-row"><label>${escapeHtml(u.Name)} <span class="muted">(${escapeHtml(u.Unit)}${u.UnitPrice != null ? ` · $${u.UnitPrice.toFixed(2)} each` : ''})</span></label>
+          <input type="number" step="0.01" min="0" class="leftover-qty" data-material="${u.MaterialId}" data-price="${u.UnitPrice ?? ''}" placeholder="used ${u.QuantityUsed}" />
+        </div>`).join('')}
+      <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+        <button type="button" class="btn btn-secondary modal-skip">Nothing left over</button>
+        <button type="button" class="btn btn-primary modal-ok">Save</button>
+      </div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const finish = (v) => { overlay.remove(); resolve(v); };
+    overlay.querySelector('.modal-skip').addEventListener('click', () => finish(true));
+    overlay.querySelector('.modal-ok').addEventListener('click', async () => {
+      const leftovers = [...overlay.querySelectorAll('.leftover-qty')]
+        .map((i) => ({ materialId: Number(i.dataset.material), quantity: Number(i.value), unitPrice: i.dataset.price === '' ? null : Number(i.dataset.price) }))
+        .filter((l) => Number.isFinite(l.quantity) && l.quantity > 0);
+      try {
+        if (leftovers.length) {
+          const r = await api(`/api/pg/work-orders/${workOrderId}/leftovers`, { method: 'POST', body: JSON.stringify({ leftovers }) });
+          toast(`${r.recorded} material(s) added to stock`);
+        }
+        finish(true);
+      } catch (e) { toast(e.message, 5000); finish(false); }
+    });
+  });
+}
+
+// Point-of-use reminder (§10). Returns the quantity drawn from stock, or 0. Says
+// nothing at all when there's no balance, which is why the endpoint answers with null
+// rather than a zero.
+async function remindMaterialOnHand(materialId, { jobLineId = null, workOrderId = null } = {}) {
+  let onHand = null;
+  try { const d = await api(`/api/pg/materials/${materialId}/on-hand`); onHand = d.onHand; } catch { return 0; }
+  if (!onHand) return 0;
+  const use = await confirmDialog(
+    `You should have ${onHand.Balance} ${onHand.Unit} of ${onHand.Name} left. Use it on this job?`,
+    { confirmLabel: 'Use from stock', cancelLabel: 'Not now', danger: false }
+  );
+  if (!use) return 0;
+  const qtyStr = await promptDialog(`How many ${onHand.Unit}?`, { value: String(onHand.Balance), confirmLabel: 'Use' });
+  if (qtyStr === null) return 0;
+  const quantity = Number(qtyStr);
+  if (!Number.isFinite(quantity) || quantity <= 0) return 0;
+  try {
+    const r = await api(`/api/pg/materials/${materialId}/use-from-stock`, {
+      method: 'POST', body: JSON.stringify({ quantity, jobLineId, workOrderId }),
+    });
+    toast(`Used ${r.QuantityUsed} ${onHand.Unit} from stock${r.Cost != null ? ` — $${r.Cost.toFixed(2)}` : ''}`);
+    return r.QuantityUsed;
+  } catch (e) { toast(e.message, 5000); return 0; }
+}
+
+// Split editor (Build Brief §9). Opened deliberately from an expense — the ordinary
+// form still writes one destination behind the scenes, so the everyday path never sees
+// any of this and stays exactly as fast as it was.
+//
+// Line items are OPTIONAL. An emailed receipt nobody itemized can still be split whole,
+// by dollars; itemizing is extra detail, never a precondition.
+async function openSplitEditor(expenseId, { onClose } = {}) {
+  let data = null;
+  let materials = [];
+  let woOptions = [];
+  let taskOptions = [];
+
+  async function load() {
+    data = await api(`/api/pg/expenses/${expenseId}/split`);
+    const [m, wo, at] = await Promise.all([
+      api('/api/pg/materials').catch(() => ({ materials: [] })),
+      api('/api/pg/work-orders?limit=200').catch(() => ({ workOrders: [] })),
+      api('/api/pg/admin-tasks').catch(() => ({ tasks: [] })),
+    ]);
+    materials = m.materials || [];
+    woOptions = (wo.workOrders || wo.items || []).map((w) => ({ value: `work_order:${w.Id}`, label: `WO — ${w.Title}` }));
+    taskOptions = (at.tasks || []).map((t) => ({ value: `admin_task:${t.Id}`, label: `Task — ${t.Title}` }));
+  }
+
+  const money = (n) => `$${Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  function destOptions() {
+    const lines = [];
+    for (const w of (data.jobLines || [])) lines.push({ value: `job_line:${w.Id}`, label: `Line — ${w.Title}` });
+    return [...lines, ...woOptions, ...taskOptions,
+      ...materials.map((m) => ({ value: `leftover:${m.Id}`, label: `Leftover stock — ${m.Name} (${m.Unit})` }))];
+  }
+
+  function draw(overlay) {
+    const s = data.summary;
+    const allocs = data.allocations || [];
+    const lis = data.lineItems || [];
+    overlay.querySelector('.split-body').innerHTML = `
+      <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:12px">
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Receipt total</div><div style="font-weight:700">${money(s.Total)}</div></div>
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Allocated</div><div style="font-weight:700">${money(s.Allocated)}</div></div>
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Still unassigned</div>
+          <div style="font-weight:700;color:${s.Unallocated > 0.005 ? '#b4690e' : '#2e8b57'}">${money(s.Unallocated)}</div></div>
+      </div>
+      ${s.Unallocated > 0.005 ? `<p class="muted" style="margin:0 0 10px">The unassigned part still draws on this receipt's fund — splitting the rest doesn't have to happen now.</p>` : ''}
+
+      <h4 style="margin:14px 0 6px">Where the money went</h4>
+      ${allocs.length ? allocs.map((a) => `
+        <div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+          <div>
+            <div><strong>${escapeHtml(a.DestLabel || a.DestType)}</strong> — ${money(a.Amount)}${a.Quantity != null ? ` <span class="muted">(${a.Quantity})</span>` : ''}</div>
+            <div class="muted" style="font-size:0.8rem">${escapeHtml(a.FundingSource || 'operating_budget')}${a.SavingsAmount ? ` · saved ${money(a.SavingsAmount)}` : ''}${a.LineItemId ? ' · from a line item' : ''}</div>
+          </div>
+          <button type="button" class="btn btn-secondary split-del-alloc" data-id="${a.Id}">Remove</button>
+        </div>`).join('') : '<p class="muted">Nothing split yet.</p>'}
+
+      <div class="card" style="margin-top:10px;background:#fbfbfe">
+        <div class="field-row"><label>Add a destination</label><div id="splitDestPicker"></div></div>
+        <div class="field-row"><label>Amount</label><input type="number" step="0.01" min="0" id="splitAmount" placeholder="${s.Unallocated > 0 ? s.Unallocated : ''}" /></div>
+        <div class="field-row"><label>Quantity (optional)</label><input type="number" step="0.01" min="0" id="splitQty" /></div>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="splitAddAlloc">Add split</button></div>
+      </div>
+
+      <h4 style="margin:18px 0 6px">Line items <span class="muted" style="font-weight:400;font-size:0.85rem">— optional detail</span></h4>
+      ${lis.length ? lis.map((l) => `
+        <div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+          <div><strong>${escapeHtml(l.Description)}</strong>${l.Quantity != null ? ` <span class="muted">— ${l.Quantity} ${escapeHtml(l.Unit || '')}</span>` : ''}${l.MaterialName ? ` <span class="muted">· ${escapeHtml(l.MaterialName)}</span>` : ''}
+            ${l.PaidAmount != null ? `<div class="muted" style="font-size:0.8rem">${money(l.PaidAmount)}${l.RegularPrice != null ? ` (reg. ${money(l.RegularPrice)})` : ''}</div>` : ''}
+          </div>
+          <button type="button" class="btn btn-secondary split-del-li" data-id="${l.Id}">Remove</button>
+        </div>`).join('') : '<p class="muted">None — the receipt can still be split whole, by dollars.</p>'}
+      <div class="card" style="margin-top:10px;background:#fbfbfe">
+        <div class="field-row"><label>Description</label><input type="text" id="liDesc" placeholder="Drywall ½ 4×8" /></div>
+        <div class="field-row"><label>Material (optional)</label><div id="liMaterialPicker"></div></div>
+        <div class="field-row"><label>Qty / unit</label>
+          <div style="display:flex;gap:8px"><input type="number" step="0.01" id="liQty" style="flex:1" /><input type="text" id="liUnit" placeholder="sheets" style="flex:1" /></div>
+        </div>
+        <div class="field-row"><label>Paid / regular price</label>
+          <div style="display:flex;gap:8px"><input type="number" step="0.01" id="liPaid" style="flex:1" /><input type="number" step="0.01" id="liReg" placeholder="without the deal" style="flex:1" /></div>
+        </div>
+        <div class="btn-row"><button type="button" class="btn btn-secondary" id="liAdd">Add line item</button></div>
+      </div>`;
+
+    let dest = null;
+    mountCombobox(overlay.querySelector('#splitDestPicker'), {
+      options: destOptions(), placeholder: 'Work order, job line, task, or leftover stock…',
+      onSelect: (o) => { dest = o ? o.value : null; },
+      onClear: () => { dest = null; },
+    });
+    let liMaterial = null;
+    mountCombobox(overlay.querySelector('#liMaterialPicker'), {
+      options: materials.map((m) => ({ value: m.Id, label: `${m.Name} (${m.Unit})` })),
+      placeholder: 'Only if this is a tracked material…',
+      onSelect: async (o) => {
+        liMaterial = o ? o.value : null;
+        // "You should have 4 sheets left" — says nothing when there's no balance.
+        if (liMaterial) await remindMaterialOnHand(liMaterial, {});
+      },
+      onClear: () => { liMaterial = null; },
+    });
+
+    overlay.querySelector('#splitAddAlloc').addEventListener('click', async () => {
+      if (!dest) return toast('Pick where this share went', 4000);
+      const [destType, destId] = String(dest).split(':');
+      const amount = Number(overlay.querySelector('#splitAmount').value || 0);
+      if (!(amount > 0)) return toast('Enter an amount', 4000);
+      try {
+        const r = await api(`/api/pg/expenses/${expenseId}/allocations`, {
+          method: 'POST',
+          body: JSON.stringify({
+            destType: destType === 'leftover' ? 'leftover' : destType,
+            destId: destType === 'leftover' ? null : Number(destId),
+            materialId: destType === 'leftover' ? Number(destId) : null,
+            amount, quantity: overlay.querySelector('#splitQty').value || null,
+          }),
+        });
+        data.allocations = r.allocations; data.summary = r.summary;
+        draw(overlay);
+      } catch (e) { toast(e.message, 5000); }
+    });
+    overlay.querySelectorAll('.split-del-alloc').forEach((b) => b.addEventListener('click', async () => {
+      const r = await api(`/api/pg/expenses/${expenseId}/allocations/${b.dataset.id}`, { method: 'DELETE' });
+      data.allocations = r.allocations; data.summary = r.summary; draw(overlay);
+    }));
+    overlay.querySelector('#liAdd').addEventListener('click', async () => {
+      const description = overlay.querySelector('#liDesc').value.trim();
+      if (!description) return toast('Describe the line item', 4000);
+      try {
+        const r = await api(`/api/pg/expenses/${expenseId}/line-items`, {
+          method: 'POST',
+          body: JSON.stringify({
+            description, materialId: liMaterial,
+            quantity: overlay.querySelector('#liQty').value || null,
+            unit: overlay.querySelector('#liUnit').value || null,
+            paidAmount: overlay.querySelector('#liPaid').value || null,
+            regularPrice: overlay.querySelector('#liReg').value || null,
+          }),
+        });
+        data.lineItems = r.lineItems; draw(overlay);
+      } catch (e) { toast(e.message, 5000); }
+    });
+    overlay.querySelectorAll('.split-del-li').forEach((b) => b.addEventListener('click', async () => {
+      const r = await api(`/api/pg/expenses/${expenseId}/line-items/${b.dataset.id}`, { method: 'DELETE' });
+      data.lineItems = r.lineItems; data.allocations = r.allocations; data.summary = r.summary; draw(overlay);
+    }));
+  }
+
+  await load();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:640px;width:95%;max-height:88vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">Split this receipt</h3>
+      <button type="button" class="btn btn-secondary modal-cancel">Done</button>
+    </div>
+    <div class="split-body" style="margin-top:12px"></div>
+  </div>`;
+  document.body.appendChild(overlay);
+  draw(overlay);
+  const close = () => { overlay.remove(); if (onClose) onClose(); };
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+}
+
 function mountCombobox(container, {
   options = [], value = null, placeholder = 'Type to search…',
   emptyText = 'No matches', inputClass = '', extraRowHtml = null, onExtraRow = null,
@@ -10555,6 +11192,10 @@ async function renderWorkOrderDetail({ id }, container = app) {
 
   container.querySelector('#completeWoBtn').addEventListener('click', async () => {
     if (!await confirmDialog(`Complete this Work Order? Any pending "asset field update" entries will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;
+    // Asked before completing, not after: a closed work order with its leftovers
+    // unrecorded is the state nobody goes back to fix. Returns true immediately when
+    // this WO bought no tracked materials, so an ordinary close is unchanged.
+    if (!await promptLeftoversOnClose(id)) return;
     try {
       await api(`/api/pg/work-orders/${id}/complete`, { method: 'POST' });
       toast('Work order completed — asset updated');

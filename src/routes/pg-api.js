@@ -7,9 +7,9 @@
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
-import { buildCapitalPlanPg, buildBoardReportPg, buildForwardFocusReportPg, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
+import { buildCapitalPlanPg, buildBoardReportPg, renderBoardReportFromItems, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
 import {
-  renderBoardReportHtml, renderBoardReportText, renderForwardFocusHtml, renderForwardFocusText, renderPlainEmailHtml,
+  renderBoardReportHtml, renderBoardReportText, renderPlainEmailHtml,
   renderWorkPerformedHtml, renderWorkPerformedText, renderDeferredBacklogHtml, renderDeferredBacklogText,
   renderVisitorActivityHtml, renderVisitorActivityText,
 } from '../reportRender.js';
@@ -85,6 +85,34 @@ import {
   listAdminTasks, getAdminTask, createAdminTask, updateAdminTask, deleteAdminTask,
   listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
   getExpensesReportRawData,
+  getOrCreateDraftBoardReport,
+  refreshBoardReportSuggestions,
+  getBoardReport,
+  listBoardReports,
+  updateBoardReport,
+  listBoardReportItems,
+  setBoardReportItemIncluded,
+  setBoardReportItemFields,
+  listBoardReportAggregates,
+  publishBoardReport,
+  recordBoardReportOutput,
+  listBoardReportOutputs,
+  getBoardReportOutput,
+  listExpenseLineItems,
+  listExpenseAllocations,
+  createExpenseLineItem,
+  deleteExpenseLineItem,
+  createExpenseAllocation,
+  deleteExpenseAllocation,
+  getExpenseSplitSummary,
+  listMaterials,
+  getMaterial,
+  createMaterial,
+  recordMaterialMovement,
+  listMaterialMovements,
+  getMaterialsUsedOnWorkOrder,
+  getMaterialOnHand,
+  useMaterialFromStock,
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
 } from '../db.js';
@@ -1059,53 +1087,13 @@ router.delete('/reports/favorites/:id', async (req, res, next) => {
 // ---- Board / monthly report — HTML + browser print, same email pattern as
 //      the legacy Activity/Capital reports in routes/reports.js. ----
 
-router.get('/reports/board/preview', async (req, res, next) => {
-  try {
-    const { periodStart, periodEnd } = req.query;
-    const data = await buildBoardReportPg({ periodStart, periodEnd });
-    res.json({ title: 'Board Report', html: renderBoardReportHtml(data), text: renderBoardReportText(data) });
-  } catch (e) { next(e); }
-});
-
-router.post('/reports/board/send', async (req, res, next) => {
-  try {
-    const { periodStart, periodEnd, recipient, subject } = req.body || {};
-    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
-    const data = await buildBoardReportPg({ periodStart, periodEnd });
-    await sendMail({
-      to: recipient,
-      subject: subject || `Camp Sychar — Board Report (${data.periodStart} to ${data.periodEnd})`,
-      html: renderBoardReportHtml(data),
-      text: renderBoardReportText(data),
-    });
-    res.json({ ok: true });
-  } catch (e) { next(e); }
-});
-
-router.get('/reports/forward-focus/preview', async (req, res, next) => {
-  try {
-    const data = await buildForwardFocusReportPg();
-    res.json({ title: 'Forward Focus', html: renderForwardFocusHtml(data), text: renderForwardFocusText(data) });
-  } catch (e) { next(e); }
-});
-
-router.post('/reports/forward-focus/send', async (req, res, next) => {
-  try {
-    const { recipient, subject } = req.body || {};
-    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
-    const data = await buildForwardFocusReportPg();
-    await sendMail({
-      to: recipient,
-      subject: subject || 'Camp Sychar — Forward Focus',
-      html: renderForwardFocusHtml(data),
-      text: renderForwardFocusText(data),
-    });
-    res.json({ ok: true });
-  } catch (e) { next(e); }
-});
-
-// ---- Work Performed / Deferred Backlog — named reports (Build Brief v2 Phase 6) ----
-
+// The ad-hoc board preview/send routes are gone (phase 6). There is one way a board
+// report is produced or sent now — the draft — so nothing can be emailed that isn't
+// also recorded as a send against a report.
+// Forward Focus retired (Build Brief §2): its content is the Coming Up section of the
+// unified board report now, and board_focus is relabelled "Feature on board report".
+// getBoardFocusItems stays in db.js — the flags it reads are still the flags Coming Up
+// suggests from.
 router.get('/reports/work-performed/preview', async (req, res, next) => {
   try {
     const { from, to } = req.query;
@@ -1979,6 +1967,291 @@ router.delete('/calendar-events/:id', async (req, res, next) => {
 });
 
 // ---- Checklists (simple ordered steps — templates + live checkable instances) ----
+
+// ── Board reports: draft, publish, history, sends (§3/§4) ────────────────
+router.get('/board-reports', async (req, res, next) => {
+  try { res.json({ reports: await listBoardReports(), outputs: await listBoardReportOutputs() }); } catch (e) { next(e); }
+});
+
+// The report screen opens the draft rather than creating one — idempotent, so two
+// tabs land on the same draft instead of racing for the one-draft index.
+router.get('/board-reports/draft', async (req, res, next) => {
+  try {
+    const report = await getOrCreateDraftBoardReport();
+    res.json({
+      report,
+      items: await listBoardReportItems(report.Id),
+      aggregates: await listBoardReportAggregates(report.Id),
+    });
+  } catch (e) { next(e); }
+});
+
+router.get('/board-reports/:id', async (req, res, next) => {
+  try {
+    const report = await getBoardReport(req.params.id);
+    if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({
+      report,
+      items: await listBoardReportItems(report.Id),
+      aggregates: await listBoardReportAggregates(report.Id),
+      outputs: await listBoardReportOutputs(report.Id),
+    });
+  } catch (e) { next(e); }
+});
+
+// Periods and the summary narrative. Autosaved by the screen; the generic dirty-guard
+// covers the notes field because it's a textarea inside the report form.
+router.patch('/board-reports/:id', async (req, res, next) => {
+  try {
+    const { title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes } = req.body || {};
+    const report = await updateBoardReport(req.params.id, {
+      title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes,
+    });
+    if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, report });
+  } catch (e) { next(e); }
+});
+
+router.patch('/board-reports/:id/items/:itemId', async (req, res, next) => {
+  try {
+    const { included, displayMode, reportNote } = req.body || {};
+    let items;
+    if (included !== undefined) items = await setBoardReportItemIncluded(req.params.id, req.params.itemId, included);
+    if (displayMode !== undefined || reportNote !== undefined) {
+      items = await setBoardReportItemFields(req.params.id, req.params.itemId, { displayMode, reportNote });
+    }
+    if (!items) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, items });
+  } catch (e) { next(e); }
+});
+
+// Re-runs every suggestion rule. Safe to call whenever the period changes — upserts
+// refresh the snapshots but never undo an explicit include/exclude.
+router.post('/board-reports/:id/refresh', async (req, res, next) => {
+  try {
+    const result = await refreshBoardReportSuggestions(req.params.id);
+    if (!result) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
+router.post('/board-reports/:id/publish', async (req, res, next) => {
+  try {
+    const report = await publishBoardReport(req.params.id);
+    if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, report });
+  } catch (e) { next(e); }
+});
+
+// Email, download and "Save a copy" all funnel through here: the report is rendered
+// once, recorded once, and — for email only — actually sent. That's what makes "every
+// copy that left the app is on file" true rather than aspirational.
+//
+// Sending or downloading a DRAFT is allowed but never silent: the caller must pass
+// confirmDraft, and both subject and body are prefixed so a working copy can't be
+// mistaken for the real thing (§3).
+router.post('/board-reports/:id/output', async (req, res, next) => {
+  try {
+    const { kind, recipient, subject, confirmDraft } = req.body || {};
+    if (!['email', 'download', 'manual'].includes(kind)) {
+      return res.status(400).json({ ok: false, error: 'kind must be email, download or manual' });
+    }
+    if (kind === 'email' && !recipient) {
+      return res.status(400).json({ ok: false, error: 'recipient is required to email' });
+    }
+    const report = await getBoardReport(req.params.id);
+    if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+
+    const isDraft = report.Status === 'draft';
+    // A manual save is an explicit act of pinning a draft, so it needs no second
+    // confirmation; leaving the app does.
+    if (isDraft && kind !== 'manual' && !confirmDraft) {
+      return res.status(409).json({
+        ok: false,
+        error: 'This report is still a draft. Repeat with confirmDraft to proceed anyway.',
+      });
+    }
+
+    const { html, text } = await renderBoardReportFromItems(report.Id);
+    const baseSubject = subject || `Camp Sychar — Board Report (${report.Title})`;
+    const finalSubject = isDraft ? `DRAFT — ${baseSubject}` : baseSubject;
+
+    if (kind === 'email') await sendMail({ to: recipient, subject: finalSubject, html, text });
+
+    const output = await recordBoardReportOutput(report.Id, {
+      kind, recipients: kind === 'email' ? recipient : null, subject: finalSubject,
+      wasDraft: isDraft, html, text, createdBy: req.user?.username || null,
+    });
+    // html comes back so a download can save the very bytes that were recorded,
+    // rather than re-rendering client-side and drifting from the stored copy.
+    res.json({ ok: true, output, html, text, subject: finalSubject });
+  } catch (e) { next(e); }
+});
+
+// History: open any past copy and see exactly what left, not a re-render of it.
+router.get('/board-report-outputs/:outputId', async (req, res, next) => {
+  try {
+    const output = await getBoardReportOutput(req.params.outputId);
+    if (!output) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ output });
+  } catch (e) { next(e); }
+});
+
+// ── Split editor (§9) ────────────────────────────────────────────────────
+// Only ever opened deliberately. The ordinary expense form still writes one
+// destination behind the scenes, so the fast path never touches any of this.
+router.get('/expenses/:id/split', async (req, res, next) => {
+  try {
+    const summary = await getExpenseSplitSummary(req.params.id);
+    if (!summary) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({
+      summary,
+      lineItems: await listExpenseLineItems(req.params.id),
+      allocations: await listExpenseAllocations(req.params.id),
+    });
+  } catch (e) { next(e); }
+});
+
+router.post('/expenses/:id/line-items', async (req, res, next) => {
+  try {
+    const { description, quantity, unit, paidAmount, regularPrice, materialId, sortIndex } = req.body || {};
+    if (!description || !String(description).trim()) {
+      return res.status(400).json({ ok: false, error: 'description is required' });
+    }
+    await createExpenseLineItem(req.params.id, { description, quantity, unit, paidAmount, regularPrice, materialId, sortIndex });
+    res.json({ ok: true, lineItems: await listExpenseLineItems(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+router.delete('/expenses/:id/line-items/:lineItemId', async (req, res, next) => {
+  try {
+    await deleteExpenseLineItem(req.params.lineItemId);
+    res.json({
+      ok: true,
+      lineItems: await listExpenseLineItems(req.params.id),
+      allocations: await listExpenseAllocations(req.params.id),
+      summary: await getExpenseSplitSummary(req.params.id),
+    });
+  } catch (e) { next(e); }
+});
+
+router.post('/expenses/:id/allocations', async (req, res, next) => {
+  try {
+    const { lineItemId, destType, destId, quantity, amount, materialId, fundingSource, fundingRefId } = req.body || {};
+    if (!['work_order', 'job_line', 'admin_task', 'leftover'].includes(destType)) {
+      return res.status(400).json({ ok: false, error: 'destType must be work_order, job_line, admin_task or leftover' });
+    }
+    if (destType === 'leftover' && !materialId) {
+      return res.status(400).json({ ok: false, error: 'Leftover stock has to say which material it is' });
+    }
+    if (destType !== 'leftover' && !destId) {
+      return res.status(400).json({ ok: false, error: 'destId is required for that destination' });
+    }
+    await createExpenseAllocation(req.params.id, { lineItemId, destType, destId, quantity, amount, materialId, fundingSource, fundingRefId });
+    res.json({
+      ok: true,
+      allocations: await listExpenseAllocations(req.params.id),
+      summary: await getExpenseSplitSummary(req.params.id),
+    });
+  } catch (e) { next(e); }
+});
+
+router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) => {
+  try {
+    await deleteExpenseAllocation(req.params.allocationId);
+    res.json({
+      ok: true,
+      allocations: await listExpenseAllocations(req.params.id),
+      summary: await getExpenseSplitSummary(req.params.id),
+    });
+  } catch (e) { next(e); }
+});
+
+// ── Materials & leftovers (§10) ──────────────────────────────────────────
+router.get('/materials', async (req, res, next) => {
+  try {
+    const { q, onHand, includeInactive } = req.query;
+    res.json({ materials: await listMaterials({
+      q: q || undefined,
+      withBalanceOnly: onHand === 'true',
+      includeInactive: includeInactive === 'true',
+    }) });
+  } catch (e) { next(e); }
+});
+
+router.post('/materials', async (req, res, next) => {
+  try {
+    const { name, unit } = req.body || {};
+    if (!name || !String(name).trim()) return res.status(400).json({ ok: false, error: 'name is required' });
+    if (!unit || !String(unit).trim()) return res.status(400).json({ ok: false, error: 'unit is required' });
+    res.json({ ok: true, material: await createMaterial({ name, unit }) });
+  } catch (e) { next(e); }
+});
+
+router.get('/materials/:id', async (req, res, next) => {
+  try {
+    const material = await getMaterial(req.params.id);
+    if (!material) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ material, movements: await listMaterialMovements(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+// The point-of-use reminder. 200 with onHand:null when there's nothing to say, rather
+// than a 404 — "no stock" is a normal answer, not a missing resource.
+router.get('/materials/:id/on-hand', async (req, res, next) => {
+  try { res.json({ onHand: await getMaterialOnHand(req.params.id) }); } catch (e) { next(e); }
+});
+
+// Corrections and tossed/damaged both land here — every balance change is a movement.
+router.post('/materials/:id/movements', async (req, res, next) => {
+  try {
+    const { kind, quantity, unitPrice, workOrderId, jobLineId, note } = req.body || {};
+    if (!['wo_close', 'to_job', 'correction', 'tossed'].includes(kind)) {
+      return res.status(400).json({ ok: false, error: 'kind must be wo_close, to_job, correction or tossed' });
+    }
+    const movement = await recordMaterialMovement({
+      materialId: Number(req.params.id), kind, quantity, unitPrice,
+      workOrderId, jobLineId, note, createdBy: req.user?.username || null,
+    });
+    res.json({ ok: true, movement, material: await getMaterial(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+router.post('/materials/:id/use-from-stock', async (req, res, next) => {
+  try {
+    const { quantity, jobLineId, workOrderId } = req.body || {};
+    const used = await useMaterialFromStock({
+      materialId: Number(req.params.id), quantity, jobLineId, workOrderId,
+      createdBy: req.user?.username || null,
+    });
+    res.json({ ok: true, ...used, material: await getMaterial(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+// Backs the "Any materials left over?" prompt at WO close. Empty array = this WO
+// bought no tracked materials, so the prompt is skipped entirely.
+router.get('/work-orders/:id/materials-used', async (req, res, next) => {
+  try { res.json({ materials: await getMaterialsUsedOnWorkOrder(req.params.id) }); } catch (e) { next(e); }
+});
+
+// One call for the whole prompt: a quantity per material, blanks omitted by the client.
+router.post('/work-orders/:id/leftovers', async (req, res, next) => {
+  try {
+    const { leftovers } = req.body || {};
+    if (!Array.isArray(leftovers)) return res.status(400).json({ ok: false, error: 'leftovers must be an array' });
+    const recorded = [];
+    for (const l of leftovers) {
+      const qty = Number(l?.quantity);
+      if (!Number.isFinite(qty) || qty <= 0) continue;   // blank means none
+      recorded.push(await recordMaterialMovement({
+        materialId: Number(l.materialId), kind: 'wo_close', quantity: qty,
+        unitPrice: l.unitPrice ?? null, workOrderId: Number(req.params.id),
+        note: 'Left over at work order close', createdBy: req.user?.username || null,
+      }));
+    }
+    res.json({ ok: true, recorded: recorded.length });
+  } catch (e) { next(e); }
+});
 
 router.get('/checklist-templates', async (req, res, next) => {
   try { res.json({ templates: await listChecklistTemplates() }); } catch (e) { next(e); }
