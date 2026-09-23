@@ -1,5 +1,24 @@
 # Open Questions
 
+## Q4 — Should ad-hoc flags allow photos too?
+
+Raised 2026-09-23 while wiring photos per answer.
+
+Photos now attach to any question with `allows_photo`. An **ad-hoc flag** ("Flag
+something else") has no question behind it, so there is no `allows_photo` to consult —
+and addendum §3 does say it captures "optional photo(s)".
+
+The plumbing already works: an ad-hoc flag is an `audit_answers` row like any other, so
+`entityType: 'audit_answer'` would attach to it unchanged. What's missing is only the
+button in the ad-hoc dialog.
+
+**Options:** always offer a photo on an ad-hoc flag (it's the case where a photo is most
+useful — you're describing something the form never anticipated); or leave it text-only
+to keep that dialog short. **My lean: always offer it.** Not built, because the ad-hoc
+dialog is currently a sequence of prompts and adding a file picker mid-sequence needs a
+real form rather than a fourth prompt.
+
+
 ## Status — 2026-09-23 (later: everything below is DEPLOYED)
 
 ### DEPLOYED to audit.fracturedrv.com

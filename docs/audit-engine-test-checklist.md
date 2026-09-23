@@ -120,3 +120,47 @@ The flags and remedies are **placeholders**, listed in `docs/audit-engine-decisi
 - **Checklist editor on WO templates** (board-report brief §7) — the checklist tables
   gained a `section` column but there is no editing screen.
 - Drag reordering in the builder (arrows/drag); ordering is by `sort_index` today.
+
+---
+
+# Final three pieces + the iPhone photo fix — 2026-09-23, deployed
+
+## iPhone photo picker (test this first, on the phone)
+
+`capture="environment"` was telling iOS to open the camera and skip its menu entirely,
+so there was no way to attach a photo already in the library. Removed from **all six**
+image inputs; `accept="image/*"` and `multiple` kept.
+
+- [ ] On the iPhone, tap **any** photo button. iOS shows **Photo Library / Take Photo /
+      Choose File** — not the camera straight away.
+- [ ] Pick two photos at once from the library; both attach.
+- [ ] Check all six places: an asset's photos, a component photo during an audit,
+      general condition photos, a finding photo, the shared attachment control on a work
+      order, and the public maintenance-request form at `/request`.
+
+## Photos per answer in the runner
+
+- [ ] Start an audit, reach a **condition question** (roof, siding, foundation — these
+      are the ones with `allows_photo`).
+- [ ] Tap **📷 photo** → the iOS menu appears → pick from the library.
+- [ ] The thumbnail appears under that question.
+- [ ] Take a photo **before** answering the question — it still attaches (the answer row
+      is created empty and the value arrives later).
+- [ ] Leave and come back; the photo is still there.
+
+## Checklist sections
+
+- [ ] Admin → **Checklist Templates** → add a step. Each step now has a **Section** field
+      suggesting "Tools & Materials" plus any section already used in that template.
+- [ ] Attach the checklist to a work order → the card groups steps under their section
+      headings, in the order the sections first appear.
+- [ ] A checklist with no sections renders exactly as it did before — flat, ungrouped.
+
+## Builder reordering
+
+- [ ] Audit Rounds → Edit form. Each top-level question has **↑ ↓** buttons.
+- [ ] Tap ↓ — the question moves and the order survives a reload. **This is the phone
+      story:** HTML5 drag events don't fire on touch at all.
+- [ ] On a desktop, drag a question by its row — it drops where you leave it.
+- [ ] Follow-up questions have no arrows and don't drag; they travel with the answer
+      that reveals them.
