@@ -4655,6 +4655,29 @@ export async function addBoardReportItemManually(reportId, item) {
   return listBoardReportItems(reportId);
 }
 
+// What has actually reached the board. An item counts as reported ONLY if it was
+// included in a report that was PUBLISHED.
+//
+// This is nearly free to compute because publishBoardReport deletes unchecked rows
+// before flipping the status — so every row still attached to a published report is,
+// by construction, one that was checked when it went out. Drafts, saved copies and
+// emailed drafts are all still status='draft', so none of them mark anything reported.
+//
+// Deliberately NOT filtered by manually_added: an item added by hand and left checked
+// at publish reached the board exactly like any other, and one added by hand then
+// unchecked was deleted at publish and stays eligible.
+async function getReportedItemKeys() {
+  const { rows } = await pool.query(
+    `SELECT bi.item_type, bi.item_id, bi.item_date::text AS item_date
+     FROM board_report_items bi
+     JOIN board_reports br ON br.id = bi.report_id
+     WHERE br.status = 'published'`
+  );
+  return new Set(rows.map((r) => `${r.item_type}:${r.item_id}:${r.item_date || ''}`));
+}
+
+const reportedKey = (itemType, itemId, itemDate = null) => `${itemType}:${itemId}:${itemDate || ''}`;
+
 // ── Board report suggestions (Build Brief §5) ────────────────────────────
 // Everything here is a SUGGESTION. Each pass upserts rows pre-checked, and
 // upsertBoardReportItem never overwrites an explicit include/exclude, so re-running
@@ -4662,7 +4685,7 @@ export async function addBoardReportItemManually(reportId, item) {
 
 // Done: job lines resolved inside the backward period — line level, so a work order
 // with 2 of 5 lines finished contributes those 2 and not itself.
-async function suggestDoneJobLines(reportId, passId, { periodStart, periodEnd }) {
+async function suggestDoneJobLines(reportId, passId, reported, { periodStart, periodEnd }) {
   // Falls back to completed_at — when the line was MARKED done — so work entered in
   // arrears with the date left blank still reaches the report (§3). The fallback is
   // reported back so the UI can say "date not recorded" rather than passing a status
@@ -4690,8 +4713,12 @@ async function suggestDoneJobLines(reportId, passId, { periodStart, periodEnd })
   );
   const woSeen = new Set();
   for (const [i, r] of rows.entries()) {
-    // The WO rides along as the grouping header the screen expands.
-    if (!woSeen.has(r.work_order_id)) {
+    // Already on a published report — it reached the board, so it is not proposed again.
+    if (reported.has(reportedKey('job_line', r.id))) continue;
+    // The WO rides along as the grouping header the screen expands. It is skipped when
+    // the header itself was already reported, but NOT merely because some of its lines
+    // were — a work order with new lines this period still needs its header.
+    if (!woSeen.has(r.work_order_id) && !reported.has(reportedKey('work_order', r.work_order_id))) {
       woSeen.add(r.work_order_id);
       await upsertBoardReportItem(reportId, { passId,
         itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
@@ -4714,7 +4741,7 @@ async function suggestDoneJobLines(reportId, passId, { periodStart, periodEnd })
 // Admin work: existing opt-out semantics preserved exactly — flagged tasks arrive
 // pre-checked, unflagged ones arrive unchecked rather than absent, so an excluded task
 // is visible as a decision instead of vanishing.
-async function suggestAdminTasks(reportId, passId, { periodStart, periodEnd }) {
+async function suggestAdminTasks(reportId, passId, reported, { periodStart, periodEnd }) {
   const { rows } = await pool.query(
     `${ADMIN_TASK_SELECT} WHERE s.counts_as_work_performed AND t.task_date BETWEEN $1 AND $2
      ORDER BY t.task_date, t.id`,
@@ -4722,6 +4749,7 @@ async function suggestAdminTasks(reportId, passId, { periodStart, periodEnd }) {
   );
   for (const [i, r] of rows.entries()) {
     const t = adminTaskRowShape(r);
+    if (reported.has(reportedKey('admin_task', t.Id))) continue;
     await upsertBoardReportItem(reportId, { passId,
       itemType: 'admin_task', itemId: t.Id, section: 'admin_work', sortIndex: i,
       included: t.IncludeInBoardReport,
@@ -4734,7 +4762,7 @@ async function suggestAdminTasks(reportId, passId, { periodStart, periodEnd }) {
 
 // Coming Up: scheduled inside the forward window, plus anything flagged regardless of
 // date, plus overdue. Overdue is computed, never a stored status, so it clears itself.
-async function suggestComingUp(reportId, passId, { forwardStart, forwardEnd }) {
+async function suggestComingUp(reportId, passId, reported, { forwardStart, forwardEnd }) {
   const todayStr = today();
   const { rows } = await pool.query(
     `SELECT jl.id, jl.title, jl.scheduled_date::text AS scheduled_date, jl.estimated_cost,
@@ -4753,6 +4781,7 @@ async function suggestComingUp(reportId, passId, { forwardStart, forwardEnd }) {
     [forwardStart, forwardEnd, todayStr]
   );
   for (const [i, r] of rows.entries()) {
+    if (reported.has(reportedKey('job_line', r.id))) continue;
     const overdue = r.scheduled_date && r.scheduled_date < todayStr;
     await upsertBoardReportItem(reportId, { passId,
       itemType: 'job_line', itemId: r.id, section: overdue ? 'overdue' : 'coming_up', sortIndex: i,
@@ -4772,13 +4801,14 @@ async function suggestComingUp(reportId, passId, { forwardStart, forwardEnd }) {
 // Findings flagged "Feature on board report" — no date at all, which is the point:
 // a deferred finding belongs in front of the board precisely because nothing is
 // scheduled for it.
-async function suggestFeaturedFindings(reportId, passId) {
+async function suggestFeaturedFindings(reportId, passId, reported) {
   const { rows } = await pool.query(
     `SELECT cf.id, cf.title, cf.estimated_cost, cf.severity, cf.status, a.name AS asset_name
      FROM condition_findings cf LEFT JOIN assets a ON a.id = cf.asset_id
      WHERE cf.board_focus = true ORDER BY cf.id DESC`
   );
   for (const [i, r] of rows.entries()) {
+    if (reported.has(reportedKey('condition_finding', r.id))) continue;
     await upsertBoardReportItem(reportId, { passId,
       itemType: 'condition_finding', itemId: r.id, section: 'coming_up', sortIndex: 1000 + i,
       snapTitle: r.title, snapSubtitle: r.severity, snapAssetName: r.asset_name,
@@ -4792,7 +4822,7 @@ async function suggestFeaturedFindings(reportId, passId) {
 // the recurrence machinery. listCalendarEventOccurrences is a pure read that already
 // reports which occurrences are materialized, so a projection is replaced by its real
 // work order rather than duplicated alongside it.
-async function suggestCalendarAndProjections(reportId, passId, { forwardStart, forwardEnd }) {
+async function suggestCalendarAndProjections(reportId, passId, reported, { forwardStart, forwardEnd }) {
   const occurrences = await listCalendarEventOccurrences(forwardStart, forwardEnd);
   const { rows: typeRows } = await pool.query(
     'SELECT id FROM calendar_event_types WHERE show_on_board_report'
@@ -4806,6 +4836,8 @@ async function suggestCalendarAndProjections(reportId, passId, { forwardStart, f
     // calendar_event_generated_wo has a row for this occurrence, so for a PM occurrence
     // a set WorkOrderId means "already materialized". That's the dedupe: the real work
     // order becomes the item and the projection is never written beside it.
+    if (reported.has(reportedKey('work_order', occ.WorkOrderId))
+        || reported.has(reportedKey('projected_occurrence', occ.Id, occ.OccurrenceDate))) continue;
     if (isPm && occ.WorkOrderId) {
       await upsertBoardReportItem(reportId, { passId,
         itemType: 'work_order', itemId: occ.WorkOrderId, section: 'coming_up', sortIndex: 2000 + i,
@@ -4843,12 +4875,14 @@ export async function refreshBoardReportSuggestions(reportId) {
   // comparing a JS clock to the database's was what made the prune delete rows the pass
   // had just written (0093).
   const passId = `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+  // Fetched once for the whole pass rather than per item.
+  const reported = await getReportedItemKeys();
   const counts = {
-    done: await suggestDoneJobLines(reportId, passId, periods),
-    adminWork: await suggestAdminTasks(reportId, passId, periods),
-    comingUp: await suggestComingUp(reportId, passId, periods),
-    featured: await suggestFeaturedFindings(reportId, passId),
-    calendar: await suggestCalendarAndProjections(reportId, passId, periods),
+    done: await suggestDoneJobLines(reportId, passId, reported, periods),
+    adminWork: await suggestAdminTasks(reportId, passId, reported, periods),
+    comingUp: await suggestComingUp(reportId, passId, reported, periods),
+    featured: await suggestFeaturedFindings(reportId, passId, reported),
+    calendar: await suggestCalendarAndProjections(reportId, passId, reported, periods),
   };
   // Drop what the current period no longer suggests — but only where the user never
   // decided anything about it. An unchecked row, a board note, or an itemized work
@@ -5024,7 +5058,18 @@ export async function upsertBoardReportItem(reportId, {
 // Checking a work order is shorthand for checking all its lines (§6): the WO row is a
 // grouping header, so its own checkbox has to carry the lines with it or the tri-state
 // would lie.
+// A published report is the record of what the board saw. Editing its items would
+// rewrite that after the fact — and now that "reported" is derived from exactly these
+// rows, it would also silently change what is eligible for future reports.
+async function assertReportEditable(reportId) {
+  const { rows } = await pool.query('SELECT status FROM board_reports WHERE id = $1', [reportId]);
+  if (rows[0]?.status === 'published') {
+    const e = new Error('Published reports are read-only'); e.status = 409; throw e;
+  }
+}
+
 export async function setBoardReportItemIncluded(reportId, itemId, included) {
+  await assertReportEditable(reportId);
   const { rows } = await pool.query(
     `UPDATE board_report_items SET included = $3, user_touched = true
      WHERE report_id = $1 AND id = $2 RETURNING item_type, item_id`,
@@ -5043,6 +5088,7 @@ export async function setBoardReportItemIncluded(reportId, itemId, included) {
 }
 
 export async function setBoardReportItemFields(reportId, itemId, { displayMode, reportNote }) {
+  await assertReportEditable(reportId);
   const setCols = []; const vals = []; let i = 3;
   if (displayMode !== undefined) { setCols.push(`display_mode = $${i++}`); vals.push(displayMode); }
   if (reportNote !== undefined) { setCols.push(`report_note = $${i++}`); vals.push(reportNote); }
