@@ -283,3 +283,78 @@ Net: two reversed (1, 4), two confirmed (3, 5), one answered where I had no lean
   since no live recurring events exist.
 - **Keep the historical-average cost** for recurring WOs in Coming Up, labeled
   "(hist. avg)".
+
+---
+
+# Funding per allocation — design, and the one choice it forces
+
+Investigated 2026-09-23, before building, per the instruction to report first.
+
+## There are not two funding models — there is one, plus a specialization
+
+**General model** (`job_lines`, `work_orders`, `job_line_templates`):
+`funding_source` ∈ `operating_budget | capital_campaign | cabin_holder | other | fund`,
+plus `funding_ref_id` pointing at the table that source implies —
+`capital_campaign_projects`, `cabin_holders`, `other_budget_categories`, `funds`.
+`operating_budget` carries no ref.
+
+**Specialization** (`expenses.fund_id` → `funds`): a direct pointer used for balance
+math. `getFundBalances()` powers the dashboard tile "$X of $Y remaining · N days left"
+from `SUM(expenses.amount) WHERE fund_id = …`.
+
+`inheritedFundId(jobLineId, fundId)` bridges them: an expense on a job line whose
+`funding_source = 'fund'` inherits that line's `funding_ref_id`, unless a fund was
+chosen explicitly.
+
+(Checked and withdrawn: `'fund'` looked absent from the `job_lines` CHECK in 0031, which
+would have made that inheritance dead code. The **live** constraint includes it — it was
+widened later. The bridge works.)
+
+Live data: all 13 job lines are `operating_budget`; 6 of 11 expenses carry a `fund_id`;
+1 fund exists; **0 expenses carry an `asset_id`**.
+
+## Proposal
+
+**Put the general model on the allocation, and derive fund balances from it.**
+
+- `expense_allocations` gains `funding_source` + `funding_ref_id`, the same shape
+  `job_lines` uses.
+- Defaults when a split row is created: a `job_line` destination stamps that line's
+  funding; `work_order`, `admin_task` and `leftover` default to `operating_budget`.
+  Overridable per row — that is the point of the split.
+- `getFundBalances()` moves from `SUM(expenses.amount) WHERE fund_id = X` to
+  `SUM(expense_allocations.amount) WHERE funding_source = 'fund' AND funding_ref_id = X`.
+  A receipt split across two funds then draws down both correctly, which the current
+  single `fund_id` cannot express at all.
+- `expenses.fund_id` retires exactly like `work_order_id`/`job_line_id`: its value moves
+  into the expense's single allocation, and the row shape keeps `FundId`/`FundName` so
+  nothing downstream changes.
+- `expenses.asset_id` **stays on the expense.** It is a reporting dimension of the
+  receipt ("this receipt was about Cabin 12"), not a destination — it is read by filters
+  and display joins, never by cost rollups. 0 rows use it today.
+
+## The choice this forces: stamp, or resolve at read
+
+Once funding lives on the allocation, an allocation's funding can **drift** from its job
+line's current funding, because the line can be re-funded later.
+
+**Stamp (recommended).** Copy the line's funding onto the allocation at split time and
+never touch it again. Matches this codebase's existing rule everywhere else — remedy
+estimates, job-line cascade values, board-report snapshots — "a report reading these rows
+years from now never has to know how they were derived." Last year's spend never moves.
+Cost: "this line is cabin-holder funded" and "the money spent on it was charged to
+operating budget" can legitimately disagree, and the UI has to be willing to show that.
+
+**Resolve at read.** Join through to the destination's current funding every time.
+Always agrees with the line; but re-funding a job line silently rewrites the history of
+what was already spent, including inside published board reports.
+
+Recommendation: **stamp**, with the split UI showing the inherited value and marking it
+when overridden.
+
+## Sequencing decision
+
+Funding columns are additive to `expense_allocations`, so the destination work does not
+have to wait on this answer. `expenses.fund_id` is therefore left **completely untouched**
+for now — still written, still read, still driving the dashboard tile — and moves only
+once stamp-vs-resolve is settled.
