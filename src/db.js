@@ -4319,6 +4319,61 @@ export async function unvoidExpense(id) {
   if (rows[0]) await logActivity({ action: 'unvoided', entityType: 'expense', entityId: rows[0].id, entityLabel: rows[0].vendor || 'Expense' });
 }
 
+// Money header and savings (Build Brief §7). Recurring and one-time savings are
+// reported SEPARATELY and never summed: $275/month secured forever and a $40 bulk
+// discount are not the same kind of number, and adding them produces a figure that
+// means nothing.
+export async function computeBoardReportAggregates(reportId) {
+  const report = await getBoardReport(reportId);
+  if (!report) return [];
+  const yearStart = `${String(report.PeriodEnd).slice(0, 4)}-01-01`;
+  const out = [];
+
+  // Spend comes from allocations, so a receipt split across jobs counts once per share
+  // rather than once per receipt.
+  const spend = await pool.query(
+    `SELECT COALESCE(SUM(ea.amount), 0) AS period,
+            COALESCE(SUM(ea.amount) FILTER (WHERE e.purchase_date >= $3), 0) AS ytd
+     FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND e.purchase_date BETWEEN $1 AND $2`,
+    [report.PeriodStart, report.PeriodEnd, yearStart]
+  );
+  const ytd = await pool.query(
+    `SELECT COALESCE(SUM(ea.amount), 0) AS ytd
+     FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND e.purchase_date BETWEEN $1 AND $2`,
+    [yearStart, report.PeriodEnd]
+  );
+  out.push({ groupKey: 'money', label: 'Spent this period', valueNumeric: Number(spend.rows[0].period) });
+  out.push({ groupKey: 'money', label: 'Spent year to date', valueNumeric: Number(ytd.rows[0].ytd) });
+
+  // Recurring is reported as an annual rate — that's how a monthly saving is worth
+  // understanding — while storage keeps the monthly figure that was negotiated.
+  const rec = await pool.query(
+    `SELECT COALESCE(SUM(CASE WHEN period = 'monthly' THEN amount * 12 ELSE amount END), 0) AS annualized
+     FROM savings_entries WHERE kind = 'recurring' AND occurred_on BETWEEN $1 AND $2`,
+    [report.PeriodStart, report.PeriodEnd]
+  );
+  const recAll = await pool.query(
+    `SELECT COALESCE(SUM(CASE WHEN period = 'monthly' THEN amount * 12 ELSE amount END), 0) AS annualized
+     FROM savings_entries WHERE kind = 'recurring' AND occurred_on <= $1`,
+    [report.PeriodEnd]
+  );
+  const one = await pool.query(
+    `SELECT COALESCE(SUM(amount), 0) AS total FROM savings_entries
+     WHERE kind = 'one_time' AND occurred_on BETWEEN $1 AND $2`,
+    [report.PeriodStart, report.PeriodEnd]
+  );
+  out.push({ groupKey: 'savings', label: 'Recurring savings secured this period (per year)', valueNumeric: Number(rec.rows[0].annualized) });
+  out.push({ groupKey: 'savings', label: 'Recurring savings secured to date (per year)', valueNumeric: Number(recAll.rows[0].annualized) });
+  out.push({ groupKey: 'savings', label: 'One-time savings this period', valueNumeric: Number(one.rows[0].total) });
+
+  await replaceBoardReportAggregates(reportId, out);
+  return listBoardReportAggregates(reportId);
+}
+
 // ── Board report suggestions (Build Brief §5) ────────────────────────────
 // Everything here is a SUGGESTION. Each pass upserts rows pre-checked, and
 // upsertBoardReportItem never overwrites an explicit include/exclude, so re-running
@@ -4352,6 +4407,7 @@ async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
     }
     await upsertBoardReportItem(reportId, {
       itemType: 'job_line', itemId: r.id, section: 'done', sortIndex: i,
+      parentWorkOrderId: r.work_order_id,
       snapTitle: r.title, snapSubtitle: r.wo_title, snapAssetName: r.asset_name,
       snapStatus: r.status_name, snapDate: r.completed_date,
       snapHours: r.actual_hours, snapCost: r.cost,
@@ -4404,6 +4460,7 @@ async function suggestComingUp(reportId, { forwardStart, forwardEnd }) {
     const overdue = r.scheduled_date && r.scheduled_date < todayStr;
     await upsertBoardReportItem(reportId, {
       itemType: 'job_line', itemId: r.id, section: overdue ? 'overdue' : 'coming_up', sortIndex: i,
+      parentWorkOrderId: r.work_order_id,
       snapTitle: r.title, snapSubtitle: r.wo_title, snapAssetName: r.asset_name,
       snapDate: r.scheduled_date, snapCost: r.estimated_cost,
     });
@@ -4481,6 +4538,8 @@ export async function refreshBoardReportSuggestions(reportId) {
     periodStart: report.PeriodStart, periodEnd: report.PeriodEnd,
     forwardStart: report.ForwardStart, forwardEnd: report.ForwardEnd,
   };
+  // Stamp the pass so anything not re-suggested this time is identifiable as stale.
+  const passStartedAt = new Date();
   const counts = {
     done: await suggestDoneJobLines(reportId, periods),
     adminWork: await suggestAdminTasks(reportId, periods),
@@ -4488,7 +4547,20 @@ export async function refreshBoardReportSuggestions(reportId) {
     featured: await suggestFeaturedFindings(reportId),
     calendar: await suggestCalendarAndProjections(reportId, periods),
   };
-  return { counts, items: await listBoardReportItems(reportId) };
+  // Drop what the current period no longer suggests — but only where the user never
+  // decided anything about it. An unchecked row, a board note, or an itemized work
+  // order is a judgment, and a date change must not throw one away silently.
+  const { rows: pruned } = await pool.query(
+    `DELETE FROM board_report_items
+     WHERE report_id = $1 AND NOT user_touched AND suggested_at < $2
+     RETURNING id`,
+    [reportId, passStartedAt]
+  );
+  return {
+    counts,
+    prunedCount: pruned.length,
+    items: await listBoardReportItems(reportId),
+  };
 }
 
 // ── Board reports as entities (Build Brief §3/§4) ────────────────────────
@@ -4593,6 +4665,8 @@ export async function listBoardReportItems(reportId) {
     SnapHours: r.snap_hours != null ? Number(r.snap_hours) : null,
     SnapCost: r.snap_cost != null ? Number(r.snap_cost) : null,
     SnapProgress: r.snap_progress,
+    ParentWorkOrderId: r.parent_work_order_id,
+    UserTouched: r.user_touched,
   }));
 }
 
@@ -4602,13 +4676,15 @@ export async function listBoardReportItems(reportId) {
 export async function upsertBoardReportItem(reportId, {
   itemType, itemId, itemDate = null, section, included, displayMode, reportNote, sortIndex,
   snapTitle, snapSubtitle, snapAssetName, snapStatus, snapDate, snapHours, snapCost, snapProgress,
+  parentWorkOrderId = null,
 }) {
   const { rows } = await pool.query(
     `INSERT INTO board_report_items
        (report_id, item_type, item_id, item_date, section, included, display_mode, report_note, sort_index,
-        snap_title, snap_subtitle, snap_asset_name, snap_status, snap_date, snap_hours, snap_cost, snap_progress)
+        snap_title, snap_subtitle, snap_asset_name, snap_status, snap_date, snap_hours, snap_cost, snap_progress,
+        parent_work_order_id, suggested_at)
      VALUES ($1,$2,$3,$4,$5,COALESCE($6,true),COALESCE($7,'summary'),$8,COALESCE($9,0),
-             $10,$11,$12,$13,$14,$15,$16,$17)
+             $10,$11,$12,$13,$14,$15,$16,$17,$18,now())
      ON CONFLICT (report_id, item_type, item_id, item_date) DO UPDATE SET
        section      = EXCLUDED.section,
        included     = COALESCE($6, board_report_items.included),
@@ -4626,7 +4702,7 @@ export async function upsertBoardReportItem(reportId, {
     [reportId, itemType, itemId, itemDate, section, included ?? null, displayMode ?? null,
       reportNote ?? null, sortIndex ?? null, snapTitle ?? null, snapSubtitle ?? null,
       snapAssetName ?? null, snapStatus ?? null, snapDate ?? null, snapHours ?? null,
-      snapCost ?? null, snapProgress ?? null]
+      snapCost ?? null, snapProgress ?? null, parentWorkOrderId]
   );
   return rows[0].id;
 }
@@ -4636,14 +4712,14 @@ export async function upsertBoardReportItem(reportId, {
 // would lie.
 export async function setBoardReportItemIncluded(reportId, itemId, included) {
   const { rows } = await pool.query(
-    `UPDATE board_report_items SET included = $3 WHERE report_id = $1 AND id = $2
-     RETURNING item_type, item_id`,
+    `UPDATE board_report_items SET included = $3, user_touched = true
+     WHERE report_id = $1 AND id = $2 RETURNING item_type, item_id`,
     [reportId, itemId, !!included]
   );
   if (!rows[0]) return null;
   if (rows[0].item_type === 'work_order') {
     await pool.query(
-      `UPDATE board_report_items SET included = $3
+      `UPDATE board_report_items SET included = $3, user_touched = true
        WHERE report_id = $1 AND item_type = 'job_line'
          AND item_id IN (SELECT id FROM job_lines WHERE work_order_id = $2)`,
       [reportId, rows[0].item_id, !!included]
@@ -4658,7 +4734,8 @@ export async function setBoardReportItemFields(reportId, itemId, { displayMode, 
   if (reportNote !== undefined) { setCols.push(`report_note = $${i++}`); vals.push(reportNote); }
   if (!setCols.length) return listBoardReportItems(reportId);
   await pool.query(
-    `UPDATE board_report_items SET ${setCols.join(', ')} WHERE report_id = $1 AND id = $2`,
+    `UPDATE board_report_items SET ${setCols.join(', ')}, user_touched = true
+     WHERE report_id = $1 AND id = $2`,
     [reportId, itemId, ...vals]
   );
   return listBoardReportItems(reportId);
@@ -4712,42 +4789,44 @@ export async function publishBoardReport(id) {
   return getBoardReport(id);
 }
 
-// Every send is kept, exactly as it went out. A corrected version later adds a row.
-export async function recordBoardReportSend(reportId, { recipients, subject, wasDraft, html, text, sentBy }) {
+// Every time a report leaves the app, a copy of exactly what left is kept. Email,
+// download and a deliberate "Save a copy" are the same event as far as the record is
+// concerned — the difference is only how it left.
+export async function recordBoardReportOutput(reportId, { kind, recipients, subject, wasDraft, html, text, createdBy }) {
   const { rows } = await pool.query(
-    `INSERT INTO board_report_sends (report_id, recipients, subject, was_draft, snapshot_html, snapshot_text, sent_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, sent_at`,
-    [reportId, recipients, subject, !!wasDraft, html, text, sentBy || null]
+    `INSERT INTO board_report_outputs (report_id, kind, recipients, subject, was_draft, snapshot_html, snapshot_text, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, created_at`,
+    [reportId, kind, recipients || null, subject, !!wasDraft, html, text, createdBy || null]
   );
-  return { Id: rows[0].id, SentAt: rows[0].sent_at };
+  return { Id: rows[0].id, Kind: kind, CreatedAt: rows[0].created_at };
 }
 
-export async function listBoardReportSends(reportId = null) {
+export async function listBoardReportOutputs(reportId = null) {
   const { rows } = await pool.query(
     reportId
-      ? `SELECT s.*, r.title FROM board_report_sends s JOIN board_reports r ON r.id = s.report_id
-         WHERE s.report_id = $1 ORDER BY s.sent_at DESC`
-      : `SELECT s.*, r.title FROM board_report_sends s JOIN board_reports r ON r.id = s.report_id
-         ORDER BY s.sent_at DESC`,
+      ? `SELECT o.*, r.title FROM board_report_outputs o JOIN board_reports r ON r.id = o.report_id
+         WHERE o.report_id = $1 ORDER BY o.created_at DESC`
+      : `SELECT o.*, r.title FROM board_report_outputs o JOIN board_reports r ON r.id = o.report_id
+         ORDER BY o.created_at DESC`,
     reportId ? [reportId] : []
   );
   return rows.map((r) => ({
-    Id: r.id, ReportId: r.report_id, ReportTitle: r.title, SentAt: r.sent_at,
-    Recipients: r.recipients, Subject: r.subject, WasDraft: r.was_draft, SentBy: r.sent_by,
+    Id: r.id, ReportId: r.report_id, ReportTitle: r.title, Kind: r.kind, CreatedAt: r.created_at,
+    Recipients: r.recipients, Subject: r.subject, WasDraft: r.was_draft, CreatedBy: r.created_by,
   }));
 }
 
-export async function getBoardReportSend(sendId) {
+export async function getBoardReportOutput(outputId) {
   const { rows } = await pool.query(
-    `SELECT s.*, r.title FROM board_report_sends s JOIN board_reports r ON r.id = s.report_id WHERE s.id = $1`,
-    [sendId]
+    `SELECT o.*, r.title FROM board_report_outputs o JOIN board_reports r ON r.id = o.report_id WHERE o.id = $1`,
+    [outputId]
   );
   if (!rows[0]) return null;
   const r = rows[0];
   return {
-    Id: r.id, ReportId: r.report_id, ReportTitle: r.title, SentAt: r.sent_at,
+    Id: r.id, ReportId: r.report_id, ReportTitle: r.title, Kind: r.kind, CreatedAt: r.created_at,
     Recipients: r.recipients, Subject: r.subject, WasDraft: r.was_draft,
-    SnapshotHtml: r.snapshot_html, SnapshotText: r.snapshot_text, SentBy: r.sent_by,
+    SnapshotHtml: r.snapshot_html, SnapshotText: r.snapshot_text, CreatedBy: r.created_by,
   };
 }
 

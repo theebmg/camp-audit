@@ -442,3 +442,38 @@ once stamp-vs-resolve is settled.
   are still the flags Coming Up suggests from.
 - **A recurring-event fixture was needed to test projections at all**, since zero
   calendar events currently recur. Verified in a rolled-back transaction.
+
+---
+
+# Phase 6 decisions logged (rendering, outputs, stale items)
+
+- **DEFECT FIXED (self-inflicted).** The Phase 4 send route rendered via
+  `buildBoardReportPg` — the *old live query* — so sending would have emailed a freshly
+  computed report ignoring every toggle, and a published report would have re-rendered
+  from current data, making the publish-freeze purely cosmetic. Replaced with
+  `renderBoardReportFromItems`, which renders `board_report_items` +
+  `board_report_aggregates`. A draft recomputes its aggregates first so the money header
+  is current; a published report never does, because recomputing is exactly what freeze
+  means not to do.
+- **The ad-hoc path is gone** (`/reports/board/preview`, `/reports/board/send`). One way
+  a board report is produced or sent, so nothing can leave the app unrecorded.
+- **`board_report_sends` became `board_report_outputs`** with a `kind` of
+  `email | download | manual`. Emailing and downloading both auto-record a copy;
+  "Save a copy" pins a draft at a moment in time *without* publishing and ending it.
+  Renamed rather than extended because a table called `sends` full of downloads
+  misleads whoever reads it next. The route returns the rendered HTML so a download
+  saves the very bytes that were recorded, instead of re-rendering client-side and
+  drifting from the stored copy.
+- **Stale items are pruned, but only when untouched.** `user_touched` is set by the
+  PATCH endpoints and `suggested_at` is stamped by every pass; anything older than the
+  current pass and untouched is deleted. Inferring "touched" from the values nearly
+  works, but a user who unchecks and re-checks is back to looking untouched while having
+  very much decided — hence an explicit flag.
+- **`parent_work_order_id` is snapshotted** on job-line items rather than looked up, so
+  a line moving between work orders after publish can't change what a published report
+  says.
+- **Recurring and one-time savings are never summed.** $275/month secured forever and a
+  $40 bulk discount are different kinds of number; the header reports recurring
+  annualized ("per year") and one-time separately. Storage keeps the monthly figure that
+  was actually negotiated.
+- **Spend reads allocations**, so a receipt split across jobs counts once per share.

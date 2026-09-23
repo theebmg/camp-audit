@@ -77,17 +77,29 @@ CREATE TABLE board_report_aggregates (
 );
 CREATE INDEX idx_board_report_aggregates_report ON board_report_aggregates(report_id, group_key, sort_index);
 
--- Every send is kept, draft or published, exactly as it went out (§3). A corrected
--- version sent later adds a row; it never replaces one.
-CREATE TABLE board_report_sends (
+-- Every time a report LEAVES the app, a copy of exactly what left is kept (§3).
+-- Three ways that happens, all the same event as far as the record is concerned:
+--   email    — sent to someone, recipients required
+--   download — saved to a file; auto-recorded, because a PDF on someone's desktop is
+--              just as much "a report that went out" as an email is
+--   manual   — "Save a copy" pressed deliberately, so a draft can be pinned at a
+--              moment in time WITHOUT publishing it and ending the draft
+--
+-- A corrected version later adds a row; it never replaces one. Named outputs rather
+-- than sends because two of the three aren't sends, and a table called sends full of
+-- downloads is the kind of thing that misleads whoever reads this next.
+CREATE TABLE board_report_outputs (
   id             serial PRIMARY KEY,
   report_id      integer NOT NULL REFERENCES board_reports(id) ON DELETE CASCADE,
-  sent_at        timestamptz NOT NULL DEFAULT now(),
-  recipients     text NOT NULL,
+  kind           text NOT NULL CHECK (kind IN ('email','download','manual')),
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  recipients     text,                      -- null for download/manual
   subject        text NOT NULL,
   was_draft      boolean NOT NULL,
   snapshot_html  text NOT NULL,
   snapshot_text  text NOT NULL,
-  sent_by        text
+  created_by     text,
+  CONSTRAINT board_report_outputs_email_needs_recipients
+    CHECK (kind <> 'email' OR recipients IS NOT NULL)
 );
-CREATE INDEX idx_board_report_sends_report ON board_report_sends(report_id, sent_at DESC);
+CREATE INDEX idx_board_report_outputs_report ON board_report_outputs(report_id, created_at DESC);

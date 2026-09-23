@@ -5,7 +5,9 @@ import {
   getAllComponentRowsWithAssetInfo, getBoardReportRawData, getBoardFocusItems, historicalAvgActualCost,
   getWorkPerformedRawData, getDeferredFindingsBacklogRawData, getVisitorActivityRawData, getAdminTasksWorkPerformedRawData,
   getAdminTasksBoardReportRawData,
+  getBoardReport, listBoardReportItems, listBoardReportAggregates, computeBoardReportAggregates,
 } from './db.js';
+import { renderBoardReportItemsHtml, renderBoardReportItemsText } from './reportRender.js';
 import { currentComponentState } from './components.js';
 import { FUNDING_SOURCE_LABELS } from './reports.js';
 
@@ -280,4 +282,19 @@ export async function buildDeferredBacklogReportPg() {
     severity, items, totalCost: items.reduce((s, i) => s + (i.cost || 0), 0),
   }));
   return { groups, totalCost: groups.reduce((s, g) => s + g.totalCost, 0), totalCount: findings.length };
+}
+
+// Renders a board report from its OWN rows. A draft recomputes its aggregates first so
+// the money header is current; a published report never does, because its figures were
+// frozen at publish and recomputing them would defeat the freeze.
+export async function renderBoardReportFromItems(reportId) {
+  const report = await getBoardReport(reportId);
+  if (!report) return null;
+  if (report.Status === 'draft') await computeBoardReportAggregates(reportId);
+  const [items, aggregates] = await Promise.all([
+    listBoardReportItems(reportId),
+    listBoardReportAggregates(reportId),
+  ]);
+  const data = { report, items, aggregates };
+  return { html: renderBoardReportItemsHtml(data), text: renderBoardReportItemsText(data), data };
 }

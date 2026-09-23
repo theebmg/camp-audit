@@ -7,7 +7,7 @@
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
-import { buildCapitalPlanPg, buildBoardReportPg, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
+import { buildCapitalPlanPg, buildBoardReportPg, renderBoardReportFromItems, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
 import {
   renderBoardReportHtml, renderBoardReportText, renderPlainEmailHtml,
   renderWorkPerformedHtml, renderWorkPerformedText, renderDeferredBacklogHtml, renderDeferredBacklogText,
@@ -95,9 +95,9 @@ import {
   setBoardReportItemFields,
   listBoardReportAggregates,
   publishBoardReport,
-  recordBoardReportSend,
-  listBoardReportSends,
-  getBoardReportSend,
+  recordBoardReportOutput,
+  listBoardReportOutputs,
+  getBoardReportOutput,
   listMaterials,
   getMaterial,
   createMaterial,
@@ -1080,29 +1080,9 @@ router.delete('/reports/favorites/:id', async (req, res, next) => {
 // ---- Board / monthly report — HTML + browser print, same email pattern as
 //      the legacy Activity/Capital reports in routes/reports.js. ----
 
-router.get('/reports/board/preview', async (req, res, next) => {
-  try {
-    const { periodStart, periodEnd } = req.query;
-    const data = await buildBoardReportPg({ periodStart, periodEnd });
-    res.json({ title: 'Board Report', html: renderBoardReportHtml(data), text: renderBoardReportText(data) });
-  } catch (e) { next(e); }
-});
-
-router.post('/reports/board/send', async (req, res, next) => {
-  try {
-    const { periodStart, periodEnd, recipient, subject } = req.body || {};
-    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
-    const data = await buildBoardReportPg({ periodStart, periodEnd });
-    await sendMail({
-      to: recipient,
-      subject: subject || `Camp Sychar — Board Report (${data.periodStart} to ${data.periodEnd})`,
-      html: renderBoardReportHtml(data),
-      text: renderBoardReportText(data),
-    });
-    res.json({ ok: true });
-  } catch (e) { next(e); }
-});
-
+// The ad-hoc board preview/send routes are gone (phase 6). There is one way a board
+// report is produced or sent now — the draft — so nothing can be emailed that isn't
+// also recorded as a send against a report.
 // Forward Focus retired (Build Brief §2): its content is the Coming Up section of the
 // unified board report now, and board_focus is relabelled "Feature on board report".
 // getBoardFocusItems stays in db.js — the flags it reads are still the flags Coming Up
@@ -1983,7 +1963,7 @@ router.delete('/calendar-events/:id', async (req, res, next) => {
 
 // ── Board reports: draft, publish, history, sends (§3/§4) ────────────────
 router.get('/board-reports', async (req, res, next) => {
-  try { res.json({ reports: await listBoardReports(), sends: await listBoardReportSends() }); } catch (e) { next(e); }
+  try { res.json({ reports: await listBoardReports(), outputs: await listBoardReportOutputs() }); } catch (e) { next(e); }
 });
 
 // The report screen opens the draft rather than creating one — idempotent, so two
@@ -2007,7 +1987,7 @@ router.get('/board-reports/:id', async (req, res, next) => {
       report,
       items: await listBoardReportItems(report.Id),
       aggregates: await listBoardReportAggregates(report.Id),
-      sends: await listBoardReportSends(report.Id),
+      outputs: await listBoardReportOutputs(report.Id),
     });
   } catch (e) { next(e); }
 });
@@ -2056,40 +2036,57 @@ router.post('/board-reports/:id/publish', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// Sending a draft is allowed but never silent: the caller must pass confirmDraft, and
-// the subject is prefixed so nobody mistakes a working copy for the real thing (§3).
-router.post('/board-reports/:id/send', async (req, res, next) => {
+// Email, download and "Save a copy" all funnel through here: the report is rendered
+// once, recorded once, and — for email only — actually sent. That's what makes "every
+// copy that left the app is on file" true rather than aspirational.
+//
+// Sending or downloading a DRAFT is allowed but never silent: the caller must pass
+// confirmDraft, and both subject and body are prefixed so a working copy can't be
+// mistaken for the real thing (§3).
+router.post('/board-reports/:id/output', async (req, res, next) => {
   try {
-    const { recipient, subject, confirmDraft } = req.body || {};
-    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
+    const { kind, recipient, subject, confirmDraft } = req.body || {};
+    if (!['email', 'download', 'manual'].includes(kind)) {
+      return res.status(400).json({ ok: false, error: 'kind must be email, download or manual' });
+    }
+    if (kind === 'email' && !recipient) {
+      return res.status(400).json({ ok: false, error: 'recipient is required to email' });
+    }
     const report = await getBoardReport(req.params.id);
     if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+
     const isDraft = report.Status === 'draft';
-    if (isDraft && !confirmDraft) {
-      return res.status(409).json({ ok: false, error: 'This report is still a draft. Re-send with confirmDraft to send it anyway.' });
+    // A manual save is an explicit act of pinning a draft, so it needs no second
+    // confirmation; leaving the app does.
+    if (isDraft && kind !== 'manual' && !confirmDraft) {
+      return res.status(409).json({
+        ok: false,
+        error: 'This report is still a draft. Repeat with confirmDraft to proceed anyway.',
+      });
     }
-    const data = await buildBoardReportPg({ periodStart: report.PeriodStart, periodEnd: report.PeriodEnd });
+
+    const { html, text } = await renderBoardReportFromItems(report.Id);
     const baseSubject = subject || `Camp Sychar — Board Report (${report.Title})`;
     const finalSubject = isDraft ? `DRAFT — ${baseSubject}` : baseSubject;
-    const html = isDraft
-      ? `<p style="background:#fff3cd;padding:10px;border-radius:6px;font-weight:700;">DRAFT — not the final report</p>${renderBoardReportHtml(data)}`
-      : renderBoardReportHtml(data);
-    const text = isDraft ? `DRAFT — not the final report\n\n${renderBoardReportText(data)}` : renderBoardReportText(data);
-    await sendMail({ to: recipient, subject: finalSubject, html, text });
-    const send = await recordBoardReportSend(report.Id, {
-      recipients: recipient, subject: finalSubject, wasDraft: isDraft, html, text,
-      sentBy: req.user?.username || null,
+
+    if (kind === 'email') await sendMail({ to: recipient, subject: finalSubject, html, text });
+
+    const output = await recordBoardReportOutput(report.Id, {
+      kind, recipients: kind === 'email' ? recipient : null, subject: finalSubject,
+      wasDraft: isDraft, html, text, createdBy: req.user?.username || null,
     });
-    res.json({ ok: true, send });
+    // html comes back so a download can save the very bytes that were recorded,
+    // rather than re-rendering client-side and drifting from the stored copy.
+    res.json({ ok: true, output, html, text, subject: finalSubject });
   } catch (e) { next(e); }
 });
 
-// History: open any past send and see exactly what went out, not a re-render of it.
-router.get('/board-report-sends/:sendId', async (req, res, next) => {
+// History: open any past copy and see exactly what left, not a re-render of it.
+router.get('/board-report-outputs/:outputId', async (req, res, next) => {
   try {
-    const send = await getBoardReportSend(req.params.sendId);
-    if (!send) return res.status(404).json({ ok: false, error: 'Not found' });
-    res.json({ send });
+    const output = await getBoardReportOutput(req.params.outputId);
+    if (!output) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ output });
   } catch (e) { next(e); }
 });
 

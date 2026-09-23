@@ -262,3 +262,118 @@ export function renderVisitorActivityText({ from, to, holders, oneOff, totalVisi
 export function renderPlainEmailHtml(subject, text) {
   return htmlShell(subject, '', `<div style="white-space:pre-wrap;line-height:1.5;">${escapeHtml(text)}</div>`);
 }
+
+// ── Board report rendered from its OWN rows (Build Brief §3/§6/§7) ───────
+// The old renderer took a live query, which meant a "published" report re-rendered
+// from current data and the freeze was cosmetic. This one renders board_report_items
+// and board_report_aggregates, so a report published in March still says in December
+// exactly what it said in March.
+
+const SECTION_TITLES = {
+  done: 'Work Completed',
+  coming_up: 'Coming Up',
+  overdue: 'Overdue',
+  admin_work: 'Administrative Work',
+};
+
+// Figures here describe maintenance and operations tracking. The camp's official books
+// live with the treasurer; this is deliberately not accounting, and says so (§7).
+const OPS_LABEL = 'Figures reflect maintenance/operations tracking, not the camp\'s official books.';
+
+function moneyHeaderHtml(aggregates) {
+  const byGroup = (g) => aggregates.filter((a) => a.GroupKey === g);
+  const money = byGroup('money');
+  const savings = byGroup('savings');
+  if (!money.length && !savings.length) return '';
+  const cell = (a) => `
+    <td style="padding:8px 14px;border-right:1px solid #eef0f6;">
+      <div style="color:#6b7086;font-size:0.78rem;text-transform:uppercase;">${escapeHtml(a.Label)}</div>
+      <div style="font-size:1.05rem;font-weight:700;">${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : escapeHtml(a.ValueText || '—')}</div>
+    </td>`;
+  return `
+    <table style="width:100%;border-collapse:collapse;background:#f9fafc;border:1px solid #eef0f6;border-radius:10px;margin-bottom:18px;">
+      <tr>${money.map(cell).join('')}</tr>
+      ${savings.length ? `<tr>${savings.map(cell).join('')}</tr>` : ''}
+    </table>`;
+}
+
+function itemLineHtml(it) {
+  const bits = [
+    it.SnapAssetName, it.SnapStatus, it.SnapDate ? fmtDate(it.SnapDate) : null,
+    it.SnapHours != null ? fmtHours(it.SnapHours) : null,
+    it.SnapCost != null ? fmtMoney(it.SnapCost) : null,
+  ].filter(Boolean);
+  return `
+    <div style="border-bottom:1px solid #eef0f6;padding:9px 0;">
+      <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${it.SnapSubtitle ? ` <span style="color:#6b7086;">— ${escapeHtml(it.SnapSubtitle)}</span>` : ''}</div>
+      ${bits.length ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(bits.join(' · '))}</div>` : ''}
+      ${it.SnapProgress ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(it.SnapProgress)}</div>` : ''}
+      ${it.ReportNote ? `<div style="margin-top:4px;font-size:0.9rem;">${escapeHtml(it.ReportNote)}</div>` : ''}
+    </div>`;
+}
+
+// A summary work order prints one line and swallows its job lines; an itemized one
+// prints its lines instead. Summary is the default for every WO (§6).
+function sectionHtml(section, items) {
+  const rows = items.filter((i) => i.Section === section && i.Included);
+  if (!rows.length) return '';
+  const summaryWoIds = new Set(
+    rows.filter((i) => i.ItemType === 'work_order' && i.DisplayMode === 'summary').map((i) => i.ItemId)
+  );
+  const visible = rows.filter((i) => !(i.ItemType === 'job_line' && summaryWoIds.has(i.ParentWorkOrderId)));
+  const hours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
+  const cost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const sub = [hours ? fmtHours(hours) : null, cost ? fmtMoney(cost) : null].filter(Boolean).join(' · ');
+  return `
+    <h2 style="margin:26px 0 4px;font-size:1.1rem;border-top:2px solid #eef0f6;padding-top:14px;">
+      ${escapeHtml(SECTION_TITLES[section] || section)}
+      <span style="color:#6b7086;font-weight:400;font-size:0.85rem;"> — ${visible.length} item(s)${sub ? ` · ${sub}` : ''}</span>
+    </h2>
+    ${visible.map(itemLineHtml).join('')}`;
+}
+
+export function renderBoardReportItemsHtml({ report, items, aggregates }) {
+  const sections = ['done', 'coming_up', 'overdue', 'admin_work'];
+  const included = items.filter((i) => i.Included);
+  const grandHours = included.reduce((t, i) => t + (i.SnapHours || 0), 0);
+  const grandCost = included.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  return htmlShell(
+    `Board Report — ${report.Title}`,
+    `${report.PeriodStart} to ${report.PeriodEnd} · looking ahead to ${report.ForwardEnd}${report.Status === 'draft' ? ' · DRAFT' : ''}`,
+    `
+    ${moneyHeaderHtml(aggregates)}
+    ${report.SummaryNotes ? `<div style="background:#fbfbfe;border:1px solid #eef0f6;border-radius:10px;padding:14px;margin-bottom:6px;white-space:pre-wrap;">${escapeHtml(report.SummaryNotes)}</div>` : ''}
+    ${sections.map((sec) => sectionHtml(sec, items)).join('')}
+    <div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
+      Total — ${included.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)}` : ''}
+    </div>
+    <div style="margin-top:8px;color:#9298b0;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
+  `
+  );
+}
+
+export function renderBoardReportItemsText({ report, items, aggregates }) {
+  const lines = [`CAMP SYCHAR — BOARD REPORT — ${report.Title}`,
+    `${report.PeriodStart} to ${report.PeriodEnd} (ahead to ${report.ForwardEnd})${report.Status === 'draft' ? ' — DRAFT' : ''}`, ''];
+  for (const a of aggregates.filter((x) => ['money', 'savings'].includes(x.GroupKey))) {
+    lines.push(`${a.Label}: ${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : (a.ValueText || '—')}`);
+  }
+  if (report.SummaryNotes) lines.push('', report.SummaryNotes);
+  const summaryWoIds = new Set(
+    items.filter((i) => i.Included && i.ItemType === 'work_order' && i.DisplayMode === 'summary').map((i) => i.ItemId)
+  );
+  for (const sec of ['done', 'coming_up', 'overdue', 'admin_work']) {
+    const rows = items.filter((i) => i.Section === sec && i.Included
+      && !(i.ItemType === 'job_line' && summaryWoIds.has(i.ParentWorkOrderId)));
+    if (!rows.length) continue;
+    lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${rows.length}):`);
+    for (const it of rows) {
+      const bits = [it.SnapAssetName, it.SnapDate ? fmtDate(it.SnapDate) : null,
+        it.SnapCost != null ? fmtMoney(it.SnapCost) : null].filter(Boolean);
+      lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
+      if (it.ReportNote) lines.push(`      ${it.ReportNote}`);
+    }
+  }
+  lines.push('', OPS_LABEL);
+  return lines.join('\n');
+}
