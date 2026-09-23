@@ -5923,8 +5923,16 @@ function adminTaskRowShape(r) {
     CreatedBy: r.created_by, CreatedAt: r.created_at, UpdatedAt: r.updated_at,
   };
 }
+// savings moved out to savings_entries (0076) so purchases can record savings the
+// same way, but the shape callers see is unchanged: RecurringMonthlySavings still
+// comes back on the task, now read through this subquery rather than a column. One
+// recurring monthly entry per task is the invariant writeAdminTaskSaving maintains.
 const ADMIN_TASK_SELECT = `
   SELECT t.*, t.task_date::text AS task_date_text, s.name AS status_name, s.counts_as_work_performed AS status_counts_as_work_performed, c.name AS category_name,
+         (SELECT se.amount FROM savings_entries se
+          WHERE se.source_type = 'admin_task' AND se.source_id = t.id
+            AND se.kind = 'recurring' AND se.period = 'monthly'
+          ORDER BY se.id LIMIT 1) AS recurring_monthly_savings,
          (SELECT count(*) FROM attachment_links al JOIN attachments a ON a.id = al.attachment_id AND a.deleted_at IS NULL
           WHERE al.entity_type = 'admin_task' AND al.entity_id = t.id) AS attachment_count
   FROM admin_tasks t
@@ -5966,24 +5974,50 @@ async function resolveAdminTaskStatusId(statusId) {
 export async function createAdminTask({ title, description, taskDate, hours, statusId, categoryId, recurringMonthlySavings, includeInBoardReport = true, createdBy }) {
   const resolvedStatusId = await resolveAdminTaskStatusId(statusId);
   const { rows } = await pool.query(
-    `INSERT INTO admin_tasks (title, description, task_date, hours, status_id, category_id, recurring_monthly_savings, include_in_board_report, created_by)
-     VALUES ($1,$2,COALESCE($3::date, current_date),$4,$5,$6,$7,$8,$9) RETURNING id, title`,
-    [title, description || null, taskDate || null, hours ?? null, resolvedStatusId, categoryId || null, recurringMonthlySavings ?? null, includeInBoardReport !== false, createdBy || null]
+    `INSERT INTO admin_tasks (title, description, task_date, hours, status_id, category_id, include_in_board_report, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+    [title, description || null, taskDate || null, hours ?? null, resolvedStatusId, categoryId || null, includeInBoardReport !== false, createdBy || null]
   );
-  await logActivity({ action: 'created', entityType: 'admin_task', entityId: rows[0].id, entityLabel: rows[0].title });
+  await writeAdminTaskSaving(rows[0].id, recurringMonthlySavings ?? null, taskDate || null);
+  await logActivity({ action: 'created', entityType: 'admin_task', entityId: rows[0].id, entityLabel: title });
   return getAdminTask(rows[0].id);
 }
+
+// One recurring monthly savings entry per admin task. null/0 removes it, so clearing
+// the field clears the saving rather than leaving a stale row the report would keep
+// counting. occurredOn follows the task's date — when the saving was secured.
+export async function writeAdminTaskSaving(taskId, amount, taskDate) {
+  const n = amount == null || amount === '' ? null : Number(amount);
+  await pool.query(
+    `DELETE FROM savings_entries
+     WHERE source_type = 'admin_task' AND source_id = $1 AND kind = 'recurring' AND period = 'monthly'`,
+    [taskId]
+  );
+  if (n == null || !(n > 0)) return;
+  await pool.query(
+    `INSERT INTO savings_entries (kind, amount, period, source_type, source_id, occurred_on)
+     VALUES ('recurring', $1, 'monthly', 'admin_task', $2, COALESCE($3::date, CURRENT_DATE))`,
+    [n, taskId, taskDate || null]
+  );
+}
+
 const ADMIN_TASK_COLUMNS = {
   title: 'title', description: 'description', taskDate: 'task_date', hours: 'hours',
-  statusId: 'status_id', categoryId: 'category_id', recurringMonthlySavings: 'recurring_monthly_savings',
+  statusId: 'status_id', categoryId: 'category_id',
   includeInBoardReport: 'include_in_board_report',
 };
+// Not in ADMIN_TASK_COLUMNS on purpose — it lives in savings_entries now.
 export async function updateAdminTask(id, fields) {
   const setCols = []; const vals = [];
   for (const [key, col] of Object.entries(ADMIN_TASK_COLUMNS)) {
     if (!(key in fields)) continue;
     vals.push(fields[key]);
     setCols.push(`${col} = $${vals.length}`);
+  }
+  if ('recurringMonthlySavings' in fields) {
+    const cur = await getAdminTask(id);
+    if (!cur) return null;
+    await writeAdminTaskSaving(id, fields.recurringMonthlySavings, fields.taskDate ?? cur.TaskDate);
   }
   if (!setCols.length) return getAdminTask(id);
   vals.push(id);
@@ -6001,6 +6035,9 @@ export async function deleteAdminTask(id) {
   try {
     await client.query('BEGIN');
     await client.query(`DELETE FROM attachment_links WHERE entity_type = 'admin_task' AND entity_id = $1`, [id]);
+    // savings_entries is polymorphic, so no FK cascade reaches it — same reason the
+    // attachment links above have to be deleted by hand.
+    await client.query(`DELETE FROM savings_entries WHERE source_type = 'admin_task' AND source_id = $1`, [id]);
     const { rows } = await client.query('DELETE FROM admin_tasks WHERE id = $1 RETURNING title', [id]);
     await client.query('COMMIT');
     if (rows[0]) await logActivity({ action: 'deleted', entityType: 'admin_task', entityId: Number(id), entityLabel: rows[0].title });
