@@ -1813,9 +1813,13 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
       const statusId = await resolveInitialJobLineStatus(client, line.statusId);
       const { rows: lineRows } = await client.query(
         `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id,
-           estimated_hours, estimated_cost, scheduled_date, status_id, pinned_fields, completed_date)
+           estimated_hours, estimated_cost, scheduled_date, status_id, pinned_fields, completed_date, completed_at)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-           CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN CURRENT_DATE ELSE NULL END)
+           CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN CURRENT_DATE ELSE NULL END,
+           -- A line created ALREADY resolved never passes through changeJobLineStatus,
+           -- so this is its only chance to be stamped. Without it, clearing the date
+           -- later leaves the line with neither and it vanishes from Done entirely.
+           CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN now() ELSE NULL END)
          RETURNING id, scheduled_date`,
         [woId, lineTitle, sortOrder++,
           line.responsibilityClass || 'self', line.fundingSource || 'operating_budget', line.fundingRefId || null,
@@ -3479,9 +3483,10 @@ export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds 
         const statusId = await resolveInitialJobLineStatus(client, line.statusId);
         const { rows } = await client.query(
           `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id,
-             estimated_hours, estimated_cost, scheduled_date, status_id, pinned_fields, completed_date)
+             estimated_hours, estimated_cost, scheduled_date, status_id, pinned_fields, completed_date, completed_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-             CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN CURRENT_DATE ELSE NULL END)
+             CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN CURRENT_DATE ELSE NULL END,
+             CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN now() ELSE NULL END)
            RETURNING id, scheduled_date`,
           [woId, title, sortOrder++, line.responsibilityClass || 'self', line.fundingSource || 'operating_budget',
             numOrNull(line.fundingRefId), numOrNull(line.estimatedHours), numOrNull(line.estimatedCost),
@@ -4673,7 +4678,11 @@ async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
      LEFT JOIN assets a ON a.id = w.asset_id
      LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
      WHERE s.counts_as_work_performed
-       AND COALESCE(jl.completed_date, jl.completed_at::date) BETWEEN $1 AND $2
+       -- EITHER date landing in the period qualifies, rather than COALESCE picking one
+       -- and discarding the other: a line whose recorded date is outside the window but
+       -- which was marked done inside it is exactly the arrears case this serves.
+       AND (jl.completed_date BETWEEN $1 AND $2
+            OR jl.completed_at::date BETWEEN $1 AND $2)
      ORDER BY COALESCE(jl.completed_date, jl.completed_at::date) DESC, jl.id`,
     [periodStart, periodEnd]
   );
