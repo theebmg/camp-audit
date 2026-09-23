@@ -88,6 +88,19 @@ dashboard strip; `docs/audit-schema.md` kept current with the migrations.
 
 Choices made while building, per "log the choice in the decisions doc."
 
+## §6 — RESOLVED 2026-09-23: keep the EAV escape hatch
+
+Decision: keep both stores. `asset_property_fields.column_name` is a router, not a
+duplicate — being able to add a property field without shipping a migration serves
+future admins, and the capability is unused rather than broken.
+
+`maps_to: { kind: "asset_property" }` writes through the existing router
+(`writeAssetProperties`, db.js ~345–390), so it inherits correct behavior for both
+column-backed and EAV-backed fields automatically.
+
+**No migration. No deletion. No data moved.** The section below records the
+investigation that led here.
+
 ## §6 — reported, NOT migrated (this is the stop-and-report case, with a different fact)
 
 The premise was that two live stores hold the same properties. They do not.
