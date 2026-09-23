@@ -5382,15 +5382,19 @@ export async function completeAuditInstance(instanceId, { lines = null, stranded
     // 2. One work order per building, only if there is work to do.
     let workOrderId = null;
     if (useLines.length) {
-      const { rows: wo } = await client.query(
-        `INSERT INTO work_orders (wo_number, title, asset_id, status_id, split_root_id, date_reported)
-         VALUES ('AUD-' || nextval('work_orders_id_seq')::text,
-                 $1, $2, (SELECT id FROM work_order_statuses ORDER BY sort_order LIMIT 1),
-                 currval('work_orders_id_seq'), CURRENT_DATE)
-         RETURNING id`,
-        [`${review.Instance.RoundName} — ${review.Instance.AssetName}`, assetId]
+      // Same pattern createWorkOrder uses: reserve the id first so the row can be its
+      // own unsplit root and carry its id as wo_number in ONE insert. currval() does
+      // not work here — the id column's own default calls nextval, so currval would
+      // point at a different number than the row actually got.
+      const { rows: idRows } = await client.query(
+        `SELECT nextval(pg_get_serial_sequence('work_orders','id')) AS id`
       );
-      workOrderId = wo.rows ? wo.rows[0].id : wo[0].id;
+      workOrderId = Number(idRows[0].id);
+      await client.query(
+        `INSERT INTO work_orders (id, title, asset_id, status_id, split_root_id, wo_number, date_reported)
+         VALUES ($1,$2,$3,(SELECT id FROM work_order_statuses WHERE name = 'Reported'),$1,$4,CURRENT_DATE)`,
+        [workOrderId, `${review.Instance.RoundName} — ${review.Instance.AssetName}`, assetId, String(workOrderId)]
+      );
 
       for (const l of useLines) {
         // Estimates are SNAPSHOTS: editing a remedy template later never moves a work
