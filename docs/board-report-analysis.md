@@ -530,3 +530,20 @@ writes its single destination behind the scenes, so the everyday path is untouch
 Line items are optional throughout — an emailed receipt nobody itemized splits whole, by
 dollars — and the editor states the unassigned remainder plainly rather than forcing the
 split to be finished in one sitting.
+
+## Materials screens
+
+Three surfaces, one screen: **Materials on hand** (nav → 📦 Materials), a **history
+overlay** per material, and two prompts that appear inside existing flows.
+
+- **Balance and history are the same screen**, because a balance is only trustworthy if
+  you can see the movements behind it. Corrections appear as their own rows.
+- **A correction is signed on purpose** — enter `-1` when you counted one fewer than the
+  system says. The UI says so rather than guessing direction from context.
+- **The WO-close prompt is asked BEFORE completing**, not after. A closed work order with
+  its leftovers unrecorded is the state nobody goes back to fix. It returns immediately
+  when the WO bought no tracked materials, so an ordinary close is untouched, and blank
+  means none — closing without typing anything is the fast path.
+- **The point-of-use reminder says nothing when there's no balance**, which is why
+  `getMaterialOnHand` returns null rather than a zero. Drawing from stock reports the
+  cost moved, and never counts it as a saving.

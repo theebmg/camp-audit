@@ -852,6 +852,7 @@ const NAV_ITEMS = [
   { icon: '📍', label: 'Locations', view: 'locations' },
   { icon: '🗒️', label: 'Notes', view: 'notes' },
   { icon: '💵', label: 'Expenses', view: 'expenses' },
+  { icon: '📦', label: 'Materials', view: 'materials' },
   { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
   { icon: '👷', label: 'Crew', view: 'crew' },
@@ -1234,6 +1235,7 @@ async function render(view, params = {}, opts = {}) {
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
       editWorkOrderLines: () => renderEditWorkOrderLines(params),
+      materials: () => renderMaterialsOnHand(),
       crew: () => renderCrew(),
       crewHours: () => renderCrewHours(),
       adminUsers: () => renderAdminUsers(),
@@ -8792,6 +8794,176 @@ const RESPONSIBILITY_CLASS_LABELS = { self: 'Self', volunteer: 'Volunteer', vend
 //
 // options: [{ value, label, sublabel? }] — `value` is compared with String().
 // Returns { getValue, setValue, setOptions, focus, input }.
+// ── Materials on hand (Build Brief §10) ──────────────────────────────────
+// The ONLY materials screen. Not an inventory system: no counts to reconcile, no
+// reorder points, no locations. A list of what's left over and where each balance came
+// from, because the balance is only trustworthy if you can see the movements behind it.
+async function renderMaterialsOnHand() {
+  setChrome({ title: 'Materials on hand', showBack: true, showLogout: true });
+  let materials = [];
+  let showAll = false;
+
+  async function load() {
+    const d = await api(`/api/pg/materials${showAll ? '' : '?onHand=true'}`);
+    materials = d.materials || [];
+  }
+
+  function draw() {
+    setApp(`
+      <div class="card">
+        <h3>Materials on hand</h3>
+        <p class="muted">What's left over from finished jobs, at the price actually paid. Drawing from stock moves that cost onto the new job — it isn't counted as a saving, because the saving was already counted when it was bought.</p>
+        <div class="btn-row">
+          <button type="button" class="btn btn-secondary" id="matToggle">${showAll ? 'Only show what\'s in stock' : 'Show everything, including empty'}</button>
+          <button type="button" class="btn btn-primary" id="matAdd">Add material</button>
+        </div>
+      </div>
+      <div class="card">
+        ${materials.length ? materials.map((m) => `
+          <div class="list-item mat-row" data-id="${m.Id}" style="display:flex;justify-content:space-between;align-items:center;gap:10px;cursor:pointer">
+            <div>
+              <div><strong>${escapeHtml(m.Name)}</strong> <span class="muted">(${escapeHtml(m.Unit)})</span></div>
+              <div class="muted" style="font-size:0.82rem">${m.LastUnitPrice != null ? `$${Number(m.LastUnitPrice).toFixed(2)} per ${escapeHtml(m.Unit)}` : 'no price recorded'}${m.LastMovedAt ? ` · last moved ${String(m.LastMovedAt).slice(0, 10)}` : ''}</div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-weight:700;font-size:1.05rem">${m.Balance}</div>
+              <div class="muted" style="font-size:0.75rem">${escapeHtml(m.Unit)}</div>
+            </div>
+          </div>`).join('') : `<p class="muted">${showAll ? 'No materials yet.' : 'Nothing in stock right now.'}</p>`}
+      </div>`);
+    document.getElementById('matToggle').addEventListener('click', async () => { showAll = !showAll; await load(); draw(); });
+    document.getElementById('matAdd').addEventListener('click', async () => {
+      const name = await promptDialog('Material name', { placeholder: 'Drywall ½ 4×8' });
+      if (!name || !name.trim()) return;
+      const unit = await promptDialog(`Unit for "${name.trim()}"`, { placeholder: 'sheets', confirmLabel: 'Add' });
+      if (!unit || !unit.trim()) return;
+      try { await api('/api/pg/materials', { method: 'POST', body: JSON.stringify({ name, unit }) });
+        toast('Material added'); await load(); draw();
+      } catch (e) { toast(e.message, 5000); }
+    });
+    app.querySelectorAll('.mat-row').forEach((el) => el.addEventListener('click', () => openMaterialHistory(el.dataset.id, { onClose: async () => { await load(); draw(); } })));
+  }
+
+  await load();
+  draw();
+}
+
+// Balance = sum of movements, so the history IS the explanation. Corrections show up
+// here as their own rows rather than quietly changing a number.
+async function openMaterialHistory(materialId, { onClose } = {}) {
+  const d = await api(`/api/pg/materials/${materialId}`);
+  const m = d.material;
+  const KINDS = { wo_close: 'Left over at WO close', to_job: 'Used on a job', correction: 'Correction', tossed: 'Tossed / damaged' };
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:560px;width:95%;max-height:86vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">${escapeHtml(m.Name)} <span class="muted" style="font-weight:400">(${escapeHtml(m.Unit)})</span></h3>
+      <button type="button" class="btn btn-secondary modal-cancel">Done</button>
+    </div>
+    <p style="margin:10px 0"><strong style="font-size:1.2rem">${m.Balance}</strong> <span class="muted">${escapeHtml(m.Unit)} on hand</span></p>
+    <div class="btn-row">
+      <button type="button" class="btn btn-secondary" id="matCorrect">Correct the count</button>
+      <button type="button" class="btn btn-secondary" id="matToss">Tossed / damaged</button>
+    </div>
+    <h4 style="margin:16px 0 6px">Movements</h4>
+    ${(d.movements || []).length ? d.movements.map((mv) => `
+      <div class="list-item">
+        <div><strong>${mv.Quantity > 0 ? '+' : ''}${mv.Quantity}</strong> — ${escapeHtml(KINDS[mv.Kind] || mv.Kind)}</div>
+        <div class="muted" style="font-size:0.82rem">${String(mv.CreatedAt).slice(0, 10)}${mv.WorkOrderTitle ? ` · ${escapeHtml(mv.WorkOrderTitle)}` : ''}${mv.JobLineTitle ? ` · ${escapeHtml(mv.JobLineTitle)}` : ''}${mv.Note ? ` · ${escapeHtml(mv.Note)}` : ''}</div>
+      </div>`).join('') : '<p class="muted">No movements yet.</p>'}
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => { overlay.remove(); if (onClose) onClose(); };
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  async function movement(kind, prompt_, noteWanted) {
+    const qtyStr = await promptDialog(prompt_, { placeholder: 'quantity', confirmLabel: 'Record' });
+    if (qtyStr === null || !qtyStr.trim()) return;
+    const quantity = Number(qtyStr);
+    if (!Number.isFinite(quantity) || quantity === 0) return toast('Enter a number', 4000);
+    let note = null;
+    if (noteWanted) note = await promptDialog('Why? (optional)', { confirmLabel: 'Record', multiline: true });
+    try {
+      await api(`/api/pg/materials/${materialId}/movements`, {
+        method: 'POST', body: JSON.stringify({ kind, quantity, note: note || null }),
+      });
+      toast('Recorded'); overlay.remove(); openMaterialHistory(materialId, { onClose });
+    } catch (e) { toast(e.message, 5000); }
+  }
+  // A correction is signed on purpose: -1 when you counted one fewer than the system says.
+  overlay.querySelector('#matCorrect').addEventListener('click', () => movement('correction', `Correction for ${m.Name} — use a negative number if there's less than recorded`, true));
+  overlay.querySelector('#matToss').addEventListener('click', () => movement('tossed', `How many ${m.Unit} of ${m.Name} are unusable?`, true));
+}
+
+// Prompt at work-order close (§10). Skipped entirely when the WO bought no tracked
+// materials, so closing an ordinary job is unchanged. Blank means none — the fast path
+// is closing without typing anything.
+async function promptLeftoversOnClose(workOrderId) {
+  let used = [];
+  try { const d = await api(`/api/pg/work-orders/${workOrderId}/materials-used`); used = d.materials || []; }
+  catch { return true; }
+  if (!used.length) return true;
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal-box" style="max-width:520px;width:95%">
+      <h3 style="margin:0 0 4px">Any materials left over?</h3>
+      <p class="muted" style="margin:0 0 12px">Leave blank for anything fully used. What you enter goes to stock at the price this job paid.</p>
+      ${used.map((u) => `
+        <div class="field-row"><label>${escapeHtml(u.Name)} <span class="muted">(${escapeHtml(u.Unit)}${u.UnitPrice != null ? ` · $${u.UnitPrice.toFixed(2)} each` : ''})</span></label>
+          <input type="number" step="0.01" min="0" class="leftover-qty" data-material="${u.MaterialId}" data-price="${u.UnitPrice ?? ''}" placeholder="used ${u.QuantityUsed}" />
+        </div>`).join('')}
+      <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+        <button type="button" class="btn btn-secondary modal-skip">Nothing left over</button>
+        <button type="button" class="btn btn-primary modal-ok">Save</button>
+      </div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const finish = (v) => { overlay.remove(); resolve(v); };
+    overlay.querySelector('.modal-skip').addEventListener('click', () => finish(true));
+    overlay.querySelector('.modal-ok').addEventListener('click', async () => {
+      const leftovers = [...overlay.querySelectorAll('.leftover-qty')]
+        .map((i) => ({ materialId: Number(i.dataset.material), quantity: Number(i.value), unitPrice: i.dataset.price === '' ? null : Number(i.dataset.price) }))
+        .filter((l) => Number.isFinite(l.quantity) && l.quantity > 0);
+      try {
+        if (leftovers.length) {
+          const r = await api(`/api/pg/work-orders/${workOrderId}/leftovers`, { method: 'POST', body: JSON.stringify({ leftovers }) });
+          toast(`${r.recorded} material(s) added to stock`);
+        }
+        finish(true);
+      } catch (e) { toast(e.message, 5000); finish(false); }
+    });
+  });
+}
+
+// Point-of-use reminder (§10). Returns the quantity drawn from stock, or 0. Says
+// nothing at all when there's no balance, which is why the endpoint answers with null
+// rather than a zero.
+async function remindMaterialOnHand(materialId, { jobLineId = null, workOrderId = null } = {}) {
+  let onHand = null;
+  try { const d = await api(`/api/pg/materials/${materialId}/on-hand`); onHand = d.onHand; } catch { return 0; }
+  if (!onHand) return 0;
+  const use = await confirmDialog(
+    `You should have ${onHand.Balance} ${onHand.Unit} of ${onHand.Name} left. Use it on this job?`,
+    { confirmLabel: 'Use from stock', cancelLabel: 'Not now', danger: false }
+  );
+  if (!use) return 0;
+  const qtyStr = await promptDialog(`How many ${onHand.Unit}?`, { value: String(onHand.Balance), confirmLabel: 'Use' });
+  if (qtyStr === null) return 0;
+  const quantity = Number(qtyStr);
+  if (!Number.isFinite(quantity) || quantity <= 0) return 0;
+  try {
+    const r = await api(`/api/pg/materials/${materialId}/use-from-stock`, {
+      method: 'POST', body: JSON.stringify({ quantity, jobLineId, workOrderId }),
+    });
+    toast(`Used ${r.QuantityUsed} ${onHand.Unit} from stock${r.Cost != null ? ` — $${r.Cost.toFixed(2)}` : ''}`);
+    return r.QuantityUsed;
+  } catch (e) { toast(e.message, 5000); return 0; }
+}
+
 // Split editor (Build Brief §9). Opened deliberately from an expense — the ordinary
 // form still writes one destination behind the scenes, so the everyday path never sees
 // any of this and stays exactly as fast as it was.
@@ -8885,7 +9057,11 @@ async function openSplitEditor(expenseId, { onClose } = {}) {
     mountCombobox(overlay.querySelector('#liMaterialPicker'), {
       options: materials.map((m) => ({ value: m.Id, label: `${m.Name} (${m.Unit})` })),
       placeholder: 'Only if this is a tracked material…',
-      onSelect: (o) => { liMaterial = o ? o.value : null; },
+      onSelect: async (o) => {
+        liMaterial = o ? o.value : null;
+        // "You should have 4 sheets left" — says nothing when there's no balance.
+        if (liMaterial) await remindMaterialOnHand(liMaterial, {});
+      },
       onClear: () => { liMaterial = null; },
     });
 
@@ -10991,6 +11167,10 @@ async function renderWorkOrderDetail({ id }, container = app) {
 
   container.querySelector('#completeWoBtn').addEventListener('click', async () => {
     if (!await confirmDialog(`Complete this Work Order? Any pending "asset field update" entries will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;
+    // Asked before completing, not after: a closed work order with its leftovers
+    // unrecorded is the state nobody goes back to fix. Returns true immediately when
+    // this WO bought no tracked materials, so an ordinary close is unchanged.
+    if (!await promptLeftoversOnClose(id)) return;
     try {
       await api(`/api/pg/work-orders/${id}/complete`, { method: 'POST' });
       toast('Work order completed — asset updated');
