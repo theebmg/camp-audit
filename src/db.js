@@ -5005,7 +5005,13 @@ export async function upsertBoardReportItem(reportId, {
        snap_date    = COALESCE(EXCLUDED.snap_date, board_report_items.snap_date),
        snap_hours   = COALESCE(EXCLUDED.snap_hours, board_report_items.snap_hours),
        snap_cost    = COALESCE(EXCLUDED.snap_cost, board_report_items.snap_cost),
-       snap_progress= COALESCE(EXCLUDED.snap_progress, board_report_items.snap_progress)
+       snap_progress= COALESCE(EXCLUDED.snap_progress, board_report_items.snap_progress),
+       parent_work_order_id = COALESCE(EXCLUDED.parent_work_order_id, board_report_items.parent_work_order_id),
+       suggested_at = now(),
+       -- Without this the row keeps its PREVIOUS pass token, and the prune at the end
+       -- of this same pass deletes it as stale. That is what made refreshing alternate
+       -- between emptying the draft and refilling it.
+       last_pass_id = EXCLUDED.last_pass_id
      RETURNING id`,
     [reportId, itemType, itemId, itemDate, section, included ?? null, displayMode ?? null,
       reportNote ?? null, sortIndex ?? null, snapTitle ?? null, snapSubtitle ?? null,
