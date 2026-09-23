@@ -640,7 +640,7 @@ async function renderAttachmentSection(entityType, entityId, container, opts = {
     <div class="btn-row" style="margin-top:8px">
       <label class="btn btn-secondary" style="cursor:pointer;margin:0">
         + Add
-        <input type="file" accept="${accept}" capture="environment" multiple style="display:none" class="attach-input" />
+        <input type="file" accept="${accept}" multiple style="display:none" class="attach-input" />
       </label>
     </div>
     <div class="attach-edit-panel" hidden></div>`;
@@ -1991,7 +1991,7 @@ async function renderAssetDetail({ id }, container = app) {
       <div id="noteList">${noteRows}</div>
       <form id="noteForm" style="margin-top:10px">
         <div class="field-row"><textarea name="note" placeholder="Quick note or follow-up for this asset…" required></textarea></div>
-        <div class="field-row"><label>Photo (optional)</label><input type="file" name="photo" accept="image/*" capture="environment" multiple /></div>
+        <div class="field-row"><label>Photo (optional)</label><input type="file" name="photo" accept="image/*" multiple /></div>
         <button class="btn btn-secondary" type="submit">Add Note</button>
       </form>
     </div>`;
@@ -2302,7 +2302,7 @@ async function renderAudit({ id }) {
           </div>
           <div class="field-row"><label>Material</label><input class="comp-material" /></div>
           <div class="field-row"><label>Notes</label><textarea class="comp-notes"></textarea></div>
-          <div class="field-row"><label>Photo (optional)</label><input type="file" class="comp-photo" accept="image/*" capture="environment" multiple /></div>
+          <div class="field-row"><label>Photo (optional)</label><input type="file" class="comp-photo" accept="image/*" multiple /></div>
           <label class="flag-check"><input type="checkbox" class="comp-flag-toggle" /> 🚩 Flag for follow-up</label>
           <div class="flag-note-wrap" hidden><input type="text" class="comp-flag-note" placeholder="Optional note" /></div>
         </div>`).join('')}
@@ -2318,7 +2318,7 @@ async function renderAudit({ id }) {
         ${componentBlock}
         <div class="card">
           <h3>Audit Photos (optional)</h3>
-          <div class="field-row"><label>General condition photos</label><input type="file" name="generalPhotos" accept="image/*" capture="environment" multiple /></div>
+          <div class="field-row"><label>General condition photos</label><input type="file" name="generalPhotos" accept="image/*" multiple /></div>
         </div>
         <div class="card">
           <h3>Report a Finding (optional)</h3>
@@ -2326,7 +2326,7 @@ async function renderAudit({ id }) {
             <select name="findingSeverity"><option value="">— none —</option>${(state.options.findingSeverity || []).map((s) => `<option>${escapeHtml(s)}</option>`).join('')}</select>
           </div>
           <div class="field-row"><label>Description</label><textarea name="findingDescription"></textarea></div>
-          <div class="field-row"><label>Photo (optional)</label><input type="file" name="findingPhoto" accept="image/*" capture="environment" multiple /></div>
+          <div class="field-row"><label>Photo (optional)</label><input type="file" name="findingPhoto" accept="image/*" multiple /></div>
         </div>
         <div class="card" id="auditUploadStatus" hidden style="border-left:4px solid #c0392b;background:#c0392b0d"></div>
         <div class="btn-row">
