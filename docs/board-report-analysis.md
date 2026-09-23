@@ -495,3 +495,38 @@ once stamp-vs-resolve is settled.
 - **`promptDialog` added** to match `confirmDialog`. Native `prompt()` was the only
   other way to ask for a string; it looks nothing like the rest of the app and is
   suppressed outright in some embedded browsers. Zero native prompts remain.
+
+---
+
+# Q1 resolved: funding is stamped onto allocations (0083)
+
+`expense_allocations.funding_source` + `funding_ref_id`, copied from the destination when
+the split is made and never re-derived. Same rule as remedy estimates, job-line cascade
+values and report snapshots: re-funding a job line next year cannot rewrite what was
+already spent.
+
+**`expenses.fund_id` stays, and is not a duplicate.** The two answer different questions:
+
+- `expenses.fund_id` — which fund this **receipt** was charged to
+- `expense_allocations.funding_*` — which funding this **share** is charged to
+
+A receipt can be *partly* split: $100 on Fund A with $60 allocated to a cabin-holder job
+leaves $40 unallocated and still drawing on Fund A. So `getFundBalances` sums allocated
+fund shares **plus each receipt's unallocated remainder** — the only arithmetic that
+stays correct mid-split, and the reason the 6 existing receipts that carry a fund and no
+destination keep working untouched.
+
+Inheritance (`resolveAllocationFunding`): a job line knows its own funding; a work order
+answers only when all its lines agree, because guessing on a mixed WO would stamp a
+number that was never true; everything else falls back to the receipt's fund.
+
+Savings distribute proportionally and are never created by splitting — the discount was
+counted once at purchase, and the shares add back to it (verified: $20 over 48/32 → 12/8).
+
+## Split editor UI
+
+Opened deliberately from an expense ("Split this receipt…"). The ordinary form still
+writes its single destination behind the scenes, so the everyday path is untouched.
+Line items are optional throughout — an emailed receipt nobody itemized splits whole, by
+dollars — and the editor states the unassigned remainder plainly rather than forcing the
+split to be finished in one sitting.

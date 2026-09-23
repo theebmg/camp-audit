@@ -98,6 +98,13 @@ import {
   recordBoardReportOutput,
   listBoardReportOutputs,
   getBoardReportOutput,
+  listExpenseLineItems,
+  listExpenseAllocations,
+  createExpenseLineItem,
+  deleteExpenseLineItem,
+  createExpenseAllocation,
+  deleteExpenseAllocation,
+  getExpenseSplitSummary,
   listMaterials,
   getMaterial,
   createMaterial,
@@ -2087,6 +2094,76 @@ router.get('/board-report-outputs/:outputId', async (req, res, next) => {
     const output = await getBoardReportOutput(req.params.outputId);
     if (!output) return res.status(404).json({ ok: false, error: 'Not found' });
     res.json({ output });
+  } catch (e) { next(e); }
+});
+
+// ── Split editor (§9) ────────────────────────────────────────────────────
+// Only ever opened deliberately. The ordinary expense form still writes one
+// destination behind the scenes, so the fast path never touches any of this.
+router.get('/expenses/:id/split', async (req, res, next) => {
+  try {
+    const summary = await getExpenseSplitSummary(req.params.id);
+    if (!summary) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({
+      summary,
+      lineItems: await listExpenseLineItems(req.params.id),
+      allocations: await listExpenseAllocations(req.params.id),
+    });
+  } catch (e) { next(e); }
+});
+
+router.post('/expenses/:id/line-items', async (req, res, next) => {
+  try {
+    const { description, quantity, unit, paidAmount, regularPrice, materialId, sortIndex } = req.body || {};
+    if (!description || !String(description).trim()) {
+      return res.status(400).json({ ok: false, error: 'description is required' });
+    }
+    await createExpenseLineItem(req.params.id, { description, quantity, unit, paidAmount, regularPrice, materialId, sortIndex });
+    res.json({ ok: true, lineItems: await listExpenseLineItems(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+router.delete('/expenses/:id/line-items/:lineItemId', async (req, res, next) => {
+  try {
+    await deleteExpenseLineItem(req.params.lineItemId);
+    res.json({
+      ok: true,
+      lineItems: await listExpenseLineItems(req.params.id),
+      allocations: await listExpenseAllocations(req.params.id),
+      summary: await getExpenseSplitSummary(req.params.id),
+    });
+  } catch (e) { next(e); }
+});
+
+router.post('/expenses/:id/allocations', async (req, res, next) => {
+  try {
+    const { lineItemId, destType, destId, quantity, amount, materialId, fundingSource, fundingRefId } = req.body || {};
+    if (!['work_order', 'job_line', 'admin_task', 'leftover'].includes(destType)) {
+      return res.status(400).json({ ok: false, error: 'destType must be work_order, job_line, admin_task or leftover' });
+    }
+    if (destType === 'leftover' && !materialId) {
+      return res.status(400).json({ ok: false, error: 'Leftover stock has to say which material it is' });
+    }
+    if (destType !== 'leftover' && !destId) {
+      return res.status(400).json({ ok: false, error: 'destId is required for that destination' });
+    }
+    await createExpenseAllocation(req.params.id, { lineItemId, destType, destId, quantity, amount, materialId, fundingSource, fundingRefId });
+    res.json({
+      ok: true,
+      allocations: await listExpenseAllocations(req.params.id),
+      summary: await getExpenseSplitSummary(req.params.id),
+    });
+  } catch (e) { next(e); }
+});
+
+router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) => {
+  try {
+    await deleteExpenseAllocation(req.params.allocationId);
+    res.json({
+      ok: true,
+      allocations: await listExpenseAllocations(req.params.id),
+      summary: await getExpenseSplitSummary(req.params.id),
+    });
   } catch (e) { next(e); }
 });
 

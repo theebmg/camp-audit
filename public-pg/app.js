@@ -4407,6 +4407,7 @@ async function renderExpenseDetail({ id } = {}) {
         <div class="field-row"><label>Notes</label><textarea name="notes">${escapeHtml(expense?.Notes || '')}</textarea></div>
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Save</button>
+          ${id ? '<button type="button" class="btn btn-secondary" id="splitExpenseBtn">Split this receipt…</button>' : ''}
           ${id ? '<button type="button" class="btn btn-secondary" id="voidExpenseBtn">Void</button>' : ''}
         </div>
       </form>
@@ -4472,6 +4473,12 @@ async function renderExpenseDetail({ id } = {}) {
         go('expenseDetail', { id: created.Id }, { replace: true });
       }
     } catch (err) { toast(err.message); }
+  });
+
+  // Opens only when asked. Saving the expense normally still writes its single
+  // destination behind the scenes, so nothing about the fast path changed.
+  document.getElementById('splitExpenseBtn')?.addEventListener('click', () => {
+    openSplitEditor(id, { onClose: () => go('expenseDetail', { id }, { replace: true }) });
   });
 
   document.getElementById('voidExpenseBtn')?.addEventListener('click', async () => {
@@ -8785,6 +8792,166 @@ const RESPONSIBILITY_CLASS_LABELS = { self: 'Self', volunteer: 'Volunteer', vend
 //
 // options: [{ value, label, sublabel? }] — `value` is compared with String().
 // Returns { getValue, setValue, setOptions, focus, input }.
+// Split editor (Build Brief §9). Opened deliberately from an expense — the ordinary
+// form still writes one destination behind the scenes, so the everyday path never sees
+// any of this and stays exactly as fast as it was.
+//
+// Line items are OPTIONAL. An emailed receipt nobody itemized can still be split whole,
+// by dollars; itemizing is extra detail, never a precondition.
+async function openSplitEditor(expenseId, { onClose } = {}) {
+  let data = null;
+  let materials = [];
+  let woOptions = [];
+  let taskOptions = [];
+
+  async function load() {
+    data = await api(`/api/pg/expenses/${expenseId}/split`);
+    const [m, wo, at] = await Promise.all([
+      api('/api/pg/materials').catch(() => ({ materials: [] })),
+      api('/api/pg/work-orders?limit=200').catch(() => ({ workOrders: [] })),
+      api('/api/pg/admin-tasks').catch(() => ({ tasks: [] })),
+    ]);
+    materials = m.materials || [];
+    woOptions = (wo.workOrders || wo.items || []).map((w) => ({ value: `work_order:${w.Id}`, label: `WO — ${w.Title}` }));
+    taskOptions = (at.tasks || []).map((t) => ({ value: `admin_task:${t.Id}`, label: `Task — ${t.Title}` }));
+  }
+
+  const money = (n) => `$${Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  function destOptions() {
+    const lines = [];
+    for (const w of (data.jobLines || [])) lines.push({ value: `job_line:${w.Id}`, label: `Line — ${w.Title}` });
+    return [...lines, ...woOptions, ...taskOptions,
+      ...materials.map((m) => ({ value: `leftover:${m.Id}`, label: `Leftover stock — ${m.Name} (${m.Unit})` }))];
+  }
+
+  function draw(overlay) {
+    const s = data.summary;
+    const allocs = data.allocations || [];
+    const lis = data.lineItems || [];
+    overlay.querySelector('.split-body').innerHTML = `
+      <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:12px">
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Receipt total</div><div style="font-weight:700">${money(s.Total)}</div></div>
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Allocated</div><div style="font-weight:700">${money(s.Allocated)}</div></div>
+        <div><div class="muted" style="font-size:0.75rem;text-transform:uppercase">Still unassigned</div>
+          <div style="font-weight:700;color:${s.Unallocated > 0.005 ? '#b4690e' : '#2e8b57'}">${money(s.Unallocated)}</div></div>
+      </div>
+      ${s.Unallocated > 0.005 ? `<p class="muted" style="margin:0 0 10px">The unassigned part still draws on this receipt's fund — splitting the rest doesn't have to happen now.</p>` : ''}
+
+      <h4 style="margin:14px 0 6px">Where the money went</h4>
+      ${allocs.length ? allocs.map((a) => `
+        <div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+          <div>
+            <div><strong>${escapeHtml(a.DestLabel || a.DestType)}</strong> — ${money(a.Amount)}${a.Quantity != null ? ` <span class="muted">(${a.Quantity})</span>` : ''}</div>
+            <div class="muted" style="font-size:0.8rem">${escapeHtml(a.FundingSource || 'operating_budget')}${a.SavingsAmount ? ` · saved ${money(a.SavingsAmount)}` : ''}${a.LineItemId ? ' · from a line item' : ''}</div>
+          </div>
+          <button type="button" class="btn btn-secondary split-del-alloc" data-id="${a.Id}">Remove</button>
+        </div>`).join('') : '<p class="muted">Nothing split yet.</p>'}
+
+      <div class="card" style="margin-top:10px;background:#fbfbfe">
+        <div class="field-row"><label>Add a destination</label><div id="splitDestPicker"></div></div>
+        <div class="field-row"><label>Amount</label><input type="number" step="0.01" min="0" id="splitAmount" placeholder="${s.Unallocated > 0 ? s.Unallocated : ''}" /></div>
+        <div class="field-row"><label>Quantity (optional)</label><input type="number" step="0.01" min="0" id="splitQty" /></div>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="splitAddAlloc">Add split</button></div>
+      </div>
+
+      <h4 style="margin:18px 0 6px">Line items <span class="muted" style="font-weight:400;font-size:0.85rem">— optional detail</span></h4>
+      ${lis.length ? lis.map((l) => `
+        <div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+          <div><strong>${escapeHtml(l.Description)}</strong>${l.Quantity != null ? ` <span class="muted">— ${l.Quantity} ${escapeHtml(l.Unit || '')}</span>` : ''}${l.MaterialName ? ` <span class="muted">· ${escapeHtml(l.MaterialName)}</span>` : ''}
+            ${l.PaidAmount != null ? `<div class="muted" style="font-size:0.8rem">${money(l.PaidAmount)}${l.RegularPrice != null ? ` (reg. ${money(l.RegularPrice)})` : ''}</div>` : ''}
+          </div>
+          <button type="button" class="btn btn-secondary split-del-li" data-id="${l.Id}">Remove</button>
+        </div>`).join('') : '<p class="muted">None — the receipt can still be split whole, by dollars.</p>'}
+      <div class="card" style="margin-top:10px;background:#fbfbfe">
+        <div class="field-row"><label>Description</label><input type="text" id="liDesc" placeholder="Drywall ½ 4×8" /></div>
+        <div class="field-row"><label>Material (optional)</label><div id="liMaterialPicker"></div></div>
+        <div class="field-row"><label>Qty / unit</label>
+          <div style="display:flex;gap:8px"><input type="number" step="0.01" id="liQty" style="flex:1" /><input type="text" id="liUnit" placeholder="sheets" style="flex:1" /></div>
+        </div>
+        <div class="field-row"><label>Paid / regular price</label>
+          <div style="display:flex;gap:8px"><input type="number" step="0.01" id="liPaid" style="flex:1" /><input type="number" step="0.01" id="liReg" placeholder="without the deal" style="flex:1" /></div>
+        </div>
+        <div class="btn-row"><button type="button" class="btn btn-secondary" id="liAdd">Add line item</button></div>
+      </div>`;
+
+    let dest = null;
+    mountCombobox(overlay.querySelector('#splitDestPicker'), {
+      options: destOptions(), placeholder: 'Work order, job line, task, or leftover stock…',
+      onSelect: (o) => { dest = o ? o.value : null; },
+      onClear: () => { dest = null; },
+    });
+    let liMaterial = null;
+    mountCombobox(overlay.querySelector('#liMaterialPicker'), {
+      options: materials.map((m) => ({ value: m.Id, label: `${m.Name} (${m.Unit})` })),
+      placeholder: 'Only if this is a tracked material…',
+      onSelect: (o) => { liMaterial = o ? o.value : null; },
+      onClear: () => { liMaterial = null; },
+    });
+
+    overlay.querySelector('#splitAddAlloc').addEventListener('click', async () => {
+      if (!dest) return toast('Pick where this share went', 4000);
+      const [destType, destId] = String(dest).split(':');
+      const amount = Number(overlay.querySelector('#splitAmount').value || 0);
+      if (!(amount > 0)) return toast('Enter an amount', 4000);
+      try {
+        const r = await api(`/api/pg/expenses/${expenseId}/allocations`, {
+          method: 'POST',
+          body: JSON.stringify({
+            destType: destType === 'leftover' ? 'leftover' : destType,
+            destId: destType === 'leftover' ? null : Number(destId),
+            materialId: destType === 'leftover' ? Number(destId) : null,
+            amount, quantity: overlay.querySelector('#splitQty').value || null,
+          }),
+        });
+        data.allocations = r.allocations; data.summary = r.summary;
+        draw(overlay);
+      } catch (e) { toast(e.message, 5000); }
+    });
+    overlay.querySelectorAll('.split-del-alloc').forEach((b) => b.addEventListener('click', async () => {
+      const r = await api(`/api/pg/expenses/${expenseId}/allocations/${b.dataset.id}`, { method: 'DELETE' });
+      data.allocations = r.allocations; data.summary = r.summary; draw(overlay);
+    }));
+    overlay.querySelector('#liAdd').addEventListener('click', async () => {
+      const description = overlay.querySelector('#liDesc').value.trim();
+      if (!description) return toast('Describe the line item', 4000);
+      try {
+        const r = await api(`/api/pg/expenses/${expenseId}/line-items`, {
+          method: 'POST',
+          body: JSON.stringify({
+            description, materialId: liMaterial,
+            quantity: overlay.querySelector('#liQty').value || null,
+            unit: overlay.querySelector('#liUnit').value || null,
+            paidAmount: overlay.querySelector('#liPaid').value || null,
+            regularPrice: overlay.querySelector('#liReg').value || null,
+          }),
+        });
+        data.lineItems = r.lineItems; draw(overlay);
+      } catch (e) { toast(e.message, 5000); }
+    });
+    overlay.querySelectorAll('.split-del-li').forEach((b) => b.addEventListener('click', async () => {
+      const r = await api(`/api/pg/expenses/${expenseId}/line-items/${b.dataset.id}`, { method: 'DELETE' });
+      data.lineItems = r.lineItems; data.allocations = r.allocations; data.summary = r.summary; draw(overlay);
+    }));
+  }
+
+  await load();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:640px;width:95%;max-height:88vh;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">Split this receipt</h3>
+      <button type="button" class="btn btn-secondary modal-cancel">Done</button>
+    </div>
+    <div class="split-body" style="margin-top:12px"></div>
+  </div>`;
+  document.body.appendChild(overlay);
+  draw(overlay);
+  const close = () => { overlay.remove(); if (onClose) onClose(); };
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+}
+
 function mountCombobox(container, {
   options = [], value = null, placeholder = 'Type to search…',
   emptyText = 'No matches', inputClass = '', extraRowHtml = null, onExtraRow = null,

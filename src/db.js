@@ -4025,9 +4025,26 @@ export async function deleteFund(id) {
 // Overage number the frontend renders in a warning color, never blocked.
 export async function getFundBalances() {
   const funds = await listFunds();
-  const { rows: spentRows } = await pool.query(
-    `SELECT fund_id, COALESCE(SUM(amount), 0) AS spent FROM expenses WHERE fund_id IS NOT NULL AND triage_status != 'void' AND deleted_at IS NULL GROUP BY fund_id`
-  );
+  // Two halves of the same money (0083): shares explicitly allocated to a fund, plus
+  // the part of each receipt nobody has split yet, which still draws on the fund the
+  // receipt was charged to. Summing only one half understates spend while a split is
+  // half-finished.
+  const { rows: spentRows } = await pool.query(`
+    SELECT fund_id, COALESCE(SUM(spent), 0) AS spent FROM (
+      SELECT ea.funding_ref_id AS fund_id, SUM(ea.amount) AS spent
+      FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
+      WHERE ea.funding_source = 'fund' AND ea.funding_ref_id IS NOT NULL
+        AND e.triage_status != 'void' AND e.deleted_at IS NULL
+      GROUP BY ea.funding_ref_id
+      UNION ALL
+      SELECT e.fund_id, GREATEST(COALESCE(e.amount, 0) - COALESCE(alloc.total, 0), 0) AS spent
+      FROM expenses e
+      LEFT JOIN (SELECT expense_id, SUM(amount) AS total FROM expense_allocations GROUP BY expense_id) alloc
+        ON alloc.expense_id = e.id
+      WHERE e.fund_id IS NOT NULL AND e.triage_status != 'void' AND e.deleted_at IS NULL
+    ) parts
+    GROUP BY fund_id
+  `);
   const spentByFund = new Map(spentRows.map((r) => [r.fund_id, Number(r.spent)]));
   const today = new Date();
   return funds.map((f) => {
@@ -4222,6 +4239,29 @@ export async function createExpense({
   return getExpense(id);
 }
 
+// What funding does a new split inherit? A job line knows its own; a work order's lines
+// may disagree, so it only answers when they agree; everything else falls back to the
+// receipt's fund. Whatever this returns is COPIED onto the allocation and never
+// re-derived — that is what "stamped" means (0083).
+export async function resolveAllocationFunding({ destType, destId, fallbackFundId = null }) {
+  const fallback = fallbackFundId
+    ? { fundingSource: 'fund', fundingRefId: fallbackFundId }
+    : { fundingSource: 'operating_budget', fundingRefId: null };
+  if (destType === 'job_line' && destId) {
+    const { rows } = await pool.query('SELECT funding_source, funding_ref_id FROM job_lines WHERE id = $1', [destId]);
+    if (rows[0]) return { fundingSource: rows[0].funding_source, fundingRefId: rows[0].funding_ref_id };
+  }
+  if (destType === 'work_order' && destId) {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT funding_source, funding_ref_id FROM job_lines WHERE work_order_id = $1`, [destId]
+    );
+    // One answer only when the whole work order agrees — guessing on a mixed WO would
+    // stamp a number that was never true.
+    if (rows.length === 1) return { fundingSource: rows[0].funding_source, fundingRefId: rows[0].funding_ref_id };
+  }
+  return fallback;
+}
+
 // The unsplit case: at most one job_line/work_order allocation, carrying the whole
 // amount. Leaves any leftover/admin_task rows and any line-item splits alone — those
 // are managed by the split editor, not by picking a destination on the main form.
@@ -4235,11 +4275,15 @@ export async function setExpenseDestination(expenseId, { jobLineId, workOrderId,
   const destType = jobLineId ? 'job_line' : (workOrderId ? 'work_order' : null);
   const destId = jobLineId || workOrderId || null;
   if (!destType) return;
-  const { rows } = await pool.query('SELECT amount FROM expenses WHERE id = $1', [expenseId]);
+  const { rows } = await pool.query('SELECT amount, fund_id FROM expenses WHERE id = $1', [expenseId]);
   const total = amount ?? (rows[0]?.amount != null ? Number(rows[0].amount) : 0);
+  const funding = await resolveAllocationFunding({
+    destType, destId, fallbackFundId: rows[0]?.fund_id ?? null,
+  });
   await pool.query(
-    `INSERT INTO expense_allocations (expense_id, dest_type, dest_id, amount) VALUES ($1,$2,$3,$4)`,
-    [expenseId, destType, destId, total ?? 0]
+    `INSERT INTO expense_allocations (expense_id, dest_type, dest_id, amount, funding_source, funding_ref_id)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [expenseId, destType, destId, total ?? 0, funding.fundingSource, funding.fundingRefId]
   );
 }
 
@@ -4827,6 +4871,128 @@ export async function getBoardReportOutput(outputId) {
     Id: r.id, ReportId: r.report_id, ReportTitle: r.title, Kind: r.kind, CreatedAt: r.created_at,
     Recipients: r.recipients, Subject: r.subject, WasDraft: r.was_draft,
     SnapshotHtml: r.snapshot_html, SnapshotText: r.snapshot_text, CreatedBy: r.created_by,
+  };
+}
+
+// ── Split editor: line items and allocations (Build Brief §9) ────────────
+
+export async function listExpenseLineItems(expenseId) {
+  const { rows } = await pool.query(
+    `SELECT li.*, m.name AS material_name, m.unit AS material_unit
+     FROM expense_line_items li LEFT JOIN materials m ON m.id = li.material_id
+     WHERE li.expense_id = $1 ORDER BY li.sort_index, li.id`,
+    [expenseId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, ExpenseId: r.expense_id, Description: r.description,
+    Quantity: r.quantity != null ? Number(r.quantity) : null, Unit: r.unit,
+    PaidAmount: r.paid_amount != null ? Number(r.paid_amount) : null,
+    RegularPrice: r.regular_price != null ? Number(r.regular_price) : null,
+    MaterialId: r.material_id, MaterialName: r.material_name || null, MaterialUnit: r.material_unit || null,
+    SortIndex: r.sort_index,
+  }));
+}
+
+export async function listExpenseAllocations(expenseId) {
+  const { rows } = await pool.query(
+    `SELECT ea.*, jl.title AS job_line_title, w.title AS work_order_title,
+            t.title AS admin_task_title, m.name AS material_name
+     FROM expense_allocations ea
+     LEFT JOIN job_lines jl ON ea.dest_type = 'job_line' AND jl.id = ea.dest_id
+     LEFT JOIN work_orders w ON ea.dest_type = 'work_order' AND w.id = ea.dest_id
+     LEFT JOIN admin_tasks t ON ea.dest_type = 'admin_task' AND t.id = ea.dest_id
+     LEFT JOIN materials m ON m.id = ea.material_id
+     WHERE ea.expense_id = $1 ORDER BY ea.id`,
+    [expenseId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, ExpenseId: r.expense_id, LineItemId: r.line_item_id,
+    DestType: r.dest_type, DestId: r.dest_id,
+    DestLabel: r.job_line_title || r.work_order_title || r.admin_task_title
+      || (r.dest_type === 'leftover' ? `Leftover stock${r.material_name ? ` — ${r.material_name}` : ''}` : null),
+    Quantity: r.quantity != null ? Number(r.quantity) : null,
+    Amount: Number(r.amount),
+    SavingsAmount: r.savings_amount != null ? Number(r.savings_amount) : 0,
+    MaterialId: r.material_id, MaterialName: r.material_name || null,
+    FundingSource: r.funding_source, FundingRefId: r.funding_ref_id,
+  }));
+}
+
+export async function createExpenseLineItem(expenseId, { description, quantity, unit, paidAmount, regularPrice, materialId, sortIndex }) {
+  const { rows } = await pool.query(
+    `INSERT INTO expense_line_items (expense_id, description, quantity, unit, paid_amount, regular_price, material_id, sort_index)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,COALESCE($8,0)) RETURNING id`,
+    [expenseId, description, quantity ?? null, unit || null, paidAmount ?? null, regularPrice ?? null, materialId || null, sortIndex ?? null]
+  );
+  return rows[0].id;
+}
+
+export async function deleteExpenseLineItem(lineItemId) {
+  await pool.query('DELETE FROM expense_line_items WHERE id = $1', [lineItemId]);
+}
+
+// Savings follow the split proportionally and are never created by it: the receipt's
+// discount was counted once at purchase (§9), so each share carries its slice and the
+// slices add back up to the whole.
+async function distributeSavings(expenseId) {
+  const { rows: er } = await pool.query(
+    'SELECT amount, regular_price FROM expenses WHERE id = $1', [expenseId]
+  );
+  const paid = er[0]?.amount != null ? Number(er[0].amount) : null;
+  const regular = er[0]?.regular_price != null ? Number(er[0].regular_price) : null;
+  const discount = (paid != null && regular != null && regular > paid) ? regular - paid : 0;
+  const { rows: al } = await pool.query(
+    'SELECT id, amount FROM expense_allocations WHERE expense_id = $1 ORDER BY id', [expenseId]
+  );
+  const total = al.reduce((t, a) => t + Number(a.amount), 0);
+  for (const a of al) {
+    const share = (discount > 0 && total > 0) ? Math.round((discount * (Number(a.amount) / total)) * 100) / 100 : 0;
+    await pool.query('UPDATE expense_allocations SET savings_amount = $2 WHERE id = $1', [a.id, share]);
+  }
+}
+
+export async function createExpenseAllocation(expenseId, {
+  lineItemId, destType, destId, quantity, amount, materialId, fundingSource, fundingRefId,
+}) {
+  const { rows: er } = await pool.query('SELECT fund_id FROM expenses WHERE id = $1', [expenseId]);
+  // An explicit choice in the split editor wins; otherwise it inherits and is stamped.
+  const funding = (fundingSource !== undefined && fundingSource !== null)
+    ? { fundingSource, fundingRefId: fundingRefId ?? null }
+    : await resolveAllocationFunding({ destType, destId, fallbackFundId: er[0]?.fund_id ?? null });
+  const { rows } = await pool.query(
+    `INSERT INTO expense_allocations
+       (expense_id, line_item_id, dest_type, dest_id, quantity, amount, material_id, funding_source, funding_ref_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+    [expenseId, lineItemId || null, destType, destId || null, quantity ?? null,
+      amount ?? 0, materialId || null, funding.fundingSource, funding.fundingRefId]
+  );
+  await distributeSavings(expenseId);
+  return rows[0].id;
+}
+
+export async function deleteExpenseAllocation(allocationId) {
+  const { rows } = await pool.query(
+    'DELETE FROM expense_allocations WHERE id = $1 RETURNING expense_id', [allocationId]
+  );
+  if (rows[0]) await distributeSavings(rows[0].expense_id);
+}
+
+// What's left to split. The everyday single-destination case never shows this; it
+// exists so a partially split receipt says plainly how much is still unassigned.
+export async function getExpenseSplitSummary(expenseId) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(e.amount, 0) AS total,
+            COALESCE((SELECT SUM(amount) FROM expense_allocations WHERE expense_id = e.id), 0) AS allocated
+     FROM expenses e WHERE e.id = $1`,
+    [expenseId]
+  );
+  if (!rows[0]) return null;
+  const total = Number(rows[0].total);
+  const allocated = Number(rows[0].allocated);
+  return {
+    Total: total, Allocated: allocated,
+    Unallocated: Math.round((total - allocated) * 100) / 100,
+    FullyAllocated: Math.abs(total - allocated) < 0.005,
   };
 }
 
