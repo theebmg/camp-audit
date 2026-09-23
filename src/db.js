@@ -5016,6 +5016,460 @@ export async function getExpenseSplitSummary(expenseId) {
   };
 }
 
+// ── Audit engine: rounds and the runner (Build Brief §3/§4/§5) ───────────
+
+export async function listAuditForms() {
+  const { rows } = await pool.query(
+    `SELECT f.*, (SELECT count(*) FROM audit_questions q WHERE q.form_id = f.id AND NOT q.archived) AS question_count
+     FROM audit_forms f WHERE f.active ORDER BY f.name`
+  );
+  return rows.map((r) => ({
+    Id: r.id, Name: r.name, Description: r.description, TargetNote: r.target_note,
+    QuestionCount: Number(r.question_count),
+  }));
+}
+
+// A round is created with one instance per asset in scope — the instances ARE the
+// scope, so there is no second copy of that fact to drift.
+export async function createAuditRound({ formId, name, assetIds = [], scheduledDate, dueDate }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO audit_rounds (form_id, name, scheduled_date, due_date) VALUES ($1,$2,$3,$4) RETURNING id`,
+      [formId, name, scheduledDate || null, dueDate || null]
+    );
+    const roundId = rows[0].id;
+    for (const assetId of assetIds) {
+      await client.query(
+        `INSERT INTO audit_round_instances (round_id, asset_id) VALUES ($1,$2)
+         ON CONFLICT (round_id, asset_id) DO NOTHING`,
+        [roundId, assetId]
+      );
+    }
+    await client.query('COMMIT');
+    await logActivity({ action: 'created', entityType: 'audit_round', entityId: roundId, entityLabel: name });
+    return getAuditRound(roundId);
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+
+export async function getAuditRound(id) {
+  const { rows } = await pool.query(
+    `SELECT r.*, f.name AS form_name,
+            r.scheduled_date::text AS scheduled_date_text, r.due_date::text AS due_date_text
+     FROM audit_rounds r JOIN audit_forms f ON f.id = r.form_id WHERE r.id = $1`,
+    [id]
+  );
+  if (!rows[0]) return null;
+  const r = rows[0];
+  return {
+    Id: r.id, FormId: r.form_id, FormName: r.form_name, Name: r.name, Status: r.status,
+    ScheduledDate: r.scheduled_date_text, DueDate: r.due_date_text, CreatedAt: r.created_at,
+  };
+}
+
+// Per-building status for the whole round in ONE aggregate — 130+ instances must not
+// become 130 queries (§5).
+export async function listAuditRoundInstances(roundId) {
+  const { rows } = await pool.query(
+    `SELECT i.id, i.asset_id, i.status, i.generated_wo_id, i.completed_at,
+            a.name AS asset_name, a.asset_type, l.name AS location_name,
+            ic.icon, at.thumb_url, at.url,
+            (SELECT count(*) FROM audit_answers an WHERE an.instance_id = i.id AND an.active) AS answered,
+            (SELECT count(*) FROM audit_answers an
+               JOIN audit_question_options o ON o.id = an.option_id
+             WHERE an.instance_id = i.id AND an.active AND o.flag) AS flagged,
+            w.title AS wo_title
+     FROM audit_round_instances i
+     JOIN assets a ON a.id = i.asset_id
+     LEFT JOIN locations l ON l.id = a.location_id
+     LEFT JOIN asset_type_icons ic ON ic.asset_type = a.asset_type
+     LEFT JOIN attachments at ON at.id = a.profile_attachment_id AND at.deleted_at IS NULL
+     LEFT JOIN work_orders w ON w.id = i.generated_wo_id
+     WHERE i.round_id = $1
+     ORDER BY l.name NULLS LAST, a.name`,
+    [roundId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, AssetId: r.asset_id, AssetName: r.asset_name, AssetType: r.asset_type,
+    LocationName: r.location_name, Status: r.status, CompletedAt: r.completed_at,
+    GeneratedWorkOrderId: r.generated_wo_id, GeneratedWorkOrderTitle: r.wo_title,
+    Answered: Number(r.answered), Flagged: Number(r.flagged),
+    Face: { PhotoUrl: r.thumb_url || r.url || null, Icon: r.icon || '🏢' },
+  }));
+}
+
+export async function listAuditRounds() {
+  const { rows } = await pool.query(
+    `SELECT r.id, r.name, r.status, r.due_date::text AS due_date, f.name AS form_name,
+            count(i.id)::int AS total,
+            count(i.id) FILTER (WHERE i.status = 'complete')::int AS complete
+     FROM audit_rounds r
+     JOIN audit_forms f ON f.id = r.form_id
+     LEFT JOIN audit_round_instances i ON i.round_id = r.id
+     GROUP BY r.id, r.name, r.status, r.due_date, f.name
+     ORDER BY r.created_at DESC`
+  );
+  return rows.map((r) => ({
+    Id: r.id, Name: r.name, Status: r.status, DueDate: r.due_date, FormName: r.form_name,
+    Total: r.total, Complete: r.complete,
+    Percent: r.total ? Math.round((r.complete / r.total) * 100) : 0,
+  }));
+}
+
+// Everything the runner needs for one building, in one call: the form, this building's
+// answers so far, and the asset's standing notes — which appear BEFORE the walkthrough
+// so "the shutoff is behind the shed" is read on the way in, not discovered after (§5c).
+export async function getAuditInstance(instanceId) {
+  const { rows: ir } = await pool.query(
+    `SELECT i.*, r.form_id, r.name AS round_name, a.name AS asset_name, a.asset_type,
+            a.building_type_id, l.name AS location_name
+     FROM audit_round_instances i
+     JOIN audit_rounds r ON r.id = i.round_id
+     JOIN assets a ON a.id = i.asset_id
+     LEFT JOIN locations l ON l.id = a.location_id
+     WHERE i.id = $1`,
+    [instanceId]
+  );
+  if (!ir[0]) return null;
+  const inst = ir[0];
+
+  const [sections, questions, options, answers, notes] = await Promise.all([
+    pool.query('SELECT id, name, sort_index FROM audit_sections WHERE form_id = $1 ORDER BY sort_index, id', [inst.form_id]),
+    pool.query(
+      `SELECT q.* FROM audit_questions q
+       WHERE q.form_id = $1 AND NOT q.archived
+         -- Building-type applicability: no rows means "every type" (§4 of the decisions).
+         AND (NOT EXISTS (SELECT 1 FROM audit_question_building_types b WHERE b.question_id = q.id)
+              OR $2::int IS NULL
+              OR EXISTS (SELECT 1 FROM audit_question_building_types b
+                         WHERE b.question_id = q.id AND b.building_type_id = $2::int))
+       ORDER BY q.sort_index, q.id`,
+      [inst.form_id, inst.building_type_id]
+    ),
+    pool.query(
+      `SELECT o.* FROM audit_question_options o
+       JOIN audit_questions q ON q.id = o.question_id
+       WHERE q.form_id = $1 AND NOT o.archived ORDER BY o.sort_index, o.id`,
+      [inst.form_id]
+    ),
+    pool.query('SELECT * FROM audit_answers WHERE instance_id = $1', [instanceId]),
+    pool.query(
+      `SELECT id, note, source, created_by, created_at FROM asset_notes
+       WHERE asset_id = $1 AND NOT resolved ORDER BY created_at DESC LIMIT 20`,
+      [inst.asset_id]
+    ),
+  ]);
+
+  const optByQ = new Map();
+  for (const o of options.rows) {
+    if (!optByQ.has(o.question_id)) optByQ.set(o.question_id, []);
+    optByQ.get(o.question_id).push({
+      Id: o.id, Label: o.label, Value: o.value, Flag: o.flag, Severe: o.severe, IsFixture: o.is_fixture,
+    });
+  }
+
+  return {
+    Instance: {
+      Id: inst.id, RoundId: inst.round_id, RoundName: inst.round_name, Status: inst.status,
+      AssetId: inst.asset_id, AssetName: inst.asset_name, AssetType: inst.asset_type,
+      LocationName: inst.location_name, GeneratedWorkOrderId: inst.generated_wo_id,
+    },
+    Sections: sections.rows.map((s) => ({ Id: s.id, Name: s.name, SortIndex: s.sort_index })),
+    Questions: questions.rows.map((q) => ({
+      Id: q.id, SectionId: q.section_id, QuestionKey: q.question_key, Prompt: q.prompt,
+      Type: q.type, Required: q.required, AllowsPhoto: q.allows_photo, ShowIf: q.show_if,
+      MapsTo: q.maps_to, Options: optByQ.get(q.id) || [],
+    })),
+    Answers: answers.rows.map((a) => ({
+      Id: a.id, QuestionId: a.question_id, SectionId: a.section_id, Kind: a.kind,
+      QuestionKey: a.question_key, Value: a.value, OptionId: a.option_id, Note: a.note,
+      NoteDestination: a.note_destination, Active: a.active,
+    })),
+    AssetNotes: notes.rows.map((n) => ({
+      Id: n.id, Note: n.note, Source: n.source, CreatedBy: n.created_by, CreatedAt: n.created_at,
+    })),
+  };
+}
+
+// One answer, saved on its own. The runner posts per answer rather than per form so a
+// dropped connection costs one field, not a building — and the retry queue on the client
+// has something idempotent to retry against.
+export async function saveAuditAnswer(instanceId, { questionId, questionKey, value, optionId, note, noteDestination, active = true }) {
+  const { rows } = await pool.query(
+    `INSERT INTO audit_answers (instance_id, question_id, question_key, value, option_id, note, note_destination, active)
+     VALUES ($1,$2,$3,$4,$5,$6,COALESCE($7,'audit_only'),$8)
+     ON CONFLICT (instance_id, question_id) DO UPDATE SET
+       value = EXCLUDED.value, option_id = EXCLUDED.option_id, note = EXCLUDED.note,
+       note_destination = COALESCE($7, audit_answers.note_destination),
+       active = EXCLUDED.active
+     RETURNING id`,
+    [instanceId, questionId, questionKey, value ?? null, optionId ?? null, note ?? null, noteDestination ?? null, active]
+  );
+  await pool.query(
+    `UPDATE audit_round_instances
+     SET status = CASE WHEN status = 'not_started' THEN 'in_progress' ELSE status END,
+         started_at = COALESCE(started_at, now())
+     WHERE id = $1`,
+    [instanceId]
+  );
+  return rows[0].id;
+}
+
+// "Flag something else" — something the form never asked about. Same table, so it shows
+// up in the audit data screen and the asset's history alongside everything else.
+export async function addAdhocFlag(instanceId, { sectionId, description, note, noteDestination, remedy }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO audit_answers (instance_id, section_id, kind, question_key, value, note, note_destination)
+       VALUES ($1,$2,'adhoc_flag','adhoc_flag',$3,$4,COALESCE($5,'audit_only')) RETURNING id`,
+      [instanceId, sectionId, description, note ?? null, noteDestination ?? null]
+    );
+    const answerId = rows[0].id;
+    if (remedy && remedy.title) {
+      await client.query(
+        `INSERT INTO audit_answer_remedies (answer_id, title, responsibility, funding_source, funding_ref_id, est_hours, est_cost)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [answerId, remedy.title, remedy.responsibility || null, remedy.fundingSource || null,
+          remedy.fundingRefId || null, remedy.estHours ?? null, remedy.estCost ?? null]
+      );
+    }
+    await client.query(
+      `UPDATE audit_round_instances
+       SET status = CASE WHEN status = 'not_started' THEN 'in_progress' ELSE status END,
+           started_at = COALESCE(started_at, now())
+       WHERE id = $1`,
+      [instanceId]
+    );
+    await client.query('COMMIT');
+    return answerId;
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+
+export async function chooseAnswerRemedy(answerId, remedyId) {
+  await pool.query(
+    `INSERT INTO audit_answer_remedies (answer_id, remedy_id) VALUES ($1,$2)
+     ON CONFLICT (answer_id, remedy_id) DO NOTHING`,
+    [answerId, remedyId]
+  );
+}
+
+// The asset-property router in one place (audit decisions §6): a field with a
+// column_name is a real assets column, one without lives in asset_property_values.
+// Both stores are kept deliberately — the EAV side is the escape hatch that lets an
+// admin add a property field without a migration.
+export async function writeAssetPropertyViaRouter(assetId, fieldKey, value) {
+  const { rows } = await pool.query(
+    'SELECT column_name FROM asset_property_fields WHERE field_key = $1', [fieldKey]
+  );
+  if (!rows[0]) return false;
+  if (rows[0].column_name) {
+    await pool.query(`UPDATE assets SET ${rows[0].column_name} = $1 WHERE id = $2`, [value, assetId]);
+  } else {
+    await pool.query(
+      `INSERT INTO asset_property_values (asset_id, field_key, value) VALUES ($1,$2,$3)
+       ON CONFLICT (asset_id, field_key) DO UPDATE SET value = EXCLUDED.value`,
+      [assetId, fieldKey, value]
+    );
+  }
+  return true;
+}
+
+// ── Audit review and generation (Build Brief §4, Addendum §4) ────────────
+
+// What this building's completed audit will produce. Read-only: the review screen shows
+// it, the grid lets it be edited, and nothing is created until completeAuditInstance.
+export async function getAuditReview(instanceId) {
+  const inst = await getAuditInstance(instanceId);
+  if (!inst) return null;
+
+  const { rows: flagged } = await pool.query(
+    `SELECT an.id AS answer_id, an.kind, an.value, an.note, an.note_destination,
+            q.prompt, q.question_key, o.label AS option_label, o.severe,
+            sec.name AS section_name
+     FROM audit_answers an
+     LEFT JOIN audit_questions q ON q.id = an.question_id
+     LEFT JOIN audit_question_options o ON o.id = an.option_id
+     LEFT JOIN audit_sections sec ON sec.id = COALESCE(an.section_id, q.section_id)
+     WHERE an.instance_id = $1 AND an.active
+       AND (o.flag = true OR an.kind = 'adhoc_flag')
+     ORDER BY an.id`,
+    [instanceId]
+  );
+
+  // Remedies: a template one carries the option's values, an inline one carries its own.
+  // Generation reads a single shape either way (0086).
+  const { rows: remedies } = await pool.query(
+    `SELECT ar.id, ar.answer_id, ar.remedy_id,
+            COALESCE(ar.title, r.title_template) AS title,
+            COALESCE(ar.responsibility, r.responsibility) AS responsibility,
+            COALESCE(ar.funding_source, r.funding_source) AS funding_source,
+            COALESCE(ar.funding_ref_id, r.funding_ref_id) AS funding_ref_id,
+            COALESCE(ar.est_hours, r.est_hours) AS est_hours,
+            COALESCE(ar.est_cost, r.est_cost) AS est_cost,
+            COALESCE(r.is_fixture, false) AS is_fixture
+     FROM audit_answer_remedies ar
+     LEFT JOIN audit_remedies r ON r.id = ar.remedy_id
+     WHERE ar.answer_id = ANY($1::int[])`,
+    [flagged.map((f) => f.answer_id)]
+  );
+  const byAnswer = new Map();
+  for (const r of remedies) {
+    if (!byAnswer.has(r.answer_id)) byAnswer.set(r.answer_id, []);
+    byAnswer.get(r.answer_id).push({
+      Id: r.id, RemedyId: r.remedy_id,
+      // {asset} is substituted at generation so the stored line names the building.
+      Title: String(r.title || '').replace(/\{asset\}/g, inst.Instance.AssetName),
+      Responsibility: r.responsibility, FundingSource: r.funding_source, FundingRefId: r.funding_ref_id,
+      EstHours: r.est_hours != null ? Number(r.est_hours) : null,
+      EstCost: r.est_cost != null ? Number(r.est_cost) : null,
+      IsFixture: r.is_fixture,
+    });
+  }
+
+  // A job note on a building that ends with no work order is STRANDED — the review
+  // screen has to ask rather than drop it (§4).
+  const strandedNotes = flagged
+    .filter((f) => f.note && f.note_destination === 'job')
+    .map((f) => ({ AnswerId: f.answer_id, Note: f.note, Prompt: f.prompt || f.value }));
+
+  const lines = flagged.flatMap((f) => (byAnswer.get(f.answer_id) || []).map((r) => ({ ...r, AnswerId: f.answer_id })));
+
+  return {
+    Instance: inst.Instance,
+    Flagged: flagged.map((f) => ({
+      AnswerId: f.answer_id, Kind: f.kind, SectionName: f.section_name,
+      // "Roof: Poor" — the chain as the reviewer reads it.
+      Chain: f.kind === 'adhoc_flag' ? `Flagged: ${f.value}` : `${f.prompt}: ${f.option_label || f.value}`,
+      Severe: !!f.severe, Note: f.note, NoteDestination: f.note_destination,
+      Remedies: byAnswer.get(f.answer_id) || [],
+    })),
+    ProposedLines: lines,
+    StrandedJobNotes: lines.length ? [] : strandedNotes,
+    // A clean building is a real outcome, not a gap: the completed instance is the record.
+    Clean: flagged.length === 0,
+  };
+}
+
+// Completing a building: findings for every flagged answer, one work order with the
+// chosen lines, maps_to routing, and note delivery. One transaction — a half-generated
+// building would be worse than none.
+export async function completeAuditInstance(instanceId, { lines = null, strandedNoteChoices = {}, createdBy } = {}) {
+  const review = await getAuditReview(instanceId);
+  if (!review) return null;
+  const assetId = review.Instance.AssetId;
+  const useLines = lines || review.ProposedLines;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. A finding per flagged answer — the ISSUE record, which outlives any one work
+    //    order and keeps the deferred-maintenance lane fed even when nothing is fixed
+    //    this year (decisions §1).
+    const findingByAnswer = new Map();
+    for (const f of review.Flagged) {
+      const { rows } = await client.query(
+        `INSERT INTO condition_findings (title, asset_id, status, date_identified, description, audit_answer_id, created_by)
+         VALUES ($1,$2,'Open',CURRENT_DATE,$3,$4,$5) RETURNING id`,
+        [f.Chain, assetId, f.Note || null, f.AnswerId, createdBy || null]
+      );
+      findingByAnswer.set(f.AnswerId, rows[0].id);
+    }
+
+    // 2. One work order per building, only if there is work to do.
+    let workOrderId = null;
+    if (useLines.length) {
+      const { rows: wo } = await client.query(
+        `INSERT INTO work_orders (wo_number, title, asset_id, status_id, split_root_id, date_reported)
+         VALUES ('AUD-' || nextval('work_orders_id_seq')::text,
+                 $1, $2, (SELECT id FROM work_order_statuses ORDER BY sort_order LIMIT 1),
+                 currval('work_orders_id_seq'), CURRENT_DATE)
+         RETURNING id`,
+        [`${review.Instance.RoundName} — ${review.Instance.AssetName}`, assetId]
+      );
+      workOrderId = wo.rows ? wo.rows[0].id : wo[0].id;
+
+      for (const l of useLines) {
+        // Estimates are SNAPSHOTS: editing a remedy template later never moves a work
+        // order that already exists.
+        await client.query(
+          `INSERT INTO job_lines (work_order_id, title, responsibility_class, funding_source, funding_ref_id,
+                                  estimated_hours, estimated_cost, status_id, condition_finding_id)
+           VALUES ($1,$2,$3,COALESCE($4,'operating_budget'),$5,$6,$7,
+                   (SELECT id FROM job_line_statuses ORDER BY sort_order LIMIT 1), $8)`,
+          [workOrderId, l.Title, l.Responsibility || 'self', l.FundingSource, l.FundingRefId,
+            l.EstHours, l.EstCost, findingByAnswer.get(l.AnswerId) || null]
+        );
+      }
+    }
+
+    // 3. maps_to routing — additive: the answer is already stored regardless (§4).
+    const { rows: mapped } = await client.query(
+      `SELECT an.value, q.maps_to FROM audit_answers an
+       JOIN audit_questions q ON q.id = an.question_id
+       WHERE an.instance_id = $1 AND an.active AND q.maps_to IS NOT NULL`,
+      [instanceId]
+    );
+    for (const m of mapped) {
+      if (!m.value) continue;
+      if (m.maps_to.kind === 'component') {
+        await client.query(
+          `INSERT INTO asset_components (asset_id, component_type, event_type, condition)
+           VALUES ($1,$2,'Inspected',$3)`,
+          [assetId, m.maps_to.component_type, m.value]
+        );
+      }
+      // asset_property goes through the existing router after commit, so column-backed
+      // and EAV-backed fields behave identically (audit decisions §6).
+    }
+
+    // 4. Notes: the original always stays on the answer; routing adds a linked copy.
+    const { rows: noted } = await client.query(
+      `SELECT id, note, note_destination FROM audit_answers
+       WHERE instance_id = $1 AND note IS NOT NULL AND note_destination <> 'audit_only'`,
+      [instanceId]
+    );
+    for (const n of noted) {
+      const choice = strandedNoteChoices[n.id];
+      const dest = (n.note_destination === 'job' && !workOrderId) ? (choice || 'audit_only') : n.note_destination;
+      if (dest === 'asset') {
+        await client.query(
+          `INSERT INTO asset_notes (asset_id, note, source, source_answer_id, created_by)
+           VALUES ($1,$2,'audit',$3,$4)`,
+          [assetId, `From ${review.Instance.RoundName}: ${n.note}`, n.id, createdBy || null]
+        );
+      } else if (dest === 'job' && workOrderId) {
+        await client.query(
+          `INSERT INTO work_order_log_entries (work_order_id, note, username)
+           VALUES ($1,$2,$3)`,
+          [workOrderId, `From ${review.Instance.RoundName}: ${n.note}`, createdBy || null]
+        );
+      }
+      await client.query('UPDATE audit_answers SET note_resolved_at = now() WHERE id = $1', [n.id]);
+    }
+
+    await client.query(
+      `UPDATE audit_round_instances SET status = 'complete', completed_at = now(), generated_wo_id = $2 WHERE id = $1`,
+      [instanceId, workOrderId]
+    );
+    await client.query('COMMIT');
+
+    // Property writes go through the same router submitAudit uses, outside the
+    // transaction that created the work order — a failed property write must not undo
+    // the audit that produced it.
+    for (const m of mapped) {
+      if (m.maps_to.kind === 'asset_property' && m.value) {
+        try { await writeAssetPropertyViaRouter(assetId, m.maps_to.field, m.value); } catch { /* non-fatal */ }
+      }
+    }
+
+    return { InstanceId: instanceId, WorkOrderId: workOrderId, Findings: findingByAnswer.size, Lines: useLines.length };
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+
 // ── Asset icons and profile photos (Addendum §5a) ────────────────────────
 // An asset's face is its own photo when it has one, and its type's icon otherwise, so
 // a list of 340 buildings never reads as identical rows.
