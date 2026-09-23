@@ -385,3 +385,33 @@ once stamp-vs-resolve is settled.
 - **`getMaterialsUsedOnWorkOrder` reaches through job lines** as well as the WO itself,
   since most allocations land on lines. Returns an empty array when the WO bought no
   tracked materials, which is the signal to skip the close prompt entirely.
+
+---
+
+# Phase 4 decisions logged (report entities)
+
+- **Item snapshots are structured columns, not a JSON blob** (§0). A published report
+  has to stay queryable — "what did we tell the board about Cabin 12 last spring" should
+  be a `WHERE`, not a document search. Rendered HTML/text lives on the *send*, in
+  addition to the rows, never instead of them.
+- **Aggregates get their own table.** Counts, funding totals, savings, backlog and
+  visitor activity have nothing to check or uncheck, but they still have to freeze at
+  publish. One row per figure (`group_key`, `label`, `value_numeric`/`value_text`) keeps
+  a published number as queryable as an included item.
+- **One draft enforced by a partial unique index**, not by convention — otherwise two
+  tabs can create rival drafts and whichever saved last wins silently.
+- **Publish deletes unchecked items rather than keeping `included = false`.** A
+  published report should contain exactly what the board saw, with no shadow list of
+  things that were considered and cut.
+- **Published reports are read-only at the data layer** (`updateBoardReport` throws 409),
+  not only in the UI. A report the board has already seen must not change underneath
+  them, which is the whole point of publishing.
+- **Unchecking a work order clears its job lines** in the same statement, because the WO
+  row is a grouping header — if its checkbox didn't carry the lines, the tri-state would
+  be lying about what's included.
+- **Suggestions never overwrite a decision.** `upsertBoardReportItem` refreshes the
+  snapshot fields but only sets `included` / `display_mode` / `report_note` when
+  explicitly passed, so re-running the suggestion pass can't re-check something that was
+  deliberately unchecked.
+- **Draft sends are allowed but never silent**: the API requires `confirmDraft` and
+  prefixes both subject and body with DRAFT.

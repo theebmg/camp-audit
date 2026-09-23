@@ -85,6 +85,18 @@ import {
   listAdminTasks, getAdminTask, createAdminTask, updateAdminTask, deleteAdminTask,
   listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
   getExpensesReportRawData,
+  getOrCreateDraftBoardReport,
+  getBoardReport,
+  listBoardReports,
+  updateBoardReport,
+  listBoardReportItems,
+  setBoardReportItemIncluded,
+  setBoardReportItemFields,
+  listBoardReportAggregates,
+  publishBoardReport,
+  recordBoardReportSend,
+  listBoardReportSends,
+  getBoardReportSend,
   listMaterials,
   getMaterial,
   createMaterial,
@@ -1987,6 +1999,108 @@ router.delete('/calendar-events/:id', async (req, res, next) => {
 });
 
 // ---- Checklists (simple ordered steps — templates + live checkable instances) ----
+
+// ── Board reports: draft, publish, history, sends (§3/§4) ────────────────
+router.get('/board-reports', async (req, res, next) => {
+  try { res.json({ reports: await listBoardReports(), sends: await listBoardReportSends() }); } catch (e) { next(e); }
+});
+
+// The report screen opens the draft rather than creating one — idempotent, so two
+// tabs land on the same draft instead of racing for the one-draft index.
+router.get('/board-reports/draft', async (req, res, next) => {
+  try {
+    const report = await getOrCreateDraftBoardReport();
+    res.json({
+      report,
+      items: await listBoardReportItems(report.Id),
+      aggregates: await listBoardReportAggregates(report.Id),
+    });
+  } catch (e) { next(e); }
+});
+
+router.get('/board-reports/:id', async (req, res, next) => {
+  try {
+    const report = await getBoardReport(req.params.id);
+    if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({
+      report,
+      items: await listBoardReportItems(report.Id),
+      aggregates: await listBoardReportAggregates(report.Id),
+      sends: await listBoardReportSends(report.Id),
+    });
+  } catch (e) { next(e); }
+});
+
+// Periods and the summary narrative. Autosaved by the screen; the generic dirty-guard
+// covers the notes field because it's a textarea inside the report form.
+router.patch('/board-reports/:id', async (req, res, next) => {
+  try {
+    const { title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes } = req.body || {};
+    const report = await updateBoardReport(req.params.id, {
+      title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes,
+    });
+    if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, report });
+  } catch (e) { next(e); }
+});
+
+router.patch('/board-reports/:id/items/:itemId', async (req, res, next) => {
+  try {
+    const { included, displayMode, reportNote } = req.body || {};
+    let items;
+    if (included !== undefined) items = await setBoardReportItemIncluded(req.params.id, req.params.itemId, included);
+    if (displayMode !== undefined || reportNote !== undefined) {
+      items = await setBoardReportItemFields(req.params.id, req.params.itemId, { displayMode, reportNote });
+    }
+    if (!items) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, items });
+  } catch (e) { next(e); }
+});
+
+router.post('/board-reports/:id/publish', async (req, res, next) => {
+  try {
+    const report = await publishBoardReport(req.params.id);
+    if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, report });
+  } catch (e) { next(e); }
+});
+
+// Sending a draft is allowed but never silent: the caller must pass confirmDraft, and
+// the subject is prefixed so nobody mistakes a working copy for the real thing (§3).
+router.post('/board-reports/:id/send', async (req, res, next) => {
+  try {
+    const { recipient, subject, confirmDraft } = req.body || {};
+    if (!recipient) return res.status(400).json({ ok: false, error: 'recipient is required' });
+    const report = await getBoardReport(req.params.id);
+    if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+    const isDraft = report.Status === 'draft';
+    if (isDraft && !confirmDraft) {
+      return res.status(409).json({ ok: false, error: 'This report is still a draft. Re-send with confirmDraft to send it anyway.' });
+    }
+    const data = await buildBoardReportPg({ periodStart: report.PeriodStart, periodEnd: report.PeriodEnd });
+    const baseSubject = subject || `Camp Sychar — Board Report (${report.Title})`;
+    const finalSubject = isDraft ? `DRAFT — ${baseSubject}` : baseSubject;
+    const html = isDraft
+      ? `<p style="background:#fff3cd;padding:10px;border-radius:6px;font-weight:700;">DRAFT — not the final report</p>${renderBoardReportHtml(data)}`
+      : renderBoardReportHtml(data);
+    const text = isDraft ? `DRAFT — not the final report\n\n${renderBoardReportText(data)}` : renderBoardReportText(data);
+    await sendMail({ to: recipient, subject: finalSubject, html, text });
+    const send = await recordBoardReportSend(report.Id, {
+      recipients: recipient, subject: finalSubject, wasDraft: isDraft, html, text,
+      sentBy: req.user?.username || null,
+    });
+    res.json({ ok: true, send });
+  } catch (e) { next(e); }
+});
+
+// History: open any past send and see exactly what went out, not a re-render of it.
+router.get('/board-report-sends/:sendId', async (req, res, next) => {
+  try {
+    const send = await getBoardReportSend(req.params.sendId);
+    if (!send) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ send });
+  } catch (e) { next(e); }
+});
 
 // ── Materials & leftovers (§10) ──────────────────────────────────────────
 router.get('/materials', async (req, res, next) => {

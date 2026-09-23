@@ -4319,6 +4319,266 @@ export async function unvoidExpense(id) {
   if (rows[0]) await logActivity({ action: 'unvoided', entityType: 'expense', entityId: rows[0].id, entityLabel: rows[0].vendor || 'Expense' });
 }
 
+// ── Board reports as entities (Build Brief §3/§4) ────────────────────────
+// Draft -> publish, with every send kept. Publishing freezes both the items and the
+// aggregates, because until now only the completed section was period-bounded and
+// every other figure silently moved as work continued.
+
+function boardReportRowShape(r) {
+  return {
+    Id: r.id, Title: r.title, Status: r.status,
+    PeriodStart: r.period_start_text || r.period_start,
+    PeriodEnd: r.period_end_text || r.period_end,
+    ForwardStart: r.forward_start_text || r.forward_start,
+    ForwardEnd: r.forward_end_text || r.forward_end,
+    SummaryNotes: r.summary_notes,
+    CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
+  };
+}
+
+const BOARD_REPORT_SELECT = `
+  SELECT r.*, r.period_start::text AS period_start_text, r.period_end::text AS period_end_text,
+         r.forward_start::text AS forward_start_text, r.forward_end::text AS forward_end_text
+  FROM board_reports r`;
+
+// §4: backward runs from the last PUBLISHED report's period_end (first ever: the start
+// of this month) through today. Forward defaults to the same length, so "last 30 days /
+// next 30 days" falls out rather than being a second thing to configure.
+export async function defaultBoardReportPeriods() {
+  const { rows } = await pool.query(
+    `SELECT period_end::text AS period_end FROM board_reports
+     WHERE status = 'published' ORDER BY period_end DESC, id DESC LIMIT 1`
+  );
+  const todayStr = today();
+  const start = rows[0]?.period_end || `${todayStr.slice(0, 7)}-01`;
+  const spanDays = Math.max(1, Math.round((new Date(todayStr) - new Date(start)) / 86400000));
+  const forwardEnd = new Date(new Date(todayStr).getTime() + spanDays * 86400000)
+    .toISOString().slice(0, 10);
+  return { periodStart: start, periodEnd: todayStr, forwardStart: todayStr, forwardEnd };
+}
+
+// One draft at a time — the partial unique index enforces it, this just makes the
+// screen idempotent: opening the report is "give me the draft," not "make one."
+export async function getOrCreateDraftBoardReport() {
+  const existing = await pool.query(`${BOARD_REPORT_SELECT} WHERE r.status = 'draft' LIMIT 1`);
+  if (existing.rows[0]) return boardReportRowShape(existing.rows[0]);
+  const p = await defaultBoardReportPeriods();
+  const title = new Date(p.periodEnd).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const { rows } = await pool.query(
+    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end)
+     VALUES ($1,'draft',$2,$3,$4,$5) RETURNING id`,
+    [title, p.periodStart, p.periodEnd, p.forwardStart, p.forwardEnd]
+  );
+  return getBoardReport(rows[0].id);
+}
+
+export async function getBoardReport(id) {
+  const { rows } = await pool.query(`${BOARD_REPORT_SELECT} WHERE r.id = $1`, [id]);
+  return rows[0] ? boardReportRowShape(rows[0]) : null;
+}
+
+export async function listBoardReports() {
+  const { rows } = await pool.query(
+    `${BOARD_REPORT_SELECT} ORDER BY COALESCE(r.published_at, r.created_at) DESC`
+  );
+  return rows.map(boardReportRowShape);
+}
+
+const BOARD_REPORT_UPDATE_COLUMNS = {
+  title: 'title', periodStart: 'period_start', periodEnd: 'period_end',
+  forwardStart: 'forward_start', forwardEnd: 'forward_end', summaryNotes: 'summary_notes',
+};
+// Published reports are read-only: a report the board has already seen must not change
+// underneath them, which is the entire point of publishing.
+export async function updateBoardReport(id, fields) {
+  const cur = await getBoardReport(id);
+  if (!cur) return null;
+  if (cur.Status === 'published') {
+    const e = new Error('Published reports are read-only'); e.status = 409; throw e;
+  }
+  const setCols = []; const vals = []; let i = 2;
+  for (const [key, col] of Object.entries(BOARD_REPORT_UPDATE_COLUMNS)) {
+    if (fields[key] === undefined) continue;
+    setCols.push(`${col} = $${i++}`); vals.push(fields[key]);
+  }
+  if (!setCols.length) return cur;
+  await pool.query(`UPDATE board_reports SET ${setCols.join(', ')} WHERE id = $1`, [id, ...vals]);
+  return getBoardReport(id);
+}
+
+export async function listBoardReportItems(reportId) {
+  const { rows } = await pool.query(
+    `SELECT *, item_date::text AS item_date_text, snap_date::text AS snap_date_text
+     FROM board_report_items WHERE report_id = $1 ORDER BY section, sort_index, id`,
+    [reportId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, ItemType: r.item_type, ItemId: r.item_id, ItemDate: r.item_date_text,
+    Section: r.section, Included: r.included, DisplayMode: r.display_mode,
+    ReportNote: r.report_note, SortIndex: r.sort_index,
+    SnapTitle: r.snap_title, SnapSubtitle: r.snap_subtitle, SnapAssetName: r.snap_asset_name,
+    SnapStatus: r.snap_status, SnapDate: r.snap_date_text,
+    SnapHours: r.snap_hours != null ? Number(r.snap_hours) : null,
+    SnapCost: r.snap_cost != null ? Number(r.snap_cost) : null,
+    SnapProgress: r.snap_progress,
+  }));
+}
+
+// Upsert so the suggestion pass and a user's toggle write the same row. A suggestion
+// never overwrites a decision already made: included/display_mode/report_note are only
+// set on insert unless explicitly passed.
+export async function upsertBoardReportItem(reportId, {
+  itemType, itemId, itemDate = null, section, included, displayMode, reportNote, sortIndex,
+  snapTitle, snapSubtitle, snapAssetName, snapStatus, snapDate, snapHours, snapCost, snapProgress,
+}) {
+  const { rows } = await pool.query(
+    `INSERT INTO board_report_items
+       (report_id, item_type, item_id, item_date, section, included, display_mode, report_note, sort_index,
+        snap_title, snap_subtitle, snap_asset_name, snap_status, snap_date, snap_hours, snap_cost, snap_progress)
+     VALUES ($1,$2,$3,$4,$5,COALESCE($6,true),COALESCE($7,'summary'),$8,COALESCE($9,0),
+             $10,$11,$12,$13,$14,$15,$16,$17)
+     ON CONFLICT (report_id, item_type, item_id, item_date) DO UPDATE SET
+       section      = EXCLUDED.section,
+       included     = COALESCE($6, board_report_items.included),
+       display_mode = COALESCE($7, board_report_items.display_mode),
+       report_note  = COALESCE($8, board_report_items.report_note),
+       snap_title   = COALESCE(EXCLUDED.snap_title, board_report_items.snap_title),
+       snap_subtitle= COALESCE(EXCLUDED.snap_subtitle, board_report_items.snap_subtitle),
+       snap_asset_name = COALESCE(EXCLUDED.snap_asset_name, board_report_items.snap_asset_name),
+       snap_status  = COALESCE(EXCLUDED.snap_status, board_report_items.snap_status),
+       snap_date    = COALESCE(EXCLUDED.snap_date, board_report_items.snap_date),
+       snap_hours   = COALESCE(EXCLUDED.snap_hours, board_report_items.snap_hours),
+       snap_cost    = COALESCE(EXCLUDED.snap_cost, board_report_items.snap_cost),
+       snap_progress= COALESCE(EXCLUDED.snap_progress, board_report_items.snap_progress)
+     RETURNING id`,
+    [reportId, itemType, itemId, itemDate, section, included ?? null, displayMode ?? null,
+      reportNote ?? null, sortIndex ?? null, snapTitle ?? null, snapSubtitle ?? null,
+      snapAssetName ?? null, snapStatus ?? null, snapDate ?? null, snapHours ?? null,
+      snapCost ?? null, snapProgress ?? null]
+  );
+  return rows[0].id;
+}
+
+// Checking a work order is shorthand for checking all its lines (§6): the WO row is a
+// grouping header, so its own checkbox has to carry the lines with it or the tri-state
+// would lie.
+export async function setBoardReportItemIncluded(reportId, itemId, included) {
+  const { rows } = await pool.query(
+    `UPDATE board_report_items SET included = $3 WHERE report_id = $1 AND id = $2
+     RETURNING item_type, item_id`,
+    [reportId, itemId, !!included]
+  );
+  if (!rows[0]) return null;
+  if (rows[0].item_type === 'work_order') {
+    await pool.query(
+      `UPDATE board_report_items SET included = $3
+       WHERE report_id = $1 AND item_type = 'job_line'
+         AND item_id IN (SELECT id FROM job_lines WHERE work_order_id = $2)`,
+      [reportId, rows[0].item_id, !!included]
+    );
+  }
+  return listBoardReportItems(reportId);
+}
+
+export async function setBoardReportItemFields(reportId, itemId, { displayMode, reportNote }) {
+  const setCols = []; const vals = []; let i = 3;
+  if (displayMode !== undefined) { setCols.push(`display_mode = $${i++}`); vals.push(displayMode); }
+  if (reportNote !== undefined) { setCols.push(`report_note = $${i++}`); vals.push(reportNote); }
+  if (!setCols.length) return listBoardReportItems(reportId);
+  await pool.query(
+    `UPDATE board_report_items SET ${setCols.join(', ')} WHERE report_id = $1 AND id = $2`,
+    [reportId, itemId, ...vals]
+  );
+  return listBoardReportItems(reportId);
+}
+
+export async function replaceBoardReportAggregates(reportId, aggregates) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM board_report_aggregates WHERE report_id = $1', [reportId]);
+    for (const [idx, a] of aggregates.entries()) {
+      await client.query(
+        `INSERT INTO board_report_aggregates (report_id, group_key, label, value_numeric, value_text, sort_index)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [reportId, a.groupKey, a.label, a.valueNumeric ?? null, a.valueText ?? null, a.sortIndex ?? idx]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+
+export async function listBoardReportAggregates(reportId) {
+  const { rows } = await pool.query(
+    `SELECT * FROM board_report_aggregates WHERE report_id = $1 ORDER BY group_key, sort_index, id`,
+    [reportId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, GroupKey: r.group_key, Label: r.label,
+    ValueNumeric: r.value_numeric != null ? Number(r.value_numeric) : null,
+    ValueText: r.value_text, SortIndex: r.sort_index,
+  }));
+}
+
+// Publish: drop the items nobody checked, then freeze. Excluded rows are deleted rather
+// than kept as included=false, so a published report contains exactly what the board
+// saw — no shadow list of things that were considered and cut.
+export async function publishBoardReport(id) {
+  const cur = await getBoardReport(id);
+  if (!cur) return null;
+  if (cur.Status === 'published') return cur;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM board_report_items WHERE report_id = $1 AND NOT included', [id]);
+    await client.query(
+      `UPDATE board_reports SET status = 'published', published_at = now() WHERE id = $1`, [id]
+    );
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  await logActivity({ action: 'published', entityType: 'board_report', entityId: Number(id), entityLabel: cur.Title });
+  return getBoardReport(id);
+}
+
+// Every send is kept, exactly as it went out. A corrected version later adds a row.
+export async function recordBoardReportSend(reportId, { recipients, subject, wasDraft, html, text, sentBy }) {
+  const { rows } = await pool.query(
+    `INSERT INTO board_report_sends (report_id, recipients, subject, was_draft, snapshot_html, snapshot_text, sent_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, sent_at`,
+    [reportId, recipients, subject, !!wasDraft, html, text, sentBy || null]
+  );
+  return { Id: rows[0].id, SentAt: rows[0].sent_at };
+}
+
+export async function listBoardReportSends(reportId = null) {
+  const { rows } = await pool.query(
+    reportId
+      ? `SELECT s.*, r.title FROM board_report_sends s JOIN board_reports r ON r.id = s.report_id
+         WHERE s.report_id = $1 ORDER BY s.sent_at DESC`
+      : `SELECT s.*, r.title FROM board_report_sends s JOIN board_reports r ON r.id = s.report_id
+         ORDER BY s.sent_at DESC`,
+    reportId ? [reportId] : []
+  );
+  return rows.map((r) => ({
+    Id: r.id, ReportId: r.report_id, ReportTitle: r.title, SentAt: r.sent_at,
+    Recipients: r.recipients, Subject: r.subject, WasDraft: r.was_draft, SentBy: r.sent_by,
+  }));
+}
+
+export async function getBoardReportSend(sendId) {
+  const { rows } = await pool.query(
+    `SELECT s.*, r.title FROM board_report_sends s JOIN board_reports r ON r.id = s.report_id WHERE s.id = $1`,
+    [sendId]
+  );
+  if (!rows[0]) return null;
+  const r = rows[0];
+  return {
+    Id: r.id, ReportId: r.report_id, ReportTitle: r.title, SentAt: r.sent_at,
+    Recipients: r.recipients, Subject: r.subject, WasDraft: r.was_draft,
+    SnapshotHtml: r.snapshot_html, SnapshotText: r.snapshot_text, SentBy: r.sent_by,
+  };
+}
+
 // ── Materials & leftovers (Build Brief §10) ──────────────────────────────
 // Deliberately not an inventory system. One list, one balance each, and the
 // balance is always the sum of movements — never a stored number that could
