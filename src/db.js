@@ -4637,6 +4637,8 @@ export async function addBoardReportItemManually(reportId, item) {
     const e = new Error('Published reports are read-only'); e.status = 409; throw e;
   }
   const section = item.section || (item.ItemType === 'admin_task' ? 'admin_work' : 'done');
+  // No pass token: a hand-added item belongs to no suggestion pass, and the prune
+  // skips it anyway on manually_added.
   await upsertBoardReportItem(reportId, {
     itemType: item.ItemType, itemId: item.ItemId, section,
     included: true, sortIndex: 0,
@@ -4660,7 +4662,7 @@ export async function addBoardReportItemManually(reportId, item) {
 
 // Done: job lines resolved inside the backward period — line level, so a work order
 // with 2 of 5 lines finished contributes those 2 and not itself.
-async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
+async function suggestDoneJobLines(reportId, passId, { periodStart, periodEnd }) {
   // Falls back to completed_at — when the line was MARKED done — so work entered in
   // arrears with the date left blank still reaches the report (§3). The fallback is
   // reported back so the UI can say "date not recorded" rather than passing a status
@@ -4691,12 +4693,12 @@ async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
     // The WO rides along as the grouping header the screen expands.
     if (!woSeen.has(r.work_order_id)) {
       woSeen.add(r.work_order_id);
-      await upsertBoardReportItem(reportId, {
+      await upsertBoardReportItem(reportId, { passId,
         itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
         snapTitle: r.wo_title, snapAssetName: r.asset_name,
       });
     }
-    await upsertBoardReportItem(reportId, {
+    await upsertBoardReportItem(reportId, { passId,
       itemType: 'job_line', itemId: r.id, section: 'done', sortIndex: i,
       parentWorkOrderId: r.work_order_id,
       snapTitle: r.title,
@@ -4712,7 +4714,7 @@ async function suggestDoneJobLines(reportId, { periodStart, periodEnd }) {
 // Admin work: existing opt-out semantics preserved exactly — flagged tasks arrive
 // pre-checked, unflagged ones arrive unchecked rather than absent, so an excluded task
 // is visible as a decision instead of vanishing.
-async function suggestAdminTasks(reportId, { periodStart, periodEnd }) {
+async function suggestAdminTasks(reportId, passId, { periodStart, periodEnd }) {
   const { rows } = await pool.query(
     `${ADMIN_TASK_SELECT} WHERE s.counts_as_work_performed AND t.task_date BETWEEN $1 AND $2
      ORDER BY t.task_date, t.id`,
@@ -4720,7 +4722,7 @@ async function suggestAdminTasks(reportId, { periodStart, periodEnd }) {
   );
   for (const [i, r] of rows.entries()) {
     const t = adminTaskRowShape(r);
-    await upsertBoardReportItem(reportId, {
+    await upsertBoardReportItem(reportId, { passId,
       itemType: 'admin_task', itemId: t.Id, section: 'admin_work', sortIndex: i,
       included: t.IncludeInBoardReport,
       snapTitle: t.Title, snapSubtitle: t.CategoryName, snapStatus: t.StatusName,
@@ -4732,7 +4734,7 @@ async function suggestAdminTasks(reportId, { periodStart, periodEnd }) {
 
 // Coming Up: scheduled inside the forward window, plus anything flagged regardless of
 // date, plus overdue. Overdue is computed, never a stored status, so it clears itself.
-async function suggestComingUp(reportId, { forwardStart, forwardEnd }) {
+async function suggestComingUp(reportId, passId, { forwardStart, forwardEnd }) {
   const todayStr = today();
   const { rows } = await pool.query(
     `SELECT jl.id, jl.title, jl.scheduled_date::text AS scheduled_date, jl.estimated_cost,
@@ -4752,7 +4754,7 @@ async function suggestComingUp(reportId, { forwardStart, forwardEnd }) {
   );
   for (const [i, r] of rows.entries()) {
     const overdue = r.scheduled_date && r.scheduled_date < todayStr;
-    await upsertBoardReportItem(reportId, {
+    await upsertBoardReportItem(reportId, { passId,
       itemType: 'job_line', itemId: r.id, section: overdue ? 'overdue' : 'coming_up', sortIndex: i,
       parentWorkOrderId: r.work_order_id,
       snapTitle: r.title,
@@ -4770,14 +4772,14 @@ async function suggestComingUp(reportId, { forwardStart, forwardEnd }) {
 // Findings flagged "Feature on board report" — no date at all, which is the point:
 // a deferred finding belongs in front of the board precisely because nothing is
 // scheduled for it.
-async function suggestFeaturedFindings(reportId) {
+async function suggestFeaturedFindings(reportId, passId) {
   const { rows } = await pool.query(
     `SELECT cf.id, cf.title, cf.estimated_cost, cf.severity, cf.status, a.name AS asset_name
      FROM condition_findings cf LEFT JOIN assets a ON a.id = cf.asset_id
      WHERE cf.board_focus = true ORDER BY cf.id DESC`
   );
   for (const [i, r] of rows.entries()) {
-    await upsertBoardReportItem(reportId, {
+    await upsertBoardReportItem(reportId, { passId,
       itemType: 'condition_finding', itemId: r.id, section: 'coming_up', sortIndex: 1000 + i,
       snapTitle: r.title, snapSubtitle: r.severity, snapAssetName: r.asset_name,
       snapStatus: r.status, snapCost: r.estimated_cost,
@@ -4790,7 +4792,7 @@ async function suggestFeaturedFindings(reportId) {
 // the recurrence machinery. listCalendarEventOccurrences is a pure read that already
 // reports which occurrences are materialized, so a projection is replaced by its real
 // work order rather than duplicated alongside it.
-async function suggestCalendarAndProjections(reportId, { forwardStart, forwardEnd }) {
+async function suggestCalendarAndProjections(reportId, passId, { forwardStart, forwardEnd }) {
   const occurrences = await listCalendarEventOccurrences(forwardStart, forwardEnd);
   const { rows: typeRows } = await pool.query(
     'SELECT id FROM calendar_event_types WHERE show_on_board_report'
@@ -4805,13 +4807,13 @@ async function suggestCalendarAndProjections(reportId, { forwardStart, forwardEn
     // a set WorkOrderId means "already materialized". That's the dedupe: the real work
     // order becomes the item and the projection is never written beside it.
     if (isPm && occ.WorkOrderId) {
-      await upsertBoardReportItem(reportId, {
+      await upsertBoardReportItem(reportId, { passId,
         itemType: 'work_order', itemId: occ.WorkOrderId, section: 'coming_up', sortIndex: 2000 + i,
         snapTitle: occ.WorkOrderTitle || occ.Title, snapDate: occ.OccurrenceDate,
       });
     } else {
       const cost = isPm ? await historicalAvgActualCost(occ.WorkOrderTemplateId) : null;
-      await upsertBoardReportItem(reportId, {
+      await upsertBoardReportItem(reportId, { passId,
         itemType: 'projected_occurrence', itemId: occ.Id, itemDate: occ.OccurrenceDate,
         section: 'coming_up', sortIndex: 2000 + i,
         snapTitle: occ.Title, snapDate: occ.OccurrenceDate, snapCost: cost,
@@ -4837,23 +4839,26 @@ export async function refreshBoardReportSuggestions(reportId) {
     periodStart: report.PeriodStart, periodEnd: report.PeriodEnd,
     forwardStart: report.ForwardStart, forwardEnd: report.ForwardEnd,
   };
-  // Stamp the pass so anything not re-suggested this time is identifiable as stale.
-  const passStartedAt = new Date();
+  // A token, not a timestamp: "did THIS pass write this row" is an exact question, and
+  // comparing a JS clock to the database's was what made the prune delete rows the pass
+  // had just written (0093).
+  const passId = `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
   const counts = {
-    done: await suggestDoneJobLines(reportId, periods),
-    adminWork: await suggestAdminTasks(reportId, periods),
-    comingUp: await suggestComingUp(reportId, periods),
-    featured: await suggestFeaturedFindings(reportId),
-    calendar: await suggestCalendarAndProjections(reportId, periods),
+    done: await suggestDoneJobLines(reportId, passId, periods),
+    adminWork: await suggestAdminTasks(reportId, passId, periods),
+    comingUp: await suggestComingUp(reportId, passId, periods),
+    featured: await suggestFeaturedFindings(reportId, passId),
+    calendar: await suggestCalendarAndProjections(reportId, passId, periods),
   };
   // Drop what the current period no longer suggests — but only where the user never
   // decided anything about it. An unchecked row, a board note, or an itemized work
   // order is a judgment, and a date change must not throw one away silently.
   const { rows: pruned } = await pool.query(
     `DELETE FROM board_report_items
-     WHERE report_id = $1 AND NOT user_touched AND suggested_at < $2
+     WHERE report_id = $1 AND NOT user_touched AND manually_added = false
+       AND last_pass_id IS DISTINCT FROM $2
      RETURNING id`,
-    [reportId, passStartedAt]
+    [reportId, passId]
   );
   return {
     counts,
@@ -4976,15 +4981,15 @@ export async function listBoardReportItems(reportId) {
 export async function upsertBoardReportItem(reportId, {
   itemType, itemId, itemDate = null, section, included, displayMode, reportNote, sortIndex,
   snapTitle, snapSubtitle, snapAssetName, snapStatus, snapDate, snapHours, snapCost, snapProgress,
-  parentWorkOrderId = null,
+  parentWorkOrderId = null, passId = null,
 }) {
   const { rows } = await pool.query(
     `INSERT INTO board_report_items
        (report_id, item_type, item_id, item_date, section, included, display_mode, report_note, sort_index,
         snap_title, snap_subtitle, snap_asset_name, snap_status, snap_date, snap_hours, snap_cost, snap_progress,
-        parent_work_order_id, suggested_at)
+        parent_work_order_id, suggested_at, last_pass_id)
      VALUES ($1,$2,$3,$4,$5,COALESCE($6,true),COALESCE($7,'summary'),$8,COALESCE($9,0),
-             $10,$11,$12,$13,$14,$15,$16,$17,$18,now())
+             $10,$11,$12,$13,$14,$15,$16,$17,$18,now(),$19)
      -- Matches the expression index from 0092: item_date is nullable, and NULL is
      -- DISTINCT from NULL in a plain unique constraint, so a bare column list here
      -- could never find the existing row and every pass inserted a duplicate.
@@ -5005,7 +5010,7 @@ export async function upsertBoardReportItem(reportId, {
     [reportId, itemType, itemId, itemDate, section, included ?? null, displayMode ?? null,
       reportNote ?? null, sortIndex ?? null, snapTitle ?? null, snapSubtitle ?? null,
       snapAssetName ?? null, snapStatus ?? null, snapDate ?? null, snapHours ?? null,
-      snapCost ?? null, snapProgress ?? null, parentWorkOrderId]
+      snapCost ?? null, snapProgress ?? null, parentWorkOrderId, passId]
   );
   return rows[0].id;
 }
