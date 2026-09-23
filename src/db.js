@@ -4319,6 +4319,162 @@ export async function unvoidExpense(id) {
   if (rows[0]) await logActivity({ action: 'unvoided', entityType: 'expense', entityId: rows[0].id, entityLabel: rows[0].vendor || 'Expense' });
 }
 
+// ── Materials & leftovers (Build Brief §10) ──────────────────────────────
+// Deliberately not an inventory system. One list, one balance each, and the
+// balance is always the sum of movements — never a stored number that could
+// drift from the history explaining it.
+
+function materialRowShape(r) {
+  return {
+    Id: r.id, Name: r.name, Unit: r.unit, Active: r.active,
+    Balance: r.balance != null ? Number(r.balance) : 0,
+    LastUnitPrice: r.last_unit_price != null ? Number(r.last_unit_price) : null,
+    LastMovedAt: r.last_moved_at || null,
+  };
+}
+
+const MATERIAL_SELECT = `
+  SELECT m.*,
+         COALESCE(mv.balance, 0) AS balance,
+         mv.last_unit_price,
+         mv.last_moved_at
+  FROM materials m
+  LEFT JOIN LATERAL (
+    SELECT SUM(quantity) AS balance,
+           MAX(created_at) AS last_moved_at,
+           (SELECT unit_price FROM material_movements
+            WHERE material_id = m.id AND unit_price IS NOT NULL
+            ORDER BY created_at DESC LIMIT 1) AS last_unit_price
+    FROM material_movements WHERE material_id = m.id
+  ) mv ON true`;
+
+// Substring match, same shape the searchable combobox expects elsewhere.
+// withBalanceOnly backs the "Materials on hand" screen; the combobox wants
+// everything, including materials that are out of stock.
+export async function listMaterials({ q, withBalanceOnly = false, includeInactive = false } = {}) {
+  const where = []; const vals = [];
+  if (!includeInactive) where.push('m.active');
+  if (q) { vals.push(`%${q}%`); where.push(`m.name ILIKE $${vals.length}`); }
+  // The balance is a lateral aggregate, so it can't be filtered in the same WHERE —
+  // it goes in HAVING-equivalent position via a wrapping condition on the join output.
+  if (withBalanceOnly) where.push('COALESCE(mv.balance, 0) > 0');
+  const { rows } = await pool.query(
+    `${MATERIAL_SELECT}${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY m.name`,
+    vals
+  );
+  return rows.map(materialRowShape);
+}
+
+export async function getMaterial(id) {
+  const { rows } = await pool.query(`${MATERIAL_SELECT} WHERE m.id = $1`, [id]);
+  return rows[0] ? materialRowShape(rows[0]) : null;
+}
+
+// "Add new" inline from the combobox. Name+unit is the identity: "Drywall 1/2" in
+// sheets and in square feet are different things to count.
+export async function createMaterial({ name, unit }) {
+  const { rows } = await pool.query(
+    `INSERT INTO materials (name, unit) VALUES ($1,$2)
+     ON CONFLICT (name, unit) DO UPDATE SET active = true
+     RETURNING id`,
+    [String(name).trim(), String(unit).trim()]
+  );
+  await logActivity({ action: 'created', entityType: 'material', entityId: rows[0].id, entityLabel: name });
+  return getMaterial(rows[0].id);
+}
+
+// Every balance change is a row. Corrections included — that's the whole point:
+// "someone counted 3 and the system said 4" stays visible instead of being
+// silently overwritten.
+export async function recordMaterialMovement({
+  materialId, kind, quantity, unitPrice, workOrderId, jobLineId, note, createdBy,
+}) {
+  const qty = Number(quantity);
+  if (!Number.isFinite(qty) || qty === 0) {
+    const err = new Error('Movement quantity must be a non-zero number');
+    err.status = 400; throw err;
+  }
+  // Callers pass a magnitude; the kind decides the direction, so a UI can't
+  // accidentally file a removal that adds stock.
+  const signed = kind === 'correction' ? qty : (kind === 'wo_close' ? Math.abs(qty) : -Math.abs(qty));
+  const { rows } = await pool.query(
+    `INSERT INTO material_movements (material_id, kind, quantity, unit_price, work_order_id, job_line_id, note, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
+    [materialId, kind, signed, unitPrice ?? null, workOrderId || null, jobLineId || null, note || null, createdBy || null]
+  );
+  return { Id: rows[0].id, MaterialId: materialId, Kind: kind, Quantity: signed };
+}
+
+export async function listMaterialMovements(materialId) {
+  const { rows } = await pool.query(
+    `SELECT mm.*, w.title AS work_order_title, jl.title AS job_line_title
+     FROM material_movements mm
+     LEFT JOIN work_orders w ON w.id = mm.work_order_id
+     LEFT JOIN job_lines jl ON jl.id = mm.job_line_id
+     WHERE mm.material_id = $1 ORDER BY mm.created_at DESC, mm.id DESC`,
+    [materialId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, Kind: r.kind, Quantity: Number(r.quantity),
+    UnitPrice: r.unit_price != null ? Number(r.unit_price) : null,
+    WorkOrderId: r.work_order_id, WorkOrderTitle: r.work_order_title || null,
+    JobLineId: r.job_line_id, JobLineTitle: r.job_line_title || null,
+    Note: r.note, CreatedBy: r.created_by, CreatedAt: r.created_at,
+  }));
+}
+
+// WO close (§10): which materials did this work order actually buy, and at what price?
+// Drives the "Any materials left over?" prompt — one row per material, blank meaning
+// none, so the fast path is closing the WO without typing anything.
+export async function getMaterialsUsedOnWorkOrder(workOrderId) {
+  const { rows } = await pool.query(
+    `SELECT m.id AS material_id, m.name, m.unit,
+            SUM(ea.quantity) AS quantity,
+            CASE WHEN SUM(ea.quantity) > 0 THEN SUM(ea.amount) / SUM(ea.quantity) ELSE NULL END AS unit_price
+     FROM expense_allocations ea
+     JOIN expense_line_items li ON li.id = ea.line_item_id
+     JOIN materials m ON m.id = li.material_id
+     JOIN expenses e ON e.id = ea.expense_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND ea.quantity IS NOT NULL AND ea.quantity > 0
+       AND (
+         (ea.dest_type = 'work_order' AND ea.dest_id = $1)
+         OR (ea.dest_type = 'job_line' AND ea.dest_id IN (SELECT id FROM job_lines WHERE work_order_id = $1))
+       )
+     GROUP BY m.id, m.name, m.unit
+     ORDER BY m.name`,
+    [workOrderId]
+  );
+  return rows.map((r) => ({
+    MaterialId: r.material_id, Name: r.name, Unit: r.unit,
+    QuantityUsed: Number(r.quantity),
+    UnitPrice: r.unit_price != null ? Math.round(Number(r.unit_price) * 100) / 100 : null,
+  }));
+}
+
+// Point-of-use reminder (§10): "You should have 4 sheets of Drywall 1/2 4x8 left."
+// Returns null rather than a zero so a caller can treat "nothing on hand" as "say
+// nothing" without checking a number.
+export async function getMaterialOnHand(materialId) {
+  const m = await getMaterial(materialId);
+  if (!m || !(m.Balance > 0)) return null;
+  return { MaterialId: m.Id, Name: m.Name, Unit: m.Unit, Balance: m.Balance, UnitPrice: m.LastUnitPrice };
+}
+
+// Drawing from stock moves cost at the price actually paid and is NOT a saving —
+// the saving was already counted once, when the material was bought (§10).
+export async function useMaterialFromStock({ materialId, quantity, jobLineId, workOrderId, createdBy }) {
+  const onHand = await getMaterialOnHand(materialId);
+  if (!onHand) { const e = new Error('No stock on hand for that material'); e.status = 400; throw e; }
+  const qty = Math.min(Math.abs(Number(quantity)), onHand.Balance);
+  await recordMaterialMovement({
+    materialId, kind: 'to_job', quantity: qty, unitPrice: onHand.UnitPrice,
+    workOrderId, jobLineId, note: 'Used from on-hand stock', createdBy,
+  });
+  return { MaterialId: materialId, QuantityUsed: qty, UnitPrice: onHand.UnitPrice,
+    Cost: onHand.UnitPrice != null ? Math.round(qty * onHand.UnitPrice * 100) / 100 : null };
+}
+
 export async function getExpensesReportRawData() {
   const { rows } = await pool.query(`
     SELECT e.*, ec.name AS category_name, f.name AS fund_name,

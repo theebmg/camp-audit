@@ -85,6 +85,14 @@ import {
   listAdminTasks, getAdminTask, createAdminTask, updateAdminTask, deleteAdminTask,
   listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
   getExpensesReportRawData,
+  listMaterials,
+  getMaterial,
+  createMaterial,
+  recordMaterialMovement,
+  listMaterialMovements,
+  getMaterialsUsedOnWorkOrder,
+  getMaterialOnHand,
+  useMaterialFromStock,
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
 } from '../db.js';
@@ -1979,6 +1987,92 @@ router.delete('/calendar-events/:id', async (req, res, next) => {
 });
 
 // ---- Checklists (simple ordered steps — templates + live checkable instances) ----
+
+// ── Materials & leftovers (§10) ──────────────────────────────────────────
+router.get('/materials', async (req, res, next) => {
+  try {
+    const { q, onHand, includeInactive } = req.query;
+    res.json({ materials: await listMaterials({
+      q: q || undefined,
+      withBalanceOnly: onHand === 'true',
+      includeInactive: includeInactive === 'true',
+    }) });
+  } catch (e) { next(e); }
+});
+
+router.post('/materials', async (req, res, next) => {
+  try {
+    const { name, unit } = req.body || {};
+    if (!name || !String(name).trim()) return res.status(400).json({ ok: false, error: 'name is required' });
+    if (!unit || !String(unit).trim()) return res.status(400).json({ ok: false, error: 'unit is required' });
+    res.json({ ok: true, material: await createMaterial({ name, unit }) });
+  } catch (e) { next(e); }
+});
+
+router.get('/materials/:id', async (req, res, next) => {
+  try {
+    const material = await getMaterial(req.params.id);
+    if (!material) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ material, movements: await listMaterialMovements(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+// The point-of-use reminder. 200 with onHand:null when there's nothing to say, rather
+// than a 404 — "no stock" is a normal answer, not a missing resource.
+router.get('/materials/:id/on-hand', async (req, res, next) => {
+  try { res.json({ onHand: await getMaterialOnHand(req.params.id) }); } catch (e) { next(e); }
+});
+
+// Corrections and tossed/damaged both land here — every balance change is a movement.
+router.post('/materials/:id/movements', async (req, res, next) => {
+  try {
+    const { kind, quantity, unitPrice, workOrderId, jobLineId, note } = req.body || {};
+    if (!['wo_close', 'to_job', 'correction', 'tossed'].includes(kind)) {
+      return res.status(400).json({ ok: false, error: 'kind must be wo_close, to_job, correction or tossed' });
+    }
+    const movement = await recordMaterialMovement({
+      materialId: Number(req.params.id), kind, quantity, unitPrice,
+      workOrderId, jobLineId, note, createdBy: req.user?.username || null,
+    });
+    res.json({ ok: true, movement, material: await getMaterial(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+router.post('/materials/:id/use-from-stock', async (req, res, next) => {
+  try {
+    const { quantity, jobLineId, workOrderId } = req.body || {};
+    const used = await useMaterialFromStock({
+      materialId: Number(req.params.id), quantity, jobLineId, workOrderId,
+      createdBy: req.user?.username || null,
+    });
+    res.json({ ok: true, ...used, material: await getMaterial(req.params.id) });
+  } catch (e) { next(e); }
+});
+
+// Backs the "Any materials left over?" prompt at WO close. Empty array = this WO
+// bought no tracked materials, so the prompt is skipped entirely.
+router.get('/work-orders/:id/materials-used', async (req, res, next) => {
+  try { res.json({ materials: await getMaterialsUsedOnWorkOrder(req.params.id) }); } catch (e) { next(e); }
+});
+
+// One call for the whole prompt: a quantity per material, blanks omitted by the client.
+router.post('/work-orders/:id/leftovers', async (req, res, next) => {
+  try {
+    const { leftovers } = req.body || {};
+    if (!Array.isArray(leftovers)) return res.status(400).json({ ok: false, error: 'leftovers must be an array' });
+    const recorded = [];
+    for (const l of leftovers) {
+      const qty = Number(l?.quantity);
+      if (!Number.isFinite(qty) || qty <= 0) continue;   // blank means none
+      recorded.push(await recordMaterialMovement({
+        materialId: Number(l.materialId), kind: 'wo_close', quantity: qty,
+        unitPrice: l.unitPrice ?? null, workOrderId: Number(req.params.id),
+        note: 'Left over at work order close', createdBy: req.user?.username || null,
+      }));
+    }
+    res.json({ ok: true, recorded: recorded.length });
+  } catch (e) { next(e); }
+});
 
 router.get('/checklist-templates', async (req, res, next) => {
   try { res.json({ templates: await listChecklistTemplates() }); } catch (e) { next(e); }

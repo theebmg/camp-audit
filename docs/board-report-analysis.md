@@ -358,3 +358,30 @@ Funding columns are additive to `expense_allocations`, so the destination work d
 have to wait on this answer. `expenses.fund_id` is therefore left **completely untouched**
 for now — still written, still read, still driving the dashboard tile — and moves only
 once stamp-vs-resolve is settled.
+
+---
+
+# Phase 3 decisions logged (materials & leftovers)
+
+- **Balance is never stored.** It is `SUM(material_movements.quantity)`. A stored
+  balance column would let the number and the history explaining it disagree, and the
+  one that disagreed would be the one nobody could reconstruct. Corrections are rows,
+  so "someone counted 3 and the system said 4" stays visible.
+- **Quantity is signed; `kind` says why.** A CHECK ties the sign to the meaning
+  (`wo_close` > 0, `to_job` and `tossed` < 0, `correction` either way), so a UI bug
+  can't file a write-off that adds stock. Callers pass a magnitude and the data layer
+  applies the direction.
+- **Material identity is name + unit.** "Drywall ½ 4×8" in sheets and in square feet
+  are different things to count, so the unique constraint spans both. Re-adding an
+  archived material reactivates it rather than erroring.
+- **`expense_allocations.material_id`** with a CHECK that a `leftover` destination must
+  name one — leftover stock of nothing is not a meaningful row. Other destination types
+  leave it null.
+- **Unit price on a leftover comes from what was actually paid**, carried on the
+  movement, so drawing from stock later moves real cost rather than an estimate. Using
+  stock is explicitly **not** a saving: the saving was counted once, at purchase.
+- **`getMaterialOnHand` returns null rather than a zero balance**, so the point-of-use
+  reminder can treat "nothing on hand" as "say nothing" without inspecting a number.
+- **`getMaterialsUsedOnWorkOrder` reaches through job lines** as well as the WO itself,
+  since most allocations land on lines. Returns an empty array when the WO bought no
+  tracked materials, which is the signal to skip the close prompt entirely.
