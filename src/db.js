@@ -4373,21 +4373,21 @@ export async function computeBoardReportAggregates(reportId) {
   const yearStart = `${String(report.PeriodEnd).slice(0, 4)}-01-01`;
   const out = [];
 
-  // Spend comes from allocations, so a receipt split across jobs counts once per share
-  // rather than once per receipt.
+  // Total spend reads the RECEIPTS, not their allocations. Allocations divide the same
+  // money between destinations — they never add to it — so summing them under-reports
+  // every receipt nobody has split yet, which is most of them. (Found the hard way:
+  // this said $0 spent against 11 real receipts, because none had been split.)
+  // Allocations are how spend is ATTRIBUTED — per fund, per job — not how it is totalled.
   const spend = await pool.query(
-    `SELECT COALESCE(SUM(ea.amount), 0) AS period,
-            COALESCE(SUM(ea.amount) FILTER (WHERE e.purchase_date >= $3), 0) AS ytd
-     FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
-     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
-       AND e.purchase_date BETWEEN $1 AND $2`,
-    [report.PeriodStart, report.PeriodEnd, yearStart]
+    `SELECT COALESCE(SUM(amount), 0) AS period FROM expenses
+     WHERE triage_status != 'void' AND deleted_at IS NULL
+       AND purchase_date BETWEEN $1 AND $2`,
+    [report.PeriodStart, report.PeriodEnd]
   );
   const ytd = await pool.query(
-    `SELECT COALESCE(SUM(ea.amount), 0) AS ytd
-     FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
-     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
-       AND e.purchase_date BETWEEN $1 AND $2`,
+    `SELECT COALESCE(SUM(amount), 0) AS ytd FROM expenses
+     WHERE triage_status != 'void' AND deleted_at IS NULL
+       AND purchase_date BETWEEN $1 AND $2`,
     [yearStart, report.PeriodEnd]
   );
   out.push({ groupKey: 'money', label: 'Spent this period', valueNumeric: Number(spend.rows[0].period) });
