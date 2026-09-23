@@ -133,6 +133,37 @@ function downloadBlob(content, filename, mime) {
 // In-page replacement for the browser's window.confirm — a floating modal
 // instead of native browser chrome. Resolves true/false the same way, so
 // every call site just becomes `await confirmDialog(...)`.
+// Text-input sibling of confirmDialog, same shape and styling. Native prompt() is the
+// only other way to ask for a string, and it looks nothing like the rest of this app —
+// and is suppressed outright in some embedded browsers.
+function promptDialog(message, { value = '', confirmLabel = 'Save', cancelLabel = 'Cancel', placeholder = '', multiline = false } = {}) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" role="dialog" aria-modal="true">
+        <p class="modal-message">${escapeHtml(message)}</p>
+        ${multiline
+          ? `<textarea class="modal-input" rows="3" placeholder="${escapeHtml(placeholder)}"></textarea>`
+          : `<input type="text" class="modal-input" placeholder="${escapeHtml(placeholder)}" />`}
+        <div class="btn-row" style="justify-content:flex-end;margin-top:18px">
+          <button type="button" class="btn btn-secondary modal-cancel">${escapeHtml(cancelLabel)}</button>
+          <button type="button" class="btn btn-primary modal-ok">${escapeHtml(confirmLabel)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const input = overlay.querySelector('.modal-input');
+    input.value = value || '';
+    input.style.width = '100%';
+    setTimeout(() => input.focus(), 0);
+    const done = (v) => { overlay.remove(); resolve(v); };
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => done(null));
+    overlay.querySelector('.modal-ok').addEventListener('click', () => done(input.value));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) done(null); });
+    if (!multiline) input.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(input.value); });
+  });
+}
+
 function confirmDialog(message, { confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = true } = {}) {
   return new Promise((resolve) => {
     const overlay = document.createElement('div');
@@ -5094,46 +5125,315 @@ function wireReportPreviewArea(report, { sendPath, sendBody }) {
   });
 }
 
+// Board Report draft editor (Build Brief §6/§7). Replaces the old ad-hoc range picker:
+// there is one report now, it is an entity, and everything on it is a decision you can
+// see and change. Suggestions arrive pre-checked; nothing is ever force-included.
 async function renderBoardReport() {
   setChrome({ title: 'Reports', showBack: false, showLogout: true });
-  const todayStr = isoDate(new Date());
-  const monthStartStr = isoDate(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
-  let periodStart = monthStartStr;
-  let periodEnd = todayStr;
-  let report = null;
-  let generating = false;
+  let report = null; let items = []; let aggregates = []; let outputs = [];
+  let busy = false;
+  const expanded = new Set();   // which work orders are showing their lines
+
+  async function load() {
+    const d = await api('/api/pg/board-reports/draft');
+    report = d.report; items = d.items || []; aggregates = d.aggregates || [];
+    const hist = await api('/api/pg/board-reports');
+    outputs = hist.outputs || [];
+  }
+
+  const linesOf = (woId) => items.filter((i) => i.ItemType === 'job_line' && i.ParentWorkOrderId === woId);
+
+  // Tri-state: all / some / none of a work order's lines are in (§6).
+  function woState(woId) {
+    const lines = linesOf(woId);
+    if (!lines.length) return 'none';
+    const on = lines.filter((l) => l.Included).length;
+    return on === lines.length ? 'all' : (on ? 'some' : 'none');
+  }
+
+  function itemRowHtml(it, indent = false) {
+    const bits = [it.SnapAssetName, it.SnapDate, it.SnapCost != null ? `$${Number(it.SnapCost).toLocaleString()}` : null]
+      .filter(Boolean).join(' · ');
+    return `
+      <div class="list-item br-row" data-item="${it.Id}" style="${indent ? 'padding-left:30px;' : ''}display:flex;align-items:flex-start;gap:10px">
+        <input type="checkbox" class="br-check" data-item="${it.Id}" ${it.Included ? 'checked' : ''} style="margin-top:3px" />
+        <div style="flex:1;min-width:0">
+          <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${it.SnapSubtitle ? ` <span class="muted">— ${escapeHtml(it.SnapSubtitle)}</span>` : ''}</div>
+          ${bits ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(bits)}</div>` : ''}
+          ${it.ReportNote
+            ? `<div style="font-size:0.9rem;margin-top:3px">${escapeHtml(it.ReportNote)} <a href="#" class="br-note" data-item="${it.Id}">edit</a></div>`
+            : `<a href="#" class="br-note muted" data-item="${it.Id}" style="font-size:0.82rem">+ add note</a>`}
+        </div>
+      </div>`;
+  }
+
+  function woRowHtml(it) {
+    const state = woState(it.ItemId);
+    const lines = linesOf(it.ItemId);
+    const open = expanded.has(it.ItemId);
+    return `
+      <div class="list-item br-row" data-item="${it.Id}" style="display:flex;align-items:flex-start;gap:10px">
+        <button type="button" class="btn-icon br-expand" data-wo="${it.ItemId}" style="background:none;border:none;cursor:pointer;padding:0 2px">${open ? '▾' : '▸'}</button>
+        <input type="checkbox" class="br-check" data-item="${it.Id}" ${it.Included ? 'checked' : ''} style="margin-top:3px" />
+        <div style="flex:1;min-width:0">
+          <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>
+            ${lines.length ? `<span class="muted" style="font-size:0.82rem"> — ${lines.filter((l) => l.Included).length} of ${lines.length} line(s)${state === 'some' ? ', partial' : ''}</span>` : ''}
+          </div>
+          ${it.SnapAssetName ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(it.SnapAssetName)}</div>` : ''}
+          <div style="margin-top:3px;font-size:0.82rem">
+            <label class="muted">Show as
+              <select class="br-mode" data-item="${it.Id}">
+                <option value="summary" ${it.DisplayMode === 'summary' ? 'selected' : ''}>Summary</option>
+                <option value="itemized" ${it.DisplayMode === 'itemized' ? 'selected' : ''}>Itemized</option>
+              </select>
+            </label>
+            ${it.ReportNote ? '' : `<a href="#" class="br-note muted" data-item="${it.Id}" style="margin-left:8px">+ add note</a>`}
+          </div>
+          ${it.ReportNote ? `<div style="font-size:0.9rem;margin-top:3px">${escapeHtml(it.ReportNote)} <a href="#" class="br-note" data-item="${it.Id}">edit</a></div>` : ''}
+        </div>
+      </div>
+      ${open ? lines.map((l) => itemRowHtml(l, true)).join('') : ''}`;
+  }
+
+  function sectionHtml(key, label) {
+    const rows = items.filter((i) => i.Section === key);
+    if (!rows.length) return '';
+    const wos = rows.filter((i) => i.ItemType === 'work_order');
+    const woIds = new Set(wos.map((w) => w.ItemId));
+    // Lines whose work order is in this section render underneath it, not twice.
+    const loose = rows.filter((i) => i.ItemType !== 'work_order'
+      && !(i.ItemType === 'job_line' && woIds.has(i.ParentWorkOrderId)));
+    const on = rows.filter((i) => i.Included).length;
+    return `
+      <div class="card">
+        <h3>${escapeHtml(label)} <span class="muted" style="font-weight:400;font-size:0.85rem">— ${on} of ${rows.length} included</span></h3>
+        ${wos.map(woRowHtml).join('')}
+        ${loose.map((i) => itemRowHtml(i)).join('')}
+      </div>`;
+  }
+
+  function moneyHtml() {
+    const g = (k) => aggregates.filter((a) => a.GroupKey === k);
+    if (!g('money').length && !g('savings').length) return '';
+    const tile = (a) => `
+      <div style="flex:1;min-width:150px">
+        <div class="muted" style="font-size:0.75rem;text-transform:uppercase">${escapeHtml(a.Label)}</div>
+        <div style="font-size:1.1rem;font-weight:700">${a.ValueNumeric != null ? `$${Number(a.ValueNumeric).toLocaleString()}` : escapeHtml(a.ValueText || '—')}</div>
+      </div>`;
+    return `
+      <div class="card">
+        <div style="display:flex;flex-wrap:wrap;gap:16px">${g('money').map(tile).join('')}</div>
+        ${g('savings').length ? `<div style="display:flex;flex-wrap:wrap;gap:16px;margin-top:12px;padding-top:12px;border-top:1px solid #eef0f6">${g('savings').map(tile).join('')}</div>` : ''}
+        <p class="muted" style="margin:10px 0 0;font-size:0.78rem">Figures reflect maintenance/operations tracking, not the camp's official books.</p>
+      </div>`;
+  }
 
   function draw() {
+    const published = report.Status === 'published';
     setApp(`
       ${reportsTabsHtml('board')}
       <div class="card">
-        <h3>Board Report</h3>
-        <p class="muted">Open Work Orders by status/priority, outstanding cost by funding source, completed items for the period below, and what's overdue/upcoming right now.</p>
-        <div class="field-row"><label>Period</label>
+        <h3>Board Report — ${escapeHtml(report.Title)} ${published ? '<span class="muted">(published)</span>' : '<span class="muted">(draft)</span>'}</h3>
+        <div class="field-row"><label>Period covered</label>
           <div class="report-date-range">
-            <input type="date" id="boardFrom" value="${periodStart}" />
+            <input type="date" id="brFrom" value="${report.PeriodStart}" ${published ? 'disabled' : ''} />
             <span class="muted">to</span>
-            <input type="date" id="boardTo" value="${periodEnd}" />
+            <input type="date" id="brTo" value="${report.PeriodEnd}" ${published ? 'disabled' : ''} />
           </div>
         </div>
-        <div class="btn-row"><button type="button" class="btn btn-primary" id="boardGenBtn" ${generating ? 'disabled' : ''}>${generating ? 'Generating…' : 'Generate'}</button></div>
+        <div class="field-row"><label>Looking ahead</label>
+          <div class="report-date-range">
+            <input type="date" id="brFwdFrom" value="${report.ForwardStart}" ${published ? 'disabled' : ''} />
+            <span class="muted">to</span>
+            <input type="date" id="brFwdTo" value="${report.ForwardEnd}" ${published ? 'disabled' : ''} />
+          </div>
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">Defaults to the same length as the period covered.</p>
+        </div>
+        ${published ? '' : `<div class="btn-row"><button type="button" class="btn btn-secondary" id="brRefresh" ${busy ? 'disabled' : ''}>${busy ? 'Working…' : 'Refresh suggestions'}</button></div>`}
       </div>
-      ${reportPreviewAreaHtml(report)}`);
+
+      ${moneyHtml()}
+
+      <div class="card">
+        <h3>Summary</h3>
+        <p class="muted">The narrative the board reads first. Saved as you type.</p>
+        <textarea id="brNotes" rows="5" ${published ? 'disabled' : ''} placeholder="What the board should know about this period…">${escapeHtml(report.SummaryNotes || '')}</textarea>
+      </div>
+
+      ${sectionHtml('done', 'Work Completed')}
+      ${sectionHtml('coming_up', 'Coming Up')}
+      ${sectionHtml('overdue', 'Overdue')}
+      ${sectionHtml('admin_work', 'Administrative Work')}
+
+      <div class="card">
+        <div class="btn-row">
+          <button type="button" class="btn btn-secondary" id="brPreview">Preview</button>
+          <button type="button" class="btn btn-secondary" id="brSave">Save a copy</button>
+          <button type="button" class="btn btn-secondary" id="brDownload">Download</button>
+          <button type="button" class="btn btn-secondary" id="brEmail">Email…</button>
+          ${published ? '' : '<button type="button" class="btn btn-primary" id="brPublish">Publish</button>'}
+        </div>
+        <p class="muted" style="margin:8px 0 0;font-size:0.82rem">Every copy that leaves the app is saved below, exactly as it went out.</p>
+      </div>
+
+      ${outputs.length ? `<div class="card">
+        <h3>History</h3>
+        ${outputs.map((o) => `<div class="list-item" style="display:flex;justify-content:space-between;gap:10px">
+          <div><strong>${escapeHtml(o.ReportTitle)}</strong> <span class="muted">— ${escapeHtml(o.Kind)}${o.WasDraft ? ' (draft)' : ''}${o.Recipients ? ` → ${escapeHtml(o.Recipients)}` : ''}</span></div>
+          <a href="#" class="br-open-output" data-id="${o.Id}">view</a>
+        </div>`).join('')}
+      </div>` : ''}
+    `);
     wireReportsTabs();
-    document.getElementById('boardGenBtn').addEventListener('click', generate);
-    wireReportPreviewArea(report, { sendPath: '/api/pg/reports/board/send', sendBody: () => ({ periodStart, periodEnd }) });
+    wire(published);
   }
 
-  async function generate() {
-    periodStart = document.getElementById('boardFrom').value || periodStart;
-    periodEnd = document.getElementById('boardTo').value || periodEnd;
-    generating = true; draw();
-    try { report = await api(`/api/pg/reports/board/preview?periodStart=${periodStart}&periodEnd=${periodEnd}`); }
-    catch (err) { toast(err.message); }
-    generating = false; draw();
+  async function patchReport(fields) {
+    await api(`/api/pg/board-reports/${report.Id}`, { method: 'PATCH', body: JSON.stringify(fields) });
   }
 
+  async function refresh() {
+    busy = true; draw();
+    try {
+      const r = await api(`/api/pg/board-reports/${report.Id}/refresh`, { method: 'POST' });
+      items = r.items || [];
+      const d = await api(`/api/pg/board-reports/${report.Id}`);
+      aggregates = d.aggregates || [];
+      if (r.prunedCount) toast(`${r.prunedCount} item(s) no longer match this period`);
+    } catch (e) { toast(e.message, 5000); }
+    busy = false; draw();
+  }
+
+  async function output(kind, extra = {}) {
+    try {
+      const res = await api(`/api/pg/board-reports/${report.Id}/output`, {
+        method: 'POST', body: JSON.stringify({ kind, ...extra }),
+      });
+      return res;
+    } catch (e) {
+      // 409 = this is still a draft; ask once, then repeat with the confirmation.
+      if (/still a draft/i.test(e.message)) {
+        if (await confirmDialog('This report is still a draft. Send it anyway? It will be clearly marked DRAFT.',
+          { confirmLabel: 'Yes, mark it DRAFT', cancelLabel: 'Cancel', danger: false })) {
+          return output(kind, { ...extra, confirmDraft: true });
+        }
+        return null;
+      }
+      toast(e.message, 5000); return null;
+    }
+  }
+
+  function wire(published) {
+    document.getElementById('brPreview').addEventListener('click', async () => {
+      const res = await output('manual', {});   // previewing pins nothing extra beyond the copy
+      if (res) showHtmlModal(res.html);
+    });
+    document.getElementById('brSave').addEventListener('click', async () => {
+      const res = await output('manual', {});
+      if (res) { toast('Copy saved'); await load(); draw(); }
+    });
+    document.getElementById('brDownload').addEventListener('click', async () => {
+      const res = await output('download', {});
+      if (!res) return;
+      // Saves the exact bytes that were recorded, not a re-render.
+      const blob = new Blob([res.html], { type: 'text/html' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `${res.subject.replace(/[^\w -]/g, '')}.html`;
+      document.body.appendChild(a); a.click(); a.remove();
+      toast('Downloaded and saved to history'); await load(); draw();
+    });
+    document.getElementById('brEmail').addEventListener('click', async () => {
+      const recipient = await promptDialog('Email the board report to:', { confirmLabel: 'Send', placeholder: 'name@example.org' });
+      if (!recipient || !recipient.trim()) return;
+      const res = await output('email', { recipient });
+      if (res) { toast(`Sent to ${recipient}`); await load(); draw(); }
+    });
+    const pub = document.getElementById('brPublish');
+    if (pub) pub.addEventListener('click', async () => {
+      const on = items.filter((i) => i.Included).length;
+      if (!await confirmDialog(`Publish this report with ${on} item(s)? Unchecked items are dropped and the report becomes read-only.`,
+        { confirmLabel: 'Publish', cancelLabel: 'Keep editing', danger: false })) return;
+      await api(`/api/pg/board-reports/${report.Id}/publish`, { method: 'POST' });
+      toast('Published'); await load(); draw();
+    });
+    app.querySelectorAll('.br-open-output').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const d = await api(`/api/pg/board-report-outputs/${el.dataset.id}`);
+      showHtmlModal(d.output.SnapshotHtml);
+    }));
+
+    if (published) return;
+
+    for (const [id, field] of [['brFrom', 'periodStart'], ['brTo', 'periodEnd'], ['brFwdFrom', 'forwardStart'], ['brFwdTo', 'forwardEnd']]) {
+      document.getElementById(id).addEventListener('change', async (e) => {
+        await patchReport({ [field]: e.target.value });
+        await refresh();
+      });
+    }
+    let notesTimer;
+    document.getElementById('brNotes').addEventListener('input', (e) => {
+      clearTimeout(notesTimer);
+      notesTimer = setTimeout(() => patchReport({ summaryNotes: e.target.value }), 700);
+    });
+    app.querySelectorAll('.br-expand').forEach((b) => b.addEventListener('click', () => {
+      const id = Number(b.dataset.wo);
+      if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
+      draw();
+    }));
+    app.querySelectorAll('.br-check').forEach((cb) => cb.addEventListener('change', async () => {
+      const r = await api(`/api/pg/board-reports/${report.Id}/items/${cb.dataset.item}`, {
+        method: 'PATCH', body: JSON.stringify({ included: cb.checked }),
+      });
+      items = r.items; draw();
+    }));
+    app.querySelectorAll('.br-mode').forEach((sel) => sel.addEventListener('change', async () => {
+      const r = await api(`/api/pg/board-reports/${report.Id}/items/${sel.dataset.item}`, {
+        method: 'PATCH', body: JSON.stringify({ displayMode: sel.value }),
+      });
+      items = r.items; draw();
+    }));
+    app.querySelectorAll('.br-note').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const it = items.find((x) => String(x.Id) === el.dataset.item);
+      const note = await promptDialog('Board-facing note for this item (leave blank to remove):', {
+        value: it?.ReportNote || '', multiline: true,
+        placeholder: 'Shown to the board — separate from the work order\'s own notes',
+      });
+      if (note === null) return;
+      const r = await api(`/api/pg/board-reports/${report.Id}/items/${el.dataset.item}`, {
+        method: 'PATCH', body: JSON.stringify({ reportNote: note }),
+      });
+      items = r.items; draw();
+    }));
+  }
+
+  await load();
+  // First open of a fresh draft has nothing in it yet; fill it before drawing so the
+  // screen never appears empty for no reason.
+  if (!items.length && report.Status === 'draft') {
+    try { const r = await api(`/api/pg/board-reports/${report.Id}/refresh`, { method: 'POST' }); items = r.items || []; } catch { /* draw empty */ }
+    try { const d = await api(`/api/pg/board-reports/${report.Id}`); aggregates = d.aggregates || []; } catch { /* ignore */ }
+  }
   draw();
+}
+
+// Shows rendered report HTML in an overlay. Used for Preview and for opening any past
+// copy out of history — same viewer either way, so what you preview and what was sent
+// look identical by construction.
+function showHtmlModal(html) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:760px;width:94%;max-height:86vh;overflow:auto">
+    <div style="display:flex;justify-content:flex-end"><button type="button" class="btn btn-secondary modal-cancel">Close</button></div>
+    <iframe style="width:100%;height:70vh;border:1px solid #eef0f6;border-radius:8px;margin-top:10px"></iframe>
+  </div>`;
+  document.body.appendChild(overlay);
+  const frame = overlay.querySelector('iframe');
+  frame.srcdoc = html;
+  const close = () => overlay.remove();
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 }
 
 // "Work Performed in a Date Range" (§6.2.1) — the fall-to-spring board

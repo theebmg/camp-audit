@@ -477,3 +477,21 @@ once stamp-vs-resolve is settled.
   annualized ("per year") and one-time separately. Storage keeps the monthly figure that
   was actually negotiated.
 - **Spend reads allocations**, so a receipt split across jobs counts once per share.
+
+## Phase 6 screen
+
+- **The draft editor replaces the old range picker entirely.** One report, one place.
+- **Tri-state work orders** are derived from their lines rather than stored, so the
+  header can never disagree with what's actually checked underneath it.
+- **Summary vs itemized is a per-WO dropdown**, summary by default for every work order
+  with no size threshold, exactly as the brief specifies.
+- **Preview, Save a copy, Download and Email all go through one endpoint.** Preview and
+  Save both record a `manual` output — previewing *is* pinning a copy, which is simpler
+  to reason about than a preview that sometimes records and sometimes doesn't.
+- **Download saves the bytes the server recorded**, not a client-side re-render, so the
+  file on disk and the row in history can't drift.
+- **History opens past copies in the same viewer as Preview**, so what you preview and
+  what was sent look identical by construction.
+- **`promptDialog` added** to match `confirmDialog`. Native `prompt()` was the only
+  other way to ask for a string; it looks nothing like the rest of the app and is
+  suppressed outright in some embedded browsers. Zero native prompts remain.
