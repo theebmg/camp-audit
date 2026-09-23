@@ -9733,6 +9733,19 @@ async function renderAuditRunner({ id }) {
       </div>
 
       <div class="card">
+        ${(() => {
+          // What's already been flagged in THIS section, so you can see it rather than
+          // wondering whether the tap registered.
+          const flags = data.Answers.filter((a) => a.Kind === 'adhoc_flag' && String(a.SectionId) === String(sec.Id));
+          if (!flags.length) return '';
+          return `<div style="margin-bottom:10px">
+            ${flags.map((f) => `<div class="list-item" style="padding:6px 0">
+              <div>⚑ ${escapeHtml(f.Value || '')}</div>
+              ${f.Note ? `<div class="muted" style="font-size:0.82rem">${escapeHtml(f.Note)}</div>` : ''}
+              ${f.Photos?.length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">${f.Photos.map((ph) => `<img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt="" style="width:52px;height:52px;object-fit:cover;border-radius:6px" />`).join('')}</div>` : ''}
+            </div>`).join('')}
+          </div>`;
+        })()}
         <button type="button" class="btn btn-secondary" id="adhocBtn" style="width:100%">＋ Flag something else</button>
         <p class="muted" style="margin:8px 0 0;font-size:0.82rem">Anything the form didn't ask about. It becomes a finding, and a job line if you add a fix.</p>
       </div>
@@ -9895,25 +9908,133 @@ function chooseNoteDestination(current = 'audit_only') {
   });
 }
 
+// "Flag something else" (Addendum §3) — one form, not a chain of prompts. A photo is
+// the whole point here: you're describing something the form never anticipated, so the
+// picture carries more than the words do. The fix fields are optional; filling in a
+// title is what turns this into a job line.
 async function openAdhocFlag(instanceId, sectionId, onDone) {
-  const description = await promptDialog('What did you find?', { multiline: true, confirmLabel: 'Next', placeholder: 'Gutter hanging off the back' });
-  if (!description || !description.trim()) return;
-  const wantFix = await confirmDialog('Add a fix for this now? It becomes a job line on this building\'s work order.',
-    { confirmLabel: 'Add a fix', cancelLabel: 'Just flag it', danger: false });
-  let remedy = null;
-  if (wantFix) {
-    const title = await promptDialog('What needs doing?', { value: description.trim(), confirmLabel: 'Next' });
-    if (title === null) return;
-    const hours = await promptDialog('Estimated hours (optional)', { confirmLabel: 'Next' });
-    const cost = await promptDialog('Estimated cost (optional)', { confirmLabel: 'Save' });
-    remedy = { title, estHours: hours ? Number(hours) : null, estCost: cost ? Number(cost) : null };
+  let fundingOptions = [];
+  try { fundingOptions = (await loadGridContext()).fundingOptions || []; } catch { /* funding is optional */ }
+  const files = [];
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:520px;width:95%;max-height:88vh;overflow:auto">
+    <h3 style="margin:0 0 4px">Flag something else</h3>
+    <p class="muted" style="margin:0 0 12px">Anything the form didn't ask about. It becomes a finding either way; add a fix and it also becomes a job line.</p>
+
+    <div class="field-row"><label>What did you find? *</label>
+      <textarea id="afDesc" rows="3" placeholder="Gutter hanging off the back corner"></textarea>
+    </div>
+
+    <div class="field-row"><label>Photos</label>
+      <label class="btn btn-secondary" style="cursor:pointer;display:inline-block">📷 Add photos
+        <input type="file" id="afPhotos" accept="image/*" multiple style="display:none" />
+      </label>
+      <div id="afThumbs" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"></div>
+    </div>
+
+    <div class="field-row"><label>Note (optional)</label>
+      <textarea id="afNote" rows="2" placeholder="Anything worth recording that isn't the fix itself"></textarea>
+    </div>
+    <div class="field-row"><label>Where should the note go?</label>
+      <select id="afNoteDest">
+        <option value="audit_only">Audit only</option>
+        <option value="asset">Also a note on this building</option>
+        <option value="job">Also on the work this creates</option>
+      </select>
+      <p class="muted" style="margin-top:2px;font-size:0.8rem">The note always stays on the audit; this adds a copy.</p>
+    </div>
+
+    <details style="margin:14px 0">
+      <summary style="cursor:pointer;font-weight:700">Add a fix (optional)</summary>
+      <p class="muted" style="margin:8px 0">Fill in a title and this becomes a job line on the building's work order.</p>
+      <div class="field-row"><label>What needs doing?</label><input type="text" id="afTitle" placeholder="Rehang gutter" /></div>
+      <div class="field-row"><label>Who does it?</label>
+        <select id="afResp">
+          <option value="self">Self</option>
+          <option value="volunteer">Volunteer</option>
+          <option value="vendor">Vendor</option>
+          <option value="cabin_holder">Cabin holder</option>
+        </select>
+      </div>
+      <div class="field-row"><label>Funding</label><div id="afFunding"></div></div>
+      <div class="field-row"><label>Hours / cost</label>
+        <div style="display:flex;gap:8px">
+          <input type="number" step="any" min="0" id="afHours" placeholder="Hrs" style="flex:1" />
+          <input type="number" step="0.01" min="0" id="afCost" placeholder="Cost" style="flex:1" />
+        </div>
+      </div>
+    </details>
+
+    <div class="btn-row" style="justify-content:flex-end">
+      <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" id="afSave">Save flag</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+
+  const fundingEl = overlay.querySelector('#afFunding');
+  const fundingCbx = mountCombobox(fundingEl, {
+    options: fundingOptions, placeholder: '— operating budget —', emptyText: 'No funding source matches',
+  });
+
+  // Files are held until the flag is saved, because a photo needs an answer row to
+  // attach to and that row doesn't exist yet.
+  function drawThumbs() {
+    overlay.querySelector('#afThumbs').innerHTML = files.map((f, i) => `
+      <div style="position:relative">
+        <img src="${URL.createObjectURL(f)}" alt="" style="width:64px;height:64px;object-fit:cover;border-radius:6px" />
+        <button type="button" class="af-rm" data-i="${i}" style="position:absolute;top:-6px;right:-6px;border:none;background:#c92a2a;color:#fff;border-radius:50%;width:20px;height:20px;cursor:pointer;line-height:1">×</button>
+      </div>`).join('');
+    overlay.querySelectorAll('.af-rm').forEach((b) => b.addEventListener('click', () => {
+      files.splice(Number(b.dataset.i), 1); drawThumbs();
+    }));
   }
-  try {
-    await api(`/api/pg/audit-instances/${instanceId}/adhoc-flags`, {
-      method: 'POST', body: JSON.stringify({ sectionId, description: description.trim(), remedy }),
-    });
-    toast('Flagged'); if (onDone) onDone();
-  } catch (e) { toast(e.message, 5000); }
+  overlay.querySelector('#afPhotos').addEventListener('change', (e) => {
+    files.push(...e.target.files); e.target.value = ''; drawThumbs();
+  });
+
+  overlay.querySelector('#afSave').addEventListener('click', async () => {
+    const description = overlay.querySelector('#afDesc').value.trim();
+    if (!description) return toast('Describe what you found', 4000);
+    const title = overlay.querySelector('#afTitle').value.trim();
+    const parsed = fundingCbx.getValue ? parseFundingOptionValue(fundingCbx.getValue()) : null;
+    const remedy = title ? {
+      title,
+      responsibility: overlay.querySelector('#afResp').value || null,
+      fundingSource: parsed ? parsed.source : null,
+      fundingRefId: parsed ? parsed.refId : null,
+      estHours: overlay.querySelector('#afHours').value ? Number(overlay.querySelector('#afHours').value) : null,
+      estCost: overlay.querySelector('#afCost').value ? Number(overlay.querySelector('#afCost').value) : null,
+    } : null;
+    const note = overlay.querySelector('#afNote').value.trim() || null;
+
+    try {
+      const res = await api(`/api/pg/audit-instances/${instanceId}/adhoc-flags`, {
+        method: 'POST',
+        body: JSON.stringify({
+          sectionId, description, note,
+          noteDestination: note ? overlay.querySelector('#afNoteDest').value : null,
+          remedy,
+        }),
+      });
+      // The answer row exists now, so the photos have something to attach to.
+      for (const file of files) {
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('entityType', 'audit_answer');
+        fd.append('entityId', String(res.answerId));
+        const r = await fetch('/api/pg/attachments', { method: 'POST', body: fd });
+        if (!r.ok) throw new Error('A photo failed to upload — the flag was still saved');
+      }
+      close();
+      toast(files.length ? `Flagged with ${files.length} photo(s)` : 'Flagged');
+      if (onDone) onDone();
+    } catch (e) { toast(e.message, 6000); if (onDone) onDone(); }
+  });
 }
 
 // Review: every flagged answer with its chain, the lines it will generate, and — when

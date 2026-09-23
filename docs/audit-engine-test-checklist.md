@@ -164,3 +164,18 @@ image inputs; `accept="image/*"` and `multiple` kept.
 - [ ] On a desktop, drag a question by its row — it drops where you leave it.
 - [ ] Follow-up questions have no arrows and don't drag; they travel with the answer
       that reveals them.
+
+## Ad-hoc flags — now a real form (Q4 resolved)
+
+- [ ] In the runner, tap **＋ Flag something else**. One form, not a chain of prompts.
+- [ ] **📷 Add photos** → the iOS menu appears → pick two from the library. Both thumbnails
+      show, each with an × to remove before saving.
+- [ ] Type a description, add a note, set **Where should the note go?** to "Also a note on
+      this building".
+- [ ] Open **Add a fix**, fill in a title, pick Volunteer and a funding source, add hours
+      and cost. Save.
+- [ ] The flag now appears **in that section** with its note and photo thumbnails, so you
+      can see it registered rather than wondering.
+- [ ] Save a flag with **no** fix — it still creates a finding, just no job line.
+- [ ] Finish the audit: the flag appears on the review screen, the fix appears as a job
+      line, and the routed note lands on the building.

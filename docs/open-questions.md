@@ -1,6 +1,16 @@
 # Open Questions
 
-## Q4 — Should ad-hoc flags allow photos too?
+## Q4 — RESOLVED 2026-09-23: yes, and the prompt chain became a real form
+
+Photos on ad-hoc flags shipped. The prompt sequence was replaced with a single form —
+description, photo picker (multiple, no `capture`), an optional fix (title,
+responsibility, funding, hours, cost) behind a disclosure, and the §4 note-routing
+choice. Files are held in the dialog until save, because a photo needs an answer row to
+attach to and that row doesn't exist until the flag is created.
+
+The original question follows.
+
+### Original question
 
 Raised 2026-09-23 while wiring photos per answer.
 
