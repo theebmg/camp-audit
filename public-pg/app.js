@@ -848,6 +848,7 @@ const NAV_ITEMS = [
   { icon: '📥', label: 'Inbox', view: 'inbox' },
   { icon: '🗂️', label: 'Admin Tasks', view: 'adminTasks' },
   { icon: '📝', label: 'Start Audit', view: 'auditPicker' },
+  { icon: '📋', label: 'Audit Rounds', view: 'auditRounds' },
   { icon: '🗺️', label: 'Map', view: 'map' },
   { icon: '📍', label: 'Locations', view: 'locations' },
   { icon: '🗒️', label: 'Notes', view: 'notes' },
@@ -1237,6 +1238,10 @@ async function render(view, params = {}, opts = {}) {
       newWorkOrder: () => renderNewWorkOrder(params),
       editWorkOrderLines: () => renderEditWorkOrderLines(params),
       materials: () => renderMaterialsOnHand(),
+      auditRounds: () => renderAuditRounds(),
+      auditRound: () => renderAuditRound(params),
+      auditRunner: () => renderAuditRunner(params),
+      auditReview: () => renderAuditReview(params),
       crew: () => renderCrew(),
       crewHours: () => renderCrewHours(),
       adminUsers: () => renderAdminUsers(),
@@ -9174,6 +9179,482 @@ async function openSplitEditor(expenseId, { onClose } = {}) {
   const close = () => { overlay.remove(); if (onClose) onClose(); };
   overlay.querySelector('.modal-cancel').addEventListener('click', close);
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+}
+
+// ── The runner (Build Brief §3) ──────────────────────────────────────────
+// Phone-first, one section per screen. Every answer saves on its own, so a dropped
+// connection costs one field rather than a building — and anything that fails to send
+// goes on a visible retry queue instead of being silently lost.
+async function renderAuditRunner({ id }) {
+  setChrome({ title: 'Audit', showBack: true, showLogout: true });
+  let data = await api(`/api/pg/audit-instances/${id}`);
+  let sectionIdx = 0;
+  const answers = new Map();           // questionId -> answer
+  for (const a of data.Answers) if (a.QuestionId) answers.set(a.QuestionId, a);
+
+  // ---- retry queue -------------------------------------------------------
+  // Writes that failed to send. Kept in memory and retried on a timer and on
+  // reconnect; the count is always on screen, because a silent queue is the same as
+  // losing the data as far as the person walking the building is concerned.
+  const queue = [];
+  let flushing = false;
+  async function send(body) {
+    try {
+      await api(`/api/pg/audit-instances/${id}/answers`, { method: 'PUT', body: JSON.stringify(body) });
+      return true;
+    } catch {
+      queue.push(body);
+      drawQueue();
+      return false;
+    }
+  }
+  async function flush() {
+    if (flushing || !queue.length) return;
+    flushing = true;
+    while (queue.length) {
+      const body = queue[0];
+      try {
+        await api(`/api/pg/audit-instances/${id}/answers`, { method: 'PUT', body: JSON.stringify(body) });
+        queue.shift();
+      } catch { break; }      // still down; leave the rest queued
+    }
+    flushing = false;
+    drawQueue();
+  }
+  setInterval(flush, 8000);
+  window.addEventListener('online', flush);
+  function drawQueue() {
+    const el = document.getElementById('runnerQueue');
+    if (el) el.innerHTML = queue.length
+      ? `<span style="color:#b4690e">${queue.length} unsaved — retrying…</span>`
+      : '<span class="muted">All saved</span>';
+  }
+
+  // ---- show_if -----------------------------------------------------------
+  // A question renders only when every condition is met. Hiding one keeps its stored
+  // answer but marks it inactive, so it's excluded from generation and required-checks
+  // and comes back untouched if the gate re-opens (§3).
+  function visible(q) {
+    if (!q.ShowIf || !Array.isArray(q.ShowIf) || !q.ShowIf.length) return true;
+    return q.ShowIf.every((cond) => {
+      const a = answers.get(cond.question_id);
+      if (!a || !a.OptionId) return false;
+      return (cond.option_ids || []).map(Number).includes(Number(a.OptionId));
+    });
+  }
+
+  const sectionQuestions = (secId) => data.Questions.filter((q) => q.SectionId === secId);
+
+  function draw() {
+    const sec = data.Sections[sectionIdx];
+    const qs = sectionQuestions(sec.Id).filter(visible);
+    const answeredCount = data.Questions.filter((q) => visible(q) && answers.get(q.Id)?.Value).length;
+    const totalVisible = data.Questions.filter(visible).length;
+
+    setApp(`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
+          <div><strong>${escapeHtml(data.Instance.AssetName)}</strong> <span class="muted">${escapeHtml(data.Instance.LocationName || '')}</span></div>
+          <div id="runnerQueue" class="muted" style="font-size:0.82rem"></div>
+        </div>
+        <div class="muted" style="margin-top:4px">Section ${sectionIdx + 1}/${data.Sections.length} · ${escapeHtml(sec.Name)} · ${answeredCount}/${totalVisible} answered</div>
+        <div style="height:6px;background:#eef0f6;border-radius:3px;margin-top:8px;overflow:hidden">
+          <div style="height:100%;width:${totalVisible ? Math.round((answeredCount / totalVisible) * 100) : 0}%;background:#3b5bdb"></div>
+        </div>
+      </div>
+
+      ${data.AssetNotes.length && sectionIdx === 0 ? `<div class="card" style="background:#fffdf5;border-color:#f0e6c8">
+        <h3 style="font-size:0.95rem;margin:0 0 6px">Before you start</h3>
+        ${data.AssetNotes.map((n) => `<div class="list-item" style="padding:6px 0"><div>${escapeHtml(n.Note)}</div><div class="muted" style="font-size:0.78rem">${n.Source === 'audit' ? 'from an audit' : 'note'} · ${String(n.CreatedAt).slice(0, 10)}</div></div>`).join('')}
+      </div>` : ''}
+
+      <div class="card">
+        ${qs.length ? qs.map(questionHtml).join('') : '<p class="muted">Nothing to answer in this section for this building.</p>'}
+      </div>
+
+      <div class="card">
+        <button type="button" class="btn btn-secondary" id="adhocBtn" style="width:100%">＋ Flag something else</button>
+        <p class="muted" style="margin:8px 0 0;font-size:0.82rem">Anything the form didn't ask about. It becomes a finding, and a job line if you add a fix.</p>
+      </div>
+
+      <div class="card">
+        <div class="btn-row">
+          ${sectionIdx > 0 ? '<button type="button" class="btn btn-secondary" id="prevSec">Back</button>' : ''}
+          ${sectionIdx < data.Sections.length - 1
+            ? '<button type="button" class="btn btn-primary" id="nextSec">Next section</button>'
+            : '<button type="button" class="btn btn-primary" id="finishBtn">Finish</button>'}
+        </div>
+      </div>`);
+    drawQueue();
+    wire();
+  }
+
+  function questionHtml(q) {
+    const a = answers.get(q.Id);
+    const val = a?.Value ?? '';
+    let input;
+    if (q.Options.length) {
+      input = `<div style="display:flex;flex-wrap:wrap;gap:8px">${q.Options.map((o) => `
+        <button type="button" class="btn ${String(a?.OptionId) === String(o.Id) ? 'btn-primary' : 'btn-secondary'} opt-btn"
+                data-q="${q.Id}" data-o="${o.Id}" data-v="${escapeHtml(o.Value)}"
+                style="flex:0 0 auto">${escapeHtml(o.Label)}${o.Flag ? ' ⚑' : ''}</button>`).join('')}</div>`;
+    } else if (q.Type === 'number') {
+      input = `<input type="number" class="q-val" data-q="${q.Id}" value="${escapeHtml(val)}" />`;
+    } else {
+      input = `<textarea class="q-val" data-q="${q.Id}" rows="2">${escapeHtml(val)}</textarea>`;
+    }
+    const flagged = a?.OptionId && q.Options.find((o) => String(o.Id) === String(a.OptionId))?.Flag;
+    return `
+      <div class="field-row" data-question="${q.Id}">
+        <label>${escapeHtml(q.Prompt)}${q.Required ? ' *' : ''}</label>
+        ${input}
+        <div style="margin-top:6px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <a href="#" class="q-note muted" data-q="${q.Id}" style="font-size:0.82rem">${a?.Note ? 'edit note' : '+ note'}</a>
+          ${flagged ? '<span style="color:#b4690e;font-size:0.82rem">flagged — a finding will be raised</span>' : ''}
+        </div>
+        ${a?.Note ? `<div style="font-size:0.88rem;margin-top:4px">${escapeHtml(a.Note)} <span class="muted">(${escapeHtml(a.NoteDestination || 'audit_only')})</span></div>` : ''}
+      </div>`;
+  }
+
+  async function saveAnswer(q, { value, optionId }) {
+    const prev = answers.get(q.Id) || {};
+    const next = { ...prev, QuestionId: q.Id, Value: value, OptionId: optionId ?? null };
+    answers.set(q.Id, next);
+    // Hidden questions keep their answer but go inactive (§3).
+    const body = {
+      questionId: q.Id, questionKey: q.QuestionKey, value, optionId: optionId ?? null,
+      note: next.Note ?? null, noteDestination: next.NoteDestination ?? null, active: true,
+    };
+    draw();
+    await send(body);
+    // Anything the change just hid is marked inactive so generation skips it.
+    for (const other of data.Questions) {
+      if (!visible(other) && answers.get(other.Id)?.Value) {
+        const oa = answers.get(other.Id);
+        await send({ questionId: other.Id, questionKey: other.QuestionKey, value: oa.Value,
+          optionId: oa.OptionId ?? null, note: oa.Note ?? null, noteDestination: oa.NoteDestination ?? null, active: false });
+      }
+    }
+  }
+
+  function wire() {
+    app.querySelectorAll('.opt-btn').forEach((b) => b.addEventListener('click', () => {
+      const q = data.Questions.find((x) => String(x.Id) === b.dataset.q);
+      saveAnswer(q, { value: b.dataset.v, optionId: Number(b.dataset.o) });
+    }));
+    app.querySelectorAll('.q-val').forEach((i) => i.addEventListener('change', () => {
+      const q = data.Questions.find((x) => String(x.Id) === i.dataset.q);
+      saveAnswer(q, { value: i.value, optionId: null });
+    }));
+    app.querySelectorAll('.q-note').forEach((el) => el.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const q = data.Questions.find((x) => String(x.Id) === el.dataset.q);
+      const a = answers.get(q.Id) || {};
+      const note = await promptDialog(`Note for "${q.Prompt}"`, { value: a.Note || '', multiline: true, confirmLabel: 'Next' });
+      if (note === null) return;
+      const dest = await chooseNoteDestination(a.NoteDestination);
+      if (dest === null) return;
+      answers.set(q.Id, { ...a, QuestionId: q.Id, Note: note, NoteDestination: dest });
+      const cur = answers.get(q.Id);
+      await send({ questionId: q.Id, questionKey: q.QuestionKey, value: cur.Value ?? null,
+        optionId: cur.OptionId ?? null, note, noteDestination: dest, active: true });
+      draw();
+    }));
+    document.getElementById('prevSec')?.addEventListener('click', () => { sectionIdx -= 1; draw(); });
+    document.getElementById('nextSec')?.addEventListener('click', () => { sectionIdx += 1; draw(); });
+    document.getElementById('adhocBtn')?.addEventListener('click', () => openAdhocFlag(id, data.Sections[sectionIdx].Id, async () => {
+      data = await api(`/api/pg/audit-instances/${id}`);
+      draw();
+    }));
+    document.getElementById('finishBtn')?.addEventListener('click', async () => {
+      const missing = data.Questions.filter((q) => q.Required && visible(q) && !answers.get(q.Id)?.Value);
+      if (missing.length) {
+        return toast(`${missing.length} required question(s) still unanswered: ${missing.map((m) => m.Prompt).join(', ')}`, 6000);
+      }
+      await flush();
+      if (queue.length) {
+        if (!await confirmDialog(`${queue.length} answer(s) still haven't saved. Review anyway?`,
+          { confirmLabel: 'Review anyway', cancelLabel: 'Wait', danger: true })) return;
+      }
+      go('auditReview', { id });
+    });
+  }
+
+  draw();
+}
+
+// Where a note should ALSO go. The original always stays on the audit answer — this
+// adds a linked copy, it never moves the record (§4).
+function chooseNoteDestination(current = 'audit_only') {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `<div class="modal-box">
+      <p class="modal-message">Where should this note go? It always stays on the audit either way.</p>
+      <div class="btn-row" style="flex-direction:column;gap:8px">
+        <button type="button" class="btn ${current === 'audit_only' ? 'btn-primary' : 'btn-secondary'}" data-d="audit_only">Audit only</button>
+        <button type="button" class="btn ${current === 'asset' ? 'btn-primary' : 'btn-secondary'}" data-d="asset">Also a note on this building</button>
+        <button type="button" class="btn ${current === 'job' ? 'btn-primary' : 'btn-secondary'}" data-d="job">Also on the work this creates</button>
+      </div>
+      <div class="btn-row" style="justify-content:flex-end;margin-top:12px"><button type="button" class="btn btn-secondary modal-cancel">Cancel</button></div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const done = (v) => { overlay.remove(); resolve(v); };
+    overlay.querySelectorAll('[data-d]').forEach((b) => b.addEventListener('click', () => done(b.dataset.d)));
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => done(null));
+  });
+}
+
+async function openAdhocFlag(instanceId, sectionId, onDone) {
+  const description = await promptDialog('What did you find?', { multiline: true, confirmLabel: 'Next', placeholder: 'Gutter hanging off the back' });
+  if (!description || !description.trim()) return;
+  const wantFix = await confirmDialog('Add a fix for this now? It becomes a job line on this building\'s work order.',
+    { confirmLabel: 'Add a fix', cancelLabel: 'Just flag it', danger: false });
+  let remedy = null;
+  if (wantFix) {
+    const title = await promptDialog('What needs doing?', { value: description.trim(), confirmLabel: 'Next' });
+    if (title === null) return;
+    const hours = await promptDialog('Estimated hours (optional)', { confirmLabel: 'Next' });
+    const cost = await promptDialog('Estimated cost (optional)', { confirmLabel: 'Save' });
+    remedy = { title, estHours: hours ? Number(hours) : null, estCost: cost ? Number(cost) : null };
+  }
+  try {
+    await api(`/api/pg/audit-instances/${instanceId}/adhoc-flags`, {
+      method: 'POST', body: JSON.stringify({ sectionId, description: description.trim(), remedy }),
+    });
+    toast('Flagged'); if (onDone) onDone();
+  } catch (e) { toast(e.message, 5000); }
+}
+
+// Review: every flagged answer with its chain, the lines it will generate, and — when
+// the building ends with no work order — the job notes that would otherwise be dropped.
+async function renderAuditReview({ id }) {
+  setChrome({ title: 'Review', showBack: true, showLogout: true });
+  const review = await api(`/api/pg/audit-instances/${id}/review`);
+  const strandedChoices = {};
+  setApp(`
+    <div class="card">
+      <h3>${escapeHtml(review.Instance.AssetName)}</h3>
+      <div class="muted">${escapeHtml(review.Instance.RoundName)}</div>
+    </div>
+    ${review.Clean ? `<div class="card">
+      <h3>No issues found</h3>
+      <p class="muted">Nothing was flagged, so no work order is created. The completed audit is the record.</p>
+    </div>` : `
+    <div class="card">
+      <h3>Flagged (${review.Flagged.length})</h3>
+      ${review.Flagged.map((f) => `
+        <div class="list-item">
+          <div><strong>${escapeHtml(f.Chain)}</strong>${f.Severe ? ' <span style="color:#c92a2a">severe</span>' : ''}</div>
+          ${f.Note ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(f.Note)}</div>` : ''}
+          ${f.Remedies.length ? '' : '<div class="muted" style="font-size:0.82rem">no fix chosen — the finding is still raised</div>'}
+        </div>`).join('')}
+    </div>
+    <div class="card">
+      <h3>Work order lines (${review.ProposedLines.length})</h3>
+      <p class="muted">Estimates are copied as they are now — editing a remedy later never changes this work order.</p>
+      ${review.ProposedLines.map((l, i) => `
+        <div class="list-item" style="display:flex;align-items:flex-start;gap:10px">
+          <input type="checkbox" class="line-inc" data-i="${i}" checked style="margin-top:3px" />
+          <div>
+            <div><strong>${escapeHtml(l.Title)}</strong>${l.IsFixture ? ' <span class="muted">(fixture values)</span>' : ''}</div>
+            <div class="muted" style="font-size:0.82rem">${escapeHtml(l.Responsibility || 'self')} · ${escapeHtml(l.FundingSource || 'operating_budget')}${l.EstHours ? ` · ${l.EstHours}h` : ''}${l.EstCost ? ` · $${l.EstCost}` : ''}</div>
+          </div>
+        </div>`).join('')}
+    </div>`}
+    ${review.StrandedJobNotes.length ? `<div class="card" style="background:#fffdf5;border-color:#f0e6c8">
+      <h3>These notes have nowhere to go</h3>
+      <p class="muted">They were marked for the work, but this building isn't producing a work order.</p>
+      ${review.StrandedJobNotes.map((n) => `
+        <div class="list-item">
+          <div>${escapeHtml(n.Note)}</div>
+          <div class="btn-row" style="margin-top:6px">
+            <button type="button" class="btn btn-secondary str" data-a="${n.AnswerId}" data-c="asset">Keep on the building</button>
+            <button type="button" class="btn btn-secondary str" data-a="${n.AnswerId}" data-c="audit_only">Audit only</button>
+          </div>
+        </div>`).join('')}
+    </div>` : ''}
+    <div class="card">
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary" id="completeBtn">${review.Clean ? 'Mark complete' : 'Create work order'}</button>
+      </div>
+    </div>`);
+
+  app.querySelectorAll('.str').forEach((b) => b.addEventListener('click', () => {
+    strandedChoices[b.dataset.a] = b.dataset.c;
+    b.closest('.list-item').querySelectorAll('.str').forEach((x) => x.classList.remove('btn-primary'));
+    b.classList.add('btn-primary');
+  }));
+  document.getElementById('completeBtn').addEventListener('click', async () => {
+    const keep = [...app.querySelectorAll('.line-inc')].map((c, i) => (c.checked ? review.ProposedLines[i] : null)).filter(Boolean);
+    try {
+      const r = await api(`/api/pg/audit-instances/${id}/complete`, {
+        method: 'POST', body: JSON.stringify({ lines: keep, strandedNoteChoices: strandedChoices }),
+      });
+      toast(r.WorkOrderId ? `Work order ${r.WorkOrderId} created` : 'Marked complete');
+      go('auditRound', { id: review.Instance.RoundId }, { replace: true });
+    } catch (e) { toast(e.message, 5000); }
+  });
+}
+
+// ── Audit rounds (Build Brief §5) ────────────────────────────────────────
+async function renderAuditRounds() {
+  setChrome({ title: 'Audit Rounds', showBack: false, showLogout: true });
+  const [{ rounds }, { forms }] = await Promise.all([
+    api('/api/pg/audit-rounds'), api('/api/pg/audit-forms'),
+  ]);
+  setApp(`
+    <div class="card">
+      <h3>Audit Rounds</h3>
+      <p class="muted">A round runs one form over a set of buildings. Each building is walked once and ends either clean or with a work order.</p>
+      <div class="btn-row"><button type="button" class="btn btn-primary" id="newRoundBtn" ${forms.length ? '' : 'disabled'}>Start a round</button></div>
+      ${forms.length ? '' : '<p class="muted">No audit form exists yet.</p>'}
+    </div>
+    <div class="card">
+      ${rounds.length ? rounds.map((r) => `
+        <div class="list-item round-row" data-id="${r.Id}" style="cursor:pointer">
+          <div style="display:flex;justify-content:space-between;gap:10px">
+            <div><strong>${escapeHtml(r.Name)}</strong> <span class="muted">— ${escapeHtml(r.FormName)}</span></div>
+            <div class="muted">${r.Complete}/${r.Total} · ${r.Percent}%</div>
+          </div>
+          <div style="height:6px;background:#eef0f6;border-radius:3px;margin-top:6px;overflow:hidden">
+            <div style="height:100%;width:${r.Percent}%;background:#3b5bdb"></div>
+          </div>
+          ${r.DueDate ? `<div class="muted" style="font-size:0.8rem;margin-top:4px">Due ${escapeHtml(r.DueDate)}</div>` : ''}
+        </div>`).join('') : '<p class="muted">No rounds yet.</p>'}
+    </div>`);
+  app.querySelectorAll('.round-row').forEach((el) => el.addEventListener('click', () => go('auditRound', { id: el.dataset.id })));
+  document.getElementById('newRoundBtn')?.addEventListener('click', () => openNewRoundDialog(forms));
+}
+
+// Scope is picked as an explicit list of buildings, filtered by location or type —
+// those filters choose what to tick, they are not stored as the scope. The instances
+// are the scope (§2), so a location gaining a building later doesn't silently join a
+// round already under way.
+async function openNewRoundDialog(forms) {
+  const [{ locations }, assetsRes] = await Promise.all([
+    api('/api/pg/locations').catch(() => ({ locations: [] })),
+    api('/api/pg/assets?limit=1000').catch(() => ({ assets: [] })),
+  ]);
+  const allAssets = assetsRes.assets || [];
+  let picked = new Set();
+  let locFilter = '', typeFilter = '', q = '';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box" style="max-width:600px;width:95%;max-height:88vh;overflow:auto">
+    <h3 style="margin:0 0 10px">Start an audit round</h3>
+    <div class="field-row"><label>Form</label><select id="roundForm">${forms.map((f) => `<option value="${f.Id}">${escapeHtml(f.Name)}</option>`).join('')}</select></div>
+    <div class="field-row"><label>Name</label><input type="text" id="roundName" placeholder="Fall 2026 Cabin Audit" /></div>
+    <div class="field-row"><label>Due date (optional)</label><input type="date" id="roundDue" /></div>
+    <h4 style="margin:16px 0 6px">Buildings</h4>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      <select id="fLoc" style="flex:1;min-width:140px"><option value="">All locations</option>${(locations || []).map((l) => `<option value="${l.Id}">${escapeHtml(l.Name)}</option>`).join('')}</select>
+      <select id="fType" style="flex:1;min-width:140px"><option value="">All types</option>${[...new Set(allAssets.map((a) => a.assetType || a.AssetType).filter(Boolean))].sort().map((t) => `<option>${escapeHtml(t)}</option>`).join('')}</select>
+      <input type="search" id="fQ" placeholder="Search…" style="flex:1;min-width:140px" />
+    </div>
+    <div class="btn-row" style="margin-bottom:8px">
+      <button type="button" class="btn btn-secondary" id="pickAll">Select all shown</button>
+      <button type="button" class="btn btn-secondary" id="pickNone">Clear</button>
+      <span class="muted" id="pickCount" style="align-self:center"></span>
+    </div>
+    <div id="assetList" style="max-height:34vh;overflow:auto;border:1px solid #eef0f6;border-radius:8px"></div>
+    <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+      <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+      <button type="button" class="btn btn-primary" id="createRound">Create round</button>
+    </div>
+  </div>`;
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.querySelector('.modal-cancel').addEventListener('click', close);
+
+  const shown = () => allAssets.filter((a) => {
+    const t = a.assetType || a.AssetType || '';
+    const lid = String(a.locationId || a.LocationId || '');
+    const nm = (a.Name || a.name || '').toLowerCase();
+    return (!locFilter || lid === locFilter) && (!typeFilter || t === typeFilter) && (!q || nm.includes(q.toLowerCase()));
+  });
+  function drawList() {
+    const list = shown();
+    overlay.querySelector('#assetList').innerHTML = list.length ? list.map((a) => `
+      <label class="list-item" style="display:flex;align-items:center;gap:10px;cursor:pointer">
+        <input type="checkbox" class="pickA" data-id="${a.Id}" ${picked.has(a.Id) ? 'checked' : ''} />
+        <span>${escapeHtml(a.Name || a.name)} <span class="muted">${escapeHtml(a.assetType || a.AssetType || '')}</span></span>
+      </label>`).join('') : '<p class="muted" style="padding:10px">Nothing matches.</p>';
+    overlay.querySelector('#pickCount').textContent = `${picked.size} selected`;
+    overlay.querySelectorAll('.pickA').forEach((cb) => cb.addEventListener('change', () => {
+      const id = Number(cb.dataset.id);
+      if (cb.checked) picked.add(id); else picked.delete(id);
+      overlay.querySelector('#pickCount').textContent = `${picked.size} selected`;
+    }));
+  }
+  drawList();
+  overlay.querySelector('#fLoc').addEventListener('change', (e) => { locFilter = e.target.value; drawList(); });
+  overlay.querySelector('#fType').addEventListener('change', (e) => { typeFilter = e.target.value; drawList(); });
+  overlay.querySelector('#fQ').addEventListener('input', (e) => { q = e.target.value; drawList(); });
+  overlay.querySelector('#pickAll').addEventListener('click', () => { shown().forEach((a) => picked.add(a.Id)); drawList(); });
+  overlay.querySelector('#pickNone').addEventListener('click', () => { picked.clear(); drawList(); });
+  overlay.querySelector('#createRound').addEventListener('click', async () => {
+    const name = overlay.querySelector('#roundName').value.trim();
+    if (!name) return toast('Give the round a name', 4000);
+    if (!picked.size) return toast('Pick at least one building', 4000);
+    try {
+      const r = await api('/api/pg/audit-rounds', {
+        method: 'POST',
+        body: JSON.stringify({
+          formId: Number(overlay.querySelector('#roundForm').value), name,
+          dueDate: overlay.querySelector('#roundDue').value || null,
+          assetIds: [...picked],
+        }),
+      });
+      close(); toast('Round created'); go('auditRound', { id: r.round.Id }, { replace: true });
+    } catch (e) { toast(e.message, 5000); }
+  });
+}
+
+// The round screen: every building, its status, and what it produced.
+async function renderAuditRound({ id }) {
+  setChrome({ title: 'Audit Round', showBack: true, showLogout: true });
+  const { round, instances } = await api(`/api/pg/audit-rounds/${id}`);
+  const done = instances.filter((i) => i.Status === 'complete').length;
+  const pct = instances.length ? Math.round((done / instances.length) * 100) : 0;
+  const byLoc = new Map();
+  for (const i of instances) {
+    const k = i.LocationName || '—';
+    if (!byLoc.has(k)) byLoc.set(k, []);
+    byLoc.get(k).push(i);
+  }
+  const badge = (i) => {
+    if (i.Status === 'complete') {
+      return i.GeneratedWorkOrderId
+        ? `<span class="muted">✓ WO ${i.GeneratedWorkOrderId}</span>`
+        : '<span class="muted">✓ clean</span>';
+    }
+    if (i.Status === 'in_progress') return `<span class="muted">${i.Answered} answered</span>`;
+    return '<span class="muted">not started</span>';
+  };
+  setApp(`
+    <div class="card">
+      <h3>${escapeHtml(round.Name)}</h3>
+      <div class="muted">${escapeHtml(round.FormName)}${round.DueDate ? ` · due ${escapeHtml(round.DueDate)}` : ''}</div>
+      <div style="height:8px;background:#eef0f6;border-radius:4px;margin-top:10px;overflow:hidden">
+        <div style="height:100%;width:${pct}%;background:#3b5bdb"></div>
+      </div>
+      <div class="muted" style="margin-top:6px">${done}/${instances.length} · ${pct}%</div>
+    </div>
+    ${[...byLoc.entries()].map(([loc, list]) => `
+      <div class="card">
+        <h3 style="font-size:1rem">${escapeHtml(loc)}</h3>
+        ${list.map((i) => `
+          <div class="list-item inst-row" data-id="${i.Id}" style="display:flex;align-items:center;gap:11px;cursor:pointer">
+            ${assetFaceHtml(i.Face, 34)}
+            <div style="flex:1;min-width:0">
+              <div><strong>${escapeHtml(i.AssetName)}</strong></div>
+              <div style="font-size:0.82rem">${badge(i)}${i.Flagged ? ` <span style="color:#b4690e">· ${i.Flagged} flagged</span>` : ''}</div>
+            </div>
+          </div>`).join('')}
+      </div>`).join('')}`);
+  app.querySelectorAll('.inst-row').forEach((el) => el.addEventListener('click', () => go('auditRunner', { id: el.dataset.id })));
 }
 
 // ── Asset face: photo, or the type's icon (Addendum §5a) ─────────────────
