@@ -112,6 +112,8 @@ import {
   updateAuditSection,
   createAuditQuestion,
   updateAuditQuestion,
+  reorderAuditQuestions,
+  reorderAuditSections,
   removeAuditQuestion,
   createAuditOption,
   updateAuditOption,
@@ -133,6 +135,7 @@ import {
   listAuditRoundInstances,
   getAuditInstance,
   saveAuditAnswer,
+  ensureAuditAnswer,
   addAdhocFlag,
   chooseAnswerRemedy,
   getAuditReview,
@@ -2309,6 +2312,27 @@ router.post('/audit-forms/:id/questions', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Reorder in one call: the client sends the ids in their new order and every
+// sort_index is rewritten. Sending one moved id and asking the server to work out the
+// rest is where off-by-ones live.
+router.put('/audit-forms/:id/question-order', async (req, res, next) => {
+  try {
+    const { questionIds } = req.body || {};
+    if (!Array.isArray(questionIds)) return res.status(400).json({ ok: false, error: 'questionIds must be an array' });
+    await reorderAuditQuestions(req.params.id, questionIds);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+router.put('/audit-forms/:id/section-order', async (req, res, next) => {
+  try {
+    const { sectionIds } = req.body || {};
+    if (!Array.isArray(sectionIds)) return res.status(400).json({ ok: false, error: 'sectionIds must be an array' });
+    await reorderAuditSections(req.params.id, sectionIds);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
 router.patch('/audit-questions/:id', async (req, res, next) => {
   try { await updateAuditQuestion(req.params.id, req.body || {}); res.json({ ok: true }); } catch (e) { next(e); }
 });
@@ -2405,6 +2429,15 @@ router.put('/audit-instances/:id/answers', async (req, res, next) => {
     if (!questionId || !questionKey) return res.status(400).json({ ok: false, error: 'questionId and questionKey are required' });
     const id = await saveAuditAnswer(req.params.id, { questionId, questionKey, value, optionId, note, noteDestination, active });
     res.json({ ok: true, answerId: id });
+  } catch (e) { next(e); }
+});
+
+// Called before a photo upload so there is an answer row to attach it to.
+router.post('/audit-instances/:id/ensure-answer', async (req, res, next) => {
+  try {
+    const { questionId, questionKey } = req.body || {};
+    if (!questionId || !questionKey) return res.status(400).json({ ok: false, error: 'questionId and questionKey are required' });
+    res.json({ ok: true, answerId: await ensureAuditAnswer(req.params.id, { questionId, questionKey }) });
   } catch (e) { next(e); }
 });
 

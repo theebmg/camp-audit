@@ -1839,12 +1839,27 @@ function checklistHtmlFor(checklist, { forCard = true } = {}) {
   const hiddenCount = checklist.Steps.length - visibleSteps.length;
   return `
     <div class="card"><h3>Checklist: ${escapeHtml(checklist.Name)}</h3>
-      ${visibleSteps.map((s) => `<div class="list-item" style="cursor:default">
-        <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
-          <input type="checkbox" class="checklist-step-toggle" data-id="${s.Id}" ${s.Done ? 'checked' : ''} />
-          <span style="${s.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(s.StepText)}</span>
-        </label>
-      </div>`).join('')}
+      ${(() => {
+        // Grouped by section, in the order the sections first appear, so the checklist
+        // reads the way it was written. Ungrouped steps keep rendering flat — an
+        // existing checklist with no sections looks exactly as it did.
+        const stepHtml = (s) => `<div class="list-item" style="cursor:default">
+          <label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer">
+            <input type="checkbox" class="checklist-step-toggle" data-id="${s.Id}" ${s.Done ? 'checked' : ''} />
+            <span style="${s.Done ? 'text-decoration:line-through;color:var(--muted)' : ''}">${escapeHtml(s.StepText)}</span>
+          </label>
+        </div>`;
+        const groups = [];
+        for (const st of visibleSteps) {
+          const key = st.Section || '';
+          const last = groups[groups.length - 1];
+          if (last && last.key === key) last.steps.push(st);
+          else groups.push({ key, steps: [st] });
+        }
+        return groups.map((g) => (g.key
+          ? `<div style="margin-top:10px"><div class="muted" style="font-size:0.78rem;text-transform:uppercase;letter-spacing:0.04em">${escapeHtml(g.key)}</div>${g.steps.map(stepHtml).join('')}</div>`
+          : g.steps.map(stepHtml).join(''))).join('');
+      })()}
       ${hiddenCount ? `<p class="muted">${hiddenCount} step${hiddenCount > 1 ? 's' : ''} hidden until their condition is met.</p>` : ''}
       <div class="btn-row">
         <a class="btn btn-secondary" href="/api/pg/checklist-instances/${checklist.Id}/pdf" target="_blank" rel="noopener">⬇ Export PDF</a>
@@ -8373,6 +8388,9 @@ async function renderAdminChecklistTemplates(container = app) {
     const text = typeof step === 'string' ? step : (step.Text || '');
     return `<div class="card step-row" data-uid="${uid}" data-depends-uid="${step.dependsOnUid || ''}" style="padding:10px 12px;margin-bottom:8px">
       <div class="inline-add-row"><input class="step-text" value="${escapeHtml(text)}" placeholder="Step description…" /><button type="button" class="btn btn-secondary row-remove">✕</button></div>
+      <div class="field-row" style="margin:8px 0 0"><label style="font-size:0.82rem">Section (optional — groups steps on the work order)</label>
+        <input class="step-section" list="checklistSections" value="${escapeHtml(typeof step === 'string' ? '' : (step.Section || ''))}" placeholder="Tools &amp; Materials" />
+      </div>
       <div class="field-row" style="margin:8px 0 0"><label style="font-size:0.82rem">Only show this step when… (optional)</label>
         <div style="display:flex;gap:8px">
           <select class="step-depends-on" style="flex:2"></select>
@@ -8405,6 +8423,10 @@ async function renderAdminChecklistTemplates(container = app) {
       <h3>${t ? `Edit "${escapeHtml(t.Name)}"` : 'New Checklist'}</h3>
       <div class="field-row"><label>Name</label><input class="cf-name" value="${escapeHtml(t?.Name || '')}" placeholder="e.g. Winterization" required /></div>
       <div class="field-row"><label>Steps (in order)</label>
+        <datalist id="checklistSections">
+          <option value="Tools &amp; Materials"></option>
+          ${[...new Set((t?.Steps || []).map((x) => x.Section).filter(Boolean))].map((sec) => `<option value="${escapeHtml(sec)}"></option>`).join('')}
+        </datalist>
         <div class="cf-steps">${rows}</div>
         <button type="button" class="btn btn-secondary cf-add-step" style="margin-top:6px">+ Add Step</button>
       </div>
@@ -8474,6 +8496,7 @@ async function renderAdminChecklistTemplates(container = app) {
         const dependsOnIndex = dependsUid ? stepRows.findIndex((r) => r.dataset.uid === dependsUid) : -1;
         return {
           text: row.querySelector('.step-text').value.trim(),
+          section: row.querySelector('.step-section')?.value.trim() || null,
           dependsOnIndex: dependsOnIndex >= 0 ? dependsOnIndex : null,
           showWhenChecked: row.querySelector('.step-show-when').value === 'true',
         };
@@ -9423,12 +9446,14 @@ async function renderAuditFormBuilder({ id }) {
       if (g != null) { if (!byOpt.has(g)) byOpt.set(g, []); byOpt.get(g).push(other); }
     }
     return `
-      <div class="list-item" style="${nested ? 'margin-left:14px;border-left:2px solid #eef0f6;padding-left:10px;' : ''}${q.Archived ? 'opacity:0.5;' : ''}">
+      <div class="list-item q-row" data-qid="${q.Id}" ${nested ? '' : 'draggable="true"'} style="${nested ? 'margin-left:14px;border-left:2px solid #eef0f6;padding-left:10px;' : ''}${q.Archived ? 'opacity:0.5;' : ''}">
         <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">
           <div><strong>${escapeHtml(q.Prompt)}</strong>
             <span class="muted" style="font-size:0.78rem">${escapeHtml(q.QuestionKey)} · ${escapeHtml(q.Type)}${q.Required ? ' · required' : ''}${q.AnswerCount ? ` · ${q.AnswerCount} answer(s)` : ''}${q.Archived ? ' · archived' : ''}</span>
           </div>
           <div style="white-space:nowrap">
+            ${nested ? '' : `<button type="button" class="btn btn-secondary q-up" data-id="${q.Id}" title="Move up" style="padding:2px 8px">↑</button>
+            <button type="button" class="btn btn-secondary q-down" data-id="${q.Id}" title="Move down" style="padding:2px 8px">↓</button>`}
             <a href="#" class="q-edit" data-id="${q.Id}">edit</a> ·
             <a href="#" class="q-del" data-id="${q.Id}">${q.AnswerCount ? 'archive' : 'delete'}</a>
           </div>
@@ -9461,14 +9486,60 @@ async function renderAuditFormBuilder({ id }) {
       ${d.Sections.map((sec) => `
         <div class="card">
           <h3 style="font-size:1rem">${escapeHtml(sec.Name)}</h3>
-          ${d.Questions.filter((q) => q.SectionId === sec.Id && !nested.has(q.Id)).map((q) => questionHtml(q)).join('') || '<p class="muted">No questions yet.</p>'}
+          <div class="q-list" data-sec="${sec.Id}">${d.Questions.filter((q) => q.SectionId === sec.Id && !nested.has(q.Id)).map((q) => questionHtml(q)).join('')}</div>
+          ${d.Questions.some((q) => q.SectionId === sec.Id && !nested.has(q.Id)) ? '' : '<p class="muted">No questions yet.</p>'}
           <div class="btn-row" style="margin-top:8px"><button type="button" class="btn btn-secondary add-q" data-sec="${sec.Id}">+ Question</button></div>
         </div>`).join('')}
       <div class="card"><div class="btn-row"><button type="button" class="btn btn-secondary" id="addSec">+ Section</button></div></div>`);
     wire();
   }
 
+  // Order is sent as the whole list, not "this one moved" — the server rewrites every
+  // sort_index, so what's on screen and what's stored can't drift apart.
+  async function saveOrder(sectionId) {
+    const ids = [...app.querySelectorAll(`.q-list[data-sec="${sectionId}"] > .q-row`)].map((el) => Number(el.dataset.qid));
+    // Nested follow-ups aren't in this list; they travel with their gate option.
+    const all = d.Questions.filter((q) => q.SectionId !== sectionId).map((q) => q.Id);
+    await api(`/api/pg/audit-forms/${d.Form.Id}/question-order`, {
+      method: 'PUT', body: JSON.stringify({ questionIds: [...ids, ...all] }),
+    });
+    reload();
+  }
+
+  function move(qid, dir) {
+    const q = d.Questions.find((x) => x.Id === Number(qid));
+    const row = app.querySelector(`.q-row[data-qid="${qid}"]`);
+    const sib = dir < 0 ? row.previousElementSibling : row.nextElementSibling;
+    if (!sib || !sib.classList.contains('q-row')) return;
+    if (dir < 0) row.parentNode.insertBefore(row, sib);
+    else row.parentNode.insertBefore(sib, row);
+    saveOrder(q.SectionId);
+  }
+
   function wire() {
+    app.querySelectorAll('.q-up').forEach((b) => b.addEventListener('click', () => move(b.dataset.id, -1)));
+    app.querySelectorAll('.q-down').forEach((b) => b.addEventListener('click', () => move(b.dataset.id, 1)));
+
+    // Drag is the desktop convenience; the arrows above are what make this usable on a
+    // phone, where HTML5 drag events don't fire at all.
+    let dragged = null;
+    app.querySelectorAll('.q-row[draggable="true"]').forEach((row) => {
+      row.addEventListener('dragstart', (e) => { dragged = row; row.style.opacity = '0.4'; e.dataTransfer.effectAllowed = 'move'; });
+      row.addEventListener('dragend', () => { row.style.opacity = ''; dragged = null; });
+      row.addEventListener('dragover', (e) => {
+        if (!dragged || dragged === row || dragged.parentNode !== row.parentNode) return;
+        e.preventDefault();
+        const box = row.getBoundingClientRect();
+        const after = (e.clientY - box.top) > box.height / 2;
+        row.parentNode.insertBefore(dragged, after ? row.nextSibling : row);
+      });
+      row.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const sec = row.closest('.q-list')?.dataset.sec;
+        if (sec) saveOrder(Number(sec));
+      });
+    });
+
     app.querySelectorAll('.o-flag').forEach((cb) => cb.addEventListener('change', async () => {
       await api(`/api/pg/audit-options/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ flag: cb.checked, severe: cb.checked ? undefined : false }) });
       reload();
@@ -9699,8 +9770,14 @@ async function renderAuditRunner({ id }) {
         ${input}
         <div style="margin-top:6px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
           <a href="#" class="q-note muted" data-q="${q.Id}" style="font-size:0.82rem">${a?.Note ? 'edit note' : '+ note'}</a>
+          ${q.AllowsPhoto ? `<label class="muted" style="font-size:0.82rem;cursor:pointer">📷 photo
+            <input type="file" class="q-photo" data-q="${q.Id}" accept="image/*" multiple style="display:none" />
+          </label>` : ''}
           ${flagged ? '<span style="color:#b4690e;font-size:0.82rem">flagged — a finding will be raised</span>' : ''}
         </div>
+        ${a?.Photos?.length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+          ${a.Photos.map((ph) => `<img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt="" style="width:64px;height:64px;object-fit:cover;border-radius:6px" />`).join('')}
+        </div>` : ''}
         ${a?.Note ? `<div style="font-size:0.88rem;margin-top:4px">${escapeHtml(a.Note)} <span class="muted">(${escapeHtml(a.NoteDestination || 'audit_only')})</span></div>` : ''}
       </div>`;
   }
@@ -9748,6 +9825,30 @@ async function renderAuditRunner({ id }) {
       await send({ questionId: q.Id, questionKey: q.QuestionKey, value: cur.Value ?? null,
         optionId: cur.OptionId ?? null, note, noteDestination: dest, active: true });
       draw();
+    }));
+    app.querySelectorAll('.q-photo').forEach((inp) => inp.addEventListener('change', async () => {
+      const files = [...inp.files];
+      if (!files.length) return;
+      const q = data.Questions.find((x) => String(x.Id) === inp.dataset.q);
+      toast(`Uploading ${files.length} photo(s)…`);
+      try {
+        // The answer row has to exist before a photo can hang off it — a photo is often
+        // taken before the question is answered.
+        const { answerId } = await api(`/api/pg/audit-instances/${id}/ensure-answer`, {
+          method: 'POST', body: JSON.stringify({ questionId: q.Id, questionKey: q.QuestionKey }),
+        });
+        for (const file of files) {
+          const fd = new FormData();
+          fd.append('file', file);
+          fd.append('entityType', 'audit_answer');
+          fd.append('entityId', String(answerId));
+          const res = await fetch('/api/pg/attachments', { method: 'POST', body: fd });
+          if (!res.ok) throw new Error('Upload failed');
+        }
+        data = await api(`/api/pg/audit-instances/${id}`);
+        for (const a of data.Answers) if (a.QuestionId) answers.set(a.QuestionId, a);
+        toast('Photo saved'); draw();
+      } catch (e) { toast(e.message, 5000); }
     }));
     document.getElementById('prevSec')?.addEventListener('click', () => { sectionIdx -= 1; draw(); });
     document.getElementById('nextSec')?.addEventListener('click', () => { sectionIdx += 1; draw(); });

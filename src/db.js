@@ -5462,6 +5462,37 @@ export async function updateAuditQuestion(id, fields) {
   await pool.query(`UPDATE audit_questions SET ${set.join(', ')} WHERE id = $1`, [id, ...vals]);
 }
 
+// Rewrites every sort_index from the order given. Gaps of 10 leave room for a later
+// insert without a second rewrite, and doing the whole list at once means the order on
+// screen and the order stored can't disagree.
+export async function reorderAuditQuestions(formId, questionIds) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [i, qid] of questionIds.entries()) {
+      await client.query(
+        'UPDATE audit_questions SET sort_index = $3 WHERE id = $1 AND form_id = $2',
+        [qid, formId, (i + 1) * 10]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+
+export async function reorderAuditSections(formId, sectionIds) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [i, sid] of sectionIds.entries()) {
+      await client.query(
+        'UPDATE audit_sections SET sort_index = $3 WHERE id = $1 AND form_id = $2',
+        [sid, formId, (i + 1) * 10]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+
 // Archive, never delete, when answers exist. A question nobody ever answered is safe to
 // remove outright — keeping it would just be clutter with no history to protect.
 export async function removeAuditQuestion(id) {
@@ -5676,7 +5707,7 @@ export async function getAuditInstance(instanceId) {
   if (!ir[0]) return null;
   const inst = ir[0];
 
-  const [sections, questions, options, answers, notes] = await Promise.all([
+  const [sections, questions, options, answers, photos, notes] = await Promise.all([
     pool.query('SELECT id, name, sort_index FROM audit_sections WHERE form_id = $1 ORDER BY sort_index, id', [inst.form_id]),
     pool.query(
       `SELECT q.* FROM audit_questions q
@@ -5696,6 +5727,17 @@ export async function getAuditInstance(instanceId) {
       [inst.form_id]
     ),
     pool.query('SELECT * FROM audit_answers WHERE instance_id = $1', [instanceId]),
+    // Photos hang off the ANSWER, through the same polymorphic attachment_links every
+    // other photo in this app uses — no second file store for audits.
+    pool.query(
+      `SELECT al.entity_id AS answer_id, at.id, at.url, at.thumb_url
+       FROM attachment_links al
+       JOIN attachments at ON at.id = al.attachment_id AND at.deleted_at IS NULL
+       WHERE al.entity_type = 'audit_answer'
+         AND al.entity_id IN (SELECT id FROM audit_answers WHERE instance_id = $1)
+       ORDER BY al.sort_order, al.id`,
+      [instanceId]
+    ),
     pool.query(
       `SELECT id, note, source, created_by, created_at FROM asset_notes
        WHERE asset_id = $1 AND NOT resolved ORDER BY created_at DESC LIMIT 20`,
@@ -5727,6 +5769,8 @@ export async function getAuditInstance(instanceId) {
       Id: a.id, QuestionId: a.question_id, SectionId: a.section_id, Kind: a.kind,
       QuestionKey: a.question_key, Value: a.value, OptionId: a.option_id, Note: a.note,
       NoteDestination: a.note_destination, Active: a.active,
+      Photos: photos.rows.filter((ph) => ph.answer_id === a.id)
+        .map((ph) => ({ Id: ph.id, Url: ph.url, ThumbUrl: ph.thumb_url })),
     })),
     AssetNotes: notes.rows.map((n) => ({
       Id: n.id, Note: n.note, Source: n.source, CreatedBy: n.created_by, CreatedAt: n.created_at,
@@ -5754,6 +5798,20 @@ export async function saveAuditAnswer(instanceId, { questionId, questionKey, val
          started_at = COALESCE(started_at, now())
      WHERE id = $1`,
     [instanceId]
+  );
+  return rows[0].id;
+}
+
+// A photo can be taken before the question is answered, so the row has to exist to
+// hang it on. Upserts an empty answer and hands back its id — the value arrives later
+// through the ordinary save path.
+export async function ensureAuditAnswer(instanceId, { questionId, questionKey }) {
+  const { rows } = await pool.query(
+    `INSERT INTO audit_answers (instance_id, question_id, question_key)
+     VALUES ($1,$2,$3)
+     ON CONFLICT (instance_id, question_id) DO UPDATE SET question_key = EXCLUDED.question_key
+     RETURNING id`,
+    [instanceId, questionId, questionKey]
   );
   return rows[0].id;
 }
@@ -7355,8 +7413,9 @@ async function writeTemplateSteps(client, templateId, steps) {
   for (let i = 0; i < steps.length; i++) {
     const s = typeof steps[i] === 'string' ? { text: steps[i] } : steps[i];
     const { rows } = await client.query(
-      'INSERT INTO checklist_template_steps (checklist_template_id, step_text, sort_order, show_when_checked) VALUES ($1,$2,$3,$4) RETURNING id',
-      [templateId, s.text, i, s.showWhenChecked !== false]
+      `INSERT INTO checklist_template_steps (checklist_template_id, step_text, sort_order, show_when_checked, section)
+       VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+      [templateId, s.text, i, s.showWhenChecked !== false, s.section || null]
     );
     ids.push(rows[0].id);
   }
@@ -7382,7 +7441,7 @@ export async function listChecklistTemplates() {
     return {
       Id: r.id, Name: r.name,
       Steps: stepRows.map((s) => ({
-        Text: s.step_text, ShowWhenChecked: s.show_when_checked,
+        Text: s.step_text, Section: s.section || null, ShowWhenChecked: s.show_when_checked,
         DependsOnIndex: s.depends_on_step_id != null ? idToIndex.get(s.depends_on_step_id) : null,
       })),
     };
@@ -7439,7 +7498,7 @@ async function getChecklistInstanceFull(instanceId) {
     Id: inst.rows[0].id, Name: inst.rows[0].name,
     WorkOrderId: inst.rows[0].work_order_id, CalendarEventId: inst.rows[0].calendar_event_id,
     Steps: steps.rows.map((s) => ({
-      Id: s.id, StepText: s.step_text, Done: s.done, SortOrder: s.sort_order,
+      Id: s.id, StepText: s.step_text, Section: s.section || null, Done: s.done, SortOrder: s.sort_order,
       DependsOnInstanceStepId: s.depends_on_instance_step_id, ShowWhenChecked: s.show_when_checked,
     })),
   };
@@ -7473,8 +7532,9 @@ async function attachChecklist({ templateId, workOrderId, calendarEventId }) {
     const templateIdToInstanceId = new Map(); // maps template_step.id -> new instance_step.id
     for (const s of stepsRes.rows) {
       const { rows: newStep } = await client.query(
-        'INSERT INTO checklist_instance_steps (checklist_instance_id, step_text, sort_order, show_when_checked) VALUES ($1,$2,$3,$4) RETURNING id',
-        [instanceId, s.step_text, s.sort_order, s.show_when_checked]
+        `INSERT INTO checklist_instance_steps (checklist_instance_id, step_text, sort_order, show_when_checked, section)
+         VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+        [instanceId, s.step_text, s.sort_order, s.show_when_checked, s.section || null]
       );
       templateIdToInstanceId.set(s.id, newStep[0].id);
     }
