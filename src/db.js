@@ -4951,7 +4951,10 @@ async function suggestFlaggedItems(reportId, passId, reported) {
       snapDate: r.completed_date,
       // "Featured since March" stays on open items so a stale flag reads as stale;
       // on finished work the flag is about to clear itself, so it says nothing.
-      snapSubtitle: !r.is_terminal && !anchorsDone && r.board_focus_set_at
+      // Any OPEN item keeps "featured since March", including one sitting in Done as
+      // the header for work its lines finished — that it is flagged and still not
+      // closed out is precisely what a reader needs to know there.
+      snapSubtitle: !r.is_terminal && r.board_focus_set_at
         ? `featured since ${monthOf(r.board_focus_set_at)}` : null,
     });
     n += 1;
