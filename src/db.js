@@ -1739,23 +1739,51 @@ export async function listOpenJobLines(queryable, woId) {
   return rows.map((r) => ({ Id: r.id, Title: r.title, StatusName: r.status_name }));
 }
 
-// Which line status resolves an open line when its work order goes terminal. Keyed off
-// the same condition that stamps date_completed, so "the work order says the work
-// happened" and "its lines say the work happened" can never disagree. Work order
-// statuses are admin-editable and carry no counts_as_work_performed flag of their own,
-// so anything else terminal — Cancelled, Deferred, a status added later — resolves to
-// Cancelled rather than silently claiming work was done. The prompt always names the
-// status being applied, so this is never a hidden choice.
+// Which line status resolves an open line when its work order goes terminal: the line
+// says what the work order says about it. Done completes the work; Deferred defers it,
+// which is a different thing from cancelling it and must not be flattened into one —
+// deferred work is coming back. Anything else terminal, including a status added later,
+// falls back to Cancelled rather than silently claiming work was done or will be. The
+// prompt always names the status being applied, so this is never a hidden choice.
+const LINE_RESOLUTION_BY_WO_STATUS = { Done: 'Done', Deferred: 'Deferred', Cancelled: 'Cancelled' };
 const workOrderCompletesWork = (statusName) => statusName === 'Done';
-const lineResolutionFor = (statusName) => (workOrderCompletesWork(statusName) ? 'Done' : 'Cancelled');
+const lineResolutionFor = (statusName) => LINE_RESOLUTION_BY_WO_STATUS[statusName] || 'Cancelled';
+
+// The resolution status has to exist and has to mean what the mapping above assumes.
+// Returns the row, or null when it isn't configured — the caller decides whether that
+// is a refusal now or a warning carried into the prompt.
+async function lineResolutionStatus(queryable, woStatusName) {
+  const name = lineResolutionFor(woStatusName);
+  const { rows } = await queryable.query(
+    'SELECT id, name, requires_note, counts_as_work_performed FROM job_line_statuses WHERE name = $1 AND active', [name]
+  );
+  if (!rows[0]) return null;
+  // A Deferred or Cancelled line must not count as work performed: changeJobLineStatus
+  // resolves a line's linked finding on exactly that flag, and deferring work is not a
+  // reason to call its finding fixed. Refuse a configuration that would do it rather
+  // than quietly resolving findings that should stay open.
+  if (!workOrderCompletesWork(woStatusName) && rows[0].counts_as_work_performed) {
+    const e = new Error(
+      `The "${name}" job line status is configured as work performed, so resolving lines with it would mark their findings resolved. `
+      + 'Untick "counts as work performed" for it under Admin → Job Line Statuses.'
+    );
+    e.status = 400; throw e;
+  }
+  return rows[0];
+}
 
 // Throws a 409 carrying the open lines, so every caller gets the same refusal and the
 // UI can offer to resolve them instead of inventing its own pre-check.
 async function assertNoOpenJobLines(client, woId, newStatusName) {
   const open = await listOpenJobLines(client, woId);
   if (!open.length) return;
+  const resolveTo = lineResolutionFor(newStatusName);
+  const configured = await lineResolutionStatus(client, newStatusName);
   const e = new Error(
-    `${open.length} job line${open.length === 1 ? ' is' : 's are'} still open on this work order.`
+    configured
+      ? `${open.length} job line${open.length === 1 ? ' is' : 's are'} still open on this work order.`
+      : `${open.length} job line${open.length === 1 ? ' is' : 's are'} still open, and there is no "${resolveTo}" job line status to resolve `
+        + `${open.length === 1 ? 'it' : 'them'} with. Add one under Admin → Job Line Statuses.`
   );
   e.status = 409;
   e.code = 'open_job_lines';
@@ -1763,7 +1791,10 @@ async function assertNoOpenJobLines(client, woId, newStatusName) {
     workOrderId: Number(woId),
     count: open.length,
     newStatus: newStatusName,
-    resolveTo: lineResolutionFor(newStatusName),
+    resolveTo,
+    // Without this the UI would offer "Yes, defer them", and answering would fail a
+    // second time on a status that was never configured.
+    resolveToConfigured: !!configured,
     lines: open,
   };
   throw e;
@@ -1778,11 +1809,13 @@ async function resolveOpenJobLines(client, woId, newStatusName, completionDate) 
   const open = await listOpenJobLines(client, woId);
   if (!open.length) return [];
   const resolveTo = lineResolutionFor(newStatusName);
-  const { rows: st } = await client.query(
-    'SELECT id, requires_note FROM job_line_statuses WHERE name = $1', [resolveTo]
-  );
-  if (!st[0]) {
-    const e = new Error(`No "${resolveTo}" job line status is configured`); e.status = 400; throw e;
+  const status = await lineResolutionStatus(client, newStatusName);
+  if (!status) {
+    const e = new Error(
+      `No "${resolveTo}" job line status is configured, so these lines cannot be resolved that way. `
+      + 'Add one under Admin → Job Line Statuses.'
+    );
+    e.status = 400; throw e;
   }
   const { rows: woRows } = await client.query('SELECT wo_number FROM work_orders WHERE id = $1', [woId]);
   const reason = `Resolved with work order ${woRows[0]?.wo_number || woId} → ${newStatusName}`;
@@ -1795,7 +1828,7 @@ async function resolveOpenJobLines(client, woId, newStatusName, completionDate) 
     }
     // Cancelled and Not Needed both require a note; supplying the reason keeps this
     // path from tripping over a rule the manual path enforces for good reason.
-    await changeJobLineStatus(client, line.Id, st[0].id, { statusNote: st[0].requires_note ? reason : null });
+    await changeJobLineStatus(client, line.Id, status.id, { statusNote: status.requires_note ? reason : null });
   }
   await client.query(
     'INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)',
@@ -2555,6 +2588,55 @@ export async function getBoardReportRawData({ periodStart, periodEnd, todayStr }
 // work that happened weeks ago — the same misdating §3 exists to prevent. The board
 // report's Done rule keys on STATUS as well as date, so a reopened WO drops out of Done
 // on status alone while its real completion date survives.
+export async function reopenWorkOrderTx(client, woId, { reason } = {}) {
+  const { rows: cur } = await client.query(
+    `SELECT w.title, w.date_completed::text AS date_completed, ws.name AS status, ws.is_terminal, ws.is_review
+     FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
+    [woId]
+  );
+  if (!cur[0]) { const e = new Error('Work Order not found'); e.status = 404; throw e; }
+  if (!cur[0].is_terminal && !cur[0].is_review) return null;
+  const { rows: review } = await client.query(
+    `SELECT id FROM work_order_statuses WHERE is_review ORDER BY sort_order LIMIT 1`
+  );
+  if (!review[0]) { const e = new Error('No Review status is configured'); e.status = 400; throw e; }
+  // Review is not terminal, so this never trips the open-lines guard — which is the
+  // point: reopening is how you legitimately get back to a work order with open lines.
+  await changeWorkOrderStatus(client, woId, review[0].id, {});
+  await client.query(
+    `INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)`,
+    [woId, `Reopened from ${cur[0].status}${cur[0].date_completed ? ` (completed ${cur[0].date_completed})` : ''}${reason ? ` — ${reason}` : ''}`, currentUsername()]
+  );
+  await logActivity({ action: 'reopened', entityType: 'work_order', entityId: Number(woId), entityLabel: cur[0].title });
+  return { fromStatus: cur[0].status };
+}
+
+// A closed work order is a record of what happened. Growing it a new line, or putting a
+// resolved line back into play, edits that record — so it goes through Review rather
+// than happening quietly underneath it. This is the other half of the invariant: the
+// terminal-status guard stops a work order closing over open lines, and this stops open
+// lines appearing underneath one that already closed.
+//
+// Returns true when it reopened, so the caller can say so. Throws 409 when the caller
+// didn't ask for a reopen, carrying what it would take to proceed.
+async function ensureOpenForLineChange(client, woId, reopen, action) {
+  const { rows } = await client.query(
+    `SELECT ws.name AS status, ws.is_terminal FROM work_orders w
+     JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
+    [woId]
+  );
+  if (!rows[0] || !rows[0].is_terminal) return false;
+  if (!reopen) {
+    const e = new Error(`This work order is ${rows[0].status}. Reopen it to Review to make this change.`);
+    e.status = 409;
+    e.code = 'work_order_closed';
+    e.details = { workOrderId: Number(woId), status: rows[0].status, action };
+    throw e;
+  }
+  await reopenWorkOrderTx(client, woId, { reason: reopen.reason || null });
+  return true;
+}
+
 export async function reopenWorkOrder(woId, { reason } = {}) {
   const { rows: cur } = await pool.query(
     `SELECT w.id, w.title, w.date_completed::text AS date_completed, ws.name AS status, ws.is_terminal, ws.is_review
@@ -2573,11 +2655,7 @@ export async function reopenWorkOrder(woId, { reason } = {}) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await changeWorkOrderStatus(client, woId, review[0].id, {});
-    await client.query(
-      `INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)`,
-      [woId, `Reopened from ${cur[0].status}${cur[0].date_completed ? ` (completed ${cur[0].date_completed})` : ''}${reason ? ` — ${reason}` : ''}`, currentUsername()]
-    );
+    await reopenWorkOrderTx(client, woId, { reason });
     await client.query('COMMIT');
   } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
   await logActivity({ action: 'reopened', entityType: 'work_order', entityId: Number(woId), entityLabel: cur[0].title });
@@ -3285,21 +3363,32 @@ export async function getJobLine(id) {
 export async function createJobLine(woId, {
   title, responsibilityClass = 'self', fundingSource = 'operating_budget', fundingRefId = null,
   estimatedHours = null, estimatedCost = null, scheduledDate = null, conditionFindingId = null,
+  reopen = null,
 }) {
-  const { rows: maxRows } = await pool.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM job_lines WHERE work_order_id = $1', [woId]);
-  const { rows } = await pool.query(
-    `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, scheduled_date, condition_finding_id, status_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,(SELECT id FROM job_line_statuses WHERE name = 'Not Started')) RETURNING *`,
-    [woId, title, maxRows[0].next, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate, conditionFindingId]
-  );
-  // A line created with a scheduled_date already set (e.g. from a template,
-  // or Create WO from Findings) needs to reach the sync worker on day one —
-  // otherwise it'd sit invisible on Google's calendar until its next edit
-  // through updateJobLine, which is the only other place this gets queued.
-  if (scheduledDate) await queueGcalSync(pool, 'job_line', rows[0].id);
-  if (conditionFindingId) await autoScheduleFindingIfLinked(pool, conditionFindingId);
-  await logActivity({ action: 'created', entityType: 'job_line', entityId: rows[0].id, entityLabel: rows[0].title, details: `On Work Order #${woId}` });
-  return hydrateJobLine(rows[0]);
+  // Transactional now, because a new line on a closed work order has to reopen it
+  // first: either both happen or neither does, rather than reopening and then failing.
+  const client = await pool.connect();
+  let row; let reopened = false;
+  try {
+    await client.query('BEGIN');
+    reopened = await ensureOpenForLineChange(client, woId, reopen, 'add_line');
+    const { rows: maxRows } = await client.query('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM job_lines WHERE work_order_id = $1', [woId]);
+    const { rows } = await client.query(
+      `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id, estimated_hours, estimated_cost, scheduled_date, condition_finding_id, status_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,(SELECT id FROM job_line_statuses WHERE name = 'Not Started')) RETURNING *`,
+      [woId, title, maxRows[0].next, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate, conditionFindingId]
+    );
+    row = rows[0];
+    // A line created with a scheduled_date already set (e.g. from a template,
+    // or Create WO from Findings) needs to reach the sync worker on day one —
+    // otherwise it'd sit invisible on Google's calendar until its next edit
+    // through updateJobLine, which is the only other place this gets queued.
+    if (scheduledDate) await queueGcalSync(client, 'job_line', row.id);
+    if (conditionFindingId) await autoScheduleFindingIfLinked(client, conditionFindingId);
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  await logActivity({ action: 'created', entityType: 'job_line', entityId: row.id, entityLabel: row.title, details: `On Work Order #${woId}` });
+  return { ...await hydrateJobLine(row), ReopenedWorkOrder: reopened };
 }
 
 // Phase 3 (3): a finding moves Open -> Scheduled the moment a job line links
@@ -3425,6 +3514,7 @@ const JOB_LINE_UPDATE_COLUMNS = [
 // than at each call site) means neither path can forget to.
 const JOB_LINE_SCHEDULE_COLUMNS = ['scheduled_date', 'scheduled_start_time', 'scheduled_duration_hours'];
 export async function updateJobLine(id, fields) {
+  let reopenedWorkOrder = false;
   const setCols = []; const vals = []; let i = 1;
   for (const [key, value] of Object.entries(fields)) {
     if (key === 'causeIds' || key === 'status_id' || key === 'statusNote') continue; // handled separately below
@@ -3445,6 +3535,21 @@ export async function updateJobLine(id, fields) {
       await queueGcalSync(client, 'job_line', Number(id));
     }
     if (fields.status_id != null) {
+      // Putting a resolved line back into play on a closed work order reopens it first
+      // — that change is what would otherwise leave a terminal WO with an open line.
+      // Only that direction: editing a line's cost or title on a closed work order is
+      // an ordinary correction and stays unguarded.
+      const { rows: tr } = await client.query(
+        `SELECT jl.work_order_id, cur.is_terminal AS was_resolved, nxt.is_terminal AS will_be_resolved
+         FROM job_lines jl
+         JOIN job_line_statuses cur ON cur.id = jl.status_id
+         JOIN job_line_statuses nxt ON nxt.id = $2
+         WHERE jl.id = $1`,
+        [id, Number(fields.status_id)]
+      );
+      if (tr[0]?.was_resolved && !tr[0].will_be_resolved) {
+        reopenedWorkOrder = await ensureOpenForLineChange(client, tr[0].work_order_id, fields.reopen, 'reopen_line');
+      }
       await changeJobLineStatus(client, id, Number(fields.status_id), { statusNote: fields.statusNote });
     }
     if (fields.condition_finding_id) {
@@ -3465,7 +3570,7 @@ export async function updateJobLine(id, fields) {
   }
   const { rows } = await pool.query('SELECT * FROM job_lines WHERE id = $1', [id]);
   await logActivity({ action: 'updated', entityType: 'job_line', entityId: rows[0].id, entityLabel: rows[0].title });
-  return hydrateJobLine(rows[0]);
+  return { ...await hydrateJobLine(rows[0]), ReopenedWorkOrder: reopenedWorkOrder };
 }
 export async function deleteJobLine(id) {
   const { rows } = await pool.query('DELETE FROM job_lines WHERE id = $1 RETURNING title, work_order_id, gcal_event_id', [id]);
@@ -3521,19 +3626,41 @@ const GRID_LINE_COLUMNS = {
 // set are eligible for deletion — a line added from the card view in another
 // tab while the grid sat open is left alone instead of being silently
 // destroyed by a stale payload.
-export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds = null } = {}) {
+export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds = null, reopen = null } = {}) {
   const client = await pool.connect();
   const gcalDeletes = [];
   const gcalSyncs = [];
+  let reopened = false;
   try {
     await client.query('BEGIN');
     const { rows: woRows } = await client.query('SELECT id FROM work_orders WHERE id = $1', [woId]);
     if (!woRows.length) { await client.query('ROLLBACK'); return null; }
 
     const { rows: existingRows } = await client.query(
-      'SELECT id, status_id, scheduled_date, scheduled_start_time, scheduled_duration_hours FROM job_lines WHERE work_order_id = $1', [woId]
+      `SELECT jl.id, jl.status_id, jl.scheduled_date, jl.scheduled_start_time, jl.scheduled_duration_hours,
+              s.is_terminal AS resolved
+       FROM job_lines jl JOIN job_line_statuses s ON s.id = jl.status_id
+       WHERE jl.work_order_id = $1`, [woId]
     );
     const existing = new Map(existingRows.map((r) => [r.id, r]));
+
+    // The grid saves everything at once, so whether it needs a reopen is decided from
+    // the whole payload BEFORE a single row is written — otherwise half the grid would
+    // save and the rest would hit a 409.
+    const terminalStatusIds = new Set(
+      (await client.query('SELECT id FROM job_line_statuses WHERE is_terminal')).rows.map((r) => r.id)
+    );
+    const addsLine = lines.some((l) => String(l?.title ?? '').trim()
+      && !(Number.isInteger(Number(l.id)) && existing.has(Number(l.id))));
+    const unresolvesLine = lines.some((l) => {
+      const id = Number(l?.id);
+      const prev = existing.get(id);
+      return prev?.resolved && l?.statusId != null && Number(l.statusId) !== prev.status_id
+        && !terminalStatusIds.has(Number(l.statusId));
+    });
+    if (addsLine || unresolvesLine) {
+      reopened = await ensureOpenForLineChange(client, woId, reopen, addsLine ? 'add_line' : 'reopen_line');
+    }
     const keptIds = new Set(lines.map((l) => Number(l.id)).filter((n) => Number.isInteger(n)));
     const deletable = knownLineIds ? new Set(knownLineIds.map(Number)) : new Set(existing.keys());
 
@@ -3599,7 +3726,9 @@ export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds 
     client.release();
   }
   for (const eventId of gcalDeletes) await queueGcalDelete(eventId);
-  return listJobLines(woId);
+  const jobLines = await listJobLines(woId);
+  jobLines.reopenedWorkOrder = reopened;
+  return jobLines;
 }
 
 const numOrNull = (v) => (v === '' || v == null || Number.isNaN(Number(v)) ? null : Number(v));

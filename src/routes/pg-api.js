@@ -1486,7 +1486,8 @@ router.get('/crew-hours/summary', async (req, res, next) => {
 
 router.post('/work-orders/:id(\\d+)/job-lines', async (req, res, next) => {
   try {
-    const { title, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate } = req.body || {};
+    const { title, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate,
+      reopenWorkOrder, reopenReason } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ ok: false, error: 'title is required' });
     res.json({
       ok: true,
@@ -1496,6 +1497,9 @@ router.post('/work-orders/:id(\\d+)/job-lines', async (req, res, next) => {
         estimatedHours: estimatedHours === '' || estimatedHours == null ? null : Number(estimatedHours),
         estimatedCost: estimatedCost === '' || estimatedCost == null ? null : Number(estimatedCost),
         scheduledDate: scheduledDate || null,
+        // "Yes, reopen it" — the answer to the 409 this same call returns for a closed
+        // work order.
+        reopen: reopenWorkOrder ? { reason: reopenReason || null } : null,
       }),
     });
   } catch (e) { next(e); }
@@ -1530,6 +1534,7 @@ router.patch('/job-lines/:jobLineId(\\d+)', async (req, res, next) => {
       fields.board_focus_set_at = body.boardFocus ? new Date() : null;
     }
     if (body.causeIds !== undefined) fields.causeIds = (body.causeIds || []).map(Number);
+    if (body.reopenWorkOrder) fields.reopen = { reason: body.reopenReason || null };
     const jobLine = await updateJobLine(req.params.jobLineId, fields);
     if (!jobLine) return res.status(404).json({ ok: false, error: 'Job line not found' });
     res.json({ ok: true, jobLine });
@@ -1694,13 +1699,17 @@ router.post('/work-orders/from-template', async (req, res, next) => {
 // See replaceWorkOrderJobLines for why knownLineIds matters.
 router.put('/work-orders/:id(\\d+)/job-lines', async (req, res, next) => {
   try {
-    const { lines, knownLineIds } = req.body || {};
+    const { lines, knownLineIds, reopenWorkOrder, reopenReason } = req.body || {};
     if (!Array.isArray(lines)) return res.status(400).json({ ok: false, error: 'lines must be an array' });
     const jobLines = await replaceWorkOrderJobLines(req.params.id, lines, {
       knownLineIds: Array.isArray(knownLineIds) ? knownLineIds : null,
+      reopen: reopenWorkOrder ? { reason: reopenReason || null } : null,
     });
     if (!jobLines) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    res.json({ ok: true, jobLines, reviewPrompt: await getWorkOrderReviewPrompt(req.params.id) });
+    res.json({
+      ok: true, jobLines, reopenedWorkOrder: jobLines.reopenedWorkOrder === true,
+      reviewPrompt: await getWorkOrderReviewPrompt(req.params.id),
+    });
   } catch (e) { next(e); }
 });
 

@@ -5842,6 +5842,33 @@ async function withOpenLinePrompt(send) {
   }
 }
 
+// The other half of the invariant, from the browser's side. A closed work order is a
+// record of what happened, so growing it a new line or putting a resolved line back
+// into play goes through Review rather than happening quietly underneath it.
+//
+// send(null) tries the change as-is; send({reason}) repeats it with the reopen. The
+// reason is optional — the same as the Reopen button asks for — and the reopen is
+// logged either way.
+async function withReopenPrompt(send) {
+  try {
+    return await send(null);
+  } catch (err) {
+    if (err.code !== 'work_order_closed') throw err;
+    const d = err.details || {};
+    const what = d.action === 'add_line'
+      ? 'Adding a job line changes what this work order says was done.'
+      : 'Reopening a line changes what this work order says was finished.';
+    const ok = await confirmDialog(
+      `This work order is closed. Reopen it to Review to make this change?\n\n${what}`,
+      { confirmLabel: 'Reopen and continue', cancelLabel: 'Cancel', danger: false },
+    );
+    if (!ok) return null;
+    const reason = await promptDialog('Why are you reopening it? (optional)', { multiline: true, confirmLabel: 'Reopen' });
+    if (reason === null) return null;   // backed out at the second step — still no change
+    return send({ reason: reason || null });
+  }
+}
+
 // Shows rendered report HTML in an overlay. Used for Preview and for opening any past
 // copy out of history — same viewer either way, so what you preview and what was sent
 // look identical by construction.
@@ -12117,14 +12144,19 @@ async function renderEditWorkOrderLines({ id }) {
     const datesToCheck = [...new Set(lines.map((l) => l.scheduledDate).filter(Boolean))];
     if (wo.Asset?.Id && !await confirmVisitorConflicts(datesToCheck.map((date) => ({ date, assetId: wo.Asset.Id })))) return;
     try {
-      const result = await api(`/api/pg/work-orders/${id}/job-lines`, {
-        method: 'PUT', body: JSON.stringify({ lines, knownLineIds: grid.knownLineIds }),
-      });
+      const result = await withReopenPrompt((reopen) => api(`/api/pg/work-orders/${id}/job-lines`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          lines, knownLineIds: grid.knownLineIds,
+          ...(reopen ? { reopenWorkOrder: true, reopenReason: reopen.reason } : {}),
+        }),
+      }));
+      if (!result) { toast('Nothing saved — the work order is still closed'); return; }
       grid.clearDraft();
-      toast('Job lines saved');
+      toast(result.reopenedWorkOrder ? 'Reopened to Review, and job lines saved' : 'Job lines saved');
       await maybePromptReview(id, result.reviewPrompt);
       go('workOrderDetail', { id }, { replace: true });
-    } catch (err) { toast(err.message); }
+    } catch (err) { toast(err.message, 5000); }
   });
 }
 
@@ -12569,11 +12601,17 @@ async function renderWorkOrderDetail({ id }, container = app) {
     e.preventDefault();
     const fd = new FormData(e.target);
     try {
-      await api(`/api/pg/work-orders/${id}/job-lines`, { method: 'POST', body: JSON.stringify({
-        title: fd.get('title'), responsibilityClass: fd.get('responsibilityClass'),
-      }) });
+      const added = await withReopenPrompt((reopen) => api(`/api/pg/work-orders/${id}/job-lines`, {
+        method: 'POST',
+        body: JSON.stringify({
+          title: fd.get('title'), responsibilityClass: fd.get('responsibilityClass'),
+          ...(reopen ? { reopenWorkOrder: true, reopenReason: reopen.reason } : {}),
+        }),
+      }));
+      if (!added) { toast('Nothing added — the work order is still closed'); return; }
+      if (added.jobLine?.ReopenedWorkOrder) toast('Reopened to Review, and the line was added');
       renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
+    } catch (err) { toast(err.message, 5000); }
   });
 
   container.querySelectorAll('.jl-card').forEach((card) => {
@@ -12628,7 +12666,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
           && !await confirmVisitorConflicts([{ date: newScheduledDate, jobLineId: jlId }])) return;
       const causeIds = [...card.querySelectorAll('.jl-e-cause:checked')].map((cb) => Number(cb.value));
       try {
-        await api(`/api/pg/job-lines/${jlId}`, { method: 'PATCH', body: JSON.stringify({
+        const saved = await withReopenPrompt((reopen) => api(`/api/pg/job-lines/${jlId}`, { method: 'PATCH', body: JSON.stringify({
+          ...(reopen ? { reopenWorkOrder: true, reopenReason: reopen.reason } : {}),
           title: card.querySelector('.jl-e-title').value.trim(),
           statusId: Number(statusSelect.value), statusNote: card.querySelector('.jl-e-status-note').value,
           responsibilityClass: card.querySelector('.jl-e-resp').value,
@@ -12648,8 +12687,9 @@ async function renderWorkOrderDetail({ id }, container = app) {
           blockedSince: card.querySelector('.jl-e-blocked-since').value,
           boardFocus: card.querySelector('.jl-e-board-focus').checked,
           causeIds,
-        }) });
-        toast('Job line saved');
+        }) }));
+        if (!saved) { toast('Nothing saved — the work order is still closed'); return; }
+        toast(saved.jobLine?.ReopenedWorkOrder ? 'Reopened to Review, and the line was saved' : 'Job line saved');
         renderWorkOrderDetail({ id }, container);
       } catch (err) { toast(err.message); }
     });
