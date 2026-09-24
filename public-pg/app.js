@@ -5855,9 +5855,11 @@ async function withReopenPrompt(send) {
   } catch (err) {
     if (err.code !== 'work_order_closed') throw err;
     const d = err.details || {};
-    const what = d.action === 'add_line'
-      ? 'Adding a job line changes what this work order says was done.'
-      : 'Reopening a line changes what this work order says was finished.';
+    const what = {
+      add_line: 'Adding a job line changes what this work order says was done.',
+      delete_line: 'Deleting a job line takes work out of what this work order says was done.',
+      reopen_line: 'Reopening a line changes what this work order says was finished.',
+    }[d.action] || 'This change edits what the work order says was done.';
     const ok = await confirmDialog(
       `This work order is closed. Reopen it to Review to make this change?\n\n${what}`,
       { confirmLabel: 'Reopen and continue', cancelLabel: 'Cancel', danger: false },
@@ -12695,7 +12697,15 @@ async function renderWorkOrderDetail({ id }, container = app) {
     });
     card.querySelector('.jl-delete-btn').addEventListener('click', async () => {
       if (!await confirmDialog(`Delete job line "${card.querySelector('.jl-delete-btn').dataset.label}"? This removes its hours, cost, and crew assignments too.`)) return;
-      try { await api(`/api/pg/job-lines/${jlId}`, { method: 'DELETE' }); renderWorkOrderDetail({ id }, container); }
+      try {
+        const gone = await withReopenPrompt((reopen) => api(`/api/pg/job-lines/${jlId}`, {
+          method: 'DELETE',
+          body: JSON.stringify(reopen ? { reopenWorkOrder: true, reopenReason: reopen.reason } : {}),
+        }));
+        if (!gone) { toast('Nothing deleted — the work order is still closed'); return; }
+        if (gone.reopenedWorkOrder) toast('Reopened to Review, and the line was deleted');
+        renderWorkOrderDetail({ id }, container);
+      }
       catch (err) { toast(err.message); }
     });
 

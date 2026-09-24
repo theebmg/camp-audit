@@ -1541,7 +1541,16 @@ router.patch('/job-lines/:jobLineId(\\d+)', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 router.delete('/job-lines/:jobLineId(\\d+)', async (req, res, next) => {
-  try { await deleteJobLine(req.params.jobLineId); res.json({ ok: true }); } catch (e) { next(e); }
+  // Body on a DELETE is unusual but this one carries an answer, not a payload: "yes,
+  // reopen the work order first". Query string would work too; the body keeps it
+  // identical in shape to the other three gated calls.
+  try {
+    const { reopenWorkOrder, reopenReason } = req.body || {};
+    const result = await deleteJobLine(req.params.jobLineId, {
+      reopen: reopenWorkOrder ? { reason: reopenReason || null } : null,
+    });
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
 });
 
 router.post('/job-lines/:jobLineId(\\d+)/volunteers', async (req, res, next) => {

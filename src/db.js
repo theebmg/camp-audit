@@ -3572,12 +3572,28 @@ export async function updateJobLine(id, fields) {
   await logActivity({ action: 'updated', entityType: 'job_line', entityId: rows[0].id, entityLabel: rows[0].title });
   return { ...await hydrateJobLine(rows[0]), ReopenedWorkOrder: reopenedWorkOrder };
 }
-export async function deleteJobLine(id) {
-  const { rows } = await pool.query('DELETE FROM job_lines WHERE id = $1 RETURNING title, work_order_id, gcal_event_id', [id]);
-  if (!rows[0]) return;
-  await queueGcalDelete(rows[0].gcal_event_id);
-  await pool.query('DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2', ['job_line', Number(id)]);
-  await logActivity({ action: 'deleted', entityType: 'job_line', entityId: Number(id), entityLabel: rows[0].title, details: `On Work Order #${rows[0].work_order_id}` });
+// Deleting a line off a closed work order takes work OUT of what the record says was
+// done, which is as much an edit to that record as adding one — so it goes through
+// Review on the same gate. Transactional for the same reason as createJobLine: the
+// reopen and the delete are one change or neither.
+export async function deleteJobLine(id, { reopen = null } = {}) {
+  const client = await pool.connect();
+  let row; let reopened = false;
+  try {
+    await client.query('BEGIN');
+    const { rows: owner } = await client.query('SELECT work_order_id FROM job_lines WHERE id = $1', [id]);
+    if (!owner[0]) { await client.query('ROLLBACK'); return { deleted: false }; }
+    reopened = await ensureOpenForLineChange(client, owner[0].work_order_id, reopen, 'delete_line');
+    const { rows } = await client.query('DELETE FROM job_lines WHERE id = $1 RETURNING title, work_order_id, gcal_event_id', [id]);
+    row = rows[0];
+    await client.query('DELETE FROM gcal_pending_syncs WHERE entity_type = $1 AND entity_id = $2', ['job_line', Number(id)]);
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  // Google is told only once the delete is actually committed — a queued tear-down for
+  // a row that rolled back would remove an event whose line still exists.
+  await queueGcalDelete(row.gcal_event_id);
+  await logActivity({ action: 'deleted', entityType: 'job_line', entityId: Number(id), entityLabel: row.title, details: `On Work Order #${row.work_order_id}` });
+  return { deleted: true, reopenedWorkOrder: reopened };
 }
 
 // ── Job Line Grid (Build Brief: grid / CSV import / templates) ────────────
@@ -3658,12 +3674,15 @@ export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds 
       return prev?.resolved && l?.statusId != null && Number(l.statusId) !== prev.status_id
         && !terminalStatusIds.has(Number(l.statusId));
     });
-    if (addsLine || unresolvesLine) {
-      reopened = await ensureOpenForLineChange(client, woId, reopen, addsLine ? 'add_line' : 'reopen_line');
-    }
+    // The grid deletes by omission — a line left out of the payload is removed — so the
+    // same gate has to cover what ISN'T in `lines`, not only what is.
     const keptIds = new Set(lines.map((l) => Number(l.id)).filter((n) => Number.isInteger(n)));
     const deletable = knownLineIds ? new Set(knownLineIds.map(Number)) : new Set(existing.keys());
-
+    const deletesLine = existingRows.some((r) => !keptIds.has(r.id) && deletable.has(r.id));
+    if (addsLine || unresolvesLine || deletesLine) {
+      const action = addsLine ? 'add_line' : (unresolvesLine ? 'reopen_line' : 'delete_line');
+      reopened = await ensureOpenForLineChange(client, woId, reopen, action);
+    }
     for (const row of existingRows) {
       if (keptIds.has(row.id) || !deletable.has(row.id)) continue;
       const { rows: delRows } = await client.query(
