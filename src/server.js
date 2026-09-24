@@ -115,7 +115,15 @@ app.use(express.static(path.join(__dirname, '..', 'public-pg')));
 // of the real error message.
 app.use((err, req, res, next) => {
   console.error(err);
-  res.status(err.status && err.status < 600 ? err.status : 500).json({ ok: false, error: err.message || 'Internal server error' });
+  // code/details ride along when a handler set them, so a refusal the UI is expected to
+  // act on (open job lines blocking a terminal status) arrives as something it can
+  // branch on rather than a sentence it would have to pattern-match.
+  res.status(err.status && err.status < 600 ? err.status : 500).json({
+    ok: false,
+    error: err.message || 'Internal server error',
+    ...(err.code ? { code: err.code } : {}),
+    ...(err.details ? { details: err.details } : {}),
+  });
 });
 
 app.listen(PORT, () => {

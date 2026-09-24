@@ -1443,10 +1443,11 @@ router.get('/work-orders/:id(\\d+)', async (req, res, next) => {
 
 router.post('/work-orders/:id(\\d+)/log', async (req, res, next) => {
   try {
-    const { note, hours, statusChange } = req.body || {};
+    const { note, hours, statusChange, resolveOpenLines } = req.body || {};
     if (!note || !note.trim()) return res.status(400).json({ ok: false, error: 'A note is required' });
     const entry = await createWorkOrderLogEntry(req.params.id, {
       note: note.trim(), hours: hours ? Number(hours) : null, statusChange: statusChange || null,
+      resolveOpenLines,
     });
     res.json({ ok: true, entry });
   } catch (e) { next(e); }
@@ -1763,6 +1764,9 @@ router.patch('/work-orders/:id(\\d+)', async (req, res, next) => {
       // a re-feature doesn't inherit the old one.
       fields.board_focus_set_at = body.boardFocus ? new Date() : null;
     }
+    // "Yes, mark the open lines too" — the answer to the 409 this same call returns
+    // when a terminal status is asked for over the top of unresolved lines.
+    if (body.resolveOpenLines) fields.resolveOpenLines = true;
     const detail = await updateWorkOrder(req.params.id, fields);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
     res.json({ ok: true, ...detail });
@@ -1788,7 +1792,7 @@ router.delete('/work-orders/:id(\\d+)/asset-updates/:auId(\\d+)', async (req, re
 
 router.post('/work-orders/:id(\\d+)/complete', async (req, res, next) => {
   try {
-    const result = await completeWorkOrder(req.params.id);
+    const result = await completeWorkOrder(req.params.id, { resolveOpenLines: (req.body || {}).resolveOpenLines });
     if (!result) return res.status(404).json({ ok: false, error: 'Work Order not found' });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }

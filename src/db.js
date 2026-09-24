@@ -1723,25 +1723,121 @@ async function resolveWorkOrderStatusId(nameOrId) {
   return rows[0].id;
 }
 
+// A work order must never be terminal while any of its lines is unresolved. Done,
+// Not Needed and Cancelled are all deliberate resolutions; anything else is still
+// outstanding, and a WO closed over the top of one is a lie — that is exactly how WO 47
+// ("Front Gate Repair") reached Done with a Not Started line, which in turn is why no
+// date-based report rule could ever see it.
+export async function listOpenJobLines(queryable, woId) {
+  const { rows } = await queryable.query(
+    `SELECT jl.id, jl.title, s.name AS status_name
+     FROM job_lines jl JOIN job_line_statuses s ON s.id = jl.status_id
+     WHERE jl.work_order_id = $1 AND NOT s.is_terminal
+     ORDER BY jl.sort_order, jl.id`,
+    [woId]
+  );
+  return rows.map((r) => ({ Id: r.id, Title: r.title, StatusName: r.status_name }));
+}
+
+// Which line status resolves an open line when its work order goes terminal. Keyed off
+// the same condition that stamps date_completed, so "the work order says the work
+// happened" and "its lines say the work happened" can never disagree. Work order
+// statuses are admin-editable and carry no counts_as_work_performed flag of their own,
+// so anything else terminal — Cancelled, Deferred, a status added later — resolves to
+// Cancelled rather than silently claiming work was done. The prompt always names the
+// status being applied, so this is never a hidden choice.
+const workOrderCompletesWork = (statusName) => statusName === 'Done';
+const lineResolutionFor = (statusName) => (workOrderCompletesWork(statusName) ? 'Done' : 'Cancelled');
+
+// Throws a 409 carrying the open lines, so every caller gets the same refusal and the
+// UI can offer to resolve them instead of inventing its own pre-check.
+async function assertNoOpenJobLines(client, woId, newStatusName) {
+  const open = await listOpenJobLines(client, woId);
+  if (!open.length) return;
+  const e = new Error(
+    `${open.length} job line${open.length === 1 ? ' is' : 's are'} still open on this work order.`
+  );
+  e.status = 409;
+  e.code = 'open_job_lines';
+  e.details = {
+    workOrderId: Number(woId),
+    count: open.length,
+    newStatus: newStatusName,
+    resolveTo: lineResolutionFor(newStatusName),
+    lines: open,
+  };
+  throw e;
+}
+
+// The "Yes, mark them too" branch. completionDate is the work order's OWN completion
+// date, not today: closing a WO in arrears must date its lines to when the work
+// happened, which is the whole point of completed_date existing separately from
+// completed_at. Set before the status change because changeJobLineStatus only defaults
+// completed_date when it finds none.
+async function resolveOpenJobLines(client, woId, newStatusName, completionDate) {
+  const open = await listOpenJobLines(client, woId);
+  if (!open.length) return [];
+  const resolveTo = lineResolutionFor(newStatusName);
+  const { rows: st } = await client.query(
+    'SELECT id, requires_note FROM job_line_statuses WHERE name = $1', [resolveTo]
+  );
+  if (!st[0]) {
+    const e = new Error(`No "${resolveTo}" job line status is configured`); e.status = 400; throw e;
+  }
+  const { rows: woRows } = await client.query('SELECT wo_number FROM work_orders WHERE id = $1', [woId]);
+  const reason = `Resolved with work order ${woRows[0]?.wo_number || woId} → ${newStatusName}`;
+  for (const line of open) {
+    if (completionDate) {
+      await client.query(
+        'UPDATE job_lines SET completed_date = COALESCE(completed_date, $2) WHERE id = $1',
+        [line.Id, completionDate]
+      );
+    }
+    // Cancelled and Not Needed both require a note; supplying the reason keeps this
+    // path from tripping over a rule the manual path enforces for good reason.
+    await changeJobLineStatus(client, line.Id, st[0].id, { statusNote: st[0].requires_note ? reason : null });
+  }
+  await client.query(
+    'INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)',
+    [woId, `${open.length} open job line(s) resolved as ${resolveTo}${completionDate ? ` (completed ${completionDate})` : ''} when the work order was marked ${newStatusName}`, currentUsername()]
+  );
+  return open;
+}
+
 // Every status transition writes a work_order_log_entries row automatically
 // (2.4) — no exceptions, no silent updates. This is the one place a WO's
 // status_id is ever written, so every caller (the WO fields form, the quick
 // "Update Status To" log-entry shortcut) goes through the same enforcement:
 // Deferred requires a reason + revisit_date (2.3), checked at the API layer
 // because that's where the board credibility comes from.
-async function changeWorkOrderStatus(client, woId, newStatusId, { deferredReason, revisitDate } = {}) {
+async function changeWorkOrderStatus(client, woId, newStatusId, { deferredReason, revisitDate, resolveOpenLines: alsoResolveLines } = {}) {
   const { rows: curRows } = await client.query(
-    `SELECT w.status_id, ws.name AS old_name, w.title, w.gcal_event_id FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
+    `SELECT w.status_id, ws.name AS old_name, w.title, w.gcal_event_id,
+            w.date_completed::text AS date_completed
+     FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
     [woId]
   );
   const cur = curRows[0];
   if (!cur) { const e = new Error('Work Order not found'); e.status = 404; throw e; }
   if (cur.status_id === newStatusId) return;
-  const { rows: newRows } = await client.query('SELECT name FROM work_order_statuses WHERE id = $1', [newStatusId]);
+  const { rows: newRows } = await client.query('SELECT name, is_terminal FROM work_order_statuses WHERE id = $1', [newStatusId]);
   const newName = newRows[0]?.name;
   if (!newName) { const e = new Error('Unknown work order status'); e.status = 400; throw e; }
   if (newName === 'Deferred' && (!deferredReason || !revisitDate)) {
     const e = new Error('Deferring a work order requires a reason and a revisit date'); e.status = 400; throw e;
+  }
+  // The completion date has to be decided BEFORE anything is written, because the lines
+  // being resolved alongside the work order are dated from it. Closing a WO in arrears
+  // dates its lines to when the work happened, not to today.
+  const completionDate = workOrderCompletesWork(newName)
+    ? (cur.date_completed || today())
+    : null;
+  // The invariant, enforced here because this is the only place a work order's status_id
+  // is ever written — the four INSERT paths all create non-terminal work orders, so
+  // every route to terminal passes through this function.
+  if (newRows[0].is_terminal) {
+    if (alsoResolveLines) await resolveOpenJobLines(client, woId, newName, completionDate);
+    else await assertNoOpenJobLines(client, woId, newName);
   }
   const setCols = ['status_id = $2'];
   const vals = [woId, newStatusId];
@@ -1751,7 +1847,7 @@ async function changeWorkOrderStatus(client, woId, newStatusId, { deferredReason
   } else {
     setCols.push('deferred_reason = NULL', 'revisit_date = NULL');
   }
-  if (newName === 'Done') setCols.push(`date_completed = COALESCE(date_completed, CURRENT_DATE)`);
+  if (completionDate) { setCols.push(`date_completed = $${vals.length + 1}`); vals.push(completionDate); }
   await client.query(`UPDATE work_orders SET ${setCols.join(', ')} WHERE id = $1`, vals);
   await client.query(
     'INSERT INTO work_order_log_entries (work_order_id, note, status_change, username) VALUES ($1,$2,$3,$4)',
@@ -1864,6 +1960,7 @@ export async function updateWorkOrder(woId, fields) {
     if (fields.status_id != null) {
       await changeWorkOrderStatus(client, woId, await resolveWorkOrderStatusId(fields.status_id), {
         deferredReason: fields.deferred_reason, revisitDate: fields.revisit_date,
+        resolveOpenLines: fields.resolveOpenLines,
       });
     }
     await client.query('COMMIT');
@@ -1899,7 +1996,14 @@ export async function listWorkOrderLogEntries(woId) {
 // The manual note (if any) and the automatic "Status changed: X → Y" entry
 // (2.4, via changeWorkOrderStatus) are deliberately two separate log rows —
 // one is what the operator wrote, the other is the unconditional audit trail.
-export async function createWorkOrderLogEntry(woId, { note, hours, statusChange }) {
+export async function createWorkOrderLogEntry(woId, { note, hours, statusChange, resolveOpenLines: alsoResolveLines }) {
+  // Checked before the note is inserted: the note goes in on its own connection, so a
+  // status change refused afterwards would leave the note stranded on the work order.
+  if (statusChange && !alsoResolveLines) {
+    const statusId = await resolveWorkOrderStatusId(statusChange);
+    const { rows: st } = await pool.query('SELECT name, is_terminal FROM work_order_statuses WHERE id = $1', [statusId]);
+    if (st[0]?.is_terminal) await assertNoOpenJobLines(pool, woId, st[0].name);
+  }
   const { rows } = await pool.query(
     'INSERT INTO work_order_log_entries (work_order_id, note, hours, username) VALUES ($1,$2,$3,$4) RETURNING *',
     [woId, note, hours ?? null, currentUsername()]
@@ -1909,7 +2013,7 @@ export async function createWorkOrderLogEntry(woId, { note, hours, statusChange 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await changeWorkOrderStatus(client, woId, statusId, {});
+      await changeWorkOrderStatus(client, woId, statusId, { resolveOpenLines: alsoResolveLines });
       await client.query('COMMIT');
     } catch (e) {
       await client.query('ROLLBACK');
@@ -2534,7 +2638,7 @@ export async function reconcileLeftoversOnReclose(workOrderId, leftovers, { crea
 // Completing a WO: apply every pending Asset Update to its target field (real
 // column or EAV, resolved the same way submitAudit does), mark each applied,
 // then close the WO. One transaction.
-export async function completeWorkOrder(woId) {
+export async function completeWorkOrder(woId, { resolveOpenLines: alsoResolveLines } = {}) {
   const woRes = await pool.query('SELECT asset_id FROM work_orders WHERE id = $1', [woId]);
   if (!woRes.rows[0]) return null;
   const assetId = woRes.rows[0].asset_id;
@@ -2546,6 +2650,10 @@ export async function completeWorkOrder(woId) {
   const propertyFields = await getAssetPropertyFields();
   const byLabel = new Map(propertyFields.map((f) => [f.title, f]));
   const pending = await pool.query('SELECT id, target_field, new_value FROM asset_updates WHERE work_order_id = $1 AND applied = false', [woId]);
+
+  // Checked up front rather than only inside changeWorkOrderStatus: the asset
+  // write-back below would otherwise run and roll back on every refusal.
+  if (!alsoResolveLines) await assertNoOpenJobLines(pool, woId, 'Done');
 
   const client = await pool.connect();
   const appliedIds = [];
@@ -2566,7 +2674,9 @@ export async function completeWorkOrder(woId) {
       await client.query('UPDATE asset_updates SET applied = true WHERE id = $1', [u.id]);
       appliedIds.push(u.id);
     }
-    await changeWorkOrderStatus(client, woId, await resolveWorkOrderStatusId('Done'), {});
+    await changeWorkOrderStatus(client, woId, await resolveWorkOrderStatusId('Done'), {
+      resolveOpenLines: alsoResolveLines,
+    });
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK');
@@ -4557,9 +4667,9 @@ export async function computeBoardReportAggregates(reportId) {
 // instead of one per keystroke. Each row carries where it is already used, so "only
 // things I haven't used yet" is a filter over this list rather than a second query.
 export async function listBoardReportCandidates(reportId = null) {
-  const [wos, lines, findings, tasks, onDraft, published] = await Promise.all([
+  const [wos, lines, findings, tasks, taskStatuses, onDraft, published] = await Promise.all([
     pool.query(
-      `SELECT w.id, w.wo_number, w.title, ws.name AS status, ws.is_terminal,
+      `SELECT w.id, w.wo_number, w.title, ws.name AS status, ws.is_terminal, ws.sort_order AS status_sort,
               w.date_completed::text AS completed_date, w.board_focus,
               COALESCE(a.name, l.name) AS place
        FROM work_orders w
@@ -4568,7 +4678,7 @@ export async function listBoardReportCandidates(reportId = null) {
        LEFT JOIN locations l ON l.id = w.location_id
        ORDER BY w.id DESC`),
     pool.query(
-      `SELECT jl.id, jl.title, s.name AS status, s.counts_as_work_performed, s.is_terminal,
+      `SELECT jl.id, jl.title, s.name AS status, s.counts_as_work_performed, s.is_terminal, s.sort_order AS status_sort,
               COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date,
               (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
               jl.scheduled_date::text AS scheduled_date, jl.board_focus,
@@ -4584,6 +4694,7 @@ export async function listBoardReportCandidates(reportId = null) {
        ORDER BY jl.id DESC`),
     pool.query(
       `SELECT cf.id, cf.title, cf.status, cf.severity, cf.estimated_cost, cf.board_focus,
+              array_position(ARRAY['Open','Scheduled','Resolved','Deferred','Dismissed'], cf.status) * 10 AS status_sort,
               cf.date_identified::text AS date_identified,
               COALESCE(a.name, l.name) AS place
        FROM condition_findings cf
@@ -4591,6 +4702,7 @@ export async function listBoardReportCandidates(reportId = null) {
        LEFT JOIN locations l ON l.id = cf.location_id
        ORDER BY cf.id DESC`),
     pool.query(`${ADMIN_TASK_SELECT} ORDER BY t.task_date DESC NULLS LAST, t.id DESC`),
+    pool.query('SELECT sort_order, name FROM admin_task_statuses'),
     // Already on THIS draft — including rows sitting unchecked, because proposing to
     // add something that is already sitting on the screen is noise either way.
     reportId
@@ -4607,6 +4719,7 @@ export async function listBoardReportCandidates(reportId = null) {
        ORDER BY br.published_at DESC NULLS LAST, br.id DESC`),
   ]);
 
+  const taskStatusSort = new Map(taskStatuses.rows.map((r) => [r.name, r.sort_order]));
   const draftKeys = new Set(onDraft.rows.map((r) => `${r.item_type}:${r.item_id}`));
   const reportedOn = new Map();
   for (const r of published.rows) {
@@ -4626,6 +4739,7 @@ export async function listBoardReportCandidates(reportId = null) {
       WoNumber: r.wo_number, Place: r.place, Status: r.status,
       Completed: r.is_terminal, CompletedDate: r.completed_date,
       Subtitle: r.place, Date: r.completed_date, Flagged: r.board_focus,
+      StatusSort: r.status_sort ?? 999,
     })),
     ...lines.rows.map((r) => mark({
       ItemType: 'job_line', ItemId: r.id, Title: r.title,
@@ -4633,7 +4747,11 @@ export async function listBoardReportCandidates(reportId = null) {
       Completed: r.counts_as_work_performed,
       CompletedDate: r.counts_as_work_performed ? r.completed_date : null,
       Subtitle: r.date_inferred ? `${r.wo_title} · date not recorded` : r.wo_title,
+      // The line's own title says what was done; without the work order it sits on, it
+      // often doesn't say what it was done TO. Both travel with the row.
+      ParentWoNumber: r.wo_number, ParentTitle: r.wo_title,
       ParentWorkOrderId: r.work_order_id, AssetName: r.place,
+      StatusSort: r.status_sort ?? 999,
       Date: r.counts_as_work_performed ? r.completed_date : r.scheduled_date,
       Hours: r.actual_hours != null ? Number(r.actual_hours) : null,
       Cost: r.cost != null ? Number(r.cost) : null, Flagged: r.board_focus,
@@ -4644,6 +4762,7 @@ export async function listBoardReportCandidates(reportId = null) {
       Completed: r.status === 'Resolved', CompletedDate: null,
       Subtitle: r.severity, AssetName: r.place, Date: r.date_identified,
       Cost: r.estimated_cost != null ? Number(r.estimated_cost) : null, Flagged: r.board_focus,
+      StatusSort: r.status_sort ?? 999,
     })),
     ...tasks.rows.map((r) => { const t = adminTaskRowShape(r); return mark({
       ItemType: 'admin_task', ItemId: t.Id, Title: t.Title,
@@ -4651,6 +4770,7 @@ export async function listBoardReportCandidates(reportId = null) {
       Completed: !!t.StatusCountsAsWorkPerformed,
       CompletedDate: t.StatusCountsAsWorkPerformed ? t.TaskDate : null,
       Subtitle: t.CategoryName, Date: t.TaskDate, Hours: t.Hours,
+      StatusSort: taskStatusSort.get(t.StatusName) ?? 999,
     }); }),
   ];
 }

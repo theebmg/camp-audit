@@ -523,7 +523,16 @@ async function api(path, opts = {}) {
     throw new Error('Not authenticated');
   }
   const body = await res.json().catch(() => ({}));
-  if (!res.ok || body.ok === false) throw new Error(body.error || `Request failed (${res.status})`);
+  if (!res.ok || body.ok === false) {
+    const err = new Error(body.error || `Request failed (${res.status})`);
+    // A refusal the caller is meant to act on carries a code and the facts behind it —
+    // e.g. open_job_lines, with the lines blocking a work order from going terminal.
+    // Without these the caller would be reduced to matching on the message text.
+    err.status = res.status;
+    if (body.code) err.code = body.code;
+    if (body.details) err.details = body.details;
+    throw err;
+  }
   // Any successful write is a save. Clearing here means a save handler that
   // navigates on success (the common shape in this app) doesn't get asked
   // "you have unsaved changes" about the very thing it just persisted —
@@ -5566,8 +5575,14 @@ async function openAddReportItem(reportId, onDone) {
       </div>
       <input type="search" class="addpanel-q" placeholder="Filter — title, WO number, asset, status or date" autocomplete="off" />
       <div class="addpanel-filters">
+        <span class="addpanel-filter-label">Type</span>
         <button type="button" class="btn btn-secondary addpanel-type selected" data-type="all">All</button>
         ${TYPES.map((t) => `<button type="button" class="btn btn-secondary addpanel-type" data-type="${t.key}">${t.label}</button>`).join('')}
+      </div>
+      <div class="addpanel-filters addpanel-statuses">
+        <span class="addpanel-filter-label">Status</span>
+      </div>
+      <div class="addpanel-filters">
         <label class="skill-chip" style="cursor:pointer;display:inline-flex;align-items:center">
           <input type="checkbox" class="addpanel-showused" style="margin-right:6px" />Show already used
         </label>
@@ -5588,6 +5603,11 @@ async function openAddReportItem(reportId, onDone) {
 
   let all = [];
   let typeFilter = 'all';
+  // Multi-select and empty-means-all: an empty set reads as "any status", which is what
+  // an untouched filter should mean. Statuses are shared across types by NAME — a "Done"
+  // work order and a "Done" job line answer the same chip — because the question being
+  // asked is about the work, not about which table it lives in.
+  const statusFilter = new Set();
   let showUsed = false;
   let query = '';
   const selected = new Map();   // key -> the candidate object, so "Add selected" needs no re-lookup
@@ -5611,6 +5631,7 @@ async function openAddReportItem(reportId, onDone) {
   function visible() {
     return all.filter((c) => {
       if (typeFilter !== 'all' && c.ItemType !== typeFilter) return false;
+      if (statusFilter.size && !statusFilter.has(c.Status)) return false;
       if (!showUsed && c.Used) return false;
       // Substring, anywhere, case-insensitive — against the same fields the columns
       // show. haystack is built once per row at load, so a keystroke is a scan of
@@ -5629,7 +5650,10 @@ async function openAddReportItem(reportId, onDone) {
     return `
       <label class="addrow addrow-pick ${c.Used ? 'addrow-used' : ''}" data-key="${escapeHtml(k)}">
         <input type="checkbox" class="addrow-check" data-key="${escapeHtml(k)}" ${selected.has(k) ? 'checked' : ''} ${locked ? 'disabled' : ''} />
-        <span class="addcell"><strong>${escapeHtml(c.Title || '(untitled)')}</strong>${badge ? `<span class="addpanel-badge">${escapeHtml(badge)}</span>` : ''}</span>
+        <span class="addcell">
+          <strong>${escapeHtml(c.Title || '(untitled)')}</strong>${badge ? `<span class="addpanel-badge">${escapeHtml(badge)}</span>` : ''}
+          ${c.ParentTitle ? `<span class="addcell-parent">on WO ${escapeHtml(c.ParentWoNumber || '?')} — ${escapeHtml(c.ParentTitle)}</span>` : ''}
+        </span>
         <span class="addcell addcell-meta" data-label="WO">${escapeHtml(c.WoNumber || '')}</span>
         <span class="addcell addcell-meta" data-label="Where">${escapeHtml(c.Place || '')}</span>
         <span class="addcell addcell-meta" data-label="Status">${escapeHtml(c.Status || '')}</span>
@@ -5659,6 +5683,36 @@ async function openAddReportItem(reportId, onDone) {
     body.innerHTML = header + groups;
   }
 
+  // Built from the statuses the candidates actually carry, ordered by the sort_order
+  // each status table defines — so the row reads Not Started, In Progress, Done rather
+  // than alphabetically, and never offers a chip that would match nothing. Counts
+  // respect the type and text filters, so the chips describe the list in front of you.
+  function renderStatusChips() {
+    const row = $('.addpanel-statuses');
+    const order = new Map();
+    for (const c of all) {
+      if (!c.Status) continue;
+      const cur = order.get(c.Status);
+      if (cur === undefined || c.StatusSort < cur) order.set(c.Status, c.StatusSort);
+    }
+    const names = [...order.keys()].sort((a, b) => (order.get(a) - order.get(b)) || a.localeCompare(b));
+    const pool = all.filter((c) => (typeFilter === 'all' || c.ItemType === typeFilter)
+      && (showUsed || !c.Used) && (!query || c.haystack.includes(query)));
+    row.innerHTML = '<span class="addpanel-filter-label">Status</span>'
+      + `<button type="button" class="btn btn-secondary addpanel-status ${statusFilter.size ? '' : 'selected'}" data-status="">Any</button>`
+      + names.map((n) => {
+        const n_ = pool.filter((c) => c.Status === n).length;
+        return `<button type="button" class="btn btn-secondary addpanel-status ${statusFilter.has(n) ? 'selected' : ''}" data-status="${escapeHtml(n)}">${escapeHtml(n)} <span class="addpanel-chip-count">${n_}</span></button>`;
+      }).join('');
+    row.querySelectorAll('.addpanel-status').forEach((b) => b.addEventListener('click', () => {
+      const name = b.dataset.status;
+      if (!name) statusFilter.clear();
+      else if (statusFilter.has(name)) statusFilter.delete(name);
+      else statusFilter.add(name);
+      renderStatusChips(); render(); syncFooter();
+    }));
+  }
+
   function syncFooter() {
     const n = selected.size;
     addBtn.disabled = !n;
@@ -5681,17 +5735,17 @@ async function openAddReportItem(reportId, onDone) {
 
   $('.addpanel-q').addEventListener('input', (e) => {
     query = e.target.value.trim().toLowerCase();
-    render(); syncFooter();
+    renderStatusChips(); render(); syncFooter();
   });
   overlay.querySelectorAll('.addpanel-type').forEach((b) => b.addEventListener('click', () => {
     typeFilter = b.dataset.type;
     overlay.querySelectorAll('.addpanel-type').forEach((x) => x.classList.toggle('selected', x === b));
-    render(); syncFooter();
+    renderStatusChips(); render(); syncFooter();
   }));
   $('.addpanel-showused').addEventListener('change', (e) => {
     showUsed = e.target.checked;
     e.target.closest('.skill-chip').classList.toggle('selected', showUsed);
-    render(); syncFooter();
+    renderStatusChips(); render(); syncFooter();
   });
 
   addBtn.addEventListener('click', async () => {
@@ -5725,7 +5779,7 @@ async function openAddReportItem(reportId, onDone) {
       // Everything the columns show, flattened once, so filtering is a substring test.
       // The date is indexed both as stored and as displayed — "2026-09-17" and
       // "17 Sep 2026" are both reasonable things to type.
-      haystack: [c.Title, c.WoNumber, c.Place, c.Status, c.Subtitle, c.CompletedDate,
+      haystack: [c.Title, c.WoNumber, c.Place, c.Status, c.Subtitle, c.CompletedDate, c.ParentTitle,
         c.CompletedDate ? formatDateNice(c.CompletedDate) : null,
         TYPES.find((t) => t.key === c.ItemType)?.label]
         .filter(Boolean).join(' ').toLowerCase(),
@@ -5734,9 +5788,45 @@ async function openAddReportItem(reportId, onDone) {
     body.innerHTML = `<p class="muted" style="padding:18px 0">Couldn't load the list: ${escapeHtml(e.message)}</p>`;
     return;
   }
+  renderStatusChips();
   render();
   syncFooter();
   setTimeout(() => $('.addpanel-q').focus(), 0);
+}
+
+// A work order must never be terminal while any of its lines is unresolved, so every
+// route to a terminal status answers with a 409 carrying the lines that blocked it.
+// One helper, so the fields form, "Complete Work Order" and the log entry's status
+// shortcut all ask the same question and retry the same way — and so any path added
+// later gets the behaviour by wrapping its request rather than reimplementing it.
+//
+// send(true) repeats the request with resolveOpenLines, which is what actually resolves
+// the lines; cancelling returns null and the work order stays in its current status.
+async function withOpenLinePrompt(send) {
+  try {
+    return await send(false);
+  } catch (err) {
+    if (err.code !== 'open_job_lines') throw err;
+    const d = err.details || {};
+    const n = d.count || 0;
+    const lines = d.lines || [];
+    const shown = lines.slice(0, 6).map((l) => `• ${l.Title} — ${l.StatusName}`).join('\n');
+    const more = lines.length > 6 ? `\n…and ${lines.length - 6} more` : '';
+    // "Mark them complete" only when the work order says work was done. A cancelled
+    // work order cancels its lines, and the button says so rather than claiming
+    // something was finished that wasn't.
+    const done = d.resolveTo === 'Done';
+    const verb = done ? 'complete' : d.resolveTo.toLowerCase();
+    const ok = await confirmDialog(
+      `${n} line${n === 1 ? ' is' : 's are'} still open. Mark ${n === 1 ? 'it' : 'them'} ${verb} too?\n\n${shown}${more}\n\n`
+      + (done
+        ? 'They will be marked Done and dated to this work order\u2019s completion date.'
+        : `They will be marked ${d.resolveTo}.`),
+      { confirmLabel: `Yes, mark ${n === 1 ? 'it' : 'them'} ${verb}`, cancelLabel: 'Cancel', danger: false },
+    );
+    if (!ok) return null;
+    return send(true);
+  }
 }
 
 // Shows rendered report HTML in an overlay. Used for Preview and for opening any past
@@ -12347,15 +12437,20 @@ async function renderWorkOrderDetail({ id }, container = app) {
     const fd = new FormData(e.target);
     const newAsset = assetPicker.getSelected();
     try {
-      await api(`/api/pg/work-orders/${id}`, { method: 'PATCH', body: JSON.stringify({
-        assetId: newAsset ? newAsset.Id : (wo.Asset ? wo.Asset.Id : ''),
-        statusId: Number(fd.get('statusId')), priority: fd.get('priority'), description: fd.get('description'),
-        deferredReason: fd.get('deferredReason') || undefined, revisitDate: fd.get('revisitDate') || undefined,
-        boardFocus: fd.has('boardFocus'),
-      }) });
+      const saved = await withOpenLinePrompt((resolveOpenLines) => api(`/api/pg/work-orders/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          assetId: newAsset ? newAsset.Id : (wo.Asset ? wo.Asset.Id : ''),
+          statusId: Number(fd.get('statusId')), priority: fd.get('priority'), description: fd.get('description'),
+          deferredReason: fd.get('deferredReason') || undefined, revisitDate: fd.get('revisitDate') || undefined,
+          boardFocus: fd.has('boardFocus'),
+          ...(resolveOpenLines ? { resolveOpenLines: true } : {}),
+        }),
+      }));
+      if (!saved) { toast('Left unchanged — the work order is still open'); return; }
       toast('Work order updated');
       renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
+    } catch (err) { toast(err.message, 5000); }
   });
 
   container.querySelector('#duplicateWoBtn').addEventListener('click', async () => {
@@ -12594,12 +12689,17 @@ async function renderWorkOrderDetail({ id }, container = app) {
     const note = fd.get('note').trim();
     if (!note) return;
     try {
-      await api(`/api/pg/work-orders/${id}/log`, { method: 'POST', body: JSON.stringify({
-        note, hours: fd.get('hours') || undefined, statusChange: fd.get('statusChange') || undefined,
-      }) });
+      const saved = await withOpenLinePrompt((resolveOpenLines) => api(`/api/pg/work-orders/${id}/log`, {
+        method: 'POST',
+        body: JSON.stringify({
+          note, hours: fd.get('hours') || undefined, statusChange: fd.get('statusChange') || undefined,
+          ...(resolveOpenLines ? { resolveOpenLines: true } : {}),
+        }),
+      }));
+      if (!saved) { toast('Left unchanged — the work order is still open'); return; }
       toast('Log entry added');
       renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
+    } catch (err) { toast(err.message, 5000); }
   });
   container.querySelectorAll('.delete-log-entry').forEach((btn) => btn.addEventListener('click', async () => {
     if (!await confirmDialog(`Delete this log entry? "${btn.dataset.label}"`)) return;
@@ -12661,15 +12761,34 @@ async function renderWorkOrderDetail({ id }, container = app) {
 
   container.querySelector('#completeWoBtn').addEventListener('click', async () => {
     if (!await confirmDialog(`Complete this Work Order? Any pending "asset field update" entries will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;
+    // Open lines are settled BEFORE the leftovers prompt: that prompt records real
+    // stock movements, and it must not do so for a close the operator then cancels.
+    // The server's 409 remains the authority — this only asks early enough to be
+    // useful, using the lines already on screen.
+    let resolveOpenLines = false;
+    const open = jobLines.filter((l) => !l.StatusIsTerminal);
+    if (open.length) {
+      const shown = open.slice(0, 6).map((l) => `• ${l.Title} — ${l.StatusName}`).join('\n');
+      const more = open.length > 6 ? `\n…and ${open.length - 6} more` : '';
+      const ok = await confirmDialog(
+        `${open.length} line${open.length === 1 ? ' is' : 's are'} still open. Mark ${open.length === 1 ? 'it' : 'them'} complete too?\n\n${shown}${more}\n\nThey will be marked Done and dated to this work order\u2019s completion date.`,
+        { confirmLabel: `Yes, mark ${open.length === 1 ? 'it' : 'them'} complete`, cancelLabel: 'Cancel', danger: false },
+      );
+      if (!ok) { toast('Left unchanged — the work order is still open'); return; }
+      resolveOpenLines = true;
+    }
     // Asked before completing, not after: a closed work order with its leftovers
     // unrecorded is the state nobody goes back to fix. Returns true immediately when
     // this WO bought no tracked materials, so an ordinary close is unchanged.
     if (!await promptLeftoversOnClose(id)) return;
     try {
-      await api(`/api/pg/work-orders/${id}/complete`, { method: 'POST' });
+      const done = await withOpenLinePrompt((retryResolve) => api(`/api/pg/work-orders/${id}/complete`, {
+        method: 'POST', body: JSON.stringify({ resolveOpenLines: resolveOpenLines || retryResolve }),
+      }));
+      if (!done) { toast('Left unchanged — the work order is still open'); return; }
       toast('Work order completed — asset updated');
       renderWorkOrderDetail({ id }, container);
-    } catch (err) { toast(err.message); }
+    } catch (err) { toast(err.message, 5000); }
   });
 
   container.querySelector('#addAssetUpdateForm').addEventListener('submit', async (e) => {

@@ -87,8 +87,16 @@
     .addpanel-foot { padding: 12px 18px; border-top: 1px solid var(--border); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; flex-shrink: 0; }
     .addpanel-q { width: 100%; margin-top: 12px; }
     .addpanel-filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
-    .addpanel-type { padding: 5px 12px; font-size: 0.82rem; }
-    .addpanel-type.selected { background: var(--accent-soft); color: var(--accent-dark); font-weight: 700; }
+    .addpanel-type, .addpanel-status { padding: 5px 12px; font-size: 0.82rem; }
+    .addpanel-type.selected, .addpanel-status.selected { background: var(--accent-soft); color: var(--accent-dark); font-weight: 700; }
+    .addpanel-filter-label {
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
+      color: var(--muted); font-weight: 700; min-width: 44px;
+    }
+    .addpanel-chip-count { opacity: 0.6; font-weight: 400; }
+    /* A job line's own title says what was done, not what it was done to — the work
+       order it sits on goes underneath so the row is recognizable on its own. */
+    .addcell-parent { display: block; color: var(--muted); font-size: 0.78rem; margin-top: 1px; }
     .addpanel-group-title {
       margin: 16px 0 0; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em;
       color: var(--muted); font-weight: 700;
