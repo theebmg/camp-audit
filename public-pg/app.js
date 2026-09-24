@@ -5602,6 +5602,7 @@ async function openAddReportItem(reportId, onDone) {
   const countEl = $('.addpanel-count');
 
   let all = [];
+  let statuses = [];
   let typeFilter = 'all';
   // Multi-select and empty-means-all: an empty set reads as "any status", which is what
   // an untouched filter should mean. Statuses are shared across types by NAME — a "Done"
@@ -5683,26 +5684,22 @@ async function openAddReportItem(reportId, onDone) {
     body.innerHTML = header + groups;
   }
 
-  // Built from the statuses the candidates actually carry, ordered by the sort_order
-  // each status table defines — so the row reads Not Started, In Progress, Done rather
-  // than alphabetically, and never offers a chip that would match nothing. Counts
-  // respect the type and text filters, so the chips describe the list in front of you.
+  // Built from the STATUS CONFIG — every active status across work orders, job lines,
+  // admin tasks and the finding lifecycle — in each table's own sort_order, so the row
+  // reads Not Started, In Progress, Done rather than alphabetically and doesn't shift
+  // as the data changes. Counts respect the type and text filters, so the chips
+  // describe the list in front of you; a status with nothing under it right now shows
+  // a 0 and dims rather than disappearing, which keeps the vocabulary visible.
   function renderStatusChips() {
     const row = $('.addpanel-statuses');
-    const order = new Map();
-    for (const c of all) {
-      if (!c.Status) continue;
-      const cur = order.get(c.Status);
-      if (cur === undefined || c.StatusSort < cur) order.set(c.Status, c.StatusSort);
-    }
-    const names = [...order.keys()].sort((a, b) => (order.get(a) - order.get(b)) || a.localeCompare(b));
+    const names = statuses.map((s) => s.name);
     const pool = all.filter((c) => (typeFilter === 'all' || c.ItemType === typeFilter)
       && (showUsed || !c.Used) && (!query || c.haystack.includes(query)));
     row.innerHTML = '<span class="addpanel-filter-label">Status</span>'
       + `<button type="button" class="btn btn-secondary addpanel-status ${statusFilter.size ? '' : 'selected'}" data-status="">Any</button>`
       + names.map((n) => {
-        const n_ = pool.filter((c) => c.Status === n).length;
-        return `<button type="button" class="btn btn-secondary addpanel-status ${statusFilter.has(n) ? 'selected' : ''}" data-status="${escapeHtml(n)}">${escapeHtml(n)} <span class="addpanel-chip-count">${n_}</span></button>`;
+        const hits = pool.filter((c) => c.Status === n).length;
+        return `<button type="button" class="btn btn-secondary addpanel-status ${statusFilter.has(n) ? 'selected' : ''} ${hits ? '' : 'addpanel-status-empty'}" data-status="${escapeHtml(n)}">${escapeHtml(n)} <span class="addpanel-chip-count">${hits}</span></button>`;
       }).join('');
     row.querySelectorAll('.addpanel-status').forEach((b) => b.addEventListener('click', () => {
       const name = b.dataset.status;
@@ -5772,8 +5769,10 @@ async function openAddReportItem(reportId, onDone) {
   });
 
   try {
-    const { candidates } = await api(`/api/pg/board-reports/candidates?reportId=${reportId}`);
-    all = (candidates || []).map((c) => ({
+    const res = await api(`/api/pg/board-reports/candidates?reportId=${reportId}`);
+    const candidates = res.candidates || [];
+    statuses = res.statuses || [];
+    all = candidates.map((c) => ({
       ...c,
       Used: !!(c.OnThisReport || c.ReportedOn),
       // Everything the columns show, flattened once, so filtering is a substring test.

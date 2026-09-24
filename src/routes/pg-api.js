@@ -2064,7 +2064,7 @@ router.get('/board-reports/draft', async (req, res, next) => {
 router.get('/board-reports/candidates', async (req, res, next) => {
   try {
     const reportId = req.query.reportId ? Number(req.query.reportId) : null;
-    res.json({ candidates: await listBoardReportCandidates(reportId) });
+    res.json(await listBoardReportCandidates(reportId));
   } catch (e) { next(e); }
 });
 

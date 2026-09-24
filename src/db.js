@@ -4670,7 +4670,7 @@ export async function computeBoardReportAggregates(reportId) {
 // instead of one per keystroke. Each row carries where it is already used, so "only
 // things I haven't used yet" is a filter over this list rather than a second query.
 export async function listBoardReportCandidates(reportId = null) {
-  const [wos, lines, findings, tasks, taskStatuses, onDraft, published] = await Promise.all([
+  const [wos, lines, findings, tasks, statusVocab, onDraft, published] = await Promise.all([
     pool.query(
       `SELECT w.id, w.wo_number, w.title, ws.name AS status, ws.is_terminal, ws.sort_order AS status_sort,
               w.date_completed::text AS completed_date, w.board_focus,
@@ -4705,7 +4705,18 @@ export async function listBoardReportCandidates(reportId = null) {
        LEFT JOIN locations l ON l.id = cf.location_id
        ORDER BY cf.id DESC`),
     pool.query(`${ADMIN_TASK_SELECT} ORDER BY t.task_date DESC NULLS LAST, t.id DESC`),
-    pool.query('SELECT sort_order, name FROM admin_task_statuses'),
+    // Every status a candidate could carry, from all four sources. Unioned by NAME
+    // because that is how the chips filter: a "Done" work order and a "Done" job line
+    // answer the same chip, since the question is about the work, not the table.
+    // A finding's status is free text under a CHECK constraint rather than a table, so
+    // its vocabulary is spelled out in the lifecycle order that constraint implies.
+    pool.query(
+      `SELECT name, sort_order FROM work_order_statuses WHERE active
+       UNION ALL SELECT name, sort_order FROM job_line_statuses WHERE active
+       UNION ALL SELECT name, sort_order FROM admin_task_statuses WHERE active
+       UNION ALL SELECT * FROM (VALUES
+         ('Open',10),('Scheduled',20),('Resolved',30),('Deferred',40),('Dismissed',50)
+       ) AS f(name, sort_order)`),
     // Already on THIS draft — including rows sitting unchecked, because proposing to
     // add something that is already sitting on the screen is noise either way.
     reportId
@@ -4722,7 +4733,14 @@ export async function listBoardReportCandidates(reportId = null) {
        ORDER BY br.published_at DESC NULLS LAST, br.id DESC`),
   ]);
 
-  const taskStatusSort = new Map(taskStatuses.rows.map((r) => [r.name, r.sort_order]));
+  // Lowest sort_order wins where two tables name the same status differently, so the
+  // chip row reads in lifecycle order: Not Started, In Progress, Done.
+  const statusSort = new Map();
+  for (const r of statusVocab.rows) {
+    const cur = statusSort.get(r.name);
+    if (cur === undefined || r.sort_order < cur) statusSort.set(r.name, r.sort_order);
+  }
+  const taskStatusSort = statusSort;
   const draftKeys = new Set(onDraft.rows.map((r) => `${r.item_type}:${r.item_id}`));
   const reportedOn = new Map();
   for (const r of published.rows) {
@@ -4736,7 +4754,11 @@ export async function listBoardReportCandidates(reportId = null) {
     return c;
   };
 
-  return [
+  const statuses = [...statusSort.entries()]
+    .map(([name, sortOrder]) => ({ name, sortOrder }))
+    .sort((a, b) => (a.sortOrder - b.sortOrder) || a.name.localeCompare(b.name));
+
+  const candidates = [
     ...wos.rows.map((r) => mark({
       ItemType: 'work_order', ItemId: r.id, Title: r.title,
       WoNumber: r.wo_number, Place: r.place, Status: r.status,
@@ -4776,6 +4798,7 @@ export async function listBoardReportCandidates(reportId = null) {
       StatusSort: taskStatusSort.get(t.StatusName) ?? 999,
     }); }),
   ];
+  return { candidates, statuses };
 }
 
 // Is this thing finished? One place, so the Add-item panel, the hand-add and the
