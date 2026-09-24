@@ -131,7 +131,7 @@ import {
   reopenWorkOrder,
   getRecordedLeftovers,
   reconcileLeftoversOnReclose,
-  searchBoardReportCandidates,
+  listBoardReportCandidates,
   addBoardReportItemManually,
   generateDueAuditRoundsForRange,
   createAuditRound,
@@ -215,7 +215,7 @@ router.get('/attachments', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/attachment-links/:linkId', async (req, res, next) => {
+router.patch('/attachment-links/:linkId(\\d+)', async (req, res, next) => {
   try {
     const { roleId, classification, caption, includeInReport, sortOrder, vendorId, quotedAmount, quoteDate, isSelectedQuote } = req.body || {};
     const updated = await updateAttachmentLink(req.params.linkId, {
@@ -229,13 +229,13 @@ router.patch('/attachment-links/:linkId', async (req, res, next) => {
 });
 
 // Detach — removes this one link only. Fast, no confirm expected client-side.
-router.delete('/attachment-links/:linkId', async (req, res, next) => {
+router.delete('/attachment-links/:linkId(\\d+)', async (req, res, next) => {
   try { await detachAttachment(req.params.linkId); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 // Void — soft-deletes the file everywhere it's linked. One tap, no confirm —
 // see voidAttachment's comment in db.js for why.
-router.post('/attachments/:id/void', async (req, res, next) => {
+router.post('/attachments/:id(\\d+)/void', async (req, res, next) => {
   try { await voidAttachment(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -249,7 +249,7 @@ router.post('/admin/attachment-roles', async (req, res, next) => {
     res.json({ ok: true, role: await createAttachmentRole({ name: name.trim(), sortOrder }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/attachment-roles/:id', async (req, res, next) => {
+router.patch('/admin/attachment-roles/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, sortOrder, defaultIncludeInReport, active } = req.body || {};
     const updated = await updateAttachmentRole(req.params.id, { name, sortOrder, defaultIncludeInReport, active });
@@ -257,7 +257,7 @@ router.patch('/admin/attachment-roles/:id', async (req, res, next) => {
     res.json({ ok: true, role: updated });
   } catch (e) { next(e); }
 });
-router.delete('/admin/attachment-roles/:id', async (req, res, next) => {
+router.delete('/admin/attachment-roles/:id(\\d+)', async (req, res, next) => {
   try { await deleteAttachmentRole(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -421,7 +421,7 @@ router.post('/admin/funds', async (req, res, next) => {
     res.json({ ok: true, fund: await createFund({ name: name.trim(), amount: Number(amount), startDate, endDate, authorizedBy, notes }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/funds/:id', async (req, res, next) => {
+router.patch('/admin/funds/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, amount, startDate, endDate, authorizedBy, notes, active } = req.body || {};
     const fund = await updateFund(req.params.id, { name, amount: amount != null ? Number(amount) : undefined, startDate, endDate, authorizedBy, notes, active });
@@ -429,7 +429,7 @@ router.patch('/admin/funds/:id', async (req, res, next) => {
     res.json({ ok: true, fund });
   } catch (e) { next(e); }
 });
-router.delete('/admin/funds/:id', async (req, res, next) => {
+router.delete('/admin/funds/:id(\\d+)', async (req, res, next) => {
   try { await deleteFund(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -446,7 +446,7 @@ router.post('/admin/expense-categories', async (req, res, next) => {
     res.json({ ok: true, category: await createExpenseCategory({ name: name.trim(), sortOrder }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/expense-categories/:id', async (req, res, next) => {
+router.patch('/admin/expense-categories/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, sortOrder, active } = req.body || {};
     const category = await updateExpenseCategory(req.params.id, { name, sortOrder, active });
@@ -454,7 +454,7 @@ router.patch('/admin/expense-categories/:id', async (req, res, next) => {
     res.json({ ok: true, category });
   } catch (e) { next(e); }
 });
-router.delete('/admin/expense-categories/:id', async (req, res, next) => {
+router.delete('/admin/expense-categories/:id(\\d+)', async (req, res, next) => {
   try { await deleteExpenseCategory(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -472,7 +472,7 @@ router.post('/admin/admin-task-categories', async (req, res, next) => {
     res.json({ ok: true, category: await createAdminTaskCategory({ name: name.trim(), sortOrder }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/admin-task-categories/:id', async (req, res, next) => {
+router.patch('/admin/admin-task-categories/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, sortOrder, active } = req.body || {};
     const category = await updateAdminTaskCategory(req.params.id, { name: name?.trim() || undefined, sortOrder, active });
@@ -480,7 +480,7 @@ router.patch('/admin/admin-task-categories/:id', async (req, res, next) => {
     res.json({ ok: true, category });
   } catch (e) { next(e); }
 });
-router.delete('/admin/admin-task-categories/:id', async (req, res, next) => {
+router.delete('/admin/admin-task-categories/:id(\\d+)', async (req, res, next) => {
   try { await deleteAdminTaskCategory(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -494,7 +494,7 @@ router.post('/admin/admin-task-statuses', async (req, res, next) => {
     res.json({ ok: true, status: await createAdminTaskStatus({ name: name.trim(), sortOrder, countsAsWorkPerformed }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/admin-task-statuses/:id', async (req, res, next) => {
+router.patch('/admin/admin-task-statuses/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, sortOrder, countsAsWorkPerformed, active } = req.body || {};
     const status = await updateAdminTaskStatus(req.params.id, { name: name?.trim() || undefined, sortOrder, countsAsWorkPerformed, active });
@@ -502,7 +502,7 @@ router.patch('/admin/admin-task-statuses/:id', async (req, res, next) => {
     res.json({ ok: true, status });
   } catch (e) { next(e); }
 });
-router.delete('/admin/admin-task-statuses/:id', async (req, res, next) => {
+router.delete('/admin/admin-task-statuses/:id(\\d+)', async (req, res, next) => {
   try { await deleteAdminTaskStatus(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -521,7 +521,7 @@ router.get('/admin-tasks', async (req, res, next) => {
     res.json({ tasks: await listAdminTasks({ statusId, categoryId, dateFrom, dateTo, q: q?.trim() || undefined }) });
   } catch (e) { next(e); }
 });
-router.get('/admin-tasks/:id', async (req, res, next) => {
+router.get('/admin-tasks/:id(\\d+)', async (req, res, next) => {
   try {
     const task = await getAdminTask(req.params.id);
     if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
@@ -543,7 +543,7 @@ router.post('/admin-tasks', async (req, res, next) => {
     res.json({ ok: true, task });
   } catch (e) { next(e); }
 });
-router.patch('/admin-tasks/:id', async (req, res, next) => {
+router.patch('/admin-tasks/:id(\\d+)', async (req, res, next) => {
   try {
     const body = req.body || {};
     const fields = {};
@@ -569,7 +569,7 @@ router.patch('/admin-tasks/:id', async (req, res, next) => {
     res.json({ ok: true, task });
   } catch (e) { next(e); }
 });
-router.delete('/admin-tasks/:id', async (req, res, next) => {
+router.delete('/admin-tasks/:id(\\d+)', async (req, res, next) => {
   try {
     if (!await deleteAdminTask(req.params.id)) return res.status(404).json({ ok: false, error: 'Task not found' });
     res.json({ ok: true });
@@ -604,7 +604,7 @@ router.get('/expenses', async (req, res, next) => {
     res.json(Array.isArray(result) ? { expenses: result } : { expenses: result.expenses, total: result.total });
   } catch (e) { next(e); }
 });
-router.get('/expenses/:id', async (req, res, next) => {
+router.get('/expenses/:id(\\d+)', async (req, res, next) => {
   try {
     const expense = await getExpense(req.params.id);
     if (!expense) return res.status(404).json({ ok: false, error: 'Expense not found' });
@@ -629,7 +629,7 @@ router.post('/expenses', async (req, res, next) => {
 // updateExpense's comment); `null` is how the frontend explicitly clears a
 // nullable field (e.g. unlinking the job line).
 function numOrNull(v) { return v === '' || v == null ? null : Number(v); }
-router.patch('/expenses/:id', async (req, res, next) => {
+router.patch('/expenses/:id(\\d+)', async (req, res, next) => {
   try {
     const body = req.body || {};
     const fields = {};
@@ -649,23 +649,23 @@ router.patch('/expenses/:id', async (req, res, next) => {
     res.json({ ok: true, expense });
   } catch (e) { next(e); }
 });
-router.post('/expenses/:id/void', async (req, res, next) => {
+router.post('/expenses/:id(\\d+)/void', async (req, res, next) => {
   try { await voidExpense(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
-router.post('/expenses/:id/unvoid', async (req, res, next) => {
+router.post('/expenses/:id(\\d+)/unvoid', async (req, res, next) => {
   try { await unvoidExpense(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 // ---- Work order splitting + family (Build Brief v2 Phase 5, §5.4) ----
 
-router.post('/work-orders/:id/split', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/split', async (req, res, next) => {
   try {
     const { jobLineIds } = req.body || {};
     if (!Array.isArray(jobLineIds) || !jobLineIds.length) return res.status(400).json({ ok: false, error: 'jobLineIds is required' });
     res.json({ ok: true, ...(await splitWorkOrder(Number(req.params.id), jobLineIds.map(Number))) });
   } catch (e) { next(e); }
 });
-router.get('/work-orders/:id/family', async (req, res, next) => {
+router.get('/work-orders/:id(\\d+)/family', async (req, res, next) => {
   try {
     const family = await getWorkOrderFamily(req.params.id);
     if (!family) return res.status(404).json({ ok: false, error: 'Work order not found' });
@@ -685,7 +685,7 @@ router.post('/admin/map-calibration', async (req, res, next) => {
     res.json({ ok: true, point: await createMapCalibrationPoint({ label, lat: Number(lat), lng: Number(lng), mapX: Number(mapX), mapY: Number(mapY) }) });
   } catch (e) { next(e); }
 });
-router.delete('/admin/map-calibration/:id', async (req, res, next) => {
+router.delete('/admin/map-calibration/:id(\\d+)', async (req, res, next) => {
   try { await deleteMapCalibrationPoint(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -711,7 +711,7 @@ router.post('/locations', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/locations/:id', async (req, res, next) => {
+router.patch('/locations/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, parentLocationId, locationType, notes } = req.body || {};
     if (!name || !name.trim()) return res.status(400).json({ ok: false, error: 'name is required' });
@@ -724,7 +724,7 @@ router.patch('/locations/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/locations/:id/assets', async (req, res, next) => {
+router.get('/locations/:id(\\d+)/assets', async (req, res, next) => {
   try {
     const assets = await listAssetsByLocation(req.params.id);
     // Faces come back with the list rather than per row, so the page renders in one
@@ -769,7 +769,7 @@ router.get('/options', async (req, res, next) => {
 
 // Deliberate admin action, not a walkthrough button — see migration brief's
 // "New tracked FIELDS" section for why this stays separate from asset_notes.
-router.patch('/assets/:id/building-type', async (req, res, next) => {
+router.patch('/assets/:id(\\d+)/building-type', async (req, res, next) => {
   try {
     const { buildingTypeId } = req.body || {};
     const updated = await setAssetBuildingType(req.params.id, buildingTypeId ?? null);
@@ -791,7 +791,7 @@ router.get('/map/pins', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/map/pins/:id', async (req, res, next) => {
+router.patch('/map/pins/:id(\\d+)', async (req, res, next) => {
   try {
     const { mapX, mapY, layerId } = req.body || {};
     // null/null explicitly unplaces the asset from the map; anything else
@@ -821,7 +821,7 @@ router.post('/map/layers', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/map/layers/:id', async (req, res, next) => {
+router.patch('/map/layers/:id(\\d+)', async (req, res, next) => {
   try {
     const updated = await updateMapLayer(req.params.id, req.body || {});
     if (!updated) return res.status(404).json({ ok: false, error: 'Layer not found' });
@@ -829,7 +829,7 @@ router.patch('/map/layers/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.delete('/map/layers/:id', async (req, res, next) => {
+router.delete('/map/layers/:id(\\d+)', async (req, res, next) => {
   try {
     await deleteMapLayer(req.params.id);
     res.json({ ok: true });
@@ -848,7 +848,7 @@ router.post('/notes', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/notes/:id', async (req, res, next) => {
+router.patch('/notes/:id(\\d+)', async (req, res, next) => {
   try {
     const updated = await updateNote(req.params.id, req.body || {});
     if (!updated) return res.status(404).json({ ok: false, error: 'Note not found' });
@@ -856,7 +856,7 @@ router.patch('/notes/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.delete('/notes/:id', async (req, res, next) => {
+router.delete('/notes/:id(\\d+)', async (req, res, next) => {
   try {
     await deleteNote(req.params.id);
     res.json({ ok: true });
@@ -877,7 +877,7 @@ router.post('/map-features', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/map-features/:id', async (req, res, next) => {
+router.patch('/map-features/:id(\\d+)', async (req, res, next) => {
   try {
     const updated = await updateMapFeature(req.params.id, req.body || {});
     if (!updated) return res.status(404).json({ ok: false, error: 'Map feature not found' });
@@ -885,7 +885,7 @@ router.patch('/map-features/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.delete('/map-features/:id', async (req, res, next) => {
+router.delete('/map-features/:id(\\d+)', async (req, res, next) => {
   try {
     await deleteMapFeature(req.params.id);
     res.json({ ok: true });
@@ -895,13 +895,13 @@ router.delete('/map-features/:id', async (req, res, next) => {
 // ---- Ad-hoc field notes (pressure-relief valve, distinct from Condition
 // Findings — see migration brief) ----
 
-router.get('/assets/:id/notes', async (req, res, next) => {
+router.get('/assets/:id(\\d+)/notes', async (req, res, next) => {
   try {
     res.json({ notes: await listAssetNotes(req.params.id) });
   } catch (e) { next(e); }
 });
 
-router.post('/assets/:id/notes', async (req, res, next) => {
+router.post('/assets/:id(\\d+)/notes', async (req, res, next) => {
   try {
     const { note, attachmentIds } = req.body || {};
     if (!note || !note.trim()) return res.status(400).json({ ok: false, error: 'note text is required' });
@@ -910,7 +910,7 @@ router.post('/assets/:id/notes', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/notes/:noteId/resolve', async (req, res, next) => {
+router.patch('/notes/:noteId(\\d+)/resolve', async (req, res, next) => {
   try {
     const resolved = req.body?.resolved !== false;
     const updated = await resolveAssetNote(req.params.noteId, resolved);
@@ -919,7 +919,7 @@ router.patch('/notes/:noteId/resolve', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/assets/:id', async (req, res, next) => {
+router.get('/assets/:id(\\d+)', async (req, res, next) => {
   try {
     const detail = await getAssetDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Asset not found' });
@@ -939,7 +939,7 @@ router.get('/assets/:id', async (req, res, next) => {
 
 // Full edit — admin screen, distinct from the guided /audit flow: direct field
 // edits only, no component events or findings created here.
-router.patch('/assets/:id', async (req, res, next) => {
+router.patch('/assets/:id(\\d+)', async (req, res, next) => {
   try {
     const { core = {}, properties = {} } = req.body || {};
     const detail = await updateAssetFull(req.params.id, { core, properties });
@@ -948,7 +948,7 @@ router.patch('/assets/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/condition-findings/:id', async (req, res, next) => {
+router.patch('/condition-findings/:id(\\d+)', async (req, res, next) => {
   try {
     const { boardFocus } = req.body || {};
     const finding = await updateConditionFinding(req.params.id, { boardFocus });
@@ -956,7 +956,7 @@ router.patch('/condition-findings/:id', async (req, res, next) => {
     res.json({ ok: true, finding });
   } catch (e) { next(e); }
 });
-router.post('/condition-findings/:id/defer', async (req, res, next) => {
+router.post('/condition-findings/:id(\\d+)/defer', async (req, res, next) => {
   try {
     const { reason, revisitDate } = req.body || {};
     const finding = await deferFinding(req.params.id, { reason, revisitDate });
@@ -964,7 +964,7 @@ router.post('/condition-findings/:id/defer', async (req, res, next) => {
     res.json({ ok: true, finding });
   } catch (e) { next(e); }
 });
-router.post('/condition-findings/:id/dismiss', async (req, res, next) => {
+router.post('/condition-findings/:id(\\d+)/dismiss', async (req, res, next) => {
   try {
     const { note } = req.body || {};
     const finding = await dismissFinding(req.params.id, { note });
@@ -978,10 +978,10 @@ router.get('/findings-summary', async (req, res, next) => {
 
 // ---- Create WO from findings (Build Brief v2 Phase 7, §7.2) ----
 
-router.get('/assets/:id/open-findings-for-wo', async (req, res, next) => {
+router.get('/assets/:id(\\d+)/open-findings-for-wo', async (req, res, next) => {
   try { res.json({ findings: await getOpenFindingsForWoCreation(req.params.id) }); } catch (e) { next(e); }
 });
-router.post('/assets/:id/create-wo-from-findings', async (req, res, next) => {
+router.post('/assets/:id(\\d+)/create-wo-from-findings', async (req, res, next) => {
   try {
     const { findings } = req.body || {}; // [{ findingId, title, responsibilityClass, fundingSource, estimatedCost }]
     if (!Array.isArray(findings) || !findings.length) return res.status(400).json({ ok: false, error: 'Select at least one finding' });
@@ -999,18 +999,18 @@ router.post('/admin/job-line-templates', async (req, res, next) => {
     res.json({ ok: true, template: await createJobLineTemplate({ buildingTypeId, componentType, defaultTitle: defaultTitle.trim(), defaultResponsibilityClass, defaultFundingSource, sortOrder }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/job-line-templates/:id', async (req, res, next) => {
+router.patch('/admin/job-line-templates/:id(\\d+)', async (req, res, next) => {
   try {
     const updated = await updateJobLineTemplate(req.params.id, req.body || {});
     if (!updated) return res.status(404).json({ ok: false, error: 'Template not found' });
     res.json({ ok: true, template: updated });
   } catch (e) { next(e); }
 });
-router.delete('/admin/job-line-templates/:id', async (req, res, next) => {
+router.delete('/admin/job-line-templates/:id(\\d+)', async (req, res, next) => {
   try { await deleteJobLineTemplate(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
-router.get('/assets/:id/history', async (req, res, next) => {
+router.get('/assets/:id(\\d+)/history', async (req, res, next) => {
   try {
     const { asset, componentRows, propertyHistory } = await getAssetHistory(req.params.id);
     if (!asset) return res.status(404).json({ ok: false, error: 'Asset not found' });
@@ -1018,7 +1018,7 @@ router.get('/assets/:id/history', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/assets/:id/audit', async (req, res, next) => {
+router.post('/assets/:id(\\d+)/audit', async (req, res, next) => {
   try {
     const { properties = {}, componentEvents = [], finding = null, generalAttachmentIds = [] } = req.body || {};
     const result = await submitAudit(req.params.id, { properties, componentEvents, finding, generalAttachmentIds });
@@ -1131,7 +1131,7 @@ router.post('/reports/favorites', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.delete('/reports/favorites/:id', async (req, res, next) => {
+router.delete('/reports/favorites/:id(\\d+)', async (req, res, next) => {
   try { await deleteReportFavorite(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -1291,7 +1291,7 @@ router.post('/admin/property-fields', async (req, res, next) => {
   }
 });
 
-router.patch('/admin/property-fields/:id', async (req, res, next) => {
+router.patch('/admin/property-fields/:id(\\d+)', async (req, res, next) => {
   try {
     const { label, options, active, sortOrder } = req.body || {};
     const field = await adminUpdatePropertyField(req.params.id, { label, options, active, sortOrder });
@@ -1342,7 +1342,7 @@ router.post('/admin/building-types', async (req, res, next) => {
   }
 });
 
-router.delete('/admin/building-types/:id', async (req, res, next) => {
+router.delete('/admin/building-types/:id(\\d+)', async (req, res, next) => {
   try {
     await adminDeleteBuildingType(req.params.id);
     res.json({ ok: true });
@@ -1379,7 +1379,7 @@ router.post('/admin/sub-areas', async (req, res, next) => {
   }
 });
 
-router.delete('/admin/sub-areas/:id', async (req, res, next) => {
+router.delete('/admin/sub-areas/:id(\\d+)', async (req, res, next) => {
   try {
     await adminDeleteSubArea(req.params.id);
     res.json({ ok: true });
@@ -1412,7 +1412,7 @@ router.post('/admin/request-fields', async (req, res, next) => {
   }
 });
 
-router.patch('/admin/request-fields/:id', async (req, res, next) => {
+router.patch('/admin/request-fields/:id(\\d+)', async (req, res, next) => {
   try {
     const { label, options, required, active, sortOrder, helpText } = req.body || {};
     const field = await adminUpdateRequestField(req.params.id, { label, options, required, active, sortOrder, helpText });
@@ -1427,7 +1427,7 @@ router.get('/work-orders', async (req, res, next) => {
   try { res.json({ workOrders: await listWorkOrders() }); } catch (e) { next(e); }
 });
 
-router.get('/work-orders/:id', async (req, res, next) => {
+router.get('/work-orders/:id(\\d+)', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
@@ -1441,7 +1441,7 @@ router.get('/work-orders/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/work-orders/:id/log', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/log', async (req, res, next) => {
   try {
     const { note, hours, statusChange } = req.body || {};
     if (!note || !note.trim()) return res.status(400).json({ ok: false, error: 'A note is required' });
@@ -1451,7 +1451,7 @@ router.post('/work-orders/:id/log', async (req, res, next) => {
     res.json({ ok: true, entry });
   } catch (e) { next(e); }
 });
-router.delete('/work-order-log/:id', async (req, res, next) => {
+router.delete('/work-order-log/:id(\\d+)', async (req, res, next) => {
   try { await deleteWorkOrderLogEntry(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -1473,7 +1473,7 @@ router.post('/crew-sessions', async (req, res, next) => {
     res.json({ ok: true, session });
   } catch (e) { next(e); }
 });
-router.delete('/crew-sessions/:id', async (req, res, next) => {
+router.delete('/crew-sessions/:id(\\d+)', async (req, res, next) => {
   try { await deleteCrewSession(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -1483,7 +1483,7 @@ router.get('/crew-hours/summary', async (req, res, next) => {
 
 // ---- Job Lines (the unit of work — Build Brief v2 Phase 1) ----
 
-router.post('/work-orders/:id/job-lines', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/job-lines', async (req, res, next) => {
   try {
     const { title, responsibilityClass, fundingSource, fundingRefId, estimatedHours, estimatedCost, scheduledDate } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ ok: false, error: 'title is required' });
@@ -1499,7 +1499,7 @@ router.post('/work-orders/:id/job-lines', async (req, res, next) => {
     });
   } catch (e) { next(e); }
 });
-router.patch('/job-lines/:jobLineId', async (req, res, next) => {
+router.patch('/job-lines/:jobLineId(\\d+)', async (req, res, next) => {
   try {
     const body = req.body || {};
     const fields = {};
@@ -1522,26 +1522,32 @@ router.patch('/job-lines/:jobLineId', async (req, res, next) => {
     if (body.blockedReason !== undefined) fields.blocked_reason = body.blockedReason;
     if (body.blockedSince !== undefined) fields.blocked_since = body.blockedSince;
     if (body.completedDate !== undefined) fields.completed_date = body.completedDate;
+    if (body.boardFocus !== undefined) {
+      fields.board_focus = !!body.boardFocus;
+      // Stamped on set, cleared on unset, so "featured since March" has a date and a
+      // re-flag doesn't inherit the old one. Same rule as the work order's flag.
+      fields.board_focus_set_at = body.boardFocus ? new Date() : null;
+    }
     if (body.causeIds !== undefined) fields.causeIds = (body.causeIds || []).map(Number);
     const jobLine = await updateJobLine(req.params.jobLineId, fields);
     if (!jobLine) return res.status(404).json({ ok: false, error: 'Job line not found' });
     res.json({ ok: true, jobLine });
   } catch (e) { next(e); }
 });
-router.delete('/job-lines/:jobLineId', async (req, res, next) => {
+router.delete('/job-lines/:jobLineId(\\d+)', async (req, res, next) => {
   try { await deleteJobLine(req.params.jobLineId); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
-router.post('/job-lines/:jobLineId/volunteers', async (req, res, next) => {
+router.post('/job-lines/:jobLineId(\\d+)/volunteers', async (req, res, next) => {
   try { res.json(await assignVolunteerToJobLine(req.params.jobLineId, req.body?.volunteerId)); } catch (e) { next(e); }
 });
-router.delete('/job-lines/:jobLineId/volunteers/:volunteerId', async (req, res, next) => {
+router.delete('/job-lines/:jobLineId(\\d+)/volunteers/:volunteerId(\\d+)', async (req, res, next) => {
   try { res.json(await unassignVolunteerFromJobLine(req.params.jobLineId, req.params.volunteerId)); } catch (e) { next(e); }
 });
-router.post('/job-lines/:jobLineId/vendors', async (req, res, next) => {
+router.post('/job-lines/:jobLineId(\\d+)/vendors', async (req, res, next) => {
   try { res.json(await assignVendorToJobLine(req.params.jobLineId, req.body?.vendorId)); } catch (e) { next(e); }
 });
-router.delete('/job-lines/:jobLineId/vendors/:vendorId', async (req, res, next) => {
+router.delete('/job-lines/:jobLineId(\\d+)/vendors/:vendorId(\\d+)', async (req, res, next) => {
   try { res.json(await unassignVendorFromJobLine(req.params.jobLineId, req.params.vendorId)); } catch (e) { next(e); }
 });
 
@@ -1556,7 +1562,7 @@ router.post('/admin/causes', async (req, res, next) => {
     res.json({ ok: true, cause: await createCause({ name: name.trim(), sortOrder }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/causes/:id', async (req, res, next) => {
+router.patch('/admin/causes/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, sortOrder, active } = req.body || {};
     const cause = await updateCause(req.params.id, { name, sortOrder, active });
@@ -1564,7 +1570,7 @@ router.patch('/admin/causes/:id', async (req, res, next) => {
     res.json({ ok: true, cause });
   } catch (e) { next(e); }
 });
-router.delete('/admin/causes/:id', async (req, res, next) => {
+router.delete('/admin/causes/:id(\\d+)', async (req, res, next) => {
   try { await deleteCause(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -1587,7 +1593,7 @@ router.post('/admin/work-order-statuses', async (req, res, next) => {
     res.json({ ok: true, status: await adminCreateWorkOrderStatus({ name: name.trim(), sortOrder, color, isTerminal, isReview }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/work-order-statuses/:id', async (req, res, next) => {
+router.patch('/admin/work-order-statuses/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, sortOrder, color, isTerminal, isReview, active } = req.body || {};
     const status = await adminUpdateWorkOrderStatus(req.params.id, { name, sortOrder, color, isTerminal, isReview, active });
@@ -1595,7 +1601,7 @@ router.patch('/admin/work-order-statuses/:id', async (req, res, next) => {
     res.json({ ok: true, status });
   } catch (e) { next(e); }
 });
-router.delete('/admin/work-order-statuses/:id', async (req, res, next) => {
+router.delete('/admin/work-order-statuses/:id(\\d+)', async (req, res, next) => {
   try { await adminDeleteWorkOrderStatus(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 router.get('/admin/job-line-statuses', async (req, res, next) => {
@@ -1608,7 +1614,7 @@ router.post('/admin/job-line-statuses', async (req, res, next) => {
     res.json({ ok: true, status: await adminCreateJobLineStatus({ name: name.trim(), sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/job-line-statuses/:id', async (req, res, next) => {
+router.patch('/admin/job-line-statuses/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel, active } = req.body || {};
     const status = await adminUpdateJobLineStatus(req.params.id, { name, sortOrder, color, isTerminal, countsAsWorkPerformed, requiresNote, noteLabel, active });
@@ -1616,7 +1622,7 @@ router.patch('/admin/job-line-statuses/:id', async (req, res, next) => {
     res.json({ ok: true, status });
   } catch (e) { next(e); }
 });
-router.delete('/admin/job-line-statuses/:id', async (req, res, next) => {
+router.delete('/admin/job-line-statuses/:id(\\d+)', async (req, res, next) => {
   try { await adminDeleteJobLineStatus(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -1685,7 +1691,7 @@ router.post('/work-orders/from-template', async (req, res, next) => {
 
 // Bulk save from the grid — the whole line set for one WO in one request.
 // See replaceWorkOrderJobLines for why knownLineIds matters.
-router.put('/work-orders/:id/job-lines', async (req, res, next) => {
+router.put('/work-orders/:id(\\d+)/job-lines', async (req, res, next) => {
   try {
     const { lines, knownLineIds } = req.body || {};
     if (!Array.isArray(lines)) return res.status(400).json({ ok: false, error: 'lines must be an array' });
@@ -1697,7 +1703,7 @@ router.put('/work-orders/:id/job-lines', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/work-orders/:id/job-lines/reorder', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/job-lines/reorder', async (req, res, next) => {
   try {
     const { orderedIds } = req.body || {};
     if (!Array.isArray(orderedIds)) return res.status(400).json({ ok: false, error: 'orderedIds must be an array' });
@@ -1707,7 +1713,7 @@ router.post('/work-orders/:id/job-lines/reorder', async (req, res, next) => {
 
 // null cascadeConfig clears the per-WO override and falls back to the global
 // default (§3.7).
-router.patch('/work-orders/:id/cascade-config', async (req, res, next) => {
+router.patch('/work-orders/:id(\\d+)/cascade-config', async (req, res, next) => {
   try {
     const result = await setWorkOrderCascadeConfig(req.params.id, req.body?.cascadeConfig ?? null);
     if (!result) return res.status(404).json({ ok: false, error: 'Work Order not found' });
@@ -1715,7 +1721,7 @@ router.patch('/work-orders/:id/cascade-config', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/work-orders/:id/review-prompt', async (req, res, next) => {
+router.get('/work-orders/:id(\\d+)/review-prompt', async (req, res, next) => {
   try {
     const prompt = await getWorkOrderReviewPrompt(req.params.id);
     if (!prompt) return res.status(404).json({ ok: false, error: 'Work Order not found' });
@@ -1723,14 +1729,14 @@ router.get('/work-orders/:id/review-prompt', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/work-orders/:id/save-as-template', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/save-as-template', async (req, res, next) => {
   try {
     const { name, description } = req.body || {};
     res.json({ ok: true, template: await saveWorkOrderAsTemplate(req.params.id, { name, description }) });
   } catch (e) { next(e); }
 });
 
-router.post('/work-orders/:id/duplicate', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/duplicate', async (req, res, next) => {
   try {
     const newId = await duplicateWorkOrder(req.params.id);
     if (!newId) return res.status(404).json({ ok: false, error: 'Work Order not found' });
@@ -1738,7 +1744,7 @@ router.post('/work-orders/:id/duplicate', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/work-orders/:id', async (req, res, next) => {
+router.patch('/work-orders/:id(\\d+)', async (req, res, next) => {
   try {
     const body = req.body || {};
     const fields = {};
@@ -1763,7 +1769,7 @@ router.patch('/work-orders/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/work-orders/:id/asset-updates', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/asset-updates', async (req, res, next) => {
   try {
     const { targetField, newValue } = req.body || {};
     const row = await addAssetUpdateToWorkOrder(req.params.id, targetField, newValue);
@@ -1771,7 +1777,7 @@ router.post('/work-orders/:id/asset-updates', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.delete('/work-orders/:id/asset-updates/:auId', async (req, res, next) => {
+router.delete('/work-orders/:id(\\d+)/asset-updates/:auId(\\d+)', async (req, res, next) => {
   try {
     const result = await deleteAssetUpdate(req.params.auId);
     if (result.notFound) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -1780,7 +1786,7 @@ router.delete('/work-orders/:id/asset-updates/:auId', async (req, res, next) => 
   } catch (e) { next(e); }
 });
 
-router.post('/work-orders/:id/complete', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/complete', async (req, res, next) => {
   try {
     const result = await completeWorkOrder(req.params.id);
     if (!result) return res.status(404).json({ ok: false, error: 'Work Order not found' });
@@ -1798,7 +1804,7 @@ router.post('/volunteers', async (req, res, next) => {
     res.json({ ok: true, volunteer: await createVolunteer({ name, phone, email, address, skill }) });
   } catch (e) { next(e); }
 });
-router.patch('/volunteers/:id', async (req, res, next) => {
+router.patch('/volunteers/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, phone, email, address, skill } = req.body || {};
     const volunteer = await updateVolunteer(req.params.id, { name, phone, email, address, skill });
@@ -1806,7 +1812,7 @@ router.patch('/volunteers/:id', async (req, res, next) => {
     res.json({ ok: true, volunteer });
   } catch (e) { next(e); }
 });
-router.delete('/volunteers/:id', async (req, res, next) => {
+router.delete('/volunteers/:id(\\d+)', async (req, res, next) => {
   try { res.json({ ok: true, ...(await removeVolunteer(req.params.id)) }); } catch (e) { next(e); }
 });
 
@@ -1820,7 +1826,7 @@ router.post('/vendors', async (req, res, next) => {
     res.json({ ok: true, vendor: await createVendor({ name, phone, email, address, specialty }) });
   } catch (e) { next(e); }
 });
-router.patch('/vendors/:id', async (req, res, next) => {
+router.patch('/vendors/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, phone, email, address, specialty } = req.body || {};
     const vendor = await updateVendor(req.params.id, { name, phone, email, address, specialty });
@@ -1828,7 +1834,7 @@ router.patch('/vendors/:id', async (req, res, next) => {
     res.json({ ok: true, vendor });
   } catch (e) { next(e); }
 });
-router.delete('/vendors/:id', async (req, res, next) => {
+router.delete('/vendors/:id(\\d+)', async (req, res, next) => {
   try { res.json({ ok: true, ...(await removeVendor(req.params.id)) }); } catch (e) { next(e); }
 });
 
@@ -1873,7 +1879,7 @@ router.post('/assets', async (req, res, next) => {
 router.get('/work-order-templates', async (req, res, next) => {
   try { res.json({ templates: await listWorkOrderTemplates() }); } catch (e) { next(e); }
 });
-router.get('/work-order-templates/:id', async (req, res, next) => {
+router.get('/work-order-templates/:id(\\d+)', async (req, res, next) => {
   try {
     const template = await getWorkOrderTemplate(req.params.id);
     if (!template) return res.status(404).json({ ok: false, error: 'Template not found' });
@@ -1887,7 +1893,7 @@ router.post('/work-order-templates', async (req, res, next) => {
     res.json({ ok: true, template: await createWorkOrderTemplate({ name, description, defaultTitle, defaultPriority, defaultDescription, lines, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds }) });
   } catch (e) { next(e); }
 });
-router.patch('/work-order-templates/:id', async (req, res, next) => {
+router.patch('/work-order-templates/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, description, defaultTitle, defaultPriority, defaultDescription, lines, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds } = req.body || {};
     const template = await updateWorkOrderTemplate(req.params.id, { name, description, defaultTitle, defaultPriority, defaultDescription, lines, assetUpdateDefaults, defaultResponsibilityClass, presetVolunteerIds, presetVendorIds });
@@ -1895,7 +1901,7 @@ router.patch('/work-order-templates/:id', async (req, res, next) => {
     res.json({ ok: true, template });
   } catch (e) { next(e); }
 });
-router.delete('/work-order-templates/:id', async (req, res, next) => {
+router.delete('/work-order-templates/:id(\\d+)', async (req, res, next) => {
   try { await deleteWorkOrderTemplate(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -1910,7 +1916,7 @@ router.post('/admin/calendar-event-types', async (req, res, next) => {
     res.json({ ok: true, type: await createCalendarEventType({ name: name.trim(), sortOrder, gcalColorId }) });
   } catch (e) { next(e); }
 });
-router.patch('/admin/calendar-event-types/:id', async (req, res, next) => {
+router.patch('/admin/calendar-event-types/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, sortOrder, gcalColorId, active } = req.body || {};
     const updated = active !== undefined
@@ -1920,7 +1926,7 @@ router.patch('/admin/calendar-event-types/:id', async (req, res, next) => {
     res.json({ ok: true, type: updated });
   } catch (e) { next(e); }
 });
-router.delete('/admin/calendar-event-types/:id', async (req, res, next) => {
+router.delete('/admin/calendar-event-types/:id(\\d+)', async (req, res, next) => {
   try { await deleteCalendarEventType(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -1967,7 +1973,7 @@ router.get('/visitor-conflicts', async (req, res, next) => {
 router.get('/job-lines/unscheduled', async (req, res, next) => {
   try { res.json({ jobLines: await listUnscheduledJobLines() }); } catch (e) { next(e); }
 });
-router.get('/calendar-events/:id', async (req, res, next) => {
+router.get('/calendar-events/:id(\\d+)', async (req, res, next) => {
   try {
     const event = await getCalendarEvent(req.params.id);
     if (!event) return res.status(404).json({ ok: false, error: 'Event not found' });
@@ -1991,7 +1997,7 @@ router.post('/calendar-events', async (req, res, next) => {
     }) });
   } catch (e) { next(e); }
 });
-router.patch('/calendar-events/:id', async (req, res, next) => {
+router.patch('/calendar-events/:id(\\d+)', async (req, res, next) => {
   try {
     const body = req.body || {};
     const fields = {};
@@ -2018,7 +2024,7 @@ router.patch('/calendar-events/:id', async (req, res, next) => {
     res.json({ ok: true, event });
   } catch (e) { next(e); }
 });
-router.delete('/calendar-events/:id', async (req, res, next) => {
+router.delete('/calendar-events/:id(\\d+)', async (req, res, next) => {
   try { await deleteCalendarEvent(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
@@ -2042,7 +2048,23 @@ router.get('/board-reports/draft', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/board-reports/:id', async (req, res, next) => {
+// Everything that could go on a report — every WO, job line, finding and admin
+// task, at any status and any date — annotated with where it is already used.
+// The Add-item panel opens on this one response and filters it in the browser, so
+// there is no request per keystroke.
+//
+// Registered ABOVE '/board-reports/:id': Express matches in registration order, and
+// with the literal below the pattern, "candidates" arrived as :id and went into
+// Postgres as an integer (0094). The :id patterns are digit-constrained now as well,
+// which is the belt to this suspenders.
+router.get('/board-reports/candidates', async (req, res, next) => {
+  try {
+    const reportId = req.query.reportId ? Number(req.query.reportId) : null;
+    res.json({ candidates: await listBoardReportCandidates(reportId) });
+  } catch (e) { next(e); }
+});
+
+router.get('/board-reports/:id(\\d+)', async (req, res, next) => {
   try {
     const report = await getBoardReport(req.params.id);
     if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2057,7 +2079,7 @@ router.get('/board-reports/:id', async (req, res, next) => {
 
 // Periods and the summary narrative. Autosaved by the screen; the generic dirty-guard
 // covers the notes field because it's a textarea inside the report form.
-router.patch('/board-reports/:id', async (req, res, next) => {
+router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
   try {
     const { title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes } = req.body || {};
     const report = await updateBoardReport(req.params.id, {
@@ -2068,7 +2090,7 @@ router.patch('/board-reports/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/board-reports/:id/items/:itemId', async (req, res, next) => {
+router.patch('/board-reports/:id(\\d+)/items/:itemId(\\d+)', async (req, res, next) => {
   try {
     const { included, displayMode, reportNote } = req.body || {};
     let items;
@@ -2083,7 +2105,25 @@ router.patch('/board-reports/:id/items/:itemId', async (req, res, next) => {
 
 // Re-runs every suggestion rule. Safe to call whenever the period changes — upserts
 // refresh the snapshots but never undo an explicit include/exclude.
-router.post('/board-reports/:id/refresh', async (req, res, next) => {
+// Hand-added items. Accepts a batch, because the Add-item panel is a multi-select
+// list with one "Add selected" button rather than a click-per-row.
+router.post('/board-reports/:id(\\d+)/items', async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const incoming = Array.isArray(body.items) ? body.items : (body.item ? [body.item] : []);
+    if (!incoming.length || incoming.some((i) => !i || !i.ItemType || !i.ItemId)) {
+      return res.status(400).json({ ok: false, error: 'items with ItemType and ItemId are required' });
+    }
+    let items;
+    for (const item of incoming) {
+      items = await addBoardReportItemManually(req.params.id, item);
+      if (!items) return res.status(404).json({ ok: false, error: 'Not found' });
+    }
+    res.json({ ok: true, items, added: incoming.length });
+  } catch (e) { next(e); }
+});
+
+router.post('/board-reports/:id(\\d+)/refresh', async (req, res, next) => {
   try {
     const result = await refreshBoardReportSuggestions(req.params.id);
     if (!result) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2091,7 +2131,7 @@ router.post('/board-reports/:id/refresh', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/board-reports/:id/publish', async (req, res, next) => {
+router.post('/board-reports/:id(\\d+)/publish', async (req, res, next) => {
   try {
     const report = await publishBoardReport(req.params.id);
     if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2106,7 +2146,7 @@ router.post('/board-reports/:id/publish', async (req, res, next) => {
 // Sending or downloading a DRAFT is allowed but never silent: the caller must pass
 // confirmDraft, and both subject and body are prefixed so a working copy can't be
 // mistaken for the real thing (§3).
-router.post('/board-reports/:id/output', async (req, res, next) => {
+router.post('/board-reports/:id(\\d+)/output', async (req, res, next) => {
   try {
     const { kind, recipient, subject, confirmDraft } = req.body || {};
     if (!['email', 'download', 'manual'].includes(kind)) {
@@ -2145,7 +2185,7 @@ router.post('/board-reports/:id/output', async (req, res, next) => {
 });
 
 // History: open any past copy and see exactly what left, not a re-render of it.
-router.get('/board-report-outputs/:outputId', async (req, res, next) => {
+router.get('/board-report-outputs/:outputId(\\d+)', async (req, res, next) => {
   try {
     const output = await getBoardReportOutput(req.params.outputId);
     if (!output) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2156,7 +2196,7 @@ router.get('/board-report-outputs/:outputId', async (req, res, next) => {
 // ── Split editor (§9) ────────────────────────────────────────────────────
 // Only ever opened deliberately. The ordinary expense form still writes one
 // destination behind the scenes, so the fast path never touches any of this.
-router.get('/expenses/:id/split', async (req, res, next) => {
+router.get('/expenses/:id(\\d+)/split', async (req, res, next) => {
   try {
     const summary = await getExpenseSplitSummary(req.params.id);
     if (!summary) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2168,7 +2208,7 @@ router.get('/expenses/:id/split', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/expenses/:id/line-items', async (req, res, next) => {
+router.post('/expenses/:id(\\d+)/line-items', async (req, res, next) => {
   try {
     const { description, quantity, unit, paidAmount, regularPrice, materialId, sortIndex } = req.body || {};
     if (!description || !String(description).trim()) {
@@ -2179,7 +2219,7 @@ router.post('/expenses/:id/line-items', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.delete('/expenses/:id/line-items/:lineItemId', async (req, res, next) => {
+router.delete('/expenses/:id(\\d+)/line-items/:lineItemId(\\d+)', async (req, res, next) => {
   try {
     await deleteExpenseLineItem(req.params.lineItemId);
     res.json({
@@ -2191,7 +2231,7 @@ router.delete('/expenses/:id/line-items/:lineItemId', async (req, res, next) => 
   } catch (e) { next(e); }
 });
 
-router.post('/expenses/:id/allocations', async (req, res, next) => {
+router.post('/expenses/:id(\\d+)/allocations', async (req, res, next) => {
   try {
     const { lineItemId, destType, destId, quantity, amount, materialId, fundingSource, fundingRefId } = req.body || {};
     if (!['work_order', 'job_line', 'admin_task', 'leftover'].includes(destType)) {
@@ -2212,7 +2252,7 @@ router.post('/expenses/:id/allocations', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) => {
+router.delete('/expenses/:id(\\d+)/allocations/:allocationId(\\d+)', async (req, res, next) => {
   try {
     await deleteExpenseAllocation(req.params.allocationId);
     res.json({
@@ -2225,7 +2265,7 @@ router.delete('/expenses/:id/allocations/:allocationId', async (req, res, next) 
 
 // Reopen a completed/closed work order (§1). Moves to Review, never back to open, and
 // leaves job line statuses alone.
-router.post('/work-orders/:id/reopen', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/reopen', async (req, res, next) => {
   try {
     const wo = await reopenWorkOrder(req.params.id, { reason: (req.body || {}).reason || null });
     if (!wo) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2234,37 +2274,16 @@ router.post('/work-orders/:id/reopen', async (req, res, next) => {
 });
 
 // What was already banked as left over, so re-closing adjusts rather than doubles.
-router.get('/work-orders/:id/recorded-leftovers', async (req, res, next) => {
+router.get('/work-orders/:id(\\d+)/recorded-leftovers', async (req, res, next) => {
   try { res.json({ leftovers: await getRecordedLeftovers(req.params.id) }); } catch (e) { next(e); }
 });
 
-router.post('/work-orders/:id/leftovers/reconcile', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/leftovers/reconcile', async (req, res, next) => {
   try {
     const { leftovers } = req.body || {};
     if (!Array.isArray(leftovers)) return res.status(400).json({ ok: false, error: 'leftovers must be an array' });
     const changes = await reconcileLeftoversOnReclose(req.params.id, leftovers, { createdBy: req.user?.username || null });
     res.json({ ok: true, changes });
-  } catch (e) { next(e); }
-});
-
-// Anything that can go on a report, any status, any date.
-router.get('/board-reports/candidates', async (req, res, next) => {
-  try {
-    const q = (req.query.q || '').trim();
-    if (q.length < 2) return res.json({ candidates: [] });
-    res.json({ candidates: await searchBoardReportCandidates(q) });
-  } catch (e) { next(e); }
-});
-
-router.post('/board-reports/:id/items', async (req, res, next) => {
-  try {
-    const { item } = req.body || {};
-    if (!item || !item.ItemType || !item.ItemId) {
-      return res.status(400).json({ ok: false, error: 'item with ItemType and ItemId is required' });
-    }
-    const items = await addBoardReportItemManually(req.params.id, item);
-    if (!items) return res.status(404).json({ ok: false, error: 'Not found' });
-    res.json({ ok: true, items });
   } catch (e) { next(e); }
 });
 
@@ -2284,7 +2303,7 @@ router.post('/audit-rounds/materialize', async (req, res, next) => {
 });
 
 // ── Query surfaces (§8) ──────────────────────────────────────────────────
-router.get('/assets/:id/condition-history', async (req, res, next) => {
+router.get('/assets/:id(\\d+)/condition-history', async (req, res, next) => {
   try {
     res.json({
       history: await getAssetConditionHistory(req.params.id),
@@ -2322,7 +2341,7 @@ router.get('/audit-data', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/audit-rounds/:id/report', async (req, res, next) => {
+router.get('/audit-rounds/:id(\\d+)/report', async (req, res, next) => {
   try {
     const report = await getAuditRoundReport(req.params.id);
     if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2331,7 +2350,7 @@ router.get('/audit-rounds/:id/report', async (req, res, next) => {
 });
 
 // ── Form builder (§7) ────────────────────────────────────────────────────
-router.get('/audit-forms/:id/full', async (req, res, next) => {
+router.get('/audit-forms/:id(\\d+)/full', async (req, res, next) => {
   try {
     const form = await getAuditFormFull(req.params.id);
     if (!form) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2347,7 +2366,7 @@ router.post('/audit-forms', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/audit-forms/:id/sections', async (req, res, next) => {
+router.post('/audit-forms/:id(\\d+)/sections', async (req, res, next) => {
   try {
     const { name, sortIndex } = req.body || {};
     if (!name) return res.status(400).json({ ok: false, error: 'name is required' });
@@ -2355,11 +2374,11 @@ router.post('/audit-forms/:id/sections', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/audit-sections/:id', async (req, res, next) => {
+router.patch('/audit-sections/:id(\\d+)', async (req, res, next) => {
   try { await updateAuditSection(req.params.id, req.body || {}); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
-router.post('/audit-forms/:id/questions', async (req, res, next) => {
+router.post('/audit-forms/:id(\\d+)/questions', async (req, res, next) => {
   try {
     const { prompt } = req.body || {};
     if (!prompt) return res.status(400).json({ ok: false, error: 'prompt is required' });
@@ -2370,7 +2389,7 @@ router.post('/audit-forms/:id/questions', async (req, res, next) => {
 // Reorder in one call: the client sends the ids in their new order and every
 // sort_index is rewritten. Sending one moved id and asking the server to work out the
 // rest is where off-by-ones live.
-router.put('/audit-forms/:id/question-order', async (req, res, next) => {
+router.put('/audit-forms/:id(\\d+)/question-order', async (req, res, next) => {
   try {
     const { questionIds } = req.body || {};
     if (!Array.isArray(questionIds)) return res.status(400).json({ ok: false, error: 'questionIds must be an array' });
@@ -2379,7 +2398,7 @@ router.put('/audit-forms/:id/question-order', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.put('/audit-forms/:id/section-order', async (req, res, next) => {
+router.put('/audit-forms/:id(\\d+)/section-order', async (req, res, next) => {
   try {
     const { sectionIds } = req.body || {};
     if (!Array.isArray(sectionIds)) return res.status(400).json({ ok: false, error: 'sectionIds must be an array' });
@@ -2388,17 +2407,17 @@ router.put('/audit-forms/:id/section-order', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/audit-questions/:id', async (req, res, next) => {
+router.patch('/audit-questions/:id(\\d+)', async (req, res, next) => {
   try { await updateAuditQuestion(req.params.id, req.body || {}); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 // Archives when answers exist, deletes when none do — the response says which, because
 // "removed" meaning two different things silently would be worse than asking.
-router.delete('/audit-questions/:id', async (req, res, next) => {
+router.delete('/audit-questions/:id(\\d+)', async (req, res, next) => {
   try { res.json({ ok: true, ...(await removeAuditQuestion(req.params.id)) }); } catch (e) { next(e); }
 });
 
-router.post('/audit-questions/:id/options', async (req, res, next) => {
+router.post('/audit-questions/:id(\\d+)/options', async (req, res, next) => {
   try {
     const { label } = req.body || {};
     if (!label) return res.status(400).json({ ok: false, error: 'label is required' });
@@ -2406,11 +2425,11 @@ router.post('/audit-questions/:id/options', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/audit-options/:id', async (req, res, next) => {
+router.patch('/audit-options/:id(\\d+)', async (req, res, next) => {
   try { await updateAuditOption(req.params.id, req.body || {}); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
-router.post('/audit-options/:id/remedies', async (req, res, next) => {
+router.post('/audit-options/:id(\\d+)/remedies', async (req, res, next) => {
   try {
     const { titleTemplate } = req.body || {};
     if (!titleTemplate) return res.status(400).json({ ok: false, error: 'titleTemplate is required' });
@@ -2418,17 +2437,17 @@ router.post('/audit-options/:id/remedies', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/audit-remedies/:id', async (req, res, next) => {
+router.patch('/audit-remedies/:id(\\d+)', async (req, res, next) => {
   try { await updateAuditRemedy(req.params.id, req.body || {}); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
-router.delete('/audit-remedies/:id', async (req, res, next) => {
+router.delete('/audit-remedies/:id(\\d+)', async (req, res, next) => {
   try { await deleteAuditRemedy(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 // Creates a question whose show_if is already wired to the option it hangs under, so
 // the tree is visible as structure rather than needing a separate logic screen.
-router.post('/audit-options/:id/follow-up', async (req, res, next) => {
+router.post('/audit-options/:id(\\d+)/follow-up', async (req, res, next) => {
   try {
     const { formId, prompt, type, options } = req.body || {};
     if (!formId || !prompt) return res.status(400).json({ ok: false, error: 'formId and prompt are required' });
@@ -2458,7 +2477,7 @@ router.post('/audit-rounds', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/audit-rounds/:id', async (req, res, next) => {
+router.get('/audit-rounds/:id(\\d+)', async (req, res, next) => {
   try {
     const round = await getAuditRound(req.params.id);
     if (!round) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2468,7 +2487,7 @@ router.get('/audit-rounds/:id', async (req, res, next) => {
 
 // Everything the runner needs for one building in one call — the form, the answers so
 // far, and the asset's standing notes.
-router.get('/audit-instances/:id', async (req, res, next) => {
+router.get('/audit-instances/:id(\\d+)', async (req, res, next) => {
   try {
     const data = await getAuditInstance(req.params.id);
     if (!data) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2478,7 +2497,7 @@ router.get('/audit-instances/:id', async (req, res, next) => {
 
 // One answer at a time, idempotent, so the client's retry queue can replay it safely
 // after a dropped connection without duplicating anything.
-router.put('/audit-instances/:id/answers', async (req, res, next) => {
+router.put('/audit-instances/:id(\\d+)/answers', async (req, res, next) => {
   try {
     const { questionId, questionKey, value, optionId, note, noteDestination, active } = req.body || {};
     if (!questionId || !questionKey) return res.status(400).json({ ok: false, error: 'questionId and questionKey are required' });
@@ -2488,7 +2507,7 @@ router.put('/audit-instances/:id/answers', async (req, res, next) => {
 });
 
 // Called before a photo upload so there is an answer row to attach it to.
-router.post('/audit-instances/:id/ensure-answer', async (req, res, next) => {
+router.post('/audit-instances/:id(\\d+)/ensure-answer', async (req, res, next) => {
   try {
     const { questionId, questionKey } = req.body || {};
     if (!questionId || !questionKey) return res.status(400).json({ ok: false, error: 'questionId and questionKey are required' });
@@ -2496,7 +2515,7 @@ router.post('/audit-instances/:id/ensure-answer', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/audit-instances/:id/adhoc-flags', async (req, res, next) => {
+router.post('/audit-instances/:id(\\d+)/adhoc-flags', async (req, res, next) => {
   try {
     const { sectionId, description, note, noteDestination, remedy } = req.body || {};
     if (!sectionId || !description) return res.status(400).json({ ok: false, error: 'sectionId and description are required' });
@@ -2505,7 +2524,7 @@ router.post('/audit-instances/:id/adhoc-flags', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/audit-answers/:answerId/remedies', async (req, res, next) => {
+router.post('/audit-answers/:answerId(\\d+)/remedies', async (req, res, next) => {
   try {
     const { remedyId } = req.body || {};
     if (!remedyId) return res.status(400).json({ ok: false, error: 'remedyId is required' });
@@ -2514,7 +2533,7 @@ router.post('/audit-answers/:answerId/remedies', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/audit-instances/:id/review', async (req, res, next) => {
+router.get('/audit-instances/:id(\\d+)/review', async (req, res, next) => {
   try {
     const review = await getAuditReview(req.params.id);
     if (!review) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2525,7 +2544,7 @@ router.get('/audit-instances/:id/review', async (req, res, next) => {
 // Creates the findings, the work order and its lines, fires maps_to routing, and
 // delivers routed notes — one transaction, because a half-generated building would be
 // worse than none.
-router.post('/audit-instances/:id/complete', async (req, res, next) => {
+router.post('/audit-instances/:id(\\d+)/complete', async (req, res, next) => {
   try {
     const { lines, strandedNoteChoices } = req.body || {};
     const result = await completeAuditInstance(req.params.id, {
@@ -2550,7 +2569,7 @@ router.put('/asset-type-icons', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/assets/:id/face', async (req, res, next) => {
+router.get('/assets/:id(\\d+)/face', async (req, res, next) => {
   try {
     const face = await getAssetFace(req.params.id);
     if (!face) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2560,7 +2579,7 @@ router.get('/assets/:id/face', async (req, res, next) => {
 
 // Designates one already-attached photo as the asset's face. null clears it and the
 // type icon takes over again.
-router.put('/assets/:id/profile-photo', async (req, res, next) => {
+router.put('/assets/:id(\\d+)/profile-photo', async (req, res, next) => {
   try {
     const face = await setAssetProfilePhoto(req.params.id, (req.body || {}).attachmentId || null);
     res.json({ ok: true, face });
@@ -2588,7 +2607,7 @@ router.post('/materials', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/materials/:id', async (req, res, next) => {
+router.get('/materials/:id(\\d+)', async (req, res, next) => {
   try {
     const material = await getMaterial(req.params.id);
     if (!material) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2598,12 +2617,12 @@ router.get('/materials/:id', async (req, res, next) => {
 
 // The point-of-use reminder. 200 with onHand:null when there's nothing to say, rather
 // than a 404 — "no stock" is a normal answer, not a missing resource.
-router.get('/materials/:id/on-hand', async (req, res, next) => {
+router.get('/materials/:id(\\d+)/on-hand', async (req, res, next) => {
   try { res.json({ onHand: await getMaterialOnHand(req.params.id) }); } catch (e) { next(e); }
 });
 
 // Corrections and tossed/damaged both land here — every balance change is a movement.
-router.post('/materials/:id/movements', async (req, res, next) => {
+router.post('/materials/:id(\\d+)/movements', async (req, res, next) => {
   try {
     const { kind, quantity, unitPrice, workOrderId, jobLineId, note } = req.body || {};
     if (!['wo_close', 'to_job', 'correction', 'tossed'].includes(kind)) {
@@ -2617,7 +2636,7 @@ router.post('/materials/:id/movements', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/materials/:id/use-from-stock', async (req, res, next) => {
+router.post('/materials/:id(\\d+)/use-from-stock', async (req, res, next) => {
   try {
     const { quantity, jobLineId, workOrderId } = req.body || {};
     const used = await useMaterialFromStock({
@@ -2630,12 +2649,12 @@ router.post('/materials/:id/use-from-stock', async (req, res, next) => {
 
 // Backs the "Any materials left over?" prompt at WO close. Empty array = this WO
 // bought no tracked materials, so the prompt is skipped entirely.
-router.get('/work-orders/:id/materials-used', async (req, res, next) => {
+router.get('/work-orders/:id(\\d+)/materials-used', async (req, res, next) => {
   try { res.json({ materials: await getMaterialsUsedOnWorkOrder(req.params.id) }); } catch (e) { next(e); }
 });
 
 // One call for the whole prompt: a quantity per material, blanks omitted by the client.
-router.post('/work-orders/:id/leftovers', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/leftovers', async (req, res, next) => {
   try {
     const { leftovers } = req.body || {};
     if (!Array.isArray(leftovers)) return res.status(400).json({ ok: false, error: 'leftovers must be an array' });
@@ -2663,7 +2682,7 @@ router.post('/checklist-templates', async (req, res, next) => {
     res.json({ ok: true, template: await createChecklistTemplate({ name, steps }) });
   } catch (e) { next(e); }
 });
-router.patch('/checklist-templates/:id', async (req, res, next) => {
+router.patch('/checklist-templates/:id(\\d+)', async (req, res, next) => {
   try {
     const { name, steps } = req.body || {};
     const template = await updateChecklistTemplate(req.params.id, { name, steps });
@@ -2671,28 +2690,28 @@ router.patch('/checklist-templates/:id', async (req, res, next) => {
     res.json({ ok: true, template });
   } catch (e) { next(e); }
 });
-router.delete('/checklist-templates/:id', async (req, res, next) => {
+router.delete('/checklist-templates/:id(\\d+)', async (req, res, next) => {
   try { await deleteChecklistTemplate(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
-router.post('/work-orders/:id/checklist', async (req, res, next) => {
+router.post('/work-orders/:id(\\d+)/checklist', async (req, res, next) => {
   try {
     const { templateId } = req.body || {};
     if (!templateId) return res.status(400).json({ ok: false, error: 'templateId is required' });
     res.json({ ok: true, checklist: await attachChecklistToWorkOrder(req.params.id, templateId) });
   } catch (e) { next(e); }
 });
-router.post('/calendar-events/:id/checklist', async (req, res, next) => {
+router.post('/calendar-events/:id(\\d+)/checklist', async (req, res, next) => {
   try {
     const { templateId } = req.body || {};
     if (!templateId) return res.status(400).json({ ok: false, error: 'templateId is required' });
     res.json({ ok: true, checklist: await attachChecklistToCalendarEvent(req.params.id, templateId) });
   } catch (e) { next(e); }
 });
-router.delete('/checklist-instances/:id', async (req, res, next) => {
+router.delete('/checklist-instances/:id(\\d+)', async (req, res, next) => {
   try { await detachChecklistInstance(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
 });
-router.patch('/checklist-steps/:id', async (req, res, next) => {
+router.patch('/checklist-steps/:id(\\d+)', async (req, res, next) => {
   try {
     const { done } = req.body || {};
     const step = await toggleChecklistStep(req.params.id, !!done);
@@ -2703,7 +2722,7 @@ router.patch('/checklist-steps/:id', async (req, res, next) => {
 
 // A step whose dependency isn't satisfied is left out of the export, same as
 // what's shown on screen — the PDF should match what you'd actually see.
-router.get('/checklist-instances/:id/pdf', async (req, res, next) => {
+router.get('/checklist-instances/:id(\\d+)/pdf', async (req, res, next) => {
   try {
     const instance = await getChecklistInstanceForExport(req.params.id);
     if (!instance) return res.status(404).json({ ok: false, error: 'Checklist not found' });
@@ -2727,7 +2746,7 @@ router.get('/checklist-instances/:id/pdf', async (req, res, next) => {
 // Handed to a vendor or volunteer so there's a record every repair went
 // through the system (see the user's "all future repairs run through this"
 // request) — deliberately excludes cost figures, see pdf.js.
-router.get('/work-orders/:id/scope-pdf', async (req, res, next) => {
+router.get('/work-orders/:id(\\d+)/scope-pdf', async (req, res, next) => {
   try {
     const detail = await getWorkOrderDetail(req.params.id);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
@@ -2784,7 +2803,7 @@ router.post('/users', async (req, res, next) => {
   }
 });
 
-router.patch('/users/:id', async (req, res, next) => {
+router.patch('/users/:id(\\d+)', async (req, res, next) => {
   try {
     const { email, password, active, role } = req.body || {};
     if (password !== undefined && password !== '' && password.length < 6) {
@@ -2811,7 +2830,7 @@ router.patch('/users/:id', async (req, res, next) => {
   }
 });
 
-router.delete('/users/:id', async (req, res, next) => {
+router.delete('/users/:id(\\d+)', async (req, res, next) => {
   try {
     const target = (await listUsers()).find((u) => u.Id === Number(req.params.id));
     if (!target) return res.status(404).json({ ok: false, error: 'User not found' });
@@ -2876,7 +2895,7 @@ router.get('/requests', async (req, res, next) => {
   try { res.json({ requests: await listMaintenanceRequests({ status: req.query.status }) }); } catch (e) { next(e); }
 });
 
-router.get('/requests/:id', async (req, res, next) => {
+router.get('/requests/:id(\\d+)', async (req, res, next) => {
   try {
     const request = await getMaintenanceRequestDetail(req.params.id);
     if (!request) return res.status(404).json({ ok: false, error: 'Request not found' });
@@ -2884,7 +2903,7 @@ router.get('/requests/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/requests/:id/status', async (req, res, next) => {
+router.patch('/requests/:id(\\d+)/status', async (req, res, next) => {
   try {
     const { status, reviewNote, notify = true } = req.body || {};
     if (status && !['submitted', 'approved', 'denied', 'converted', 'closed'].includes(status)) {
@@ -2897,7 +2916,7 @@ router.patch('/requests/:id/status', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.patch('/requests/:id/asset', async (req, res, next) => {
+router.patch('/requests/:id(\\d+)/asset', async (req, res, next) => {
   try {
     const request = await linkRequestToAsset(req.params.id, req.body?.assetId || null);
     if (!request) return res.status(404).json({ ok: false, error: 'Request not found' });
@@ -2906,7 +2925,7 @@ router.patch('/requests/:id/asset', async (req, res, next) => {
 });
 
 // The one deliberate bridge from Requests into Work Orders. Never automatic.
-router.post('/requests/:id/convert', async (req, res, next) => {
+router.post('/requests/:id(\\d+)/convert', async (req, res, next) => {
   try {
     const result = await convertRequestToWorkOrder(req.params.id, { scheduledDate: req.body?.scheduledDate });
     if (!result) return res.status(404).json({ ok: false, error: 'Request not found' });
@@ -2915,12 +2934,12 @@ router.post('/requests/:id/convert', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.get('/requests/:id/messages', async (req, res, next) => {
+router.get('/requests/:id(\\d+)/messages', async (req, res, next) => {
   try { res.json({ messages: await listRequestMessages(req.params.id) }); } catch (e) { next(e); }
 });
 
 // Free-form email from inside the app — "or allow me to email from inside."
-router.post('/requests/:id/messages', async (req, res, next) => {
+router.post('/requests/:id(\\d+)/messages', async (req, res, next) => {
   try {
     const { subject, body } = req.body || {};
     if (!subject?.trim() || !body?.trim()) return res.status(400).json({ ok: false, error: 'subject and body are required' });

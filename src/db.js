@@ -2567,7 +2567,6 @@ export async function completeWorkOrder(woId) {
       appliedIds.push(u.id);
     }
     await changeWorkOrderStatus(client, woId, await resolveWorkOrderStatusId('Done'), {});
-    await clearBoardFocusOnResolve(client, 'work_order', woId);
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK');
@@ -3119,6 +3118,7 @@ function jobLineRowShape(r) {
     Complaint: r.complaint, CauseNote: r.cause_note, Correction: r.correction,
     BlockedReason: r.blocked_reason, BlockedSince: r.blocked_since, CompletedDate: r.completed_date,
     ConditionFindingId: r.condition_finding_id,
+    BoardFocus: r.board_focus, BoardFocusSetAt: r.board_focus_set_at,
     // Grid-only rendering metadata (§3): which cascade columns this line had
     // PINNED when it was last saved. The real columns above are always fully
     // stamped, so nothing outside the grid ever needs to read this.
@@ -3193,43 +3193,10 @@ export async function createJobLine(woId, {
 // to it — automatic, no note, because linking IS the decision (something is
 // now going to happen to it). Only fires from Open; a finding already
 // Resolved/Deferred/Dismissed doesn't get silently reopened by a later link.
-// A featured flag clears itself the moment the thing stops being outstanding (§2).
-// Recorded in the work order's log where there is one, so the flag disappearing is
-// explained rather than just noticed.
-async function clearBoardFocusOnResolve(client, kind, id) {
-  if (kind === 'job_line') {
-    const { rows } = await client.query(
-      `UPDATE job_lines SET board_focus = false, board_focus_set_at = NULL
-       WHERE id = $1 AND board_focus RETURNING work_order_id, title`, [id]
-    );
-    if (rows[0]) {
-      await client.query(
-        `INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)`,
-        [rows[0].work_order_id, `Board feature cleared automatically — "${rows[0].title}" was completed`, currentUsername()]
-      );
-    }
-    return;
-  }
-  if (kind === 'work_order') {
-    const { rows } = await client.query(
-      `UPDATE work_orders SET board_focus = false, board_focus_set_at = NULL
-       WHERE id = $1 AND board_focus RETURNING id`, [id]
-    );
-    if (rows[0]) {
-      await client.query(
-        `INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)`,
-        [id, 'Board feature cleared automatically — work order completed', currentUsername()]
-      );
-    }
-    return;
-  }
-  if (kind === 'finding') {
-    await client.query(
-      `UPDATE condition_findings SET board_focus = false, board_focus_set_at = NULL
-       WHERE id = $1 AND board_focus`, [id]
-    );
-  }
-}
+// The board-report flag used to be cleared here, the moment a WO, line or finding
+// resolved. It no longer is: "Include on board report" means the board still owes this
+// a look, which completing the work does not answer — publishing a report that carries
+// it does. publishBoardReport clears it; nothing else does.
 
 async function autoScheduleFindingIfLinked(queryable, findingId) {
   await queryable.query(`UPDATE condition_findings SET status = 'Scheduled' WHERE id = $1 AND status = 'Open'`, [findingId]);
@@ -3245,7 +3212,6 @@ async function autoResolveLinkedFinding(client, jobLineId) {
   const { rows } = await client.query('SELECT condition_finding_id FROM job_lines WHERE id = $1', [jobLineId]);
   const findingId = rows[0]?.condition_finding_id;
   if (!findingId) return;
-  await clearBoardFocusOnResolve(client, 'finding', findingId);
   const { rows: curRows } = await client.query('SELECT status, gcal_event_id FROM condition_findings WHERE id = $1', [findingId]);
   const cur = curRows[0];
   await client.query(`UPDATE condition_findings SET status = 'Resolved' WHERE id = $1`, [findingId]);
@@ -3298,10 +3264,6 @@ async function changeJobLineStatus(client, jobLineId, newStatusId, { statusNote 
   await client.query(`UPDATE job_lines SET ${setCols.join(', ')} WHERE id = $1`, vals);
   if (newStatus.counts_as_work_performed) {
     await autoResolveLinkedFinding(client, jobLineId);
-    // The featured flag means "the board should see this because it is outstanding".
-    // Once it is done it stops being outstanding and appears in Done through the
-    // ordinary rule, so the flag clears itself rather than lingering (§2).
-    await clearBoardFocusOnResolve(client, 'job_line', jobLineId);
   }
   const noteText = statusNote?.trim()
     ? `Job line "${cur.title}" → ${newStatus.name}: ${statusNote.trim()}`
@@ -3342,7 +3304,7 @@ const JOB_LINE_UPDATE_COLUMNS = [
   'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost', 'scheduled_date',
   'scheduled_start_time', 'scheduled_duration_hours',
   'complaint', 'cause_note', 'correction', 'blocked_reason', 'blocked_since', 'completed_date',
-  'condition_finding_id',
+  'condition_finding_id', 'board_focus', 'board_focus_set_at',
 ];
 // Any of these changing is a calendar-visible move — the job-line edit
 // form's Scheduled Date field and the Calendar's drag-to-reschedule both
@@ -4586,49 +4548,144 @@ export async function computeBoardReportAggregates(reportId) {
   return listBoardReportAggregates(reportId);
 }
 
-// Search for anything that can go on a report, regardless of status or date (§3). The
-// suggestion rules decide what is PROPOSED; this exists so no rule can keep something
-// off a report that belongs on it.
-export async function searchBoardReportCandidates(q, limit = 30) {
-  const like = `%${q}%`;
-  const [wos, lines, findings, tasks] = await Promise.all([
+// Everything that could go on a report, regardless of status or date (§3). The
+// suggestion rules decide what is PROPOSED; this decides what is POSSIBLE, so no rule
+// can keep something off a report that belongs on it.
+//
+// No text filter and no limit: the Add-item panel opens on the whole list and narrows
+// it in the browser, which is what makes typing feel instant and costs one request
+// instead of one per keystroke. Each row carries where it is already used, so "only
+// things I haven't used yet" is a filter over this list rather than a second query.
+export async function listBoardReportCandidates(reportId = null) {
+  const [wos, lines, findings, tasks, onDraft, published] = await Promise.all([
     pool.query(
-      `SELECT w.id, w.title, ws.name AS status, a.name AS asset_name
-       FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id
+      `SELECT w.id, w.wo_number, w.title, ws.name AS status, ws.is_terminal,
+              w.date_completed::text AS completed_date, w.board_focus,
+              COALESCE(a.name, l.name) AS place
+       FROM work_orders w
+       JOIN work_order_statuses ws ON ws.id = w.status_id
        LEFT JOIN assets a ON a.id = w.asset_id
-       WHERE w.title ILIKE $1 ORDER BY w.id DESC LIMIT $2`, [like, limit]),
+       LEFT JOIN locations l ON l.id = w.location_id
+       ORDER BY w.id DESC`),
     pool.query(
-      `SELECT jl.id, jl.title, s.name AS status, w.id AS work_order_id, w.title AS wo_title,
+      `SELECT jl.id, jl.title, s.name AS status, s.counts_as_work_performed, s.is_terminal,
               COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date,
               (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
-              jl.actual_hours, jl.estimated_cost, a.name AS asset_name
-       FROM job_lines jl JOIN job_line_statuses s ON s.id = jl.status_id
+              jl.scheduled_date::text AS scheduled_date, jl.board_focus,
+              jl.actual_hours, COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost,
+              w.id AS work_order_id, w.wo_number, w.title AS wo_title,
+              COALESCE(a.name, l.name) AS place
+       FROM job_lines jl
+       JOIN job_line_statuses s ON s.id = jl.status_id
        JOIN work_orders w ON w.id = jl.work_order_id
        LEFT JOIN assets a ON a.id = w.asset_id
-       WHERE jl.title ILIKE $1 ORDER BY jl.id DESC LIMIT $2`, [like, limit]),
+       LEFT JOIN locations l ON l.id = w.location_id
+       LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+       ORDER BY jl.id DESC`),
     pool.query(
-      `SELECT cf.id, cf.title, cf.status, cf.estimated_cost, a.name AS asset_name
-       FROM condition_findings cf LEFT JOIN assets a ON a.id = cf.asset_id
-       WHERE cf.title ILIKE $1 ORDER BY cf.id DESC LIMIT $2`, [like, limit]),
+      `SELECT cf.id, cf.title, cf.status, cf.severity, cf.estimated_cost, cf.board_focus,
+              cf.date_identified::text AS date_identified,
+              COALESCE(a.name, l.name) AS place
+       FROM condition_findings cf
+       LEFT JOIN assets a ON a.id = cf.asset_id
+       LEFT JOIN locations l ON l.id = cf.location_id
+       ORDER BY cf.id DESC`),
+    pool.query(`${ADMIN_TASK_SELECT} ORDER BY t.task_date DESC NULLS LAST, t.id DESC`),
+    // Already on THIS draft — including rows sitting unchecked, because proposing to
+    // add something that is already sitting on the screen is noise either way.
+    reportId
+      ? pool.query('SELECT item_type, item_id FROM board_report_items WHERE report_id = $1', [reportId])
+      : Promise.resolve({ rows: [] }),
+    // Already reached the board. Newest first so a thing reported twice reads as the
+    // most recent time it went out.
     pool.query(
-      `${ADMIN_TASK_SELECT} WHERE t.title ILIKE $1 ORDER BY t.id DESC LIMIT $2`, [like, limit]),
+      `SELECT bi.item_type, bi.item_id,
+              to_char(COALESCE(br.period_end, br.published_at::date), 'FMMonth YYYY') AS label
+       FROM board_report_items bi
+       JOIN board_reports br ON br.id = bi.report_id
+       WHERE br.status = 'published'
+       ORDER BY br.published_at DESC NULLS LAST, br.id DESC`),
   ]);
+
+  const draftKeys = new Set(onDraft.rows.map((r) => `${r.item_type}:${r.item_id}`));
+  const reportedOn = new Map();
+  for (const r of published.rows) {
+    const k = `${r.item_type}:${r.item_id}`;
+    if (!reportedOn.has(k)) reportedOn.set(k, r.label);
+  }
+  const mark = (c) => {
+    const k = `${c.ItemType}:${c.ItemId}`;
+    c.OnThisReport = draftKeys.has(k);
+    c.ReportedOn = reportedOn.get(k) || null;
+    return c;
+  };
+
   return [
-    ...wos.rows.map((r) => ({ ItemType: 'work_order', ItemId: r.id, Title: r.title,
-      Subtitle: r.asset_name, Status: r.status })),
-    ...lines.rows.map((r) => ({ ItemType: 'job_line', ItemId: r.id, Title: r.title,
+    ...wos.rows.map((r) => mark({
+      ItemType: 'work_order', ItemId: r.id, Title: r.title,
+      WoNumber: r.wo_number, Place: r.place, Status: r.status,
+      Completed: r.is_terminal, CompletedDate: r.completed_date,
+      Subtitle: r.place, Date: r.completed_date, Flagged: r.board_focus,
+    })),
+    ...lines.rows.map((r) => mark({
+      ItemType: 'job_line', ItemId: r.id, Title: r.title,
+      WoNumber: r.wo_number, Place: r.place, Status: r.status,
+      Completed: r.counts_as_work_performed,
+      CompletedDate: r.counts_as_work_performed ? r.completed_date : null,
       Subtitle: r.date_inferred ? `${r.wo_title} · date not recorded` : r.wo_title,
-      Status: r.status, ParentWorkOrderId: r.work_order_id, AssetName: r.asset_name,
-      Date: r.completed_date, Hours: r.actual_hours, Cost: r.estimated_cost })),
-    ...findings.rows.map((r) => ({ ItemType: 'condition_finding', ItemId: r.id, Title: r.title,
-      Subtitle: r.asset_name, Status: r.status, Cost: r.estimated_cost })),
-    ...tasks.rows.map((r) => { const t = adminTaskRowShape(r); return {
-      ItemType: 'admin_task', ItemId: t.Id, Title: t.Title, Subtitle: t.CategoryName,
-      Status: t.StatusName, Date: t.TaskDate, Hours: t.Hours }; }),
+      ParentWorkOrderId: r.work_order_id, AssetName: r.place,
+      Date: r.counts_as_work_performed ? r.completed_date : r.scheduled_date,
+      Hours: r.actual_hours != null ? Number(r.actual_hours) : null,
+      Cost: r.cost != null ? Number(r.cost) : null, Flagged: r.board_focus,
+    })),
+    ...findings.rows.map((r) => mark({
+      ItemType: 'condition_finding', ItemId: r.id, Title: r.title,
+      WoNumber: null, Place: r.place, Status: r.status || 'Open',
+      Completed: r.status === 'Resolved', CompletedDate: null,
+      Subtitle: r.severity, AssetName: r.place, Date: r.date_identified,
+      Cost: r.estimated_cost != null ? Number(r.estimated_cost) : null, Flagged: r.board_focus,
+    })),
+    ...tasks.rows.map((r) => { const t = adminTaskRowShape(r); return mark({
+      ItemType: 'admin_task', ItemId: t.Id, Title: t.Title,
+      WoNumber: null, Place: t.CategoryName, Status: t.StatusName,
+      Completed: !!t.StatusCountsAsWorkPerformed,
+      CompletedDate: t.StatusCountsAsWorkPerformed ? t.TaskDate : null,
+      Subtitle: t.CategoryName, Date: t.TaskDate, Hours: t.Hours,
+    }); }),
   ];
 }
 
-// Adds a searched item to the draft. Marked manually_added AND user_touched, so a
+// Is this thing finished? One place, so the Add-item panel, the hand-add and the
+// flag rule all agree on what "completed" means per type rather than each deciding.
+// Read from the live row, never from what the client posted — the browser's copy of a
+// status can be a minute old, and the section an item lands in must not depend on that.
+export async function boardItemCompletion(itemType, itemId) {
+  const q = {
+    work_order: `SELECT ws.is_terminal AS completed, w.date_completed::text AS completed_date
+                 FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
+    job_line: `SELECT s.counts_as_work_performed AS completed,
+                      COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date
+               FROM job_lines jl JOIN job_line_statuses s ON s.id = jl.status_id WHERE jl.id = $1`,
+    condition_finding: `SELECT (status = 'Resolved') AS completed, NULL::text AS completed_date
+                        FROM condition_findings WHERE id = $1`,
+    admin_task: `SELECT s.counts_as_work_performed AS completed, t.task_date::text AS completed_date
+                 FROM admin_tasks t JOIN admin_task_statuses s ON s.id = t.status_id WHERE t.id = $1`,
+  }[itemType];
+  if (!q) return { completed: false, completedDate: null };
+  const { rows } = await pool.query(q, [itemId]);
+  return { completed: !!rows[0]?.completed, completedDate: rows[0]?.completed_date ?? null };
+}
+
+// Done if the work is finished, Coming Up if it isn't — admin work keeps its own
+// section either way, because that's how the report is laid out rather than a
+// statement about whether the task is finished.
+export async function boardSectionFor(itemType, itemId) {
+  if (itemType === 'admin_task') return 'admin_work';
+  const { completed } = await boardItemCompletion(itemType, itemId);
+  return completed ? 'done' : 'coming_up';
+}
+
+// Adds a chosen item to the draft. Marked manually_added AND user_touched, so a
 // suggestion refresh can neither remove it nor pretend it proposed it.
 export async function addBoardReportItemManually(reportId, item) {
   const report = await getBoardReport(reportId);
@@ -4636,7 +4693,7 @@ export async function addBoardReportItemManually(reportId, item) {
   if (report.Status === 'published') {
     const e = new Error('Published reports are read-only'); e.status = 409; throw e;
   }
-  const section = item.section || (item.ItemType === 'admin_task' ? 'admin_work' : 'done');
+  const section = item.section || await boardSectionFor(item.ItemType, item.ItemId);
   // No pass token: a hand-added item belongs to no suggestion pass, and the prune
   // skips it anyway on manually_added.
   await upsertBoardReportItem(reportId, {
@@ -4798,25 +4855,6 @@ async function suggestComingUp(reportId, passId, reported, { forwardStart, forwa
   return rows.length;
 }
 
-// Findings flagged "Feature on board report" — no date at all, which is the point:
-// a deferred finding belongs in front of the board precisely because nothing is
-// scheduled for it.
-async function suggestFeaturedFindings(reportId, passId, reported) {
-  const { rows } = await pool.query(
-    `SELECT cf.id, cf.title, cf.estimated_cost, cf.severity, cf.status, a.name AS asset_name
-     FROM condition_findings cf LEFT JOIN assets a ON a.id = cf.asset_id
-     WHERE cf.board_focus = true ORDER BY cf.id DESC`
-  );
-  for (const [i, r] of rows.entries()) {
-    if (reported.has(reportedKey('condition_finding', r.id))) continue;
-    await upsertBoardReportItem(reportId, { passId,
-      itemType: 'condition_finding', itemId: r.id, section: 'coming_up', sortIndex: 1000 + i,
-      snapTitle: r.title, snapSubtitle: r.severity, snapAssetName: r.asset_name,
-      snapStatus: r.status, snapCost: r.estimated_cost,
-    });
-  }
-  return rows.length;
-}
 
 // Calendar events whose TYPE is opted in, plus scheduler occurrences projected from
 // the recurrence machinery. listCalendarEventOccurrences is a pure read that already
@@ -4859,6 +4897,133 @@ async function suggestCalendarAndProjections(reportId, passId, reported, { forwa
   return n;
 }
 
+// "Include on board report" — the flag, under its current meaning (§3). It is not a
+// statement about dates or about the future; it means put this in front of the board,
+// and the item's own state decides which section that is:
+//
+//   flagged AND finished  -> Done, whatever the period dates say. This is the case the
+//                            date rules structurally cannot reach: they key off job
+//                            LINE completion, so a work order closed at the WO level,
+//                            or work finished outside the window, was invisible.
+//   flagged AND open      -> Coming Up, on every draft, until it is finished.
+//
+// The flag survives completion — it is cleared by publishBoardReport when a report
+// carrying the item actually goes out, so "flagged" reliably means "still owed to the
+// board" rather than "not done yet."
+//
+// Runs LAST in the pass so its section wins: upsert assigns section unconditionally,
+// and a flag is a more deliberate statement than any date rule.
+async function suggestFlaggedItems(reportId, passId, reported) {
+  const monthOf = (d) => new Date(d).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  let n = 0;
+
+  const { rows: wos } = await pool.query(
+    `SELECT w.id, w.title, ws.name AS status, ws.is_terminal,
+            w.date_completed::text AS completed_date, w.board_focus_set_at,
+            COALESCE(a.name, l.name) AS place
+     FROM work_orders w
+     JOIN work_order_statuses ws ON ws.id = w.status_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN locations l ON l.id = w.location_id
+     WHERE w.board_focus ORDER BY w.id DESC`
+  );
+  for (const [i, r] of wos.entries()) {
+    if (reported.has(reportedKey('work_order', r.id))) continue;
+    await upsertBoardReportItem(reportId, { passId,
+      itemType: 'work_order', itemId: r.id,
+      section: r.is_terminal ? 'done' : 'coming_up', sortIndex: 3000 + i,
+      snapTitle: r.title, snapAssetName: r.place, snapStatus: r.status,
+      snapDate: r.is_terminal ? r.completed_date : null,
+      // "Featured since March" stays on open items so a stale flag reads as stale;
+      // on finished work the flag is about to clear itself, so it says nothing.
+      snapSubtitle: !r.is_terminal && r.board_focus_set_at ? `featured since ${monthOf(r.board_focus_set_at)}` : null,
+    });
+    n += 1;
+    // A flagged, finished work order brings its finished lines with it, so Done shows
+    // the work rather than a bare header. Lines still open are left alone: they have
+    // not happened, and the WO's own flag doesn't make them Done.
+    if (r.is_terminal) {
+      const { rows: kids } = await pool.query(
+        `SELECT jl.id, jl.title, s.name AS status_name,
+                COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date,
+                (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
+                jl.actual_hours, COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost
+         FROM job_lines jl
+         JOIN job_line_statuses s ON s.id = jl.status_id
+         LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+         WHERE jl.work_order_id = $1 AND s.counts_as_work_performed
+         ORDER BY jl.sort_order, jl.id`, [r.id]
+      );
+      for (const [k, c] of kids.entries()) {
+        if (reported.has(reportedKey('job_line', c.id))) continue;
+        await upsertBoardReportItem(reportId, { passId,
+          itemType: 'job_line', itemId: c.id, section: 'done', sortIndex: 3000 + i + k,
+          parentWorkOrderId: r.id, snapTitle: c.title,
+          snapSubtitle: c.date_inferred ? `${r.title} · date not recorded` : r.title,
+          snapAssetName: r.place, snapStatus: c.status_name, snapDate: c.completed_date,
+          snapHours: c.actual_hours, snapCost: c.cost,
+        });
+        n += 1;
+      }
+    }
+  }
+
+  const { rows: lines } = await pool.query(
+    `SELECT jl.id, jl.title, s.name AS status, s.counts_as_work_performed,
+            COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date,
+            (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
+            jl.scheduled_date::text AS scheduled_date, jl.board_focus_set_at,
+            jl.actual_hours, COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost,
+            w.id AS work_order_id, w.title AS wo_title, COALESCE(a.name, l.name) AS place
+     FROM job_lines jl
+     JOIN job_line_statuses s ON s.id = jl.status_id
+     JOIN work_orders w ON w.id = jl.work_order_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN locations l ON l.id = w.location_id
+     LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+     WHERE jl.board_focus ORDER BY jl.id DESC`
+  );
+  for (const [i, r] of lines.entries()) {
+    if (reported.has(reportedKey('job_line', r.id))) continue;
+    const done = r.counts_as_work_performed;
+    const stale = !done && r.board_focus_set_at ? ` · featured since ${monthOf(r.board_focus_set_at)}` : '';
+    await upsertBoardReportItem(reportId, { passId,
+      itemType: 'job_line', itemId: r.id,
+      section: done ? 'done' : 'coming_up', sortIndex: 3500 + i,
+      parentWorkOrderId: r.work_order_id, snapTitle: r.title,
+      snapSubtitle: `${r.wo_title}${done && r.date_inferred ? ' · date not recorded' : stale}`,
+      snapAssetName: r.place, snapStatus: r.status,
+      snapDate: done ? r.completed_date : r.scheduled_date,
+      snapHours: r.actual_hours, snapCost: r.cost,
+    });
+    n += 1;
+  }
+
+  const { rows: findings } = await pool.query(
+    `SELECT cf.id, cf.title, cf.severity, cf.status, cf.estimated_cost, cf.board_focus_set_at,
+            COALESCE(a.name, l.name) AS place
+     FROM condition_findings cf
+     LEFT JOIN assets a ON a.id = cf.asset_id
+     LEFT JOIN locations l ON l.id = cf.location_id
+     WHERE cf.board_focus ORDER BY cf.id DESC`
+  );
+  for (const [i, r] of findings.entries()) {
+    if (reported.has(reportedKey('condition_finding', r.id))) continue;
+    const done = r.status === 'Resolved';
+    await upsertBoardReportItem(reportId, { passId,
+      itemType: 'condition_finding', itemId: r.id,
+      section: done ? 'done' : 'coming_up', sortIndex: 4000 + i,
+      snapTitle: r.title,
+      snapSubtitle: !done && r.board_focus_set_at
+        ? `${r.severity || ''}${r.severity ? ' · ' : ''}featured since ${monthOf(r.board_focus_set_at)}`
+        : r.severity,
+      snapAssetName: r.place, snapStatus: r.status, snapCost: r.estimated_cost,
+    });
+    n += 1;
+  }
+  return n;
+}
+
 // One pass over every rule. Safe to re-run — that's what makes changing the period on
 // the screen cheap, and why upsert never clobbers a decision.
 export async function refreshBoardReportSuggestions(reportId) {
@@ -4881,8 +5046,10 @@ export async function refreshBoardReportSuggestions(reportId) {
     done: await suggestDoneJobLines(reportId, passId, reported, periods),
     adminWork: await suggestAdminTasks(reportId, passId, reported, periods),
     comingUp: await suggestComingUp(reportId, passId, reported, periods),
-    featured: await suggestFeaturedFindings(reportId, passId, reported),
     calendar: await suggestCalendarAndProjections(reportId, passId, reported, periods),
+    // Last: a flag is the most deliberate statement there is about an item, so its
+    // section overrides whatever a date rule put the same row in.
+    flagged: await suggestFlaggedItems(reportId, passId, reported),
   };
   // Drop what the current period no longer suggests — but only where the user never
   // decided anything about it. An unchecked row, a board note, or an itemized work
@@ -4898,6 +5065,10 @@ export async function refreshBoardReportSuggestions(reportId) {
     counts,
     prunedCount: pruned.length,
     items: await listBoardReportItems(reportId),
+    // The money header is period-bounded, so it is as much a function of the dates as
+    // the item list is. Recomputing it here is what makes "Refresh" mean the whole
+    // screen rather than only the parts made of items.
+    aggregates: await computeBoardReportAggregates(reportId),
   };
 }
 
@@ -5140,6 +5311,41 @@ export async function publishBoardReport(id) {
   try {
     await client.query('BEGIN');
     await client.query('DELETE FROM board_report_items WHERE report_id = $1 AND NOT included', [id]);
+    // Publishing is what the flag was waiting for. "Include on board report" means the
+    // board still owes a look at this; once a report carrying it has actually gone out,
+    // that's answered — so the flag clears here, and ONLY here. It deliberately does
+    // not clear when the work finishes: flagging completed work is a main use of the
+    // flag, and clearing on completion made that impossible to hold onto.
+    //
+    // Runs after the delete above, so only items that were still checked — the ones the
+    // board actually saw — clear their flag. An item considered and cut stays flagged
+    // and comes back on the next draft.
+    const cleared = {};
+    for (const [type, table] of [['work_order', 'work_orders'], ['job_line', 'job_lines'],
+      ['condition_finding', 'condition_findings']]) {
+      const { rows } = await client.query(
+        `UPDATE ${table} SET board_focus = false, board_focus_set_at = NULL
+         WHERE board_focus AND id IN (
+           SELECT item_id FROM board_report_items WHERE report_id = $1 AND item_type = $2
+         ) RETURNING id`, [id, type]
+      );
+      cleared[type] = rows.map((r) => r.id);
+    }
+    // Recorded in the work order log where there is one, so a flag disappearing is
+    // explained rather than just noticed.
+    for (const woId of cleared.work_order) {
+      await client.query(
+        `INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)`,
+        [woId, `Board report flag cleared — included on the published report "${cur.Title}"`, currentUsername()]
+      );
+    }
+    for (const lineId of cleared.job_line) {
+      await client.query(
+        `INSERT INTO work_order_log_entries (work_order_id, note, username)
+         SELECT jl.work_order_id, $2, $3 FROM job_lines jl WHERE jl.id = $1`,
+        [lineId, `Board report flag cleared — included on the published report "${cur.Title}"`, currentUsername()]
+      );
+    }
     await client.query(
       `UPDATE board_reports SET status = 'published', published_at = now() WHERE id = $1`, [id]
     );

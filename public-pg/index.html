@@ -78,6 +78,56 @@
     @keyframes modalPopIn { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
     .reveal { margin-left: 16px; padding-left: 12px; border-left: 2px solid var(--border); }
 
+    /* Add-item panel (board report) — a full list you scan and narrow, not a search
+       box you have to guess the right words for. One grid on desktop; the same rows
+       restack into labelled cards on a phone rather than scrolling sideways. */
+    .addpanel { max-width: 960px; width: 100%; max-height: 88vh; padding: 0; display: flex; flex-direction: column; }
+    .addpanel-head { padding: 16px 18px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .addpanel-body { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 0 18px 4px; -webkit-overflow-scrolling: touch; }
+    .addpanel-foot { padding: 12px 18px; border-top: 1px solid var(--border); display: flex; gap: 12px; align-items: center; flex-wrap: wrap; flex-shrink: 0; }
+    .addpanel-q { width: 100%; margin-top: 12px; }
+    .addpanel-filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+    .addpanel-type { padding: 5px 12px; font-size: 0.82rem; }
+    .addpanel-type.selected { background: var(--accent-soft); color: var(--accent-dark); font-weight: 700; }
+    .addpanel-group-title {
+      margin: 16px 0 0; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em;
+      color: var(--muted); font-weight: 700;
+    }
+    .addrow {
+      display: grid; grid-template-columns: 24px minmax(0, 1fr) 86px 150px 116px 104px;
+      gap: 10px; align-items: center; padding: 9px 4px; border-bottom: 1px solid var(--border);
+    }
+    .addrow-head {
+      position: sticky; top: 0; z-index: 1; background: var(--surface);
+      font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;
+      color: var(--muted); font-weight: 700; border-bottom: 1px solid var(--border);
+    }
+    .addrow-pick { cursor: pointer; }
+    .addrow-pick:hover { background: var(--surface-alt); }
+    .addrow input[type="checkbox"] { width: 18px; height: 18px; margin: 0; }
+    .addcell { min-width: 0; overflow-wrap: anywhere; font-size: 0.88rem; }
+    .addcell-meta { color: var(--muted); font-size: 0.82rem; }
+    .addrow-used { opacity: 0.62; }
+    .addpanel-badge {
+      display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px;
+      background: var(--surface-alt); color: var(--muted); font-size: 0.7rem; font-weight: 600;
+      white-space: nowrap;
+    }
+    @media (max-width: 760px) {
+      .addpanel { max-height: 94vh; }
+      .addpanel-head, .addpanel-body, .addpanel-foot { padding-left: 14px; padding-right: 14px; }
+      .addrow-head { display: none; }
+      .addrow { grid-template-columns: 24px minmax(0, 1fr); gap: 6px 10px; padding: 11px 2px; }
+      /* Every cell after the checkbox and title drops into the second column, where
+         it has to say what it is — a bare "47" under a title means nothing. */
+      .addrow > .addcell-meta { grid-column: 2; }
+      .addrow > .addcell-meta:empty { display: none; }
+      .addrow > .addcell-meta[data-label]::before {
+        content: attr(data-label) ": "; color: var(--muted); font-weight: 600;
+      }
+      .addpanel-foot .btn { flex: 1; }
+    }
+
     /* Text links inside tables (e.g. Locations grid view) — themed accent
        color instead of the browser's default blue, which read poorly
        against the dark theme's background. */

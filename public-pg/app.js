@@ -1980,7 +1980,7 @@ async function renderAssetDetail({ id }, container = app) {
           <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             <span class="pill">${escapeHtml(f.Severity || '')}</span>
             <span class="pill">${escapeHtml(f.Status || 'Open')}</span>
-            <button type="button" class="btn btn-secondary toggle-board-focus" data-id="${f.Id}" data-next="${!f.BoardFocus}" style="padding:2px 8px;font-size:0.75rem;${f.BoardFocus ? 'background:#f0f2fb' : ''}">${f.BoardFocus ? '★ Board Focus' : '☆ Flag for Board'}</button>
+            <button type="button" class="btn btn-secondary toggle-board-focus" data-id="${f.Id}" data-next="${!f.BoardFocus}" title="Put this on the next board report draft, whatever the dates say" style="padding:2px 8px;font-size:0.75rem;${f.BoardFocus ? 'background:#f0f2fb' : ''}">${f.BoardFocus ? '★ On board report' : '☆ Include on board report'}</button>
             ${!decided ? `<button type="button" class="btn btn-secondary finding-defer-toggle" data-id="${f.Id}" style="padding:2px 8px;font-size:0.75rem">Defer</button>
             <button type="button" class="btn btn-secondary finding-dismiss-toggle" data-id="${f.Id}" style="padding:2px 8px;font-size:0.75rem">Dismiss</button>` : ''}
           </span>
@@ -3044,7 +3044,7 @@ function initMapEditor({ pins, features, layers }) {
         <div style="font-weight:700;font-size:0.95rem;margin-bottom:2px">${escapeHtml(p.name)}</div>
         <div class="muted" style="margin-bottom:10px">${escapeHtml(p.category || 'Asset')}${p.locationName ? ' · ' + escapeHtml(p.locationName) : ''}</div>
         <div class="map-info-row"><span class="map-legend-dot" style="background:${MAP_SEVERITY_COLORS[bucket]}"></span><span style="font-size:0.82rem">${escapeHtml(sevLabel)}${p.openFindingCount ? ` (${p.openFindingCount} open)` : ''}</span></div>
-        ${p.boardFocus ? '<div class="map-info-row" style="color:#a4801a;font-size:0.8rem">🏳 Flagged for board report</div>' : ''}
+        ${p.boardFocus ? '<div class="map-info-row" style="color:#a4801a;font-size:0.8rem">🏳 Included on board report</div>' : ''}
         ${p.holderName ? `<div class="map-info-row" style="font-size:0.8rem">🏠 Held by ${escapeHtml(p.holderName)}</div>` : ''}
         <button type="button" class="btn btn-secondary" id="mapGoAsset" style="width:100%;margin-top:6px">View asset →</button>
         <button type="button" class="btn btn-danger" id="mapRemovePin" style="width:100%;margin-top:8px">Remove from map</button>`;
@@ -4711,7 +4711,7 @@ async function renderAdminTaskDetail({ id } = {}) {
           <p class="muted" style="margin-top:2px;font-size:0.8rem">Only when the task eliminated or reduced a recurring cost — e.g. a cancelled $45/month subscription. The report totals it monthly and annualized.</p>
         </div>
         <div class="field-row">
-          <label class="skill-chip ${task?.IncludeInBoardReport !== false ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="includeInBoardReport" style="margin-right:6px" ${task?.IncludeInBoardReport !== false ? 'checked' : ''} />Include in board report</label>
+          <label class="skill-chip ${task?.IncludeInBoardReport !== false ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="includeInBoardReport" style="margin-right:6px" ${task?.IncludeInBoardReport !== false ? 'checked' : ''} />Include on board report</label>
         </div>
         <div class="btn-row">
           <button class="btn btn-primary" type="submit">Save</button>
@@ -5394,11 +5394,20 @@ async function renderBoardReport() {
   async function refresh() {
     busy = true; draw();
     try {
+      const before = items.length;
       const r = await api(`/api/pg/board-reports/${report.Id}/refresh`, { method: 'POST' });
       items = r.items || [];
-      const d = await api(`/api/pg/board-reports/${report.Id}`);
-      aggregates = d.aggregates || [];
-      if (r.prunedCount) toast(`${r.prunedCount} item(s) no longer match this period`);
+      // The refresh recomputes the aggregates itself now, so they come back with the
+      // items rather than needing a second request for a table nothing had rewritten.
+      aggregates = r.aggregates || aggregates;
+      // Always say something. A refresh that changes nothing is a real, common and
+      // perfectly good outcome — but silence makes it indistinguishable from a broken
+      // button, which is exactly how the unwired button read for so long.
+      const added = items.length - before + (r.prunedCount || 0);
+      const bits = [];
+      if (added > 0) bits.push(`${added} added`);
+      if (r.prunedCount) bits.push(`${r.prunedCount} no longer match this period`);
+      toast(bits.length ? `Suggestions refreshed — ${bits.join(', ')}` : 'Suggestions refreshed — nothing changed');
     } catch (e) { toast(e.message, 5000); }
     busy = false; draw();
   }
@@ -5423,6 +5432,11 @@ async function renderBoardReport() {
   }
 
   function wire(published) {
+    // Wired here and nowhere else. The button existed from the first version of this
+    // screen but was never bound to anything: refresh() was only ever reached by
+    // changing one of the four dates, so clicking Refresh genuinely did nothing —
+    // no request, no error, nothing in the console to explain it (0094).
+    document.getElementById('brRefresh')?.addEventListener('click', refresh);
     document.getElementById('brAddItem')?.addEventListener('click', () => openAddReportItem(report.Id, async () => {
       const d = await api(`/api/pg/board-reports/${report.Id}`);
       items = d.items; aggregates = d.aggregates; draw();
@@ -5515,8 +5529,10 @@ async function renderBoardReport() {
   // First open of a fresh draft has nothing in it yet; fill it before drawing so the
   // screen never appears empty for no reason.
   if (!items.length && report.Status === 'draft') {
-    try { const r = await api(`/api/pg/board-reports/${report.Id}/refresh`, { method: 'POST' }); items = r.items || []; } catch { /* draw empty */ }
-    try { const d = await api(`/api/pg/board-reports/${report.Id}`); aggregates = d.aggregates || []; } catch { /* ignore */ }
+    try {
+      const r = await api(`/api/pg/board-reports/${report.Id}/refresh`, { method: 'POST' });
+      items = r.items || []; aggregates = r.aggregates || [];
+    } catch { /* draw empty */ }
   }
   draw();
 }
@@ -5524,45 +5540,203 @@ async function renderBoardReport() {
 // Add anything to the draft, whatever its status or date (§3). The suggestion rules
 // decide what gets PROPOSED; this is the escape hatch that stops a rule from keeping
 // something off a report that belongs on it.
+//
+// A panel, not a search box: it opens on the whole list, because "what is there?" is
+// the question being asked and a box you have to type into can't answer it. The list
+// is fetched once and narrowed in the browser, so typing costs nothing and never races
+// a response. By default it shows only what hasn't been used — everything else is one
+// toggle away, labelled with where it went.
 async function openAddReportItem(reportId, onDone) {
+  const TYPES = [
+    { key: 'work_order', label: 'Work orders', short: 'WO' },
+    { key: 'job_line', label: 'Job lines', short: 'Line' },
+    { key: 'condition_finding', label: 'Findings', short: 'Finding' },
+    { key: 'admin_task', label: 'Admin tasks', short: 'Task' },
+  ];
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
-  overlay.innerHTML = `<div class="modal-box" style="max-width:560px;width:95%;max-height:84vh;overflow:auto">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <h3 style="margin:0">Add an item</h3>
-      <button type="button" class="btn btn-secondary modal-cancel">Done</button>
+  overlay.innerHTML = `<div class="modal-box addpanel" role="dialog" aria-modal="true" aria-label="Add to this report">
+    <div class="addpanel-head">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+        <div>
+          <h3 style="margin:0">Add to this report</h3>
+          <p class="muted" style="margin:4px 0 0;font-size:0.85rem">Everything on the books — work orders, job lines, findings and admin tasks, at any status and any date.</p>
+        </div>
+        <button type="button" class="btn btn-secondary addpanel-close">Close</button>
+      </div>
+      <input type="search" class="addpanel-q" placeholder="Filter — title, WO number, asset, status or date" autocomplete="off" />
+      <div class="addpanel-filters">
+        <button type="button" class="btn btn-secondary addpanel-type selected" data-type="all">All</button>
+        ${TYPES.map((t) => `<button type="button" class="btn btn-secondary addpanel-type" data-type="${t.key}">${t.label}</button>`).join('')}
+        <label class="skill-chip" style="cursor:pointer;display:inline-flex;align-items:center">
+          <input type="checkbox" class="addpanel-showused" style="margin-right:6px" />Show already used
+        </label>
+      </div>
     </div>
-    <p class="muted" style="margin:10px 0">Work orders, job lines, findings and admin tasks — any status, any date.</p>
-    <input type="search" id="addQ" placeholder="Search…" style="width:100%" />
-    <div id="addResults" style="margin-top:10px"></div>
+    <div class="addpanel-body"><p class="muted" style="padding:18px 0">Loading…</p></div>
+    <div class="addpanel-foot">
+      <button type="button" class="btn btn-primary addpanel-add" disabled>Add selected</button>
+      <span class="muted addpanel-count"></span>
+    </div>
   </div>`;
   document.body.appendChild(overlay);
-  const close = () => { overlay.remove(); if (onDone) onDone(); };
-  overlay.querySelector('.modal-cancel').addEventListener('click', close);
 
-  const KIND = { work_order: 'WO', job_line: 'Line', condition_finding: 'Finding', admin_task: 'Task' };
-  let timer;
-  const search = async () => {
-    const q = overlay.querySelector('#addQ').value.trim();
-    if (q.length < 2) { overlay.querySelector('#addResults').innerHTML = '<p class="muted">Type at least two characters.</p>'; return; }
-    const { candidates } = await api(`/api/pg/board-reports/candidates?q=${encodeURIComponent(q)}`);
-    overlay.querySelector('#addResults').innerHTML = candidates.length ? candidates.map((c, i) => `
-      <div class="list-item add-cand" data-i="${i}" style="cursor:pointer">
-        <div><span class="muted" style="font-size:0.78rem">${KIND[c.ItemType] || c.ItemType}</span> <strong>${escapeHtml(c.Title)}</strong></div>
-        <div class="muted" style="font-size:0.82rem">${escapeHtml([c.Subtitle, c.Status, c.Date].filter(Boolean).join(' · '))}</div>
-      </div>`).join('') : '<p class="muted">Nothing matches.</p>';
-    overlay.querySelectorAll('.add-cand').forEach((el) => el.addEventListener('click', async () => {
-      try {
-        await api(`/api/pg/board-reports/${reportId}/items`, {
-          method: 'POST', body: JSON.stringify({ item: candidates[Number(el.dataset.i)] }),
-        });
-        toast('Added to the draft');
-        el.style.opacity = '0.4';
-      } catch (e) { toast(e.message, 5000); }
-    }));
+  const $ = (sel) => overlay.querySelector(sel);
+  const body = $('.addpanel-body');
+  const addBtn = $('.addpanel-add');
+  const countEl = $('.addpanel-count');
+
+  let all = [];
+  let typeFilter = 'all';
+  let showUsed = false;
+  let query = '';
+  const selected = new Map();   // key -> the candidate object, so "Add selected" needs no re-lookup
+
+  const keyOf = (c) => `${c.ItemType}:${c.ItemId}`;
+  const usedLabel = (c) => (c.OnThisReport ? 'on this report' : (c.ReportedOn ? `reported ${c.ReportedOn}` : null));
+
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener('keydown', onKey);
+    overlay.remove();
+    if (onDone) onDone();
   };
-  overlay.querySelector('#addQ').addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(search, 250); });
-  setTimeout(() => overlay.querySelector('#addQ').focus(), 0);
+  function onKey(e) { if (e.key === 'Escape') close(); }
+  document.addEventListener('keydown', onKey);
+  $('.addpanel-close').addEventListener('click', close);
+  overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+
+  function visible() {
+    return all.filter((c) => {
+      if (typeFilter !== 'all' && c.ItemType !== typeFilter) return false;
+      if (!showUsed && c.Used) return false;
+      // Substring, anywhere, case-insensitive — against the same fields the columns
+      // show. haystack is built once per row at load, so a keystroke is a scan of
+      // strings already in memory rather than a request.
+      return !query || c.haystack.includes(query);
+    });
+  }
+
+  function rowHtml(c) {
+    const k = keyOf(c);
+    const badge = usedLabel(c);
+    // Already on this draft: nothing to add, so the row is shown (when "show already
+    // used" is on) but not selectable. Reported in a past month IS selectable — putting
+    // something in front of the board a second time is a legitimate choice.
+    const locked = c.OnThisReport;
+    return `
+      <label class="addrow addrow-pick ${c.Used ? 'addrow-used' : ''}" data-key="${escapeHtml(k)}">
+        <input type="checkbox" class="addrow-check" data-key="${escapeHtml(k)}" ${selected.has(k) ? 'checked' : ''} ${locked ? 'disabled' : ''} />
+        <span class="addcell"><strong>${escapeHtml(c.Title || '(untitled)')}</strong>${badge ? `<span class="addpanel-badge">${escapeHtml(badge)}</span>` : ''}</span>
+        <span class="addcell addcell-meta" data-label="WO">${escapeHtml(c.WoNumber || '')}</span>
+        <span class="addcell addcell-meta" data-label="Where">${escapeHtml(c.Place || '')}</span>
+        <span class="addcell addcell-meta" data-label="Status">${escapeHtml(c.Status || '')}</span>
+        <span class="addcell addcell-meta" data-label="Completed">${c.CompletedDate ? escapeHtml(formatDateNice(c.CompletedDate)) : ''}</span>
+      </label>`;
+  }
+
+  function render() {
+    const rows = visible();
+    if (!all.length) { body.innerHTML = '<p class="muted" style="padding:18px 0">Nothing on the books yet.</p>'; return; }
+    if (!rows.length) {
+      body.innerHTML = `<p class="muted" style="padding:18px 0">Nothing matches${!showUsed && all.some((c) => c.Used) ? ' — everything that does is already on a report. Turn on "Show already used" to see it.' : '.'}</p>`;
+      return;
+    }
+    const header = `<div class="addrow addrow-head">
+      <span></span><span>Title</span><span>WO</span><span>Asset / location</span><span>Status</span><span>Completed</span>
+    </div>`;
+    // Grouped by type as well as filterable by it, so "all" is still readable.
+    const groups = TYPES.map((t) => {
+      const mine = rows.filter((c) => c.ItemType === t.key);
+      if (!mine.length) return '';
+      return `<div class="addpanel-group">
+        <p class="addpanel-group-title">${t.label} (${mine.length})</p>
+        ${mine.map(rowHtml).join('')}
+      </div>`;
+    }).join('');
+    body.innerHTML = header + groups;
+  }
+
+  function syncFooter() {
+    const n = selected.size;
+    addBtn.disabled = !n;
+    addBtn.textContent = n ? `Add selected (${n})` : 'Add selected';
+    const shown = visible().length;
+    countEl.textContent = `${shown} of ${all.length} shown${showUsed ? '' : ' · already-used items hidden'}`;
+  }
+
+  // One checkbox listener on the body rather than one per row: the list re-renders on
+  // every keystroke, and re-binding hundreds of handlers each time is what would make
+  // typing feel slow.
+  body.addEventListener('change', (e) => {
+    const cb = e.target.closest('.addrow-check');
+    if (!cb) return;
+    const k = cb.dataset.key;
+    if (cb.checked) selected.set(k, all.find((c) => keyOf(c) === k));
+    else selected.delete(k);
+    syncFooter();
+  });
+
+  $('.addpanel-q').addEventListener('input', (e) => {
+    query = e.target.value.trim().toLowerCase();
+    render(); syncFooter();
+  });
+  overlay.querySelectorAll('.addpanel-type').forEach((b) => b.addEventListener('click', () => {
+    typeFilter = b.dataset.type;
+    overlay.querySelectorAll('.addpanel-type').forEach((x) => x.classList.toggle('selected', x === b));
+    render(); syncFooter();
+  }));
+  $('.addpanel-showused').addEventListener('change', (e) => {
+    showUsed = e.target.checked;
+    e.target.closest('.skill-chip').classList.toggle('selected', showUsed);
+    render(); syncFooter();
+  });
+
+  addBtn.addEventListener('click', async () => {
+    const items = [...selected.values()];
+    if (!items.length) return;
+    addBtn.disabled = true; addBtn.textContent = 'Adding…';
+    try {
+      await api(`/api/pg/board-reports/${reportId}/items`, {
+        method: 'POST', body: JSON.stringify({ items }),
+      });
+      // The panel stays open — adding one batch is rarely the whole job — but the rows
+      // just added now read as used, so they can't be added twice by accident.
+      for (const it of items) {
+        const c = all.find((x) => keyOf(x) === keyOf(it));
+        if (c) { c.OnThisReport = true; c.Used = true; }
+      }
+      selected.clear();
+      toast(`Added ${items.length} item${items.length === 1 ? '' : 's'} to the draft`);
+      render();
+    } catch (e) {
+      toast(e.message, 5000);
+    }
+    syncFooter();
+  });
+
+  try {
+    const { candidates } = await api(`/api/pg/board-reports/candidates?reportId=${reportId}`);
+    all = (candidates || []).map((c) => ({
+      ...c,
+      Used: !!(c.OnThisReport || c.ReportedOn),
+      // Everything the columns show, flattened once, so filtering is a substring test.
+      // The date is indexed both as stored and as displayed — "2026-09-17" and
+      // "17 Sep 2026" are both reasonable things to type.
+      haystack: [c.Title, c.WoNumber, c.Place, c.Status, c.Subtitle, c.CompletedDate,
+        c.CompletedDate ? formatDateNice(c.CompletedDate) : null,
+        TYPES.find((t) => t.key === c.ItemType)?.label]
+        .filter(Boolean).join(' ').toLowerCase(),
+    }));
+  } catch (e) {
+    body.innerHTML = `<p class="muted" style="padding:18px 0">Couldn't load the list: ${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  render();
+  syncFooter();
+  setTimeout(() => $('.addpanel-q').focus(), 0);
 }
 
 // Shows rendered report HTML in an overlay. Used for Preview and for opening any past
@@ -11928,6 +12102,10 @@ function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
       <div class="field-row"><label>Correction</label><textarea class="jl-e-correction" placeholder="What was done to fix it?">${escapeHtml(jl.Correction || '')}</textarea></div>
       <div class="field-row"><label>Blocked Reason</label><input class="jl-e-blocked-reason" value="${escapeHtml(jl.BlockedReason || '')}" placeholder="Leave blank if not blocked" /></div>
       <div class="field-row"><label>Blocked Since</label><input class="jl-e-blocked-since" type="date" value="${(jl.BlockedSince || '').slice(0, 10)}" /></div>
+      <div class="field-row"><label>Board Report</label>
+        <label class="skill-chip ${jl.BoardFocus ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" class="jl-e-board-focus" style="margin-right:6px" ${jl.BoardFocus ? 'checked' : ''} />Include on board report</label>
+        <p class="muted" style="margin:4px 0 0;font-size:0.8rem">Done if this line is finished, Coming Up if it isn't. Clears when a report carrying it is published.</p>
+      </div>
       <div class="btn-row">
         <button class="btn btn-primary jl-save-btn" type="submit">Save Line</button>
         <button class="btn btn-secondary jl-delete-btn" type="button" data-label="${escapeHtml(jl.Title)}">Delete Line</button>
@@ -12054,8 +12232,9 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <div class="field-row"><label>Priority</label>
           <select name="priority">${['Low', 'Medium', 'High', 'Urgent'].map((s) => `<option ${wo.Priority === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         </div>
-        <div class="field-row"><label>Board Focus</label>
-          <label class="skill-chip ${wo.BoardFocus ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="boardFocus" style="margin-right:6px" ${wo.BoardFocus ? 'checked' : ''} />Flag for board report</label>
+        <div class="field-row"><label>Board Report</label>
+          <label class="skill-chip ${wo.BoardFocus ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="boardFocus" style="margin-right:6px" ${wo.BoardFocus ? 'checked' : ''} />Include on board report</label>
+          <p class="muted" style="margin:4px 0 0;font-size:0.8rem">Puts this on the next draft whatever the dates say — in Done if it's finished, in Coming Up if it isn't. Clears when a report carrying it is published.</p>
         </div>
         <div class="field-row"><label>Description</label><textarea name="description">${escapeHtml(wo.Description || '')}</textarea></div>
         <button class="btn btn-secondary" type="submit">Save Changes</button>
@@ -12320,6 +12499,10 @@ async function renderWorkOrderDetail({ id }, container = app) {
     card.querySelectorAll('.jl-e-cause').forEach((cb) => cb.addEventListener('change', () => {
       cb.closest('.skill-chip').classList.toggle('selected', cb.checked);
     }));
+    const jlFocusCb = card.querySelector('.jl-e-board-focus');
+    jlFocusCb?.addEventListener('change', () => {
+      jlFocusCb.closest('.skill-chip').classList.toggle('selected', jlFocusCb.checked);
+    });
 
     card.querySelector('.jl-edit-form').addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -12355,6 +12538,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
           correction: card.querySelector('.jl-e-correction').value,
           blockedReason: card.querySelector('.jl-e-blocked-reason').value,
           blockedSince: card.querySelector('.jl-e-blocked-since').value,
+          boardFocus: card.querySelector('.jl-e-board-focus').checked,
           causeIds,
         }) });
         toast('Job line saved');
