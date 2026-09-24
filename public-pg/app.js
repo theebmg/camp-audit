@@ -5609,6 +5609,7 @@ async function openAddReportItem(reportId, onDone) {
   // work order and a "Done" job line answer the same chip — because the question being
   // asked is about the work, not about which table it lives in.
   const statusFilter = new Set();
+  let showAllStatuses = false;
   let showUsed = false;
   let query = '';
   const selected = new Map();   // key -> the candidate object, so "Add selected" needs no re-lookup
@@ -5695,12 +5696,21 @@ async function openAddReportItem(reportId, onDone) {
     const names = statuses.map((s) => s.name);
     const pool = all.filter((c) => (typeFilter === 'all' || c.ItemType === typeFilter)
       && (showUsed || !c.Used) && (!query || c.haystack.includes(query)));
+    const chip = (n, hits) => `<button type="button" class="btn btn-secondary addpanel-status ${statusFilter.has(n) ? 'selected' : ''} ${hits ? '' : 'addpanel-status-empty'}" data-status="${escapeHtml(n)}">${escapeHtml(n)} <span class="addpanel-chip-count">${hits}</span></button>`;
+    const counts = new Map(names.map((n) => [n, pool.filter((c) => c.Status === n).length]));
+    // The whole configured vocabulary is eighteen statuses, and most of them have
+    // nothing under them on any given day. Showing all eighteen buries the list it is
+    // meant to filter — worse on a phone, where they wrap to four rows. Empty ones
+    // (unless currently selected) fold behind one toggle: still there, not in the way.
+    const live = names.filter((n) => counts.get(n) || statusFilter.has(n));
+    const empty = names.filter((n) => !counts.get(n) && !statusFilter.has(n));
     row.innerHTML = '<span class="addpanel-filter-label">Status</span>'
       + `<button type="button" class="btn btn-secondary addpanel-status ${statusFilter.size ? '' : 'selected'}" data-status="">Any</button>`
-      + names.map((n) => {
-        const hits = pool.filter((c) => c.Status === n).length;
-        return `<button type="button" class="btn btn-secondary addpanel-status ${statusFilter.has(n) ? 'selected' : ''} ${hits ? '' : 'addpanel-status-empty'}" data-status="${escapeHtml(n)}">${escapeHtml(n)} <span class="addpanel-chip-count">${hits}</span></button>`;
-      }).join('');
+      + live.map((n) => chip(n, counts.get(n))).join('')
+      + (showAllStatuses ? empty.map((n) => chip(n, 0)).join('') : '')
+      + (empty.length
+        ? `<button type="button" class="btn btn-secondary addpanel-morestatus">${showAllStatuses ? '− fewer' : `+${empty.length} with none`}</button>`
+        : '');
     row.querySelectorAll('.addpanel-status').forEach((b) => b.addEventListener('click', () => {
       const name = b.dataset.status;
       if (!name) statusFilter.clear();
@@ -5708,6 +5718,10 @@ async function openAddReportItem(reportId, onDone) {
       else statusFilter.add(name);
       renderStatusChips(); render(); syncFooter();
     }));
+    row.querySelector('.addpanel-morestatus')?.addEventListener('click', () => {
+      showAllStatuses = !showAllStatuses;
+      renderStatusChips();
+    });
   }
 
   function syncFooter() {
