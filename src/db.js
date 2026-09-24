@@ -4929,14 +4929,30 @@ async function suggestFlaggedItems(reportId, passId, reported) {
   );
   for (const [i, r] of wos.entries()) {
     if (reported.has(reportedKey('work_order', r.id))) continue;
+    // A work order row is also the grouping HEADER its job lines render under, and a
+    // header has to sit in the same section as the lines it heads. The Done rule puts a
+    // WO in Done only when it actually has lines completed in this period, so if this
+    // pass already put it there, that claim on the section is the stronger one: moving
+    // it to Coming Up because the WO itself hasn't been closed out yet would leave its
+    // finished lines in Done with nothing above them.
+    //
+    // The flag is not lost by staying put — it survives until publish either way, so
+    // the item is still guaranteed to reach the board.
+    const { rows: existing } = await pool.query(
+      `SELECT section FROM board_report_items
+       WHERE report_id = $1 AND item_type = 'work_order' AND item_id = $2 AND last_pass_id = $3`,
+      [reportId, r.id, passId]
+    );
+    const anchorsDone = existing[0]?.section === 'done';
     await upsertBoardReportItem(reportId, { passId,
       itemType: 'work_order', itemId: r.id,
-      section: r.is_terminal ? 'done' : 'coming_up', sortIndex: 3000 + i,
+      section: (r.is_terminal || anchorsDone) ? 'done' : 'coming_up', sortIndex: 3000 + i,
       snapTitle: r.title, snapAssetName: r.place, snapStatus: r.status,
-      snapDate: r.is_terminal ? r.completed_date : null,
+      snapDate: r.completed_date,
       // "Featured since March" stays on open items so a stale flag reads as stale;
       // on finished work the flag is about to clear itself, so it says nothing.
-      snapSubtitle: !r.is_terminal && r.board_focus_set_at ? `featured since ${monthOf(r.board_focus_set_at)}` : null,
+      snapSubtitle: !r.is_terminal && !anchorsDone && r.board_focus_set_at
+        ? `featured since ${monthOf(r.board_focus_set_at)}` : null,
     });
     n += 1;
     // A flagged, finished work order brings its finished lines with it, so Done shows
