@@ -2581,7 +2581,10 @@ export async function reopenWorkOrder(woId, { reason } = {}) {
     await client.query('COMMIT');
   } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
   await logActivity({ action: 'reopened', entityType: 'work_order', entityId: Number(woId), entityLabel: cur[0].title });
-  return getWorkOrder(woId);
+  // getWorkOrder has never existed — this threw a ReferenceError on every reopen, AFTER
+  // the transaction had committed, so the work order really did move to Review and the
+  // screen still reported a 500. Found by reopening WO 47 to re-run its close.
+  return (await getWorkOrderDetail(woId))?.workOrder || null;
 }
 
 // What was already recorded as left over at the last close, so re-closing ADJUSTS those
