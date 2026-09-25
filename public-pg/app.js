@@ -228,6 +228,9 @@ function pickFromListDialog(title, items, { cancelLabel = 'Cancel' } = {}) {
 // transitions rather than instant flashes.
 function setApp(html, container = app) {
   container.innerHTML = html;
+  // Card tables need a label per cell; taken from each table's own thead so no screen
+  // has to remember to ask (mobile audit, Q7).
+  try { applyCardTableLabels(container); } catch { /* labels are cosmetic */ }
   container.classList.remove('view-fade');
   void container.offsetWidth; // force reflow so the animation replays
   container.classList.add('view-fade');
@@ -1698,7 +1701,7 @@ async function renderLocations(container = app, { onOpenLocation } = {}) {
         <td data-label="Parent">${escapeHtml(parentNameById.get(l.ParentLocationId) || '—')}</td>
         <td data-label="Actions"><button class="btn btn-secondary edit-location" data-id="${l.Id}">Edit</button></td>
       </tr>`).join('');
-    return `<div style="overflow-x:auto"><table class="report-table">
+    return `<div style="overflow-x:auto"><table class="report-table" data-card="1">
       <thead><tr><th>Name</th><th>Type</th><th>Parent</th><th>Actions</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="4" class="muted">${emptyMsg}</td></tr>`}</tbody>
     </table></div>`;
@@ -4275,7 +4278,7 @@ async function renderAllExpensesTab() {
         </div>
       </div>
       <div style="overflow-x:auto">
-        <table class="report-table">
+        <table class="report-table" data-card="1">
           <thead><tr>
             <th>Date</th>
             <th>Vendor</th>
@@ -4626,7 +4629,7 @@ async function renderAdminTasks() {
         </div>
       </div>
       <div style="overflow-x:auto">
-        <table class="report-table">
+        <table class="report-table" data-card="1">
           <thead><tr>
             <th>Date</th><th>Title</th><th>Category</th><th>Status</th>
             <th style="text-align:right">Hours</th><th style="text-align:right">Savings / mo</th>
@@ -9054,7 +9057,7 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
           </div>
         </details>
         <div class="card" style="overflow-x:auto">
-          <table class="report-table">
+          <table class="report-table" data-card="1">
             <thead><tr><th>Title</th>${visibleCols.map((c) => `<th>${escapeHtml(c.label)}</th>`).join('')}</tr></thead>
             <tbody>${tableRows || `<tr><td colspan="${visibleCols.length + 1}" class="muted">${filterLabel ? 'Nothing matches this filter.' : 'No work orders yet — tap + New Work Order above to create one.'}</td></tr>`}</tbody>
           </table>
@@ -10680,6 +10683,28 @@ async function renderAuditRound({ id }) {
       </div>`).join('')}`);
   app.querySelectorAll('.inst-row').forEach((el) => el.addEventListener('click', () => go('auditRunner', { id: el.dataset.id })));
   document.getElementById('roundReportBtn')?.addEventListener('click', () => go('auditRoundReport', { id }));
+}
+
+// ── Phone card tables (mobile audit, Q7) ─────────────────────────────────
+// Tables you ACT on from the phone become stacked "label: value" cards under 760px;
+// data and report tables keep horizontal scroll inside their own container. The
+// classification per table is listed in docs/mobile-audit.md.
+//
+// The card layout needs a label per cell. Rather than hand-writing data-label onto every
+// <td> — dozens of edits that then drift when a column changes — each cell takes its
+// label from its own table's <thead> by index, once, after render.
+function applyCardTableLabels(root = app) {
+  for (const table of root.querySelectorAll('table[data-card="1"]')) {
+    const heads = [...table.querySelectorAll('thead th')].map((th) => th.textContent.trim());
+    if (!heads.length) continue;
+    for (const row of table.querySelectorAll('tbody tr')) {
+      [...row.children].forEach((cell, i) => {
+        if (cell.tagName !== 'TD') return;
+        // An empty header means the column is an action or icon — no label wanted.
+        if (heads[i] && !cell.hasAttribute('data-label')) cell.setAttribute('data-label', heads[i]);
+      });
+    }
+  }
 }
 
 // ── Asset face: photo, or the type's icon (Addendum §5a) ─────────────────
@@ -12438,6 +12463,10 @@ async function renderWorkOrderDetail({ id }, container = app) {
         ${jobLines.length > 1 ? `<button type="button" class="btn btn-secondary" id="reorderLinesBtn">↕ Reorder</button>` : ''}
         ${!wo.StatusIsTerminal ? `<button type="button" class="btn btn-secondary" id="splitLinesBtn">Split Selected Lines Into New WO</button>` : ''}
       </div>
+      ${window.innerWidth < GRID_MIN_WIDTH ? `<p class="muted" style="font-size:0.85rem;margin:2px 0 10px">
+        Each line opens below for status, notes and photos. Editing several at once — costs,
+        funding, dates across the whole job — is easier in the grid on a desktop.
+      </p>` : ''}
       ${jobLineRows}
       <div class="card" style="margin-top:10px;background:transparent;border:1px dashed var(--border,#ccc)">
         <h4 style="margin-top:0">+ Add Job Line</h4>

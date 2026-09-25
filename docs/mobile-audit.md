@@ -115,6 +115,73 @@ focus; keyboard shortcut legends hidden.
 | `Viewport argument key "no;" not recognized` | materials, expense-detail | **Pre-existing, not fixed** — a malformed viewport directive injected by one of these screens, not the index meta (which is now clean) |
 | `filterToggle.addEventListener` null | reports-add-item | **Introduced by me, fixed** |
 
+## Table classification (Q7) — for review
+
+The rule: tables I act on from the phone become stacked label:value cards; report and
+data tables keep horizontal scroll inside their own container. Implemented as one
+attribute — `data-card="1"` on the table — plus two CSS blocks in the `max-width:760px`
+media query. `applyCardTableLabels()` runs inside `setApp()` and stamps each body cell's
+`data-label` from that table's own `<thead>`, so no screen has to remember to do it and a
+new column can never ship an unlabelled cell. A header cell that is empty (an action or
+icon column) produces no label, because "​: ✎ ✕" is noise.
+
+Every `<table>` in the app, with its call: 14 in total.
+
+### Cards below 760px (`data-card="1"`)
+
+| Table | app.js | Why |
+|---|---|---|
+| Work order list | `renderWorkOrders` :9060 | The list you work from in the field. |
+| Expenses / receipt inbox | `renderAllExpensesTab` :4281 | Receipts get split and assigned on the phone. |
+| Admin tasks | `renderAdminTasks` :4632 | Checked off away from a desk. |
+| Asset list | `renderLocations` :1704 | The way into everything else on site. |
+
+### Horizontal scroll, inside the table's own box
+
+| Table | app.js | Why |
+|---|---|---|
+| Capital planning | `renderCapitalPlan` :3670 | Read across years; comparing columns is the point. Already has its own cards/table toggle — left in place, so the user can still opt into cards. |
+| Maintenance log | `renderMaintenanceLog` :4791 | Data table. Same pre-existing cards/table toggle, left in place. |
+| Audit data (reports explorer) | `renderReportsExplorer` :5076 | Arbitrary user-chosen columns; there is no stable label set to stack. |
+| Activity log | `renderActivityLog` :6278 | Chronological data table, read not acted on. |
+| Applicability matrix | `renderAdminApplicability` :7045 | A matrix. Stacking it destroys the grid that carries the meaning. |
+| Crew hours | `renderCrewHours` :13052 | Data table. |
+| Crew | `renderCrew` :13192 | **Judgment call — flagging it.** It has row actions, so by the letter of the rule it could be a card list, but adding and deactivating crew is office work, not field work. Left as scroll. Say the word and it's a one-attribute change. |
+
+### Neither
+
+| Table | app.js | Why |
+|---|---|---|
+| Job line grid | `mountJobLineGrid` :11112 | Desktop-only by design, gated at 900px (Q8). Never rendered on a phone. |
+
+### Named in the brief but not tables at all
+
+Four of the surfaces the brief listed as tables are already `div`-based list rows, so they
+stack natively and needed nothing:
+
+- **Findings** — `.list-item` rows.
+- **Materials on hand** — `renderMaterialsOnHand` :9292, `.mat-row` list items.
+- **Audit round building list** — `.round-row` / `.inst-row` list items.
+- **Board report** — `renderBoardReport` :5238, `.list-item.br-row` flex rows.
+- **Round report** — `renderAuditRoundReport` :9771, `.list-item` rows.
+
+They do get the Q6 44px treatment, which is where they actually needed work.
+
+## Work order screen on a phone (Q8)
+
+The 900px gate stays. Below it:
+
+- **Lines show as cards.** `jobLineCardHtml` :12244 renders every line as a
+  `<details class="card jl-card">` — status, notes and photos inside. This is the only
+  rendering below 900px; the grid is a separate, additive surface.
+- **One line can be added.** The `#addJlForm` "+ Add Job Line" form is in the WO detail
+  markup at every width.
+- **One line can be edited.** Each card's own controls; no grid needed.
+- **Grid button is hidden**, not merely disabled, below 900px (:12462).
+- **New:** a one-line note under the button row, shown only below 900px, saying each line
+  opens below and that editing several at once is easier in the grid on a desktop. Without
+  it the absence of the button reads as a missing feature rather than a deliberate split.
+
 ## Not yet done — needs another pass
 
 - **Runner, review, Flag something else, split editor, materials prompts, reorder sheet,

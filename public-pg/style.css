@@ -876,19 +876,57 @@ label {
      scrolls inside its own container instead. */
   html, body { overflow-x: hidden; }
   .card { max-width: 100%; box-sizing: border-box; }
-  table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+  /* Q7: tables NOT marked data-card keep horizontal scroll inside their own container,
+     so the page body never moves sideways. */
+  table:not([data-card="1"]) { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+
+  /* Q7: tables you act on from the phone become stacked label:value cards. Reuses the
+     existing card-mode presentation rather than inventing a second one; the labels come
+     from each table's own thead (applyCardTableLabels). */
+  table[data-card="1"] { max-width: 100%; }
+  table[data-card="1"] thead { display: none; }
+  table[data-card="1"],
+  table[data-card="1"] tbody,
+  table[data-card="1"] tr,
+  table[data-card="1"] td { display: block; width: 100%; box-sizing: border-box; }
+  table[data-card="1"] tr {
+    margin-bottom: 10px; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 10px 12px; background: var(--surface);
+  }
+  table[data-card="1"] td { border: none; padding: 3px 0; overflow-wrap: anywhere; }
+  table[data-card="1"] td[data-label]::before {
+    content: attr(data-label) ": "; color: var(--muted); font-weight: 600; font-size: 0.82rem;
+  }
+  /* A cell with no header is an action or an icon; a label would be noise. */
+  table[data-card="1"] td:not([data-label]) { padding-top: 6px; }
   pre, code { overflow-x: auto; max-width: 100%; }
   img { max-width: 100%; height: auto; }
 
   /* Long titles and ids wrap rather than pushing buttons off the row. */
   h1, h2, h3, h4, .list-item, .field-row label { overflow-wrap: anywhere; }
 
-  /* 44px minimum tap target. The visual box on a checkbox can stay small as long as the
-     row around it is tappable, which is why labels get the height too. */
-  .btn, button, .view-toggle-btn, select, .list-item > a, label.skill-chip { min-height: 44px; }
+  /* 44px minimum on CONTROLS only (mobile audit Q6): buttons, row actions, checkboxes,
+     icon buttons, and links that act as controls. Links inside prose are deliberately
+     left alone — padding those out would change the density of every screen and they
+     are read, not aimed at. */
+  .btn, button, .view-toggle-btn, select,
+  label.skill-chip, .chip-row > label,
+  .q-note, .o-remedy, .o-follow, .rm-edit, .rm-del, .q-edit, .q-del,
+  .br-note, .addpanel-type, .addpanel-status, .addpanel-filtertoggle,
+  .list-item[data-view], .list-item[data-id], .round-row, .inst-row, .mat-row,
+  .add-cand, .br-open-output, .edit-form, .pf-pick {
+    min-height: 44px;
+  }
   .btn { padding-top: 10px; padding-bottom: 10px; }
+  /* A link acting as a control needs the height AND something to aim at. */
+  .q-note, .o-remedy, .o-follow, .rm-edit, .rm-del, .q-edit, .q-del, .br-note {
+    display: inline-flex; align-items: center; padding: 0 8px;
+  }
+  /* The visual box on a checkbox stays small; the row around it is what gets aimed at. */
   input[type="checkbox"], input[type="radio"] { min-width: 22px; min-height: 22px; }
-  .list-item label { min-height: 44px; display: flex; align-items: center; }
+  .list-item label, table[data-card="1"] tbody tr label { min-height: 44px; display: flex; align-items: center; }
+  /* Rows that open something are targets in their own right. */
+  table[data-card="1"] tbody tr { min-height: 44px; }
 
   /* Adjacent icon buttons — reorder arrows, × removes — need thumb clearance. */
   .q-up, .q-down, .row-remove, .af-rm { min-width: 44px; min-height: 44px; }
