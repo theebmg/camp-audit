@@ -179,6 +179,18 @@ async function tableExists(name) {
   return !!rows[0].t;
 }
 
+const HAS_ID = new Map();
+async function hasIdColumn(client, table) {
+  if (HAS_ID.has(table)) return HAS_ID.get(table);
+  const { rows } = await client.query(
+    `SELECT 1 FROM pg_attribute
+     WHERE attrelid = $1::regclass AND attname = 'id' AND attnum > 0 AND NOT attisdropped`,
+    [table]
+  );
+  HAS_ID.set(table, rows.length > 0);
+  return rows.length > 0;
+}
+
 // Every table with a single-column foreign key pointing at `table`.
 async function childrenOf(client, table) {
   const { rows } = await client.query(
@@ -203,14 +215,16 @@ async function deleteReferencing(client, table, ids, depth = 0, seen = new Set()
     const step = `${child}.${col}`;
     if (seen.has(step)) continue;
     seen.add(step);
-    // Grandchildren first, where the child has an id of its own to follow.
+    // Grandchildren first, where the child has an id of its own to follow. Ask the
+    // catalog whether it does — trying the SELECT and catching the failure aborts the
+    // whole transaction, which is a slower way of finding out.
     let childIds = [];
-    try {
+    if (await hasIdColumn(client, child)) {
       const { rows } = await client.query(
         `SELECT id FROM ${child} WHERE ${col} = ANY($1::int[])`, [ids]
       );
       childIds = rows.map((r) => r.id);
-    } catch { /* no id column — it is a leaf, delete it directly */ }
+    }
     if (childIds.length) await deleteReferencing(client, child, childIds, depth + 1, seen);
     const r = await client.query(`DELETE FROM ${child} WHERE ${col} = ANY($1::int[])`, [ids]);
     if (r.rowCount) say(`  deleted ${r.rowCount} from ${child} (via ${col})`);
