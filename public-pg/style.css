@@ -927,8 +927,11 @@ label {
      (the two that weren't got wrapped). :has() is Safari 15.4+, so a phone has it. */
   input[type="checkbox"], input[type="radio"] { min-width: 22px; min-height: 22px; }
   label:has(> input[type="checkbox"]),
-  label:has(> input[type="radio"]) {
-    min-height: 44px; display: flex; align-items: center; gap: 8px;
+  label:has(> input[type="radio"]),
+  /* A file input is hidden and its label IS the button — the "📷 photo" control in the
+     audit runner was a 16px-tall tap target. */
+  label:has(> input[type="file"]) {
+    min-height: 44px; display: inline-flex; align-items: center; gap: 8px;
   }
   .list-item label, table[data-card="1"] tbody tr label { min-height: 44px; display: flex; align-items: center; }
   /* Rows that open something are targets in their own right. */
@@ -942,7 +945,10 @@ label {
   /* The accent swatch is a 22px colour dot, and min-height alone turned it into a 22x44
      oval. Give the button the full 44px and paint the dot inside it with content-box, so
      the target is a thumb and the dot stays a dot. */
-  .accent-swatch {
+     Scoped through the parent on purpose: index.html's inline <style> sets .accent-swatch
+     to 22px, and the cascade puts that block AFTER this file at equal specificity, so a
+     bare .accent-swatch here loses. Same trap as the sub-16px fields below. */
+  .accent-swatches > .accent-swatch {
     width: 44px; height: 44px; padding: 11px;
     background-clip: content-box; background-origin: content-box;
   }

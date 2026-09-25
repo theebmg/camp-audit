@@ -302,14 +302,27 @@ function screensFor(ids) {
     { id: 'wo-leftover-prompt', view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
       once: true,
       open: async (p) => {
+        // Three steps, not one: confirm the close (it writes pending asset updates), then
+        // confirm settling the still-open lines, and only then does promptLeftoversOnClose
+        // run. Pressing once landed on the open-lines confirm and reported "no leftover
+        // prompt", which was the harness stopping early, not the app.
         await tap(p, '#completeWoBtn', 4000); await wait(p, 1200);
-        await tap(p, '.modal-box .btn-primary', 3000); await wait(p, 1800);
+        for (let i = 0; i < 2; i++) {
+          await tap(p, '.modal-box .btn-primary', 3000).catch(() => {});
+          await wait(p, 1500);
+          if (await p.locator('.modal-box:has(.leftover-qty)').count()) break;
+        }
+        await wait(p, 600);
       },
       extra: async (p) => p.evaluate(() => {
         const box = document.querySelector('.modal-box');
         const text = box ? box.textContent : document.body.textContent;
         return {
           promptShown: !!box,
+          // The leftover prompt is the one with a quantity field per material — that is a
+          // fact about the DOM, not a guess from the wording.
+          isLeftoverPrompt: !!document.querySelector('.leftover-qty'),
+          materialRows: document.querySelectorAll('.leftover-qty').length,
           mentionsLeftover: /left ?over|left on|remaining|in stock|on hand/i.test(text),
           promptFitsScreen: box ? Math.round(box.getBoundingClientRect().height) <= window.innerHeight : null,
         };
@@ -346,12 +359,21 @@ async function measure(page) {
       + ' .round-row, .inst-row, .mat-row, .add-cand, .br-open-output, .edit-form, .pf-pick';
     const small = [];
     const smallFont = [];
+    // What you aim at is not always the element itself. A checkbox's drawn box stays 22px
+    // on purpose — a 44px checkbox looks like a bug — and the LABEL around it carries the
+    // 44px; a hidden file input's label IS the button. Measuring the input in those cases
+    // reports a problem that was deliberately solved, which is how 644 "offenders" showed
+    // up unchanged after the rule that fixed them shipped.
+    const hitTarget = (el) => (/^(checkbox|radio|file)$/.test(el.type || '')
+      ? (el.closest('label') || el) : el);
     for (const el of document.querySelectorAll(CONTROL)) {
-      const r = el.getBoundingClientRect();
+      const target = hitTarget(el);
+      const r = target.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
       if (r.height < 44 || r.width < 24) {
         small.push({ tag: el.tagName.toLowerCase(), cls: (el.className || '').toString().slice(0, 30),
-          text: (el.textContent || '').trim().slice(0, 18), h: Math.round(r.height), w: Math.round(r.width) });
+          via: target === el ? 'self' : 'label',
+          text: (target.textContent || '').trim().slice(0, 18), h: Math.round(r.height), w: Math.round(r.width) });
       }
     }
     for (const el of document.querySelectorAll('input, select, textarea')) {

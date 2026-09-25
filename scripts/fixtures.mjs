@@ -95,34 +95,9 @@ async function create() {
   made.jobLineIds = lines;
   say(`work order #${woId} with lines ${lines.map((i) => `#${i}`).join(', ')}`);
 
-  // 4. A receipt with line items, unassigned, so the split editor has real money and
-  //    real lines to divide — and a second one with no line items, which is the
-  //    whole-receipt-by-dollar-amount case.
-  const cat = (await db.listExpenseCategories())[0] || null;
-  const receipt = await db.createExpense({
-    vendor: t('Hardware Store'), amount: 248.31, purchaseDate: AS_OF,
-    taxAmount: 14.67, categoryId: cat ? cat.Id : null, assetId: asset.Id,
-    notes: 'Mobile audit fixture receipt. Safe to delete.',
-  });
-  made.receiptId = receipt.Id;
-  for (const li of [
-    { description: t('Aluminum gutter, 10ft'), quantity: 3, unit: 'each', paidAmount: 96.00, regularPrice: 111.00 },
-    { description: t('Cedar tread 2x12'), quantity: 1, unit: 'each', paidAmount: 38.40 },
-    { description: t('Exterior paint, gallon'), quantity: 2, unit: 'gal', paidAmount: 79.24 },
-    { description: t('Deck screws, 5lb'), quantity: 1, unit: 'box', paidAmount: 20.00 },
-  ]) {
-    await db.createExpenseLineItem(receipt.Id, li);
-  }
-  const flatReceipt = await db.createExpense({
-    vendor: t('Lumber Yard — no line items'), amount: 412.00, purchaseDate: AS_OF,
-    categoryId: cat ? cat.Id : null,
-    notes: 'Fixture: emailed receipt with no itemisation, to split by dollar amount.',
-  });
-  made.flatReceiptId = flatReceipt.Id;
-  say(`receipts #${receipt.Id} (4 line items) and #${flatReceipt.Id} (flat)`);
-
-  // 5. Materials with a leftover balance on hand, at the price actually paid — reaches
-  //    materials on hand, the point-of-use reminder, and count correction.
+  // 4. Materials, first, because the receipt's line items point at them. Each gets a
+  //    balance on hand at the price actually paid — that reaches materials on hand, the
+  //    point-of-use reminder, and count correction.
   const materials = [];
   for (const m of [
     { name: t('Aluminum gutter, 10ft'), unit: 'each', qty: 2, price: 32.00 },
@@ -139,6 +114,45 @@ async function create() {
   }
   made.materialIds = materials;
   say(`materials ${materials.map((i) => `#${i}`).join(', ')} with stock on hand`);
+
+  // 5. A receipt with line items so the split editor has real money and real lines to
+  //    divide — and a second with none, which is the whole-receipt-by-dollar-amount case.
+  //
+  //    Three of the line items are tagged as tracked materials and allocated to the
+  //    fixture work order. That is what the leftover prompt keys off:
+  //    getMaterialsUsedOnWorkOrder joins allocations → line items → materials, so a
+  //    receipt that is merely *near* the job raises nothing. Without this the prompt at
+  //    close correctly never appears, which is exactly what the first run reported.
+  const cat = (await db.listExpenseCategories())[0] || null;
+  const receipt = await db.createExpense({
+    vendor: t('Hardware Store'), amount: 248.31, purchaseDate: AS_OF,
+    taxAmount: 14.67, categoryId: cat ? cat.Id : null, assetId: asset.Id,
+    notes: 'Mobile audit fixture receipt. Safe to delete.',
+  });
+  made.receiptId = receipt.Id;
+  const LINES = [
+    { description: t('Aluminum gutter, 10ft'), quantity: 3, unit: 'each', paidAmount: 96.00, regularPrice: 111.00, mat: 0 },
+    { description: t('Cedar tread 2x12'), quantity: 1, unit: 'each', paidAmount: 38.40, mat: null },
+    { description: t('Exterior paint, gallon'), quantity: 2, unit: 'gal', paidAmount: 79.24, mat: 1 },
+    { description: t('Deck screws, 5lb'), quantity: 1, unit: 'box', paidAmount: 20.00, mat: 2 },
+  ];
+  for (const li of LINES) {
+    const materialId = li.mat == null ? null : materials[li.mat];
+    const lineItemId = await db.createExpenseLineItem(receipt.Id, { ...li, materialId });
+    if (materialId) {
+      await db.createExpenseAllocation(receipt.Id, {
+        lineItemId, destType: 'work_order', destId: woId,
+        quantity: li.quantity, amount: li.paidAmount, materialId,
+      });
+    }
+  }
+  const flatReceipt = await db.createExpense({
+    vendor: t('Lumber Yard — no line items'), amount: 412.00, purchaseDate: AS_OF,
+    categoryId: cat ? cat.Id : null,
+    notes: 'Fixture: emailed receipt with no itemisation, to split by dollar amount.',
+  });
+  made.flatReceiptId = flatReceipt.Id;
+  say(`receipts #${receipt.Id} (4 line items, 3 allocated to the WO) and #${flatReceipt.Id} (flat)`);
 
   say('\nfixtures created:', JSON.stringify(made));
   return made;

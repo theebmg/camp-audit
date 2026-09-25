@@ -285,11 +285,74 @@ Verified in WebKit against the deployed site, without an account (the login page
 | The flip survives the cascade | yes — the base `.ac-results` rule sits in `index.html`'s inline `<style>`, *after* the `style.css` link, so this only works because `.ac-results.cbx-above` is more specific. Worth knowing before anyone "tidies" it. |
 | `--kb` lifts bottom-pinned chrome | toast `bottom` goes 22px → **358px** under a 336px keyboard |
 
-**Not yet verified: every screen in the table above this one.** Running the harness needs a
-sign-in, and the throwaway `mobaudit` account was deleted at the end of pass 1 as promised.
-Recreating it was blocked — see the note at the top of this section's follow-up. Until it
-runs, the field screens are *written* but not *seen*, and I am not claiming otherwise.
-
 Also still needing a real phone, not emulation: whether the keyboard's dismissal animation
 leaves the layout settled, and whether Safari's toolbar collapsing on scroll fights the
 same rules.
+
+## The biggest find: Safari has been ignoring our `<select>` styling
+
+**Needs your call, because the fix is visible.**
+
+`style.css:407` styles selects alongevery text input — same 12px/14px padding, same border,
+same radius. In Safari that has never happened. WebKit refuses author `padding`, `height`
+and `min-height` on a `<select>` for as long as it is drawn as a native `menulist`.
+
+Measured on the live site, on the same element, in the same page load:
+
+| | width × height | padding | min-height |
+|---|---|---|---|
+| as shipped (`appearance: auto`) | 200 × **24** | `0px` | `18px` |
+| with `appearance: none` | 201 × **45** | `12px 14px` | `44px` |
+
+So a dropdown is a 24px-tall native control where the stylesheet asks for a 46px box. On a
+phone that is half the minimum tap target; on a desktop it is a cosmetic inconsistency
+nobody noticed because a mouse doesn't care.
+
+**What I changed:** `appearance: none` on selects *inside the 760px mobile block only*, plus
+a chevron background, since turning the native appearance off takes the native arrow away.
+Phones get a 44px dropdown that matches the inputs around it. Desktop is untouched.
+
+**What I did not change:** the same fix at desktop widths. It would make every dropdown in
+the app match its own stylesheet, which is almost certainly what was intended — but it
+changes how the app looks on a real screen, and that is your call, not mine. Say the word
+and it moves out of the media query; it is one line.
+
+## Tap targets, after
+
+The 2,352 number from pass 1 was mostly prose links and is gone. What the harness found
+once it counted only Q6's controls, at 393px, and what each turned out to be:
+
+| Count | Control | Cause | Fixed |
+|---|---|---|---|
+| 586 | `.report-filter-cb` 22×22 | checkbox inside `label.report-chip`, label not sized | `label:has(> input[type=checkbox])` → 44px |
+| 47 | `.report-col-toggle` 22×22 | same | same rule |
+| 30 | `.accent-swatch` 22×**44** | **my regression** — a blanket `min-height` on `button` turned a 22px round dot into an oval | real 44px button, dot painted inside with `content-box` |
+| 6 | `.br-check` 22×22 | bare checkbox, no wrapping label | wrapped in a label in the markup |
+| 4 | `.widget-toggle` 22×22 | checkbox inside a label | covered by the `:has()` rule |
+| 3 | `.br-expand` **9**×44 | a 9px-wide chevron | `.btn-icon` joins the icon-button rule |
+| 6 | selects 200×24 / 331×23 | the `appearance` problem above | `appearance: none` |
+| 22 | `.report-filter-date` at 13.12px | `.report-date-range input[type=date]` at `0.82rem` in index.html's inline `<style>`, which the cascade puts after style.css at equal specificity | `font-size: 16px !important`, with the reason in the comment |
+
+The drawn box on a checkbox stays 22px deliberately — a 44px checkbox looks like a bug.
+What got the 44px is the label around it, which is how all but two of them were already
+built.
+
+## Three harness screens were wrong, not the app
+
+Worth recording, because each one looked like a finding:
+
+- **Runner sections were hardcoded 1–6** against a 3-section form. `#nextSec` is simply
+  absent on the last section, so the walk stopped early and quietly photographed section 3
+  four times. The count is now read from the instance.
+- **The photo assertion ran on section 1** and reported "0 image inputs", which reads like
+  photos are switched off. They are not: 11 of the 19 questions allow them, all on the
+  Condition section. Sections 1 and 2 are identification and access and carry none by
+  design. It now walks to the right section first.
+- **The point-of-use reminder** is wired to exactly one place — `remindMaterialOnHand`, on
+  the material picker for a receipt line inside the split editor. Not to opening a job line,
+  which is where the brief's wording pointed and where the screen first looked. The screen
+  now goes where the code is.
+
+And the leftover-materials prompt only appears *after* the close is confirmed, so it is its
+own screen now, marked `once` so it presses through on one viewport at the very end rather
+than closing the fixture work order out from under every screen after it.
