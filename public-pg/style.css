@@ -959,3 +959,30 @@ label {
 /* Chip rows size to their text and wrap; they are never full-width stacked blocks. */
 .chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip-row > * { flex: 0 0 auto; width: auto; }
+
+/* ---------- The on-screen keyboard (mobile audit) ----------
+   --kb is set by trackKeyboardInset() in app.js: the pixels of the layout viewport the
+   keyboard is currently covering. iOS never resizes the window for the keyboard, so
+   without this every bottom-pinned thing hides underneath it. Default 0 so nothing moves
+   on a desktop, and so the rules are harmless in a browser with no visualViewport. */
+:root { --kb: 0px; }
+
+/* Anything fixed to the bottom of the screen rides up on top of the keyboard. */
+.toast { bottom: calc(22px + var(--kb)); }
+.reorder-sheet { padding-bottom: var(--kb); }
+
+/* A sticky Save row has to clear the keyboard too, or you cannot reach it from the
+   field you are typing in. */
+.kb-open .panel-footer { bottom: var(--kb); }
+
+/* A full-screen panel or modal shrinks to the band that is still visible, so its own
+   internal scroll keeps working instead of the page scrolling behind the keyboard. */
+.kb-open .addpanel,
+.kb-open .reorder-sheet { max-height: calc(100dvh - var(--kb)); }
+
+/* Combobox list flipped above its input, when the keyboard leaves no room below
+   (placeResults() in mountCombobox). The base rule hangs it off top:100%. */
+.ac-results.cbx-above {
+  top: auto; bottom: 100%;
+  margin-top: 0; margin-bottom: 4px;
+}

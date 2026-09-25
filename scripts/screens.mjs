@@ -2,11 +2,24 @@
 // console errors per screen. Dev-only: playwright is a devDependency and the production
 // image is built with `npm ci --omit=dev`, so none of this ships.
 //
-//   BASE=https://audit.fracturedrv.com USER=mobaudit PASS=… node scripts/screens.mjs before
+//   BASE=https://audit.fracturedrv.com USER_NAME=mobaudit PASS=… node scripts/screens.mjs before
+//
+// Pass 2 adds the field screens — the runner, the WO card view, the split editor, the
+// leftover prompt — which cannot be reached against an empty database. Make the data
+// first, and take it away afterwards:
+//
+//   docker exec camp-audit node scripts/fixtures.mjs create
+//   … run this …
+//   docker exec camp-audit node scripts/fixtures.mjs delete
+//
+// The fixtures are found by name at runtime rather than by id, so no ids have to be
+// carried between the two scripts.
 //
 // Emulation is not a real iPhone. Anything depending on the real Safari toolbar
 // collapsing, momentum scrolling, or the on-screen keyboard has to be checked by hand —
-// those are called out in docs/mobile-audit.md.
+// those are called out in docs/mobile-audit.md. The keyboard cases below reproduce the
+// GEOMETRY a keyboard creates, which is what the layout code reacts to; they do not
+// reproduce the keyboard.
 import { webkit } from 'playwright';
 import fs from 'fs';
 import path from 'path';
@@ -15,58 +28,256 @@ const BASE = process.env.BASE || 'https://audit.fracturedrv.com';
 const USER = process.env.USER_NAME || 'mobaudit';
 const PASS = process.env.PASS;
 const PHASE = process.argv[2] || 'before';
+const ONLY = process.argv[3] || null;      // optional screen-id substring filter
 const OUT = path.join('docs', 'mobile-screens', PHASE);
+const FIXTURE_TAG = '[FIXTURE]';
 
 if (!PASS) { console.error('PASS is required'); process.exit(1); }
 
 // 393x852 is the iPhone 14 Pro. The others bracket it: a small Android, a narrowed
-// desktop window, and full desktop.
+// desktop window, and full desktop. `kbHeight` is how tall the visible band becomes on
+// that device once the keyboard is up — used by the keyboard cases below.
 const VIEWPORTS = [
-  { name: '393-iphone14pro', width: 393, height: 852, mobile: true },
-  { name: '360-android',     width: 360, height: 800, mobile: true },
+  { name: '393-iphone14pro', width: 393, height: 852, mobile: true, kbHeight: 516 },
+  { name: '360-android',     width: 360, height: 800, mobile: true, kbHeight: 480 },
   { name: '760-narrow',      width: 760, height: 1000, mobile: false },
   { name: '1440-desktop',    width: 1440, height: 900, mobile: false },
+  // Landscape. A phone on its side is how a lot of field photography happens, and it is
+  // where a runner section or a WO card view runs out of vertical room first.
+  { name: '852-landscape',   width: 852, height: 393, mobile: true, landscape: true },
 ];
 
-// Every screen reachable by a view name, plus the overlays that have to be opened by
-// clicking something. `open` runs after the view renders.
-const SCREENS = [
-  { id: 'dashboard',        view: 'dashboard' },
-  { id: 'work-orders',      view: 'workOrders' },
-  { id: 'wo-detail',        view: 'workOrders', open: async (p) => { await p.locator('.list-item, tr[data-id]').first().click({ timeout: 4000 }); } },
-  { id: 'locations',        view: 'locations' },
-  { id: 'asset-profile',    view: 'locations', open: async (p) => {
-      await p.locator('.list-item').first().click({ timeout: 4000 });
-      await p.waitForTimeout(600);
-      await p.locator('.list-item').first().click({ timeout: 4000 });
-    } },
-  { id: 'calendar',         view: 'calendar' },
-  { id: 'inbox',            view: 'inbox' },
-  { id: 'admin-tasks',      view: 'adminTasks' },
-  { id: 'audit-picker',     view: 'auditPicker' },
-  { id: 'audit-rounds',     view: 'auditRounds' },
-  { id: 'audit-new-round',  view: 'auditRounds', open: async (p) => { await p.locator('#newRoundBtn').click({ timeout: 4000 }); } },
-  { id: 'audit-form-builder', view: 'auditRounds', open: async (p) => { await p.locator('.edit-form').first().click({ timeout: 4000 }); } },
-  { id: 'map',              view: 'map' },
-  { id: 'notes',            view: 'notes' },
-  { id: 'expenses',         view: 'expenses' },
-  { id: 'expense-detail',   view: 'expenses', open: async (p) => { await p.locator('.list-item').first().click({ timeout: 4000 }); } },
-  { id: 'materials',        view: 'materials' },
-  { id: 'capital-plan',     view: 'capitalPlan' },
-  { id: 'requests',         view: 'requests' },
-  { id: 'crew',             view: 'crew' },
-  { id: 'crew-hours',       view: 'crewHours' },
-  { id: 'maintenance-log',  view: 'maintenanceLog' },
-  { id: 'activity-log',     view: 'activityLog' },
-  { id: 'admin-hub',        view: 'admin' },
-  { id: 'reports-board',    view: 'reports', params: { mode: 'board' } },
-  { id: 'reports-add-item', view: 'reports', params: { mode: 'board' }, open: async (p) => { await p.locator('#brAddItem').click({ timeout: 6000 }); await p.waitForTimeout(800); } },
-  { id: 'reports-explorer', view: 'reports', params: { mode: 'explorer' } },
-  { id: 'reports-work-performed', view: 'reports', params: { mode: 'workPerformed' } },
-  { id: 'reports-deferred', view: 'reports', params: { mode: 'deferredBacklog' } },
-  { id: 'reports-visitor',  view: 'reports', params: { mode: 'visitorActivity' } },
-  { id: 'reports-audit-data', view: 'reports', params: { mode: 'auditData' } },
-];
+// ── helpers the screen definitions use ───────────────────────────────────
+const tap = (p, sel, timeout = 5000) => p.locator(sel).first().click({ timeout });
+const wait = (p, ms) => p.waitForTimeout(ms);
+
+// Keyboard, part one — geometry. visualViewport cannot be faked from outside the page, so
+// `keyboard: 'geometry'` shrinks the real viewport to the band a keyboard would leave.
+// The layout code reads that band, so a combobox with nowhere to hang below really does
+// have to flip above its input, and placeResults() is genuinely under test.
+//
+// Keyboard, part two — the --kb custom property that lifts bottom-pinned chrome. That one
+// is ours, so `keyboard: 'inset'` drives it directly.
+async function forceKeyboardInset(page, px) {
+  await page.evaluate((n) => {
+    document.documentElement.style.setProperty('--kb', `${n}px`);
+    document.documentElement.classList.toggle('kb-open', n > 90);
+  }, px);
+  await wait(page, 200);
+}
+async function clearKeyboardInset(page) {
+  await page.evaluate(() => {
+    document.documentElement.style.removeProperty('--kb');
+    document.documentElement.classList.remove('kb-open');
+  });
+}
+
+// ── screens ──────────────────────────────────────────────────────────────
+// `ids` carries the fixture record ids discovered after login. A screen that needs one
+// and does not get it is skipped and reported as such, rather than silently passing.
+function screensFor(ids) {
+  return [
+    // ---- pass 1: every screen reachable by view name ----
+    { id: 'dashboard',        view: 'dashboard' },
+    { id: 'work-orders',      view: 'workOrders' },
+    { id: 'wo-detail',        view: 'workOrders', open: async (p) => { await tap(p, '.list-item, tr[data-id]'); } },
+    { id: 'locations',        view: 'locations' },
+    { id: 'asset-profile',    view: 'locations', open: async (p) => {
+        await tap(p, '.list-item'); await wait(p, 600); await tap(p, '.list-item');
+      } },
+    { id: 'calendar',         view: 'calendar' },
+    { id: 'inbox',            view: 'inbox' },
+    { id: 'admin-tasks',      view: 'adminTasks' },
+    { id: 'audit-picker',     view: 'auditPicker' },
+    { id: 'audit-rounds',     view: 'auditRounds' },
+    { id: 'audit-new-round',  view: 'auditRounds', open: async (p) => { await tap(p, '#newRoundBtn'); } },
+    { id: 'audit-form-builder', view: 'auditRounds', open: async (p) => { await tap(p, '.edit-form'); } },
+    { id: 'map',              view: 'map' },
+    { id: 'notes',            view: 'notes' },
+    { id: 'expenses',         view: 'expenses' },
+    { id: 'expense-detail',   view: 'expenses', open: async (p) => { await tap(p, '.list-item'); } },
+    { id: 'materials',        view: 'materials' },
+    { id: 'capital-plan',     view: 'capitalPlan' },
+    { id: 'requests',         view: 'requests' },
+    { id: 'crew',             view: 'crew' },
+    { id: 'crew-hours',       view: 'crewHours' },
+    { id: 'maintenance-log',  view: 'maintenanceLog' },
+    { id: 'activity-log',     view: 'activityLog' },
+    { id: 'admin-hub',        view: 'admin' },
+    { id: 'reports-board',    view: 'reports', params: { mode: 'board' } },
+    { id: 'reports-add-item', view: 'reports', params: { mode: 'board' }, open: async (p) => { await tap(p, '#brAddItem', 6000); await wait(p, 800); } },
+    { id: 'reports-explorer', view: 'reports', params: { mode: 'explorer' } },
+    { id: 'reports-work-performed', view: 'reports', params: { mode: 'workPerformed' } },
+    { id: 'reports-deferred', view: 'reports', params: { mode: 'deferredBacklog' } },
+    { id: 'reports-visitor',  view: 'reports', params: { mode: 'visitorActivity' } },
+    { id: 'reports-audit-data', view: 'reports', params: { mode: 'auditData' } },
+
+    // ---- pass 2, priority 1: the audit runner ----
+    // Every section in turn. The runner numbers its sections, so walk them by index
+    // rather than by name — a reworded section must not silently drop out of the audit.
+    { id: 'round-detail',     view: 'auditRound', params: { id: ids.roundId }, needs: 'roundId' },
+    { id: 'runner-s1',        view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId' },
+    ...[2, 3, 4, 5, 6].map((n) => ({
+      id: `runner-s${n}`, view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId',
+      open: async (p) => {
+        // #nextSec is absent on the last section, so a form with fewer sections than this
+        // stops early rather than erroring — the missing captures say how many there were.
+        for (let i = 1; i < n; i++) { await tap(p, '#nextSec', 3000); await wait(p, 700); }
+      },
+    })),
+    // A follow-up question only exists once its parent answer is chosen. Every option is
+    // an .opt-btn; tapping the first one on section 1 is the shortest route to one.
+    { id: 'runner-followup',  view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId',
+      open: async (p) => { await tap(p, '.opt-btn', 4000); await wait(p, 1100); } },
+    // Photo capture is not a click test: clicking a file input opens the OS chooser, which
+    // proves nothing about the app. What matters is how the input is declared — no
+    // `capture`, so the photo library is offered and not just the camera, and `multiple`
+    // where more than one photo makes sense. That is assertable, so assert it.
+    { id: 'runner-photo',     view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId',
+      open: async (p) => { await tap(p, '.opt-btn', 4000).catch(() => {}); await wait(p, 700); },
+      extra: async (p) => p.evaluate(() => {
+        const inputs = [...document.querySelectorAll('input[type=file]')]
+          .filter((el) => (el.getAttribute('accept') || '').includes('image'));
+        return {
+          imageInputs: inputs.length,
+          withCaptureAttr: inputs.filter((el) => el.hasAttribute('capture')).length,
+          withMultiple: inputs.filter((el) => el.hasAttribute('multiple')).length,
+          // The label wrapping a hidden file input is the real tap target.
+          labelHeights: inputs.map((el) => {
+            const lab = el.closest('label');
+            return lab ? Math.round(lab.getBoundingClientRect().height) : 0;
+          }),
+        };
+      }) },
+    { id: 'runner-flag-other', view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId',
+      open: async (p) => { await tap(p, '#adhocBtn', 4000); await wait(p, 900); } },
+    { id: 'runner-review',    view: 'auditReview', params: { id: ids.instanceId }, needs: 'instanceId' },
+    // Generation: #completeBtn is "Create work order" when the review is dirty and "Mark
+    // complete" when it is clean. Screenshot the button and whatever confirm it raises —
+    // never press through, so the fixture round stays re-runnable.
+    { id: 'runner-generate',  view: 'auditReview', params: { id: ids.instanceId }, needs: 'instanceId',
+      open: async (p) => { await tap(p, '#completeBtn', 4000); await wait(p, 900); },
+      after: async (p) => { await tap(p, '.modal-box .btn-secondary', 1500).catch(() => {}); } },
+    { id: 'round-report',     view: 'auditRoundReport', params: { id: ids.roundId }, needs: 'roundId' },
+
+    // ---- priority 2: the work order in the field ----
+    { id: 'wo-card-view',     view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId' },
+    { id: 'wo-line-open',     view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
+      open: async (p) => { await tap(p, '.jl-card summary', 4000); await wait(p, 600); } },
+    // Adding one line on the phone (Q8). The form is in the markup at every width; what
+    // is being checked is that it is reachable and usable without the grid.
+    { id: 'wo-add-line',      view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
+      open: async (p) => { await p.locator('#addJlForm').scrollIntoViewIfNeeded({ timeout: 4000 }); await wait(p, 500); },
+      extra: async (p) => p.evaluate(() => {
+        const form = document.getElementById('addJlForm');
+        const grid = document.getElementById('editLinesBtn');
+        return {
+          addLineFormPresent: !!form,
+          gridButtonHidden: grid ? grid.hidden : null,
+          // The Q8 note only appears below the 900px gate.
+          desktopNoteShown: /easier in the grid/i.test(document.body.textContent),
+          lineCards: document.querySelectorAll('.jl-card').length,
+        };
+      }) },
+    { id: 'wo-checklist',     view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
+      open: async (p) => { await tap(p, '#attachChecklistBtn, #checklistSections summary', 4000); await wait(p, 700); } },
+    { id: 'wo-log',           view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
+      open: async (p) => { await p.locator('#addLogEntryForm').scrollIntoViewIfNeeded({ timeout: 4000 }); await wait(p, 500); } },
+    { id: 'wo-reorder-sheet', view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
+      open: async (p) => { await tap(p, '#reorderLinesBtn', 4000); await wait(p, 800); } },
+    // Reopen prompt: it is raised by adding or resolving a line on a DONE work order. The
+    // fixture WO is open, so rather than closing it — which would consume the fixture and
+    // change what every later screen sees — the prompt is reached by completing the WO,
+    // screenshotting, and cancelling out.
+    // Closing the fixture WO is also what raises the leftover-materials prompt, so one
+    // capture covers both; `extra` records which of them actually appeared.
+    { id: 'wo-close-prompt',  view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
+      open: async (p) => { await tap(p, '#completeWoBtn', 4000); await wait(p, 1200); },
+      extra: async (p) => p.evaluate(() => {
+        const box = document.querySelector('.modal-box');
+        const text = box ? box.textContent : '';
+        return {
+          promptShown: !!box,
+          mentionsLeftover: /left ?over|remaining|on hand/i.test(text),
+          mentionsReopen: /reopen/i.test(text),
+          promptFitsScreen: box ? Math.round(box.getBoundingClientRect().height) <= window.innerHeight : null,
+        };
+      }),
+      after: async (p) => { await tap(p, '.modal-box .btn-secondary', 1500).catch(() => {}); } },
+
+    // ---- priority 3: money in the field ----
+    { id: 'receipt-detail',   view: 'expenseDetail', params: { id: ids.receiptId }, needs: 'receiptId' },
+    { id: 'split-editor',     view: 'expenseDetail', params: { id: ids.receiptId }, needs: 'receiptId',
+      open: async (p) => { await tap(p, '#splitExpenseBtn', 4000); await wait(p, 1000); } },
+    // The same editor against a receipt with NO line items — the whole-receipt,
+    // split-by-dollar-amount case, which is how emailed receipts actually arrive.
+    { id: 'split-flat-receipt', view: 'expenseDetail', params: { id: ids.flatReceiptId }, needs: 'flatReceiptId',
+      open: async (p) => { await tap(p, '#splitExpenseBtn', 4000); await wait(p, 1000); } },
+
+    // ---- priority 4: materials ----
+    { id: 'materials-on-hand', view: 'materials' },
+    { id: 'material-detail',  view: 'materials',
+      open: async (p) => { await tap(p, '.mat-row, .list-item', 4000); await wait(p, 700); } },
+    { id: 'count-correction', view: 'materials',
+      open: async (p) => {
+        await tap(p, '.mat-row, .list-item', 4000); await wait(p, 700);
+        await tap(p, '#matCorrect', 4000); await wait(p, 800);
+      },
+      after: async (p) => { await tap(p, '.modal-box .btn-secondary', 1500).catch(() => {}); } },
+    // The point-of-use reminder fires when a line's material is already in stock — the
+    // fixture puts the same three materials on hand that the fixture work order needs, so
+    // opening a line is enough to raise it.
+    { id: 'point-of-use',     view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
+      open: async (p) => { await tap(p, '.jl-card summary', 4000); await wait(p, 1000); },
+      extra: async (p) => p.evaluate(() => ({
+        reminderShown: /in stock|on hand|drawing from stock/i.test(document.body.textContent),
+      })) },
+
+    // ---- priority 5: the keyboard ----
+    // Geometry first: the visible band really is short, so a combobox has to flip above
+    // its input instead of hanging under the keyboard.
+    { id: 'kb-combobox-flip', view: 'newWorkOrder', keyboard: 'geometry',
+      open: async (p) => {
+        await tap(p, '.cbx-input, .ac-input', 5000);
+        await wait(p, 800);
+      },
+      extra: async (p) => p.evaluate(() => {
+        const r = document.querySelector('.ac-results:not([hidden])');
+        if (!r) return { comboboxOpen: false };
+        const input = r.parentElement.querySelector('.ac-input, .cbx-input');
+        const ir = input.getBoundingClientRect(); const rr = r.getBoundingClientRect();
+        return {
+          comboboxOpen: true,
+          flippedAbove: r.classList.contains('cbx-above'),
+          listBottom: Math.round(rr.bottom), listTop: Math.round(rr.top),
+          inputTop: Math.round(ir.top),
+          insideViewport: rr.top >= -1 && rr.bottom <= window.innerHeight + 1,
+        };
+      }) },
+    // Then the inset: a sticky Save row and a toast have to ride above the keyboard.
+    { id: 'kb-bottom-chrome', view: 'reports', params: { mode: 'board' }, keyboard: 'inset',
+      open: async (p) => {
+        // The add-item panel is the screen with filters above a list and a footer below —
+        // exactly the shape the keyboard interferes with.
+        await tap(p, '#brAddItem', 5000).catch(() => {});
+        await wait(p, 800);
+        await tap(p, '.addpanel-filtertoggle', 2500).catch(() => {});
+      },
+      extra: async (p) => p.evaluate(() => {
+        const kb = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--kb'), 10) || 0;
+        const toast = document.querySelector('.toast');
+        return {
+          kbVar: kb,
+          kbOpenClass: document.documentElement.classList.contains('kb-open'),
+          toastBottom: toast ? Math.round(getComputedStyle(toast).bottom) : null,
+        };
+      }) },
+    // And the runner itself with the keyboard up: a note field must stay visible.
+    { id: 'kb-runner-note',   view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId',
+      keyboard: 'geometry',
+      open: async (p) => { await tap(p, 'textarea, .q-note', 4000).catch(() => {}); await wait(p, 600); } },
+  ];
+}
 
 // Page-body horizontal overflow is the single most useful automated signal: if the body
 // scrolls sideways, something is wider than the screen and a human will feel it.
@@ -88,30 +299,73 @@ async function measure(page) {
         }
       }
     }
-    // Tap targets below 44px, and inputs whose font-size would make iOS zoom.
+    // Tap targets below 44px, and inputs whose font-size would make iOS zoom. Only the
+    // controls Q6 covers count — a link inside prose is deliberately left alone, so
+    // counting it here would report a problem that is not one.
+    const CONTROL = 'button, .btn, select, [role=button], input[type=checkbox], input[type=radio],'
+      + ' .view-toggle-btn, label.skill-chip, .chip-row > label, .q-note, .o-remedy, .o-follow,'
+      + ' .rm-edit, .rm-del, .q-edit, .q-del, .br-note, .list-item[data-view], .list-item[data-id],'
+      + ' .round-row, .inst-row, .mat-row, .add-cand, .br-open-output, .edit-form, .pf-pick';
     const small = [];
     const smallFont = [];
-    for (const el of document.querySelectorAll('button, a, input, select, textarea, label, [role=button]')) {
+    for (const el of document.querySelectorAll(CONTROL)) {
       const r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
       if (r.height < 44 || r.width < 24) {
         small.push({ tag: el.tagName.toLowerCase(), cls: (el.className || '').toString().slice(0, 30),
           text: (el.textContent || '').trim().slice(0, 18), h: Math.round(r.height), w: Math.round(r.width) });
       }
-      if (/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) {
-        const fs = parseFloat(getComputedStyle(el).fontSize);
-        if (fs && fs < 16) smallFont.push({ tag: el.tagName.toLowerCase(), fontSize: fs, cls: (el.className || '').toString().slice(0, 30) });
-      }
     }
+    for (const el of document.querySelectorAll('input, select, textarea')) {
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      const fs = parseFloat(getComputedStyle(el).fontSize);
+      if (fs && fs < 16) smallFont.push({ tag: el.tagName.toLowerCase(), fontSize: fs, cls: (el.className || '').toString().slice(0, 30) });
+    }
+    // Any element that overflows its own box horizontally — a table scrolling inside its
+    // container is correct and must not be reported as a page problem.
+    const scrollers = [...document.querySelectorAll('table, .jlg-scroll, [style*="overflow-x"]')]
+      .filter((el) => el.scrollWidth > el.clientWidth + 1)
+      .map((el) => ({ tag: el.tagName.toLowerCase(), cls: (el.className || '').toString().slice(0, 30),
+        card: el.getAttribute('data-card') === '1' }));
     return {
       overflow, offenders: offenders.slice(0, 8),
       smallTargets: small.length, smallTargetSample: small.slice(0, 6),
       smallFonts: smallFont.length, smallFontSample: smallFont.slice(0, 4),
+      cardTables: document.querySelectorAll('table[data-card="1"]').length,
+      scrollTables: scrollers.filter((s) => s.tag === 'table' && !s.card).length,
       bodyFontSize: parseFloat(getComputedStyle(document.body).fontSize),
     };
   });
 }
 
+// Find the fixture records by name, from inside the page so the session cookie is used.
+async function discoverFixtures(page) {
+  return page.evaluate(async (TAG) => {
+    const get = async (u) => { try { const r = await fetch(u); return r.ok ? r.json() : null; } catch { return null; } };
+    const out = {};
+    const rounds = await get('/api/pg/audit-rounds');
+    const round = (rounds?.rounds || []).find((r) => (r.Name || '').startsWith(TAG));
+    if (round) {
+      out.roundId = round.Id;
+      const d = await get(`/api/pg/audit-rounds/${round.Id}`);
+      const inst = (d?.instances || [])[0];
+      if (inst) out.instanceId = inst.Id;
+    }
+    const wos = await get('/api/pg/work-orders');
+    const wo = (wos?.workOrders || []).find((w) => (w.Title || '').startsWith(TAG));
+    if (wo) out.workOrderId = wo.Id;
+    const exp = await get('/api/pg/expenses');
+    const list = exp?.expenses || [];
+    const withLines = list.find((e) => (e.Vendor || '').startsWith(`${TAG} Hardware`));
+    const flat = list.find((e) => (e.Vendor || '').startsWith(`${TAG} Lumber`));
+    if (withLines) out.receiptId = withLines.Id;
+    if (flat) out.flatReceiptId = flat.Id;
+    return out;
+  }, FIXTURE_TAG);
+}
+
+// ── run ──────────────────────────────────────────────────────────────────
 const report = [];
 
 for (const vp of VIEWPORTS) {
@@ -140,24 +394,51 @@ for (const vp of VIEWPORTS) {
   await page.waitForFunction(() => !document.getElementById('loginForm'), { timeout: 15000 });
   await page.waitForTimeout(1500);
 
+  const ids = await discoverFixtures(page);
+  if (vp === VIEWPORTS[0]) {
+    const found = Object.entries(ids).map(([k, v]) => `${k}=${v}`).join(' ') || 'none';
+    console.log(`  fixtures: ${found}`);
+    if (!ids.instanceId) console.log('  (no fixture round — run scripts/fixtures.mjs create for the field screens)');
+  }
+
+  const SCREENS = screensFor(ids).filter((s) => !ONLY || s.id.includes(ONLY));
   fs.mkdirSync(path.join(OUT, vp.name), { recursive: true });
 
   for (const s of SCREENS) {
+    // A screen whose fixture is missing is reported as skipped. Silently passing it would
+    // read as "the runner is fine on a phone" when the runner was never opened.
+    if (s.needs && !ids[s.needs]) {
+      report.push({ viewport: vp.name, screen: s.id, skipped: `no fixture ${s.needs}` });
+      console.log(`  ${vp.name.padEnd(18)} ${s.id.padEnd(24)} SKIP (no ${s.needs})`);
+      continue;
+    }
+    // Landscape only carries the screens where vertical room is the question.
+    if (vp.landscape && !/^(runner-|wo-|kb-|round-detail)/.test(s.id)) continue;
+    if (s.keyboard && !vp.kbHeight) continue;   // no keyboard on a desktop
+
     const before = consoleErrors.length;
     try {
+      if (s.keyboard === 'geometry') await page.setViewportSize({ width: vp.width, height: vp.kbHeight });
       await page.evaluate(([view, params]) => window.go(view, params || {}, { reset: true }), [s.view, s.params || {}]);
       await page.waitForTimeout(1400);
-      if (s.open) { try { await s.open(page); await page.waitForTimeout(1200); } catch { /* control absent at this width */ } }
+      if (s.keyboard === 'inset') await forceKeyboardInset(page, Math.round(vp.height - vp.kbHeight));
+      if (s.open) { try { await s.open(page, ids); await page.waitForTimeout(1200); } catch { /* control absent at this width */ } }
       const m = await measure(page);
+      const extra = s.extra ? await s.extra(page).catch(() => null) : null;
       await page.screenshot({ path: path.join(OUT, vp.name, `${s.id}.png`), fullPage: false });
-      report.push({ viewport: vp.name, screen: s.id, ...m, newConsoleErrors: consoleErrors.slice(before) });
+      report.push({ viewport: vp.name, screen: s.id, ...m, ...(extra ? { extra } : {}), newConsoleErrors: consoleErrors.slice(before) });
       const flag = m.overflow > 1 ? `OVERFLOW +${m.overflow}px` : 'ok';
-      console.log(`  ${vp.name.padEnd(18)} ${s.id.padEnd(24)} ${flag.padEnd(18)} targets<44:${String(m.smallTargets).padStart(3)} fonts<16:${String(m.smallFonts).padStart(2)}`);
-      // Close any overlay so the next screen starts clean.
-      await page.evaluate(() => document.querySelectorAll('.modal-overlay, .reorder-sheet').forEach((e) => e.remove()));
+      const note = extra ? '  ' + JSON.stringify(extra) : '';
+      console.log(`  ${vp.name.padEnd(18)} ${s.id.padEnd(24)} ${flag.padEnd(18)} targets<44:${String(m.smallTargets).padStart(3)} fonts<16:${String(m.smallFonts).padStart(2)}${note}`);
+      if (s.after) await s.after(page).catch(() => {});
     } catch (e) {
       report.push({ viewport: vp.name, screen: s.id, error: String(e.message).split('\n')[0].slice(0, 120) });
       console.log(`  ${vp.name.padEnd(18)} ${s.id.padEnd(24)} ERROR ${String(e.message).split('\n')[0].slice(0, 60)}`);
+    } finally {
+      // Leave the next screen a clean page: no overlay, no forced inset, real viewport.
+      await page.evaluate(() => document.querySelectorAll('.modal-overlay, .reorder-sheet, .day-panel-overlay').forEach((e) => e.remove())).catch(() => {});
+      await clearKeyboardInset(page).catch(() => {});
+      if (s.keyboard === 'geometry') await page.setViewportSize({ width: vp.width, height: vp.height }).catch(() => {});
     }
   }
   await browser.close();
@@ -166,5 +447,6 @@ for (const vp of VIEWPORTS) {
 fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(report, null, 2));
 const overflowing = report.filter((r) => r.overflow > 1);
 const errs = report.filter((r) => r.newConsoleErrors?.length);
-console.log(`\n  ${report.length} captures. ${overflowing.length} with body overflow. ${errs.length} with console errors.`);
+const skipped = report.filter((r) => r.skipped);
+console.log(`\n  ${report.length} captures. ${overflowing.length} with body overflow. ${errs.length} with console errors. ${skipped.length} skipped for missing fixtures.`);
 console.log(`  -> ${OUT}/report.json`);

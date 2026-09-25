@@ -193,9 +193,77 @@ The 900px gate stays. Below it:
 - **Tables → stacked cards.** Tables currently scroll horizontally inside their container,
   which stops the page overflowing but is not the "stacked cards preferred for anything I
   act on" the brief asks for. **Needs your call on which tables.**
-- **2,352 sub-44px tap targets remain at 393px.** The count is dominated by inline `<a>`
-  links inside text, which arguably shouldn't be 44px tall. Raising every one would change
-  the look of every screen. **Needs your call:** buttons and row actions only, or links too?
-- **Job-line grid on a phone** — untouched this pass. It no longer overflows the page, but
-  I have not confirmed whether it's genuinely usable or whether it should fall back to
-  cards. Not yet decided.
+- ~~**2,352 sub-44px tap targets remain at 393px.**~~ Answered (Q6) and done: controls only,
+  prose links left alone. The harness now counts only the controls Q6 covers, so the number
+  it reports is the number that matters.
+- ~~**Job-line grid on a phone**~~ Answered (Q8) and done: the 900px gate stays, the card
+  view is the phone surface, and a note now says so.
+
+## Pass 2 — the field screens
+
+The screens that actually get used standing in a building could not be reached before,
+because they need data: the runner needs a round, the split editor needs a receipt with
+line items, the leftover prompt needs a job with materials on it. So there are now two
+scripts, and the first one makes that data.
+
+```
+docker exec camp-audit node scripts/fixtures.mjs create     # or list, or delete
+BASE=https://audit.fracturedrv.com USER_NAME=<verify user> PASS=… \
+  node scripts/screens.mjs after
+docker exec camp-audit node scripts/fixtures.mjs delete
+```
+
+`fixtures.mjs` runs inside the container, because that is where `DATABASE_URL` lives, and
+imports the same `db.js` the app does — so a fixture goes through the same code path a real
+record would and cannot drift from it. Everything it writes is named `[FIXTURE] …`, and
+`delete` removes exactly the rows carrying that tag, children first. It makes: a throwaway
+area and cabin, a round on the live seed form, two open findings, a work order with three
+lines (two of them linked to those findings), a receipt with four line items, a second
+receipt with none — the emailed, split-by-dollar-amount case — and three materials with
+stock on hand at the price paid.
+
+`screens.mjs` finds those records by name at runtime rather than by id, so no ids have to
+be carried between the two scripts, and a screen whose fixture is missing is reported as
+**skipped**. That matters: silently passing would read as "the runner is fine on a phone"
+when the runner was never opened.
+
+What it now covers, beyond pass 1: the round detail, all six runner sections walked in
+order, a follow-up question, "Flag something else", review, generation (opened and
+cancelled, never pressed through, so the fixture round stays re-runnable), the round
+report, the WO card view, a line opened, the add-a-line form, the checklist, the log, the
+reorder sheet, the close prompt, the receipt detail and split editor for both receipt
+shapes, materials on hand, count correction, and the point-of-use reminder.
+
+### Photo capture is asserted, not clicked
+
+Clicking a file input opens the operating system's file chooser, which proves nothing about
+the app. What matters is how the input is *declared*: no `capture` attribute, so iOS offers
+the photo library and not only the camera, and `multiple` where more than one photo makes
+sense. The harness reads those attributes and reports the counts, plus the height of the
+label that wraps each one — the label is the real tap target, since the input itself is
+hidden.
+
+### The keyboard
+
+Two separate problems, tested two different ways.
+
+**Geometry.** iOS does not resize the window when the keyboard opens; it shrinks the
+*visual* viewport. `visualViewport` cannot be faked from outside the page, so instead the
+harness shrinks the real viewport to the band a keyboard would leave (516px on an iPhone 14
+Pro). The layout code reads that band, so a combobox with nowhere to hang below genuinely
+has nowhere to hang, and `placeResults()` has to flip the list above its input. The harness
+then reports whether it did, and whether the list stayed on screen.
+
+**The inset.** `trackKeyboardInset()` publishes the overlap as `--kb` on `<html>` and adds
+`.kb-open`, and CSS lifts the toast, the sticky Save row and any full-screen panel by that
+much. That half is ours, so the harness drives `--kb` directly and reads back where the
+bottom chrome ended up.
+
+Neither reproduces a keyboard. What still needs a real phone: whether the keyboard's
+dismissal animation leaves the layout settled, and whether the Safari toolbar collapsing on
+scroll fights the same rules.
+
+### Landscape
+
+A fifth viewport, 852×393, carrying only the screens where vertical room is the question —
+the runner sections and the work order card view.

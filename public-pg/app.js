@@ -10707,6 +10707,49 @@ function applyCardTableLabels(root = app) {
   }
 }
 
+// ── The on-screen keyboard (mobile audit) ────────────────────────────────
+// iOS does not resize the window when the keyboard comes up — it shrinks the VISUAL
+// viewport and leaves `innerHeight` alone. Anything pinned to the bottom (a panel's Save
+// row, a toast) therefore ends up underneath the keyboard, and 100dvh no longer describes
+// what you can see. So publish the overlap once, as a custom property, and let CSS use it.
+//
+// --kb is how many pixels of the layout viewport the keyboard is covering.
+// .kb-open is on <html> whenever that is more than a token amount.
+const KB_MIN = 90;  // below this it is a toolbar appearing, not a keyboard
+
+function trackKeyboardInset() {
+  const vv = window.visualViewport;
+  const root = document.documentElement;
+  if (!vv) { root.style.setProperty('--kb', '0px'); return; }
+  const apply = () => {
+    // offsetTop matters: when the page is scrolled inside the visual viewport, the
+    // bottom of what you can see is offsetTop + height, not height.
+    const overlap = Math.max(0, Math.round(window.innerHeight - (vv.height + vv.offsetTop)));
+    root.style.setProperty('--kb', `${overlap}px`);
+    root.classList.toggle('kb-open', overlap > KB_MIN);
+    // The field the keyboard just covered is the whole reason the keyboard opened.
+    const el = document.activeElement;
+    if (overlap > KB_MIN && el && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom > vv.offsetTop + vv.height - 8 || r.top < vv.offsetTop + 8) {
+        el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      }
+    }
+  };
+  vv.addEventListener('resize', apply);
+  vv.addEventListener('scroll', apply);
+  apply();
+}
+trackKeyboardInset();
+
+// How much of the layout viewport is actually visible right now — a combobox list or any
+// other popover has to fit inside THIS, not inside innerHeight.
+function visibleBand() {
+  const vv = window.visualViewport;
+  const top = vv ? vv.offsetTop : 0;
+  return { top, bottom: top + (vv ? vv.height : window.innerHeight) };
+}
+
 // ── Asset face: photo, or the type's icon (Addendum §5a) ─────────────────
 // One helper everywhere an asset appears, so the same building looks the same in the
 // header, in a list and in search results.
@@ -10837,8 +10880,27 @@ function mountCombobox(container, {
       el.addEventListener('mousedown', (e) => { e.preventDefault(); pick(filtered[Number(el.dataset.i)]); });
     });
     if (onExtraRow) onExtraRow(resultsEl, input.value.trim());
+    placeResults();
     const active = resultsEl.querySelector('.cbx-active');
     if (active) active.scrollIntoView({ block: 'nearest' });
+  }
+
+  // On a phone the keyboard covers the bottom half of the screen, and a list hanging below
+  // the input lands squarely underneath it. Measure the band that is actually visible and,
+  // if there is more room above the input than below, hang the list upwards instead. The
+  // height is capped to whatever room that side has, so the list cannot run off the top
+  // of the screen either.
+  function placeResults() {
+    const { top, bottom } = visibleBand();
+    const r = input.getBoundingClientRect();
+    const GAP = 8;
+    const below = bottom - r.bottom - GAP;
+    const above = r.top - top - GAP;
+    resultsEl.style.maxHeight = 'none';
+    const wanted = Math.min(resultsEl.scrollHeight || 240, 320);
+    const up = below < Math.min(wanted, 180) && above > below;
+    resultsEl.classList.toggle('cbx-above', up);
+    resultsEl.style.maxHeight = `${Math.max(120, Math.min(wanted, up ? above : below))}px`;
   }
 
   function open(query = '') {
@@ -10854,6 +10916,14 @@ function mountCombobox(container, {
     input.value = selected ? selected.label : '';
     close();
     onSelect(selected);
+  }
+
+  // The keyboard arrives a beat AFTER focus, so the first placement gets measured against
+  // the full-height viewport. Re-measure whenever the visible band changes.
+  if (window.visualViewport) {
+    const reflow = () => { if (!resultsEl.hidden) placeResults(); };
+    window.visualViewport.addEventListener('resize', reflow);
+    window.visualViewport.addEventListener('scroll', reflow);
   }
 
   input.addEventListener('input', () => open(input.value));
