@@ -320,3 +320,32 @@ inside "no subscriptions beyond Quo".
 
 **Flagged because it adds a dependency.** The alternative is signed stateless cookies, which
 would mean rewriting auth rather than configuring it.
+
+## Q9 — A merge has to defeat the sync, or it undoes itself
+
+**Found while building §1, not during §0.** `cabin_holders` is a derived roster:
+`syncCabinHoldersFromAssets()` runs before every list read and re-inserts a row for every
+distinct `assets.lodge_holder` text. **All 173 holders are backed by that text; none are
+hand-made.** So a merge that repointed only keys would be undone on the next page load.
+
+**Decided:** a `cabin_holder_aliases` table. A merge records the removed name as an alias of
+the kept person; the sync skips aliased names instead of recreating them, and resolves
+`assets.cabin_holder_id` through aliases too. `assets.lodge_holder` keeps the text as it was
+imported — it is source data — and a later import of the same variant now lands on the right
+person by itself.
+
+**Rejected:** rewriting `assets.lodge_holder` from the removed name to the kept one. It would
+work, but it edits imported source text to fix a resolution problem, and loses the fact that
+the asset was ever labelled that way.
+
+## Q10 — Correction: five tables carry the polymorphic funding reference, not six
+
+My §0 write-up said six, including `work_orders`. **`work_orders` has neither
+`funding_source` nor `funding_ref_id`** in the live schema — 0016 added a `funding_ref_id`
+there and it is gone, presumably dropped when funding moved to `job_lines` in 0031. The fifth
+table is `audit_answer_remedies`, which I missed.
+
+The authoritative five, from `information_schema`: `job_lines`,
+`work_order_template_lines`, `audit_remedies`, `audit_answer_remedies`,
+`expense_allocations`. **Zero rows in any of them are funded by a cabin holder today**, so the
+merge risk is latent, not live — but it would be silent when it arrived.

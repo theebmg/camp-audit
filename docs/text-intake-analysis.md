@@ -92,15 +92,60 @@ Real foreign keys (`ON DELETE NO ACTION` on both):
 
 **And one soft reference with no foreign key at all**, which the merge tool in §1 must know
 about: `job_lines.funding_source = 'cabin_holder'` with `funding_ref_id` holding a
-`cabin_holders.id` (db.js:1259, 1579). `funding_ref_id` is a bare `integer` on six tables —
-`work_orders`, `job_lines`, `work_order_template_lines`, `audit_remedies`,
-`expense_allocations`, and the ad-hoc flag table from 0086 — and none of them constrain it.
+`cabin_holders.id` (db.js:1259, 1579). `funding_ref_id` is a bare `integer`, unconstrained, on
+**exactly five** tables — the authoritative list, read from `information_schema` rather than
+from the migration files:
+
+| table | funding_source | funding_ref_id | rows funded by a holder today |
+|---|---|---|---|
+| `job_lines` | yes | yes | 0 |
+| `work_order_template_lines` | yes | yes | 0 |
+| `audit_remedies` | yes | yes | 0 |
+| `audit_answer_remedies` | yes | yes | 0 |
+| `expense_allocations` | yes | yes | 0 |
+
+**Correction to an earlier draft of this document,** which said six tables including
+`work_orders`. `work_orders` has neither column: migration 0016 added a `funding_ref_id` there
+and it is gone from the live schema, presumably dropped when funding moved to `job_lines` in
+0031. The fifth table is `audit_answer_remedies`, which that draft missed.
+
+Nothing is funded by a cabin holder *yet* — all five counts are zero — so the merge risk is
+latent rather than live. It is still worth building correctly, because by the time it matters
+the data will be there and the failure would be silent.
 
 **Consequence: a merge tool that walks foreign keys will silently miss funding.** Repointing
 has to be explicit for every `(table, funding_ref_id)` pair where `funding_source =
 'cabin_holder'`. This is the same shape of trap as the fixture cleanup last week, and the
 opposite lesson: there, following the keys was right because everything was a key; here,
 following the keys alone would lose data.
+
+### `cabin_holders` is a DERIVED roster, which changes what a merge has to do
+
+`syncCabinHoldersFromAssets()` (db.js:1204) runs **before every list read**. It inserts a
+holder row for every distinct `assets.lodge_holder` text, then resolves
+`assets.cabin_holder_id` by matching that text against holder names.
+
+| | count |
+|---|---|
+| assets | 340 |
+| …with `lodge_holder` text | 174 |
+| distinct `lodge_holder` values | 173 |
+| holders backed by that text | **173 — all of them** |
+| holders with no backing text (hand-made) | **0** |
+
+So **a merge that only repointed keys would be silently undone on the next page load**: the
+sync would recreate the row it had just removed, from the asset text that still says the old
+name. Not one holder is hand-made, so this affects every possible merge.
+
+The fix is an alias, not a rewrite of `assets.lodge_holder`. That column is the original
+imported text and should stay as typed; what changes is which person the text resolves to. A
+new `cabin_holder_aliases` table records the removed name against the kept person, the sync
+stops inventing a row for an aliased name, and a later import of the same variant lands on the
+right person by itself.
+
+`cabin_holders.name` is also `UNIQUE`, so exact-name duplicates are already impossible.
+Duplicates can only arise as *variants* — `Lapp, Jen` against `Jen Lapp` — which is precisely
+what §1's normalisation is for.
 
 ### `volunteers` and `vendors` — 1 row each
 
