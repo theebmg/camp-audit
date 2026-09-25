@@ -159,26 +159,16 @@ async function create() {
 }
 
 // ── list / delete ────────────────────────────────────────────────────────
-// Ordered children-first, so foreign keys never block the delete. Each statement
-// re-finds its rows by tag rather than trusting a manifest, because a manifest written
-// into a container survives nothing.
-const TAGGED = [
-  ['material_movements', `material_id IN (SELECT id FROM materials WHERE name LIKE $1)`],
-  ['materials',          `name LIKE $1`],
-  ['expense_line_items', `expense_id IN (SELECT id FROM expenses WHERE vendor LIKE $1)`],
-  ['expense_allocations',`expense_id IN (SELECT id FROM expenses WHERE vendor LIKE $1)`],
-  // savings_entries points at its source by (source_type, source_id), not a real FK,
-  // so nothing forces this delete — it just keeps a discount saving from outliving the
-  // receipt that earned it.
-  ['savings_entries',    `source_type = 'expense' AND source_id IN (SELECT id FROM expenses WHERE vendor LIKE $1)`],
-  ['expenses',           `vendor LIKE $1`],
-  ['audit_answers',      `instance_id IN (SELECT i.id FROM audit_round_instances i
-                            JOIN audit_rounds r ON r.id = i.round_id WHERE r.name LIKE $1)`],
-  ['audit_round_instances', `round_id IN (SELECT id FROM audit_rounds WHERE name LIKE $1)`],
+// The roots: every table that carries the tag in a column of its own. Everything else
+// that needs removing hangs off one of these by a foreign key, and is found by following
+// those keys rather than by being listed here. An earlier version DID list them, and it
+// broke the first time a fixture round wrote an asset_components row nobody had thought
+// of — the point of a fixture is that cleaning up cannot depend on remembering.
+const ROOTS = [
+  ['work_orders',        `title LIKE $1`],   // before assets: its lines reference findings
   ['audit_rounds',       `name LIKE $1`],
-  ['job_lines',          `work_order_id IN (SELECT id FROM work_orders WHERE title LIKE $1)`],
-  ['work_order_log_entries', `work_order_id IN (SELECT id FROM work_orders WHERE title LIKE $1)`],
-  ['work_orders',        `title LIKE $1`],
+  ['expenses',           `vendor LIKE $1`],
+  ['materials',          `name LIKE $1`],
   ['condition_findings', `title LIKE $1`],
   ['assets',             `name LIKE $1`],
   ['locations',          `name LIKE $1`],
@@ -189,22 +179,80 @@ async function tableExists(name) {
   return !!rows[0].t;
 }
 
-async function list() {
-  for (const [table, where] of TAGGED) {
-    if (!await tableExists(table)) continue;
-    const { rows } = await pool.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${where}`, [`${TAG}%`]);
-    if (rows[0].n) say(`${String(rows[0].n).padStart(4)}  ${table}`);
+// Every table with a single-column foreign key pointing at `table`.
+async function childrenOf(client, table) {
+  const { rows } = await client.query(
+    `SELECT con.conrelid::regclass::text AS child, att.attname AS col
+     FROM pg_constraint con
+     JOIN pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = con.conkey[1]
+     WHERE con.confrelid = $1::regclass
+       AND con.contype = 'f'
+       AND array_length(con.conkey, 1) = 1`,
+    [table]
+  );
+  return rows;
+}
+
+// Delete everything pointing at these ids, depth first, then nothing is left holding a
+// reference when the roots go. Rows are only ever matched by an FK column equal to a
+// fixture id, so this cannot reach real data.
+async function deleteReferencing(client, table, ids, depth = 0, seen = new Set()) {
+  if (!ids.length || depth > 4) return;
+  for (const { child, col } of await childrenOf(client, table)) {
+    if (child === table) continue;             // self-reference: the root delete covers it
+    const step = `${child}.${col}`;
+    if (seen.has(step)) continue;
+    seen.add(step);
+    // Grandchildren first, where the child has an id of its own to follow.
+    let childIds = [];
+    try {
+      const { rows } = await client.query(
+        `SELECT id FROM ${child} WHERE ${col} = ANY($1::int[])`, [ids]
+      );
+      childIds = rows.map((r) => r.id);
+    } catch { /* no id column — it is a leaf, delete it directly */ }
+    if (childIds.length) await deleteReferencing(client, child, childIds, depth + 1, seen);
+    const r = await client.query(`DELETE FROM ${child} WHERE ${col} = ANY($1::int[])`, [ids]);
+    if (r.rowCount) say(`  deleted ${r.rowCount} from ${child} (via ${col})`);
   }
+}
+
+async function rootIds(client, table, where) {
+  const { rows } = await client.query(`SELECT id FROM ${table} WHERE ${where}`, [`${TAG}%`]);
+  return rows.map((r) => r.id);
+}
+
+async function list() {
+  const client = await pool.connect();
+  try {
+    for (const [table, where] of ROOTS) {
+      if (!await tableExists(table)) continue;
+      const ids = await rootIds(client, table, where);
+      if (ids.length) say(`${String(ids.length).padStart(4)}  ${table}  (${ids.join(', ')})`);
+    }
+  } finally { client.release(); }
 }
 
 async function remove() {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    for (const [table, where] of TAGGED) {
+    // First, because it finds its rows THROUGH expenses: savings_entries names its source
+    // by (source_type, source_id) rather than a real FK, so no key walk reaches it and the
+    // subquery would come up empty once the receipts are gone.
+    const s = await client.query(
+      `DELETE FROM savings_entries WHERE source_type = 'expense'
+         AND source_id IN (SELECT id FROM expenses WHERE vendor LIKE $1)`, [`${TAG}%`]
+    );
+    if (s.rowCount) say(`deleted ${s.rowCount} from savings_entries`);
+    for (const [table, where] of ROOTS) {
       if (!await tableExists(table)) continue;
-      const r = await client.query(`DELETE FROM ${table} WHERE ${where}`, [`${TAG}%`]);
-      if (r.rowCount) say(`deleted ${r.rowCount} from ${table}`);
+      const ids = await rootIds(client, table, where);
+      if (!ids.length) continue;
+      say(`${table}: ${ids.length}`);
+      await deleteReferencing(client, table, ids);
+      const r = await client.query(`DELETE FROM ${table} WHERE id = ANY($1::int[])`, [ids]);
+      say(`  deleted ${r.rowCount} from ${table}`);
     }
     await client.query('COMMIT');
   } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
