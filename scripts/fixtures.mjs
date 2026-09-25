@@ -72,26 +72,28 @@ async function create() {
 
   // 3. A work order with lines — one of them linked to a finding — to reach the card
   //    view, the checklist, the reorder sheet and the reopen prompt.
-  const wo = await db.createWorkOrder({
+  // createWorkOrder is the one creator here that returns { workOrderId }, not a row shape
+  // with an Id — it reserves the id up front so the WO can be its own split root.
+  const { workOrderId: woId } = await db.createWorkOrder({
     title: t('Porch and gutter repairs'), assetId: asset.Id, locationId: loc.Id,
     priority: 'Medium', scheduledDate: AS_OF,
     description: 'Mobile audit fixture work order. Safe to delete.',
   });
-  made.workOrderId = wo.Id;
+  made.workOrderId = woId;
   const lines = [];
-  lines.push((await db.createJobLine(wo.Id, {
+  lines.push((await db.createJobLine(woId, {
     title: t('Re-hang gutter, replace soft fascia'), estimatedHours: 3, estimatedCost: 180,
     conditionFindingId: findings[0],
   })).Id);
-  lines.push((await db.createJobLine(wo.Id, {
+  lines.push((await db.createJobLine(woId, {
     title: t('Replace cracked tread'), estimatedHours: 1.5, estimatedCost: 45,
     conditionFindingId: findings[1],
   })).Id);
-  lines.push((await db.createJobLine(wo.Id, {
+  lines.push((await db.createJobLine(woId, {
     title: t('Paint the repaired sections'), estimatedHours: 2, estimatedCost: 60,
   })).Id);
   made.jobLineIds = lines;
-  say(`work order #${wo.Id} with lines ${lines.map((i) => `#${i}`).join(', ')}`);
+  say(`work order #${woId} with lines ${lines.map((i) => `#${i}`).join(', ')}`);
 
   // 4. A receipt with line items, unassigned, so the split editor has real money and
   //    real lines to divide — and a second one with no line items, which is the
@@ -130,7 +132,7 @@ async function create() {
     const mat = await db.createMaterial({ name: m.name, unit: m.unit });
     await db.recordMaterialMovement({
       materialId: mat.Id, kind: 'wo_close', quantity: m.qty, unitPrice: m.price,
-      workOrderId: wo.Id, note: 'Fixture: left over from the fixture work order.',
+      workOrderId: woId, note: 'Fixture: left over from the fixture work order.',
       createdBy: 'fixtures',
     });
     materials.push(mat.Id);
