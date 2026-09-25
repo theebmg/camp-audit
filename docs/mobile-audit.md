@@ -267,3 +267,29 @@ scroll fights the same rules.
 
 A fifth viewport, 852×393, carrying only the screens where vertical room is the question —
 the runner sections and the work order card view.
+
+### What has actually been verified, and what has not
+
+Verified in WebKit against the deployed site, without an account (the login page loads
+`app.js` and both stylesheets, so the boot path and the whole cascade are real):
+
+| Check | Result |
+|---|---|
+| `trackKeyboardInset()` runs without throwing | `--kb` reads `0px` on load |
+| No page errors at boot | only the expected pre-login 401 |
+| Viewport meta | `width=device-width, initial-scale=1, viewport-fit=cover` |
+| Login inputs at 16px, so iOS does not zoom | 16, 16 |
+| Body horizontal overflow at 393px | 0 |
+| Default combobox list hangs below its input | input 600–624, list **628–868** — off the bottom of an 852-tall screen, which is the problem |
+| `.cbx-above` puts it above instead | list **356–596**, entirely above the input |
+| The flip survives the cascade | yes — the base `.ac-results` rule sits in `index.html`'s inline `<style>`, *after* the `style.css` link, so this only works because `.ac-results.cbx-above` is more specific. Worth knowing before anyone "tidies" it. |
+| `--kb` lifts bottom-pinned chrome | toast `bottom` goes 22px → **358px** under a 336px keyboard |
+
+**Not yet verified: every screen in the table above this one.** Running the harness needs a
+sign-in, and the throwaway `mobaudit` account was deleted at the end of pass 1 as promised.
+Recreating it was blocked — see the note at the top of this section's follow-up. Until it
+runs, the field screens are *written* but not *seen*, and I am not claiming otherwise.
+
+Also still needing a real phone, not emulation: whether the keyboard's dismissal animation
+leaves the layout settled, and whether Safari's toolbar collapsing on scroll fights the
+same rules.
