@@ -117,11 +117,12 @@ function screensFor(ids) {
     // rather than by name — a reworded section must not silently drop out of the audit.
     { id: 'round-detail',     view: 'auditRound', params: { id: ids.roundId }, needs: 'roundId' },
     { id: 'runner-s1',        view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId' },
-    ...[2, 3, 4, 5, 6].map((n) => ({
+    // Exactly as many section captures as the form has — discovered, not guessed. Guessing
+    // six against a three-section form quietly photographed section 3 four times, because
+    // #nextSec is simply absent on the last one.
+    ...Array.from({ length: Math.max(0, (ids.sectionCount || 1) - 1) }, (_, i) => i + 2).map((n) => ({
       id: `runner-s${n}`, view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId',
       open: async (p) => {
-        // #nextSec is absent on the last section, so a form with fewer sections than this
-        // stops early rather than erroring — the missing captures say how many there were.
         for (let i = 1; i < n; i++) { await tap(p, '#nextSec', 3000); await wait(p, 700); }
       },
     })),
@@ -133,8 +134,16 @@ function screensFor(ids) {
     // proves nothing about the app. What matters is how the input is declared — no
     // `capture`, so the photo library is offered and not just the camera, and `multiple`
     // where more than one photo makes sense. That is assertable, so assert it.
+    //
+    // It has to be asserted on the section that HAS photos. In the seed form that is the
+    // last one (Condition); the first two sections are identification and access and carry
+    // none, so asserting on section 1 reported "0 image inputs" and looked like a bug.
     { id: 'runner-photo',     view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId',
-      open: async (p) => { await tap(p, '.opt-btn', 4000).catch(() => {}); await wait(p, 700); },
+      open: async (p, ids2) => {
+        for (let i = 1; i < (ids2.sectionCount || 1); i++) { await tap(p, '#nextSec', 3000).catch(() => {}); await wait(p, 600); }
+        await tap(p, '.opt-btn', 4000).catch(() => {});
+        await wait(p, 700);
+      },
       extra: async (p) => p.evaluate(() => {
         const inputs = [...document.querySelectorAll('input[type=file]')]
           .filter((el) => (el.getAttribute('accept') || '').includes('image'));
@@ -189,17 +198,15 @@ function screensFor(ids) {
     // fixture WO is open, so rather than closing it — which would consume the fixture and
     // change what every later screen sees — the prompt is reached by completing the WO,
     // screenshotting, and cancelling out.
-    // Closing the fixture WO is also what raises the leftover-materials prompt, so one
-    // capture covers both; `extra` records which of them actually appeared.
+    // The confirm that closing a WO raises. Cancelled, so the WO stays open for every
+    // screen after this one; the leftover prompt that comes AFTER confirming is captured
+    // once, at the very end (see 'wo-leftover-prompt').
     { id: 'wo-close-prompt',  view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
       open: async (p) => { await tap(p, '#completeWoBtn', 4000); await wait(p, 1200); },
       extra: async (p) => p.evaluate(() => {
         const box = document.querySelector('.modal-box');
-        const text = box ? box.textContent : '';
         return {
           promptShown: !!box,
-          mentionsLeftover: /left ?over|remaining|on hand/i.test(text),
-          mentionsReopen: /reopen/i.test(text),
           promptFitsScreen: box ? Math.round(box.getBoundingClientRect().height) <= window.innerHeight : null,
         };
       }),
@@ -224,14 +231,24 @@ function screensFor(ids) {
         await tap(p, '#matCorrect', 4000); await wait(p, 800);
       },
       after: async (p) => { await tap(p, '.modal-box .btn-secondary', 1500).catch(() => {}); } },
-    // The point-of-use reminder fires when a line's material is already in stock — the
-    // fixture puts the same three materials on hand that the fixture work order needs, so
-    // opening a line is enough to raise it.
-    { id: 'point-of-use',     view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
-      open: async (p) => { await tap(p, '.jl-card summary', 4000); await wait(p, 1000); },
+    // The point-of-use reminder ("you should have 2 each of X left — use it on this job?")
+    // fires from remindMaterialOnHand, which is wired to ONE place: the material picker on
+    // a receipt line inside the split editor. Not to opening a job line, which is where the
+    // brief's wording pointed and where this screen first looked for it.
+    { id: 'point-of-use',     view: 'expenseDetail', params: { id: ids.receiptId }, needs: 'receiptId',
+      open: async (p) => {
+        await tap(p, '#splitExpenseBtn', 4000); await wait(p, 1000);
+        await tap(p, '#liMaterialPicker .cbx-input, #liMaterialPicker input', 4000);
+        await wait(p, 700);
+        // Pick the first tracked material; the fixture put all three in stock.
+        await tap(p, '#liMaterialPicker .cbx-item', 3000).catch(() => {});
+        await wait(p, 1200);
+      },
       extra: async (p) => p.evaluate(() => ({
-        reminderShown: /in stock|on hand|drawing from stock/i.test(document.body.textContent),
-      })) },
+        reminderShown: /should have .* left/i.test(document.body.textContent),
+        dialogShown: !!document.querySelector('.modal-box'),
+      })),
+      after: async (p) => { await tap(p, '.modal-box .btn-secondary', 1500).catch(() => {}); } },
 
     // ---- priority 5: the keyboard ----
     // Geometry first: the visible band really is short, so a combobox has to flip above
@@ -276,6 +293,27 @@ function screensFor(ids) {
     { id: 'kb-runner-note',   view: 'auditRunner', params: { id: ids.instanceId }, needs: 'instanceId',
       keyboard: 'geometry',
       open: async (p) => { await tap(p, 'textarea, .q-note', 4000).catch(() => {}); await wait(p, 600); } },
+
+    // ---- last, because it consumes the fixture ----
+    // The leftover-materials prompt only appears AFTER the close is confirmed, so this one
+    // presses through. That closes the fixture work order, which is why it runs once, on
+    // the primary phone viewport, at the very end — every screen before it still sees an
+    // open WO, and the fixture is deleted afterwards anyway.
+    { id: 'wo-leftover-prompt', view: 'workOrderDetail', params: { id: ids.workOrderId }, needs: 'workOrderId',
+      once: true,
+      open: async (p) => {
+        await tap(p, '#completeWoBtn', 4000); await wait(p, 1200);
+        await tap(p, '.modal-box .btn-primary', 3000); await wait(p, 1800);
+      },
+      extra: async (p) => p.evaluate(() => {
+        const box = document.querySelector('.modal-box');
+        const text = box ? box.textContent : document.body.textContent;
+        return {
+          promptShown: !!box,
+          mentionsLeftover: /left ?over|left on|remaining|in stock|on hand/i.test(text),
+          promptFitsScreen: box ? Math.round(box.getBoundingClientRect().height) <= window.innerHeight : null,
+        };
+      }) },
   ];
 }
 
@@ -350,7 +388,13 @@ async function discoverFixtures(page) {
       out.roundId = round.Id;
       const d = await get(`/api/pg/audit-rounds/${round.Id}`);
       const inst = (d?.instances || [])[0];
-      if (inst) out.instanceId = inst.Id;
+      if (inst) {
+        out.instanceId = inst.Id;
+        // How many sections the form actually has, so the runner walk matches it instead
+        // of guessing and re-photographing the last section.
+        const full = await get(`/api/pg/audit-instances/${inst.Id}`);
+        out.sectionCount = (full?.Sections || []).length || 1;
+      }
     }
     const wos = await get('/api/pg/work-orders');
     const wo = (wos?.workOrders || []).find((w) => (w.Title || '').startsWith(TAG));
@@ -415,6 +459,9 @@ for (const vp of VIEWPORTS) {
     // Landscape only carries the screens where vertical room is the question.
     if (vp.landscape && !/^(runner-|wo-|kb-|round-detail)/.test(s.id)) continue;
     if (s.keyboard && !vp.kbHeight) continue;   // no keyboard on a desktop
+    // A screen marked `once` changes state that later screens depend on, so it runs on the
+    // primary phone viewport only.
+    if (s.once && vp !== VIEWPORTS[0]) continue;
 
     const before = consoleErrors.length;
     try {
@@ -426,10 +473,15 @@ for (const vp of VIEWPORTS) {
       const m = await measure(page);
       const extra = s.extra ? await s.extra(page).catch(() => null) : null;
       await page.screenshot({ path: path.join(OUT, vp.name, `${s.id}.png`), fullPage: false });
-      report.push({ viewport: vp.name, screen: s.id, ...m, ...(extra ? { extra } : {}), newConsoleErrors: consoleErrors.slice(before) });
+      report.push({ viewport: vp.name, screen: s.id, touch: !!vp.mobile, ...m, ...(extra ? { extra } : {}), newConsoleErrors: consoleErrors.slice(before) });
       const flag = m.overflow > 1 ? `OVERFLOW +${m.overflow}px` : 'ok';
       const note = extra ? '  ' + JSON.stringify(extra) : '';
-      console.log(`  ${vp.name.padEnd(18)} ${s.id.padEnd(24)} ${flag.padEnd(18)} targets<44:${String(m.smallTargets).padStart(3)} fonts<16:${String(m.smallFonts).padStart(2)}${note}`);
+      // 44px targets and 16px fonts are TOUCH requirements — printing them for a desktop
+      // viewport invites chasing numbers that were never a problem.
+      const touchCols = vp.mobile
+        ? `targets<44:${String(m.smallTargets).padStart(3)} fonts<16:${String(m.smallFonts).padStart(2)}`
+        : 'targets<44:  - fonts<16: -';
+      console.log(`  ${vp.name.padEnd(18)} ${s.id.padEnd(24)} ${flag.padEnd(18)} ${touchCols}${note}`);
       if (s.after) await s.after(page).catch(() => {});
     } catch (e) {
       report.push({ viewport: vp.name, screen: s.id, error: String(e.message).split('\n')[0].slice(0, 120) });
@@ -448,5 +500,9 @@ fs.writeFileSync(path.join(OUT, 'report.json'), JSON.stringify(report, null, 2))
 const overflowing = report.filter((r) => r.overflow > 1);
 const errs = report.filter((r) => r.newConsoleErrors?.length);
 const skipped = report.filter((r) => r.skipped);
+const touch = report.filter((r) => r.touch);
+const badTargets = touch.filter((r) => r.smallTargets > 0);
+const badFonts = touch.filter((r) => r.smallFonts > 0);
 console.log(`\n  ${report.length} captures. ${overflowing.length} with body overflow. ${errs.length} with console errors. ${skipped.length} skipped for missing fixtures.`);
+console.log(`  touch viewports: ${badTargets.length}/${touch.length} screens with a sub-44px control, ${badFonts.length}/${touch.length} with a sub-16px field.`);
 console.log(`  -> ${OUT}/report.json`);

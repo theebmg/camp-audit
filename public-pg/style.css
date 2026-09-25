@@ -922,18 +922,49 @@ label {
   .q-note, .o-remedy, .o-follow, .rm-edit, .rm-del, .q-edit, .q-del, .br-note {
     display: inline-flex; align-items: center; padding: 0 8px;
   }
-  /* The visual box on a checkbox stays small; the row around it is what gets aimed at. */
+  /* A checkbox's drawn box stays small — a 44px checkbox looks like a bug. What gets
+     aimed at is the label wrapping it, which is how every checkbox in this app is built
+     (the two that weren't got wrapped). :has() is Safari 15.4+, so a phone has it. */
   input[type="checkbox"], input[type="radio"] { min-width: 22px; min-height: 22px; }
+  label:has(> input[type="checkbox"]),
+  label:has(> input[type="radio"]) {
+    min-height: 44px; display: flex; align-items: center; gap: 8px;
+  }
   .list-item label, table[data-card="1"] tbody tr label { min-height: 44px; display: flex; align-items: center; }
   /* Rows that open something are targets in their own right. */
   table[data-card="1"] tbody tr { min-height: 44px; }
 
-  /* Adjacent icon buttons — reorder arrows, × removes — need thumb clearance. */
-  .q-up, .q-down, .row-remove, .af-rm { min-width: 44px; min-height: 44px; }
+  /* Adjacent icon buttons — reorder arrows, × removes — need thumb clearance. A chevron
+     can be 9px wide and still be the thing you are trying to hit. */
+  .q-up, .q-down, .row-remove, .af-rm, .btn-icon { min-width: 44px; min-height: 44px; }
   .q-up + .q-down { margin-left: 6px; }
 
-  /* iOS zooms the page when a focused input is under 16px. */
-  input, select, textarea { font-size: 16px; }
+  /* The accent swatch is a 22px colour dot, and min-height alone turned it into a 22x44
+     oval. Give the button the full 44px and paint the dot inside it with content-box, so
+     the target is a thumb and the dot stays a dot. */
+  .accent-swatch {
+    width: 44px; height: 44px; padding: 11px;
+    background-clip: content-box; background-origin: content-box;
+  }
+
+  /* WebKit will not apply author padding, height or min-height to a <select> while it is
+     drawn as a native menulist — measured: 200x24 with padding 0, against the 12px/14px
+     and 44px the stylesheet asks for. appearance:none is the only way in, so selects get
+     it here along with a chevron of their own, since turning it off takes the native one
+     away. (This is also true on desktop Safari; see docs/mobile-audit.md.) */
+  select {
+    -webkit-appearance: none; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%236b7280' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    padding-right: 38px;
+  }
+
+  /* iOS zooms the whole page when you focus a field under 16px, and there is no field
+     where a smaller font is worth that. !important because several sub-16px rules live in
+     index.html's inline <style>, which the cascade puts after this file at equal
+     specificity — e.g. .report-date-range input[type="date"] at 0.82rem. */
+  input, select, textarea { font-size: 16px !important; }
 
   /* Toasts clear the home indicator. */
   #toast, .action-toast { bottom: calc(16px + env(safe-area-inset-bottom, 0px)); }

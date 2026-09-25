@@ -5263,7 +5263,7 @@ async function renderBoardReport() {
       .filter(Boolean).join(' · ');
     return `
       <div class="list-item br-row" data-item="${it.Id}" style="${indent ? 'padding-left:30px;' : ''}display:flex;align-items:flex-start;gap:10px">
-        <input type="checkbox" class="br-check" data-item="${it.Id}" ${it.Included ? 'checked' : ''} style="margin-top:3px" />
+        <label class="br-check-wrap" style="flex:0 0 auto;margin:0"><input type="checkbox" class="br-check" data-item="${it.Id}" ${it.Included ? 'checked' : ''} /></label>
         <div style="flex:1;min-width:0">
           <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${it.SnapSubtitle ? ` <span class="muted">— ${escapeHtml(it.SnapSubtitle)}</span>` : ''}${it.ManuallyAdded ? ' <span class="muted" style="font-size:0.75rem">· added by hand</span>' : ''}</div>
           ${bits ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(bits)}</div>` : ''}
@@ -5281,7 +5281,7 @@ async function renderBoardReport() {
     return `
       <div class="list-item br-row" data-item="${it.Id}" style="display:flex;align-items:flex-start;gap:10px">
         <button type="button" class="btn-icon br-expand" data-wo="${it.ItemId}" style="background:none;border:none;cursor:pointer;padding:0 2px">${open ? '▾' : '▸'}</button>
-        <input type="checkbox" class="br-check" data-item="${it.Id}" ${it.Included ? 'checked' : ''} style="margin-top:3px" />
+        <label class="br-check-wrap" style="flex:0 0 auto;margin:0"><input type="checkbox" class="br-check" data-item="${it.Id}" ${it.Included ? 'checked' : ''} /></label>
         <div style="flex:1;min-width:0">
           <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>
             ${lines.length ? `<span class="muted" style="font-size:0.82rem"> — ${lines.filter((l) => l.Included).length} of ${lines.length} line(s)${state === 'some' ? ', partial' : ''}</span>` : ''}
