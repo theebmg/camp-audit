@@ -5627,6 +5627,34 @@ async function openAddReportItem(reportId, onDone) {
   };
   function onKey(e) { if (e.key === 'Escape') close(); }
   document.addEventListener('keydown', onKey);
+  // Type and status chips collapse behind one control on narrow screens so the results
+  // list keeps the height. The control always carries the active count, so collapsed
+  // never means a filter is silently narrowing the list.
+  const filterWrap = $('.addpanel-filterwrap');
+  const filterToggle = $('.addpanel-filtertoggle');
+  const PHONE_PANEL = 760;
+  let filtersOpen = window.innerWidth > PHONE_PANEL;
+  function activeFilterCount() {
+    let n = 0;
+    const type = overlay.querySelector('.addpanel-type.selected');
+    if (type && type.dataset.type !== 'all') n += 1;
+    n += overlay.querySelectorAll('.addpanel-status.selected').length;
+    return n;
+  }
+  function syncFilterToggle() {
+    const n = activeFilterCount();
+    filterToggle.textContent = n ? `Filters · ${n}` : 'Filters';
+    filterToggle.classList.toggle('selected', n > 0);
+    filterWrap.hidden = window.innerWidth <= PHONE_PANEL && !filtersOpen;
+  }
+  filterToggle.addEventListener('click', () => { filtersOpen = !filtersOpen; syncFilterToggle(); });
+  window.addEventListener('resize', syncFilterToggle);
+  // Chip clicks are handled by the panel's own listeners; resync after they run.
+  overlay.addEventListener('click', (e) => {
+    if (e.target.closest('.addpanel-type, .addpanel-status')) setTimeout(syncFilterToggle, 0);
+  });
+  syncFilterToggle();
+
   $('.addpanel-close').addEventListener('click', close);
   overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
 
@@ -9800,8 +9828,8 @@ async function renderAuditFormBuilder({ id }) {
   function optionHtml(o, followUps) {
     return `
       <div style="padding:4px 0 4px 10px">
-        <label style="display:flex;align-items:center;gap:8px;font-size:0.9rem">
-          <span style="flex:1">${escapeHtml(o.Label)}${o.IsFixture ? ' <span style="color:#b4690e;font-size:0.78rem">fixture</span>' : ''}</span>
+        <label style="display:flex;align-items:center;gap:8px;font-size:0.9rem;flex-wrap:wrap">
+          <span style="flex:1 1 140px;min-width:0;overflow-wrap:anywhere">${escapeHtml(o.Label)}${o.IsFixture ? ' <span style="color:#b4690e;font-size:0.78rem">fixture</span>' : ''}</span>
           <label class="muted" style="font-size:0.78rem"><input type="checkbox" class="o-flag" data-id="${o.Id}" ${o.Flag ? 'checked' : ''} /> problem</label>
           <label class="muted" style="font-size:0.78rem"><input type="checkbox" class="o-sev" data-id="${o.Id}" ${o.Severe ? 'checked' : ''} ${o.Flag ? '' : 'disabled'} /> severe</label>
           <a href="#" class="o-remedy muted" data-id="${o.Id}" style="font-size:0.78rem">+ fix</a>
@@ -9819,14 +9847,14 @@ async function renderAuditFormBuilder({ id }) {
       if (g != null) { if (!byOpt.has(g)) byOpt.set(g, []); byOpt.get(g).push(other); }
     }
     return `
-      <div class="list-item q-row" data-qid="${q.Id}" ${nested ? '' : 'draggable="true"'} style="${nested ? 'margin-left:14px;border-left:2px solid #eef0f6;padding-left:10px;' : ''}${q.Archived ? 'opacity:0.5;' : ''}">
-        <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">
-          <div><strong>${escapeHtml(q.Prompt)}</strong>
+      <div class="list-item q-row" data-qid="${q.Id}" ${nested ? '' : 'draggable="true"'} style="min-width:0;${nested ? 'margin-left:10px;border-left:2px solid #eef0f6;padding-left:8px;' : ''}${q.Archived ? 'opacity:0.5;' : ''}">
+        <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;flex-wrap:wrap">
+          <div style="flex:1 1 200px;min-width:0;overflow-wrap:anywhere"><strong>${escapeHtml(q.Prompt)}</strong>
             <span class="muted" style="font-size:0.78rem">${escapeHtml(q.QuestionKey)} · ${escapeHtml(q.Type)}${q.Required ? ' · required' : ''}${q.AnswerCount ? ` · ${q.AnswerCount} answer(s)` : ''}${q.Archived ? ' · archived' : ''}</span>
           </div>
-          <div style="white-space:nowrap">
-            ${nested ? '' : `<button type="button" class="btn btn-secondary q-up" data-id="${q.Id}" title="Move up" style="padding:2px 8px">↑</button>
-            <button type="button" class="btn btn-secondary q-down" data-id="${q.Id}" title="Move down" style="padding:2px 8px">↓</button>`}
+          <div style="display:flex;gap:6px;align-items:center;flex:0 0 auto">
+            ${nested ? '' : `<button type="button" class="btn btn-secondary q-up" data-id="${q.Id}" title="Move up" style="padding:2px 10px">↑</button>
+            <button type="button" class="btn btn-secondary q-down" data-id="${q.Id}" title="Move down" style="padding:2px 10px">↓</button>`}
             <a href="#" class="q-edit" data-id="${q.Id}">edit</a> ·
             <a href="#" class="q-del" data-id="${q.Id}">${q.AnswerCount ? 'archive' : 'delete'}</a>
           </div>

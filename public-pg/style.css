@@ -59,11 +59,11 @@ html, body {
   -webkit-tap-highlight-color: transparent;
 }
 
-body { min-height: 100vh; }
+body { min-height: 100dvh; }
 
 .app-shell {
   display: flex;
-  min-height: 100vh;
+  min-height: 100dvh;
 }
 
 /* ---------- Sidebar ---------- */
@@ -77,7 +77,7 @@ body { min-height: 100vh; }
   flex-direction: column;
   position: sticky;
   top: 0;
-  height: 100vh;
+  height: 100dvh;
 }
 
 .sidebar-header {
@@ -636,7 +636,7 @@ label {
     z-index: 30;
     left: -100%;
     top: 0;
-    height: 100vh;
+    height: 100dvh;
     width: min(var(--sidebar-w), 82vw);
     transition: left 0.2s ease;
     box-shadow: var(--shadow-md);
@@ -838,3 +838,86 @@ label {
   background: var(--surface-alt); color: var(--text); font-size: 1.15rem; cursor: pointer;
 }
 .reorder-move:disabled { opacity: 0.35; cursor: default; }
+
+
+/* ---------- Mobile: safe areas, overflow, tap targets ----------
+   Added by the mobile audit. env(safe-area-inset-*) appeared nowhere in this app
+   before, including on the full-screen reorder sheet, so pinned chrome sat under the
+   notch and the home indicator on every iPhone. */
+
+.reorder-sheet {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  height: 100dvh;
+}
+
+/* Full-screen panels on phones. A centred modal at 393px wastes the edges and puts its
+   footer below the fold with nothing to scroll. */
+@media (max-width: 760px) {
+  .modal-overlay {
+    padding: 0;
+    align-items: stretch;
+    justify-content: stretch;
+  }
+  .modal-overlay > .modal-box {
+    width: 100%;
+    max-width: none;
+    max-height: none;
+    height: 100dvh;
+    border-radius: 0;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    padding-top: calc(14px + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Nothing may take the page body sideways. Anything genuinely wider than the screen
+     scrolls inside its own container instead. */
+  html, body { overflow-x: hidden; }
+  .card { max-width: 100%; box-sizing: border-box; }
+  table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+  pre, code { overflow-x: auto; max-width: 100%; }
+  img { max-width: 100%; height: auto; }
+
+  /* Long titles and ids wrap rather than pushing buttons off the row. */
+  h1, h2, h3, h4, .list-item, .field-row label { overflow-wrap: anywhere; }
+
+  /* 44px minimum tap target. The visual box on a checkbox can stay small as long as the
+     row around it is tappable, which is why labels get the height too. */
+  .btn, button, .view-toggle-btn, select, .list-item > a, label.skill-chip { min-height: 44px; }
+  .btn { padding-top: 10px; padding-bottom: 10px; }
+  input[type="checkbox"], input[type="radio"] { min-width: 22px; min-height: 22px; }
+  .list-item label { min-height: 44px; display: flex; align-items: center; }
+
+  /* Adjacent icon buttons — reorder arrows, × removes — need thumb clearance. */
+  .q-up, .q-down, .row-remove, .af-rm { min-width: 44px; min-height: 44px; }
+  .q-up + .q-down { margin-left: 6px; }
+
+  /* iOS zooms the page when a focused input is under 16px. */
+  input, select, textarea { font-size: 16px; }
+
+  /* Toasts clear the home indicator. */
+  #toast, .action-toast { bottom: calc(16px + env(safe-area-inset-bottom, 0px)); }
+
+  /* Keyboard shortcut legends are noise without a keyboard. */
+  .jlg-legend, .shortcut-legend { display: none; }
+}
+
+/* A panel with filters above a list: the list gets the leftover height and scrolls
+   internally, so the filters can never squeeze it to one row. */
+.panel-col { display: flex; flex-direction: column; min-height: 0; }
+.panel-fixed { flex: 0 0 auto; }
+.panel-scroll { flex: 1 1 auto; overflow-y: auto; min-height: 0; -webkit-overflow-scrolling: touch; }
+.panel-footer {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  background: var(--surface);
+  position: sticky;
+  bottom: 0;
+}
+
+/* Chip rows size to their text and wrap; they are never full-width stacked blocks. */
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip-row > * { flex: 0 0 auto; width: auto; }

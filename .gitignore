@@ -4,3 +4,6 @@ node_modules/
 .DS_Store
 data-export/
 map-source/
+
+# Local-only browser screenshots from scripts/screens.mjs
+docs/mobile-screens/
