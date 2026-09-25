@@ -467,9 +467,13 @@ for (const vp of VIEWPORTS) {
   if (vp === VIEWPORTS[0]) {
     const css = await page.evaluate((needed) => {
       const seen = [];
+      // Collect the selector AND recurse — not one or the other. Now that CSS Nesting has
+      // shipped, a plain CSSStyleRule carries an empty `cssRules` list, which is truthy, so
+      // an `if (r.cssRules) … else` walks into nothing and reads no selectors at all. That
+      // made the check report every rule missing, including ones measured working.
       const scan = (list) => { for (const r of list) {
-        if (r.cssRules) scan(r.cssRules);
-        else if (r.selectorText) seen.push(r.selectorText);
+        if (r.selectorText) seen.push(r.selectorText);
+        if (r.cssRules && r.cssRules.length) scan(r.cssRules);
       } };
       for (const ss of document.styleSheets) { try { scan(ss.cssRules); } catch { /* cross-origin */ } }
       const joined = seen.join(' | ');

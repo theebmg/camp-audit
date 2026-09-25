@@ -939,7 +939,7 @@ label {
 
   /* Adjacent icon buttons — reorder arrows, × removes — need thumb clearance. A chevron
      can be 9px wide and still be the thing you are trying to hit. */
-  .q-up, .q-down, .row-remove, .af-rm, .btn-icon { min-width: 44px; min-height: 44px; }
+  .q-up, .q-down, .row-remove, .af-rm, .btn-icon, .jlg-remove { min-width: 44px; min-height: 44px; }
   .q-up + .q-down { margin-left: 6px; }
 
   /* The accent swatch is a 22px colour dot, and min-height alone turned it into a 22x44
