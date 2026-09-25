@@ -166,7 +166,7 @@ function screensFor(ids) {
     // never press through, so the fixture round stays re-runnable.
     { id: 'runner-generate',  view: 'auditReview', params: { id: ids.instanceId }, needs: 'instanceId',
       open: async (p) => { await tap(p, '#completeBtn', 4000); await wait(p, 900); },
-      after: async (p) => { await tap(p, '.modal-box .btn-secondary', 1500).catch(() => {}); } },
+      after: async (p) => { await tap(p, '.modal-cancel', 1500).catch(() => {}); } },
     { id: 'round-report',     view: 'auditRoundReport', params: { id: ids.roundId }, needs: 'roundId' },
 
     // ---- priority 2: the work order in the field ----
@@ -210,7 +210,7 @@ function screensFor(ids) {
           promptFitsScreen: box ? Math.round(box.getBoundingClientRect().height) <= window.innerHeight : null,
         };
       }),
-      after: async (p) => { await tap(p, '.modal-box .btn-secondary', 1500).catch(() => {}); } },
+      after: async (p) => { await tap(p, '.modal-cancel', 1500).catch(() => {}); } },
 
     // ---- priority 3: money in the field ----
     { id: 'receipt-detail',   view: 'expenseDetail', params: { id: ids.receiptId }, needs: 'receiptId' },
@@ -230,7 +230,7 @@ function screensFor(ids) {
         await tap(p, '.mat-row, .list-item', 4000); await wait(p, 700);
         await tap(p, '#matCorrect', 4000); await wait(p, 800);
       },
-      after: async (p) => { await tap(p, '.modal-box .btn-secondary', 1500).catch(() => {}); } },
+      after: async (p) => { await tap(p, '.modal-cancel', 1500).catch(() => {}); } },
     // The point-of-use reminder ("you should have 2 each of X left — use it on this job?")
     // fires from remindMaterialOnHand, which is wired to ONE place: the material picker on
     // a receipt line inside the split editor. Not to opening a job line, which is where the
@@ -248,7 +248,7 @@ function screensFor(ids) {
         reminderShown: /should have .* left/i.test(document.body.textContent),
         dialogShown: !!document.querySelector('.modal-box'),
       })),
-      after: async (p) => { await tap(p, '.modal-box .btn-secondary', 1500).catch(() => {}); } },
+      after: async (p) => { await tap(p, '.modal-cancel', 1500).catch(() => {}); } },
 
     // ---- priority 5: the keyboard ----
     // Geometry first: the visible band really is short, so a combobox has to flip above
@@ -308,7 +308,7 @@ function screensFor(ids) {
         // prompt", which was the harness stopping early, not the app.
         await tap(p, '#completeWoBtn', 4000); await wait(p, 1200);
         for (let i = 0; i < 2; i++) {
-          await tap(p, '.modal-box .btn-primary', 3000).catch(() => {});
+          await tap(p, '.modal-confirm', 3000).catch(() => {});
           await wait(p, 1500);
           if (await p.locator('.modal-box:has(.leftover-qty)').count()) break;
         }
@@ -459,6 +459,26 @@ for (const vp of VIEWPORTS) {
   await page.click('#loginForm button[type=submit]');
   await page.waitForFunction(() => !document.getElementById('loginForm'), { timeout: 15000 });
   await page.waitForTimeout(1500);
+
+  // Did the stylesheet actually parse? A stray */ inside a comment silently drops the rule
+  // after it, and the only symptom is a measurement that refuses to change — which cost
+  // three rounds of "the fix is deployed but nothing moved" before it was found. Assert the
+  // rules this pass depends on are in the CSSOM, not merely in the file.
+  if (vp === VIEWPORTS[0]) {
+    const css = await page.evaluate((needed) => {
+      const seen = [];
+      const scan = (list) => { for (const r of list) {
+        if (r.cssRules) scan(r.cssRules);
+        else if (r.selectorText) seen.push(r.selectorText);
+      } };
+      for (const ss of document.styleSheets) { try { scan(ss.cssRules); } catch { /* cross-origin */ } }
+      const joined = seen.join(' | ');
+      return needed.filter((n) => !joined.includes(n));
+    }, ['.cbx-above', '.kb-open', '.accent-swatches > .accent-swatch',
+        'label:has(> input[type="file"])', 'table[data-card="1"]']);
+    if (css.length) console.log(`  !! STYLESHEET: these rules did not parse: ${css.join(', ')}`);
+    else console.log('  stylesheet: all audit rules parsed');
+  }
 
   const ids = await discoverFixtures(page);
   if (vp === VIEWPORTS[0]) {

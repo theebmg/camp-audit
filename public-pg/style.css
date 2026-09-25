@@ -944,14 +944,18 @@ label {
 
   /* The accent swatch is a 22px colour dot, and min-height alone turned it into a 22x44
      oval. Give the button the full 44px and paint the dot inside it with content-box, so
-     the target is a thumb and the dot stays a dot. */
+     the target is a thumb and the dot stays a dot.
+
      Scoped through the parent on purpose: index.html's inline <style> sets .accent-swatch
      to 22px, and the cascade puts that block AFTER this file at equal specificity, so a
-     bare .accent-swatch here loses. Same trap as the sub-16px fields below. */
-  .accent-swatches > .accent-swatch {
-    width: 44px; height: 44px; padding: 11px;
-    background-clip: content-box; background-origin: content-box;
-  }
+     bare .accent-swatch here loses. Same trap as the sub-16px fields below.
+
+     The colour moved onto an inner .accent-dot (index.html, app.js) so the button can grow
+     without the dot growing: the markup sets the colour inline, and an inline background
+     shorthand beats anything a stylesheet says about the button itself. The row wraps,
+     because six 44px targets do not fit across a 203px sidebar. */
+  .accent-swatches { flex-wrap: wrap; }
+  .accent-swatches > .accent-swatch { width: 44px; height: 44px; }
 
   /* WebKit will not apply author padding, height or min-height to a <select> while it is
      drawn as a native menulist — measured: 200x24 with padding 0, against the 12px/14px

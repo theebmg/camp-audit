@@ -183,13 +183,24 @@
     .theme-picker { margin-bottom: 12px; }
     .theme-picker .view-toggle { width: 100%; }
     .theme-picker .view-toggle-btn { flex: 1; }
-    .accent-swatches { display: flex; gap: 8px; margin-top: 8px; }
+    .accent-swatches { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    /* The button is the tap target and the dot inside it is what you see, so the target can
+       grow to 44px on a phone without the dot growing with it (mobile audit Q6). The colour
+       has to live on the dot: the markup sets it inline, and an inline background shorthand
+       beats anything a stylesheet can say about the button. */
     .accent-swatch {
-      width: 22px; height: 22px; border-radius: 50%; cursor: pointer; border: 2px solid transparent;
-      padding: 0; transition: transform 0.1s ease, border-color 0.1s ease;
+      width: 22px; height: 22px; flex: 0 0 auto;
+      display: inline-flex; align-items: center; justify-content: center;
+      padding: 0; border: none; background: none; cursor: pointer;
+      transition: transform 0.1s ease;
+    }
+    .accent-dot {
+      width: 22px; height: 22px; border-radius: 50%;
+      border: 2px solid transparent; box-sizing: border-box;
+      transition: border-color 0.1s ease;
     }
     .accent-swatch:hover { transform: scale(1.12); }
-    .accent-swatch.active { border-color: var(--text); }
+    .accent-swatch.active .accent-dot { border-color: var(--text); }
 
     /* Admin hub — category cards that stack left-to-right, wrapping down as
        the viewport allows. */

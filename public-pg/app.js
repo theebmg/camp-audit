@@ -295,7 +295,7 @@ function renderThemePicker() {
       ${['system', 'light', 'dark'].map((c) => `<button type="button" class="view-toggle-btn theme-choice-btn ${choice === c ? 'active' : ''}" data-choice="${c}">${c === 'system' ? '🖥️ System' : c === 'light' ? '☀️ Light' : '🌙 Dark'}</button>`).join('')}
     </div>
     <div class="accent-swatches">
-      ${Object.entries(window.ACCENT_PRESETS).map(([key, preset]) => `<button type="button" class="accent-swatch ${accentKey === key ? 'active' : ''}" data-accent="${key}" style="background:${preset.light[0]}" title="${key}"></button>`).join('')}
+      ${Object.entries(window.ACCENT_PRESETS).map(([key, preset]) => `<button type="button" class="accent-swatch ${accentKey === key ? 'active' : ''}" data-accent="${key}" title="${key}"><span class="accent-dot" style="background:${preset.light[0]}"></span></button>`).join('')}
     </div>`;
   el.querySelectorAll('.theme-choice-btn').forEach((btn) => btn.addEventListener('click', () => {
     applyTheme(btn.dataset.choice);
