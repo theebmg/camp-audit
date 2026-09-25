@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Sychar Operations</title>
   <link rel="stylesheet" href="/style.css" />
   <style>
@@ -95,6 +95,7 @@
       color: var(--muted); font-weight: 700; min-width: 44px;
     }
     .addpanel-chip-count { opacity: 0.6; font-weight: 400; }
+    .addpanel-filtertoggle { display: none; margin-top: 10px; }
     .addpanel-status-empty { opacity: 0.45; }
     .addpanel-status-empty.selected { opacity: 1; }
     /* A job line's own title says what was done, not what it was done to — the work
@@ -125,7 +126,14 @@
       white-space: nowrap;
     }
     @media (max-width: 760px) {
-      .addpanel { max-height: 94vh; }
+      /* Full-screen on a phone, and it keeps its OWN internal scroll: the generic
+         full-screen modal rule gives the box overflow-y:auto, which would fight
+         .addpanel-body and produce two nested scrollers. */
+      .addpanel { max-height: none; height: 100dvh; overflow: hidden; }
+      /* Collapsed by default so the list gets the height. The toggle carries the active
+         count, so hiding the chips never hides the fact that a filter is on. */
+      .addpanel-filterwrap[hidden] { display: none !important; }
+      .addpanel-filtertoggle { display: inline-flex !important; min-height: 44px; align-items: center; }
       .addpanel-head, .addpanel-body, .addpanel-foot { padding-left: 14px; padding-right: 14px; }
       .addrow-head { display: none; }
       .addrow { grid-template-columns: 24px minmax(0, 1fr); gap: 6px 10px; padding: 11px 2px; }
@@ -371,7 +379,15 @@
        picked by screen width on first visit; overridden choice persists via
        localStorage (see getTableViewMode() in app.js). */
     .view-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius-sm);
-      overflow: hidden; margin-bottom: 12px; }
+      overflow: hidden; margin-bottom: 12px; max-width: 100%; }
+    /* Tab strips are the most common cause of page-body overflow on a phone: a row of
+       fixed-padding buttons is simply wider than 393px. Scroll the strip, not the page. */
+    @media (max-width: 760px) {
+      .view-toggle { display: flex; overflow-x: auto; overflow-y: hidden;
+        -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+      .view-toggle::-webkit-scrollbar { display: none; }
+      .view-toggle-btn { flex: 0 0 auto; white-space: nowrap; min-height: 44px; }
+    }
     .view-toggle-btn { padding: 7px 14px; border: none; background: var(--surface); color: var(--muted);
       font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: background-color 0.15s ease, color 0.15s ease; }
     .view-toggle-btn.active { background: var(--accent-soft); color: var(--accent-dark); }
