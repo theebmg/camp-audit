@@ -5574,13 +5574,16 @@ async function openAddReportItem(reportId, onDone) {
         <button type="button" class="btn btn-secondary addpanel-close">Close</button>
       </div>
       <input type="search" class="addpanel-q" placeholder="Filter — title, WO number, asset, status or date" autocomplete="off" />
-      <div class="addpanel-filters">
-        <span class="addpanel-filter-label">Type</span>
-        <button type="button" class="btn btn-secondary addpanel-type selected" data-type="all">All</button>
-        ${TYPES.map((t) => `<button type="button" class="btn btn-secondary addpanel-type" data-type="${t.key}">${t.label}</button>`).join('')}
-      </div>
-      <div class="addpanel-filters addpanel-statuses">
-        <span class="addpanel-filter-label">Status</span>
+      <button type="button" class="btn btn-secondary addpanel-filtertoggle">Filters</button>
+      <div class="addpanel-filterwrap">
+        <div class="addpanel-filters chip-row">
+          <span class="addpanel-filter-label">Type</span>
+          <button type="button" class="btn btn-secondary addpanel-type selected" data-type="all">All</button>
+          ${TYPES.map((t) => `<button type="button" class="btn btn-secondary addpanel-type" data-type="${t.key}">${t.label}</button>`).join('')}
+        </div>
+        <div class="addpanel-filters addpanel-statuses chip-row">
+          <span class="addpanel-filter-label">Status</span>
+        </div>
       </div>
       <div class="addpanel-filters">
         <label class="skill-chip" style="cursor:pointer;display:inline-flex;align-items:center">
@@ -5632,6 +5635,9 @@ async function openAddReportItem(reportId, onDone) {
   // never means a filter is silently narrowing the list.
   const filterWrap = $('.addpanel-filterwrap');
   const filterToggle = $('.addpanel-filtertoggle');
+  // Defensive: this went null once when a markup edit was lost, and a hard pageerror
+  // took the whole panel down rather than just losing the toggle.
+  if (!filterWrap || !filterToggle) console.warn('add-item filter toggle markup missing');
   const PHONE_PANEL = 760;
   let filtersOpen = window.innerWidth > PHONE_PANEL;
   function activeFilterCount() {
@@ -5642,12 +5648,13 @@ async function openAddReportItem(reportId, onDone) {
     return n;
   }
   function syncFilterToggle() {
+    if (!filterToggle || !filterWrap) return;
     const n = activeFilterCount();
     filterToggle.textContent = n ? `Filters · ${n}` : 'Filters';
     filterToggle.classList.toggle('selected', n > 0);
     filterWrap.hidden = window.innerWidth <= PHONE_PANEL && !filtersOpen;
   }
-  filterToggle.addEventListener('click', () => { filtersOpen = !filtersOpen; syncFilterToggle(); });
+  if (filterToggle) filterToggle.addEventListener('click', () => { filtersOpen = !filtersOpen; syncFilterToggle(); });
   window.addEventListener('resize', syncFilterToggle);
   // Chip clicks are handled by the panel's own listeners; resync after they run.
   overlay.addEventListener('click', (e) => {
@@ -9827,7 +9834,7 @@ async function renderAuditFormBuilder({ id }) {
 
   function optionHtml(o, followUps) {
     return `
-      <div style="padding:4px 0 4px 10px">
+      <div style="padding:4px 0 4px 10px;min-width:0">
         <label style="display:flex;align-items:center;gap:8px;font-size:0.9rem;flex-wrap:wrap">
           <span style="flex:1 1 140px;min-width:0;overflow-wrap:anywhere">${escapeHtml(o.Label)}${o.IsFixture ? ' <span style="color:#b4690e;font-size:0.78rem">fixture</span>' : ''}</span>
           <label class="muted" style="font-size:0.78rem"><input type="checkbox" class="o-flag" data-id="${o.Id}" ${o.Flag ? 'checked' : ''} /> problem</label>
