@@ -1,5 +1,35 @@
 # Open Questions
 
+## Q6 — Tap targets: buttons only, or inline links too?
+
+2,352 elements at 393px are under 44px tall after the mobile pass. The count is dominated
+by **inline `<a>` links inside sentences** ("edit", "remove", "+ note"), which a 44px
+minimum would space out dramatically and change the density of every screen.
+
+**Options:** (a) buttons, row actions and chips only — done, which is where it stands
+now; (b) also pad inline action links, accepting looser text; (c) convert inline action
+links into small buttons. **My lean: (a), plus (c) for the handful that are genuinely
+primary actions** — the × remove and ↑↓ arrows already got 44px.
+
+## Q7 — Which tables should become stacked cards on a phone?
+
+The brief prefers stacked cards "for anything I act on". Right now every table scrolls
+horizontally inside its own container, which fixes the page overflow but keeps the
+side-scroll. Converting is per-table work and changes how each screen reads.
+
+**Needs your list**, or say "all of them" and I'll convert the lot. Candidates: work
+order lists, expenses, locations grid, crew hours, maintenance log, activity log.
+
+## Q8 — Job-line grid on a phone
+
+Untouched this pass. It no longer overflows the page body, but I have not verified it's
+usable at 393px. The brief allows falling back to cards with a note that bulk editing is
+easier on desktop. **I have not decided this** — it needs a real look at the grid on a
+phone first, which the screenshot script can't reach without a work order that has lines
+and a width above `GRID_MIN_WIDTH` (900px), the gate that currently hides it on phones
+anyway.
+
+
 ## Q5 — Reopen keeps `date_completed`. Confirm that's what you want.
 
 Decided 2026-09-23 while building reopen; logged rather than asked, since either
