@@ -250,3 +250,73 @@ allocations point at job lines, the asset is reachable through the line's work o
 **Options:** keep it (status quo, costs nothing), or retire it in a later migration once
 the split UI shows whether it ever gets used. **My lean: keep, revisit after the split
 UI has been in use.** No work is blocked either way.
+
+---
+
+# Text intake / People / Visitor log — decided, pending Ben's review
+
+Five decisions from the §0 investigation (`docs/text-intake-analysis.md`). All five are
+decided and being built; each is here because it is a real choice, not a detail.
+
+## Q4 — "Extend the existing visitor data" cannot be followed literally
+
+**Finding:** there is no visitor store. A visit is a `calendar_events` row with a
+`visitor_name`, and the Visitor Activity report is three lines that filter calendar
+occurrences by that column. The whole table holds **5 events, 1 of them a visit**.
+
+A visit log needs headcount, duration, arrival time, photos, expected/confirmed/no-show,
+source, and confirmed-by/at. None of those are calendar-event properties, and §2 itself
+describes visits with no calendar event at all — a text after the fact, a manual quick entry.
+
+**Decided:** a `visits` table becomes the single visit store. Calendar visit events create an
+`expected` visit, exactly as §2 specifies, and Visitor Activity is repointed to read `visits`.
+This is not a parallel store — afterwards there is one place a visit lives, and the calendar
+goes back to scheduling them. The one existing visitor event gets a row so nothing is lost.
+
+**If Ben disagrees:** the alternative is putting all of it on `calendar_events`, which means a
+row there for every visit that was never scheduled. Say so and it changes.
+
+## Q5 — `cabin_holders` has no phone or email, and 173 rows not 174
+
+**Finding:** the columns are `id, name, notes, created_at`. Nothing else. The 174 in the brief
+is the count of assets pointing at a holder (174 of 340); there are 173 holders.
+
+**Decided:** add `phone` and `email` as additive columns. Table keeps its name so both FKs and
+the soft funding reference keep working; the UI calls it People.
+
+## Q6 — Some "cabin holders" are not people
+
+**Finding:** the list includes `Storage`, `Full Cabin - Boyette`, `Starbuck`, and
+`Lapp, Jen` alongside ordinary names. 8 rows contain `&` or ` and `. These are cabin labels as
+much as people, and they are load-bearing — assets point at them.
+
+**Decided:** leave them alone. Roles are optional, so a label row simply has none. No cleanup
+pass, no guessing which are people. The duplicate check splits on commas and ampersands as
+well as spaces, so `Lapp, Jen` and `Jen Lapp` are recognised as the same person.
+
+**If Ben wants them cleaned up:** that is a separate pass with his eyes on the list, not
+something to infer.
+
+## Q7 — The merge tool cannot rely on foreign keys
+
+**Finding:** `job_lines.funding_source = 'cabin_holder'` puts a `cabin_holders.id` in
+`funding_ref_id`, which is a bare `integer` with **no foreign key**, on six tables:
+`work_orders`, `job_lines`, `work_order_template_lines`, `audit_remedies`,
+`expense_allocations`, and the 0086 ad-hoc flag table.
+
+**Decided:** merge repoints those explicitly, per table, filtered on
+`funding_source = 'cabin_holder'`. A key walk alone would silently lose funding history —
+the exact opposite of the fixture cleanup, where following keys was the right answer.
+
+## Q8 — §8 needs a session store before a long session means anything
+
+**Finding:** `express-session` with no `store` configured, so the default **MemoryStore**, and
+`maxAge` of 12 hours. Every deploy recreates the container, so **every deploy signs everyone
+out** — no cookie lifetime survives that.
+
+**Decided:** `connect-pg-simple` against the existing Postgres (additive session table), plus
+`rolling: true` and a 90-day `maxAge`. One npm dependency, no new service, which I read as
+inside "no subscriptions beyond Quo".
+
+**Flagged because it adds a dependency.** The alternative is signed stateless cookies, which
+would mean rewriting auth rather than configuring it.
