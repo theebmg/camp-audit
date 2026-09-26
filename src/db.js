@@ -3246,8 +3246,11 @@ const PERSON_SELECT = `
     GROUP BY chp.person_id
   ) h ON h.person_id = p.id
   LEFT JOIN (
+    -- Confirmed only. An 'expected' visit has not happened yet — that is the whole reason
+    -- the "Did they show up?" queue exists — and a no-show did not happen at all. Counting
+    -- either would make a profile claim visits nobody made.
     SELECT person_id, count(*) AS visit_count, max(visit_date)::text AS last_visit
-    FROM visits WHERE status <> 'no_show' AND person_id IS NOT NULL GROUP BY person_id
+    FROM visits WHERE status = 'confirmed' AND person_id IS NOT NULL GROUP BY person_id
   ) vi ON vi.person_id = p.id
 `;
 
@@ -3488,9 +3491,11 @@ const GROUP_SELECT = `
   LEFT JOIN group_types gt ON gt.id = g.type_id
   LEFT JOIN people cp ON cp.id = g.contact_person_id
   LEFT JOIN (
+    -- Confirmed only, same reason as people. "3 visits this year, usually ~15" has to mean
+    -- visits that happened.
     SELECT group_id, count(*) AS visit_count, max(visit_date)::text AS last_visit,
            avg(headcount) AS typical_headcount
-    FROM visits WHERE status <> 'no_show' AND group_id IS NOT NULL GROUP BY group_id
+    FROM visits WHERE status = 'confirmed' AND group_id IS NOT NULL GROUP BY group_id
   ) v ON v.group_id = g.id
 `;
 
