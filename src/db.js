@@ -8806,6 +8806,404 @@ export async function listVisitorConflicts({ date, assetId, jobLineId }) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+// Text intake — Incoming inbox (text-intake brief §3–§7)
+//
+// Nothing files automatically. A text becomes an incoming_items row and waits. The first word
+// may name a category, which pre-selects it and is stripped for display — never for storage,
+// because what arrived is what is kept.
+// ══════════════════════════════════════════════════════════════════════════
+
+const INCOMING_HINTS = new Set(['visitor', 'receipt', 'fix', 'note']);
+
+// The hint is the first word, case-insensitive, optionally followed by a colon. Deliberately
+// the whole of the parsing in this feature: no dates, no names, no amounts are read from the
+// body. Ben fills those in while confirming (§4).
+export function parseIncomingHint(body) {
+  const text = String(body || '');
+  const m = text.match(/^\s*([A-Za-z]+)\s*:?\s*/);
+  if (!m) return { hint: null, display: text.trim() };
+  const word = m[1].toLowerCase();
+  if (!INCOMING_HINTS.has(word)) return { hint: null, display: text.trim() };
+  return { hint: word, display: text.slice(m[0].length).trim() };
+}
+
+// America/New_York, always (§4). A 9 PM text must land on the day it was sent, so the date and
+// time are derived in that zone rather than in whatever the server happens to be set to.
+export function toEasternParts(date) {
+  const d = date instanceof Date ? date : new Date(date);
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+  });
+  const p = Object.fromEntries(fmt.formatToParts(d).filter((x) => x.type !== 'literal').map((x) => [x.type, x.value]));
+  // en-CA gives 24-hour time, but midnight can come back as "24" in some engines.
+  const hour = p.hour === '24' ? '00' : p.hour;
+  return { date: `${p.year}-${p.month}-${p.day}`, time: `${hour}:${p.minute}:${p.second}` };
+}
+
+function incomingRowShape(r) {
+  const { hint, display } = parseIncomingHint(r.body_text);
+  return {
+    Id: r.id,
+    Source: r.source,
+    ExternalId: r.external_id,
+    FromNumber: r.from_number,
+    BodyText: r.body_text,
+    // What to show: the message without the hint word, since the hint is already a chip.
+    DisplayText: display || r.body_text,
+    Hint: r.hint ?? hint,
+    ReceivedAt: r.received_at,
+    ReceivedDate: r.received_date_text ?? (r.received_date ? String(r.received_date).slice(0, 10) : null),
+    ReceivedTime: r.received_time ? String(r.received_time).slice(0, 5) : null,
+    Status: r.status,
+    FiledAs: r.filed_as,
+    FiledEntity: r.filed_entity,
+    FiledEntityId: r.filed_entity_id,
+    FiledBy: r.filed_by,
+    FiledAt: r.filed_at,
+    PhotoCount: Number(r.photo_count || 0),
+    CreatedAt: r.created_at,
+  };
+}
+
+const INCOMING_SELECT = `
+  SELECT i.*, i.received_date::text AS received_date_text,
+         (SELECT count(*) FROM attachment_links al
+           WHERE al.entity_type = 'incoming_item' AND al.entity_id = i.id) AS photo_count
+  FROM incoming_items i
+`;
+
+export async function listIncomingItems({ status = null, limit = 200 } = {}) {
+  const vals = []; let filter = '';
+  if (status) { vals.push(status); filter = `WHERE i.status = $${vals.length}`; }
+  vals.push(limit);
+  const { rows } = await pool.query(
+    `${INCOMING_SELECT} ${filter} ORDER BY i.received_at DESC, i.id DESC LIMIT $${vals.length}`, vals
+  );
+  return rows.map(incomingRowShape);
+}
+
+export async function getIncomingItem(id) {
+  const { rows } = await pool.query(`${INCOMING_SELECT} WHERE i.id = $1`, [id]);
+  if (!rows[0]) return null;
+  const item = incomingRowShape(rows[0]);
+  item.Photos = await listAttachmentsForEntity('incoming_item', id);
+  const { rows: moves } = await pool.query(
+    `SELECT * FROM incoming_moves WHERE item_id = $1 ORDER BY moved_at DESC`, [id]
+  );
+  item.Moves = moves.map((m) => ({
+    Id: m.id, FromKind: m.from_kind, FromEntity: m.from_entity, FromEntityId: m.from_entity_id,
+    ToKind: m.to_kind, ToEntity: m.to_entity, ToEntityId: m.to_entity_id,
+    LeftBehind: m.left_behind, MovedBy: m.moved_by, MovedAt: m.moved_at,
+  }));
+  return item;
+}
+
+// Idempotent by externalId: a retried delivery finds the row and changes nothing (§3).
+export async function createIncomingItem({
+  externalId = null, fromNumber = null, bodyText = '', receivedAt = new Date(),
+  source = 'text', attachmentIds = [],
+}) {
+  const { hint } = parseIncomingHint(bodyText);
+  const parts = toEasternParts(receivedAt);
+  const client = await pool.connect();
+  let id; let created = false;
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO incoming_items (source, external_id, from_number, body_text, hint,
+                                   received_at, received_date, received_time)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (external_id) DO NOTHING
+       RETURNING id`,
+      [source, externalId, fromNumber, bodyText, hint, receivedAt, parts.date, parts.time]
+    );
+    if (rows[0]) { id = rows[0].id; created = true; }
+    else {
+      const { rows: existing } = await client.query('SELECT id FROM incoming_items WHERE external_id = $1', [externalId]);
+      id = existing[0]?.id;
+    }
+    if (created) {
+      for (const attachmentId of attachmentIds || []) {
+        await linkAttachment(attachmentId, { entityType: 'incoming_item', entityId: id }, client);
+      }
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  if (created) {
+    await logActivity({ action: 'received', entityType: 'incoming_item', entityId: id,
+      entityLabel: (bodyText || '').slice(0, 60) || '(no text)', details: `from ${fromNumber || 'unknown'}` });
+  }
+  return { Item: await getIncomingItem(id), Created: created };
+}
+
+export async function markIncomingFiled(id, { filedAs, entity, entityId, by = null }, client = pool) {
+  await client.query(
+    `UPDATE incoming_items SET status = 'filed', filed_as = $2, filed_entity = $3,
+            filed_entity_id = $4, filed_by = $5, filed_at = now() WHERE id = $1`,
+    [id, filedAs, entity, entityId, by]
+  );
+}
+
+export async function dismissIncomingItem(id, { by = null } = {}) {
+  // Dismiss keeps the item (§5) — it is marked, not deleted, so a text that turned out to be
+  // nothing is still a record that it arrived.
+  await pool.query(`UPDATE incoming_items SET status = 'dismissed', filed_by = $2, filed_at = now() WHERE id = $1`, [id, by]);
+  await logActivity({ action: 'dismissed', entityType: 'incoming_item', entityId: Number(id), entityLabel: '' });
+  return getIncomingItem(id);
+}
+
+export async function reopenIncomingItem(id) {
+  await pool.query(
+    `UPDATE incoming_items SET status = 'new', filed_as = NULL, filed_entity = NULL,
+            filed_entity_id = NULL, filed_by = NULL, filed_at = NULL WHERE id = $1`, [id]
+  );
+  return getIncomingItem(id);
+}
+
+// ── Settings (§3, §7) ─────────────────────────────────────────────────────
+export async function getTextIntakeSettings() {
+  const { rows } = await pool.query('SELECT * FROM text_intake_settings WHERE id = 1');
+  const r = rows[0] || {};
+  return {
+    AllowedSenders: r.allowed_senders || [],
+    SendConfirmation: r.send_confirmation ?? true,
+    ConfirmationText: r.confirmation_text || 'Got it — in Incoming.',
+    ReplyFromNumber: r.reply_from_number || null,
+    IgnoredSenderCount: r.ignored_sender_count || 0,
+    LastIgnoredAt: r.last_ignored_at || null,
+    LastDeliveryAt: r.last_delivery_at || null,
+    // Never returned: the API key and signing secret. They are environment variables.
+    WebhookConfigured: !!(process.env.QUO_SIGNING_SECRET && process.env.QUO_API_KEY),
+  };
+}
+
+export async function updateTextIntakeSettings({ allowedSenders, sendConfirmation, confirmationText, replyFromNumber }) {
+  const sets = []; const vals = []; let i = 1;
+  const set = (col, v) => { sets.push(`${col} = $${i++}`); vals.push(v); };
+  if (allowedSenders !== undefined) set('allowed_senders', (allowedSenders || []).map(normalizePhone).filter(Boolean));
+  if (sendConfirmation !== undefined) set('send_confirmation', !!sendConfirmation);
+  if (confirmationText !== undefined) set('confirmation_text', String(confirmationText || '').trim() || 'Got it — in Incoming.');
+  if (replyFromNumber !== undefined) set('reply_from_number', normalizePhone(replyFromNumber) || null);
+  if (!sets.length) return getTextIntakeSettings();
+  await pool.query(`UPDATE text_intake_settings SET ${sets.join(', ')} WHERE id = 1`, vals);
+  return getTextIntakeSettings();
+}
+
+// Phone numbers arrive in several shapes — +15551234567, (555) 123-4567, 555.123.4567 — and
+// an allowlist that only matches one of them is an allowlist that silently ignores Ben.
+// Compared on digits alone, with a leading US 1 dropped so 10- and 11-digit forms match.
+export function normalizePhone(raw) {
+  if (!raw) return null;
+  let digits = String(raw).replace(/\D/g, '');
+  if (digits.length === 11 && digits.startsWith('1')) digits = digits.slice(1);
+  return digits || null;
+}
+
+export async function isAllowedSender(number) {
+  const { AllowedSenders } = await getTextIntakeSettings();
+  const n = normalizePhone(number);
+  if (!n) return false;
+  // No allowlist configured means nothing is processed. Fail closed: an empty list is "not set
+  // up yet", not "accept everything".
+  if (!AllowedSenders.length) return false;
+  return AllowedSenders.some((a) => normalizePhone(a) === n);
+}
+
+export async function countIgnoredSender() {
+  // The count is for debugging; the content is never stored (§3).
+  await pool.query(
+    `UPDATE text_intake_settings SET ignored_sender_count = ignored_sender_count + 1,
+            last_ignored_at = now() WHERE id = 1`
+  );
+}
+
+export async function noteDelivery() {
+  await pool.query('UPDATE text_intake_settings SET last_delivery_at = now() WHERE id = 1');
+}
+
+// ── Move to… (§6) ─────────────────────────────────────────────────────────
+// Re-file an item as another category, carrying the message and its attachments. The old
+// destination is removed when that is safe and reported when it is not, rather than being
+// broken quietly.
+export async function recordIncomingMove(itemId, { fromKind, fromEntity, fromEntityId, toKind, toEntity, toEntityId, leftBehind = null, by = null }) {
+  await pool.query(
+    `INSERT INTO incoming_moves (item_id, from_kind, from_entity, from_entity_id,
+                                 to_kind, to_entity, to_entity_id, left_behind, moved_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [itemId, fromKind || null, fromEntity || null, fromEntityId || null,
+      toKind, toEntity || null, toEntityId || null, leftBehind, by]
+  );
+}
+
+// Can the thing this item became be safely undone? Says why not, in words a person can act on.
+export async function describeUnfilePlan(item) {
+  if (!item || item.Status !== 'filed' || !item.FiledEntity) return { CanRemove: true, Reason: null };
+  if (item.FiledEntity === 'visit') return { CanRemove: true, Reason: null };
+  if (item.FiledEntity === 'attachment_batch') return { CanRemove: true, Reason: null };
+  if (item.FiledEntity === 'asset_note') return { CanRemove: true, Reason: null };
+  if (item.FiledEntity === 'expense') {
+    const { rows } = await pool.query(
+      `SELECT count(*)::int n FROM expense_allocations WHERE expense_id = $1`, [item.FiledEntityId]
+    );
+    if (rows[0].n > 1) {
+      return {
+        CanRemove: false,
+        Reason: `That receipt is already split across ${rows[0].n} destinations. Moving it would undo the split, so the expense is left where it is — unpick the split first if you really want it moved.`,
+      };
+    }
+    return { CanRemove: true, Reason: null };
+  }
+  return { CanRemove: true, Reason: null };
+}
+
+// ── Filing an incoming item (§5) and moving it (§6) ───────────────────────
+// Four destinations, each the SAME one an emailed item would reach — a texted receipt becomes
+// an ordinary triage-inbox expense, a texted photo lands where emailed work photos land. The
+// only difference is source = 'text'.
+
+async function attachmentIdsFor(itemId) {
+  const photos = await listAttachmentsForEntity('incoming_item', itemId);
+  return photos.map((p) => p.Id);
+}
+
+export async function fileIncomingItem(itemId, opts) {
+  const item = await getIncomingItem(itemId);
+  if (!item) { const e = new Error('Item not found'); e.status = 404; throw e; }
+  const { filedAs, by = null } = opts;
+  const attachmentIds = await attachmentIdsFor(itemId);
+  let entity; let entityId; let label;
+
+  if (filedAs === 'visitor') {
+    const visit = await createVisit({
+      personId: opts.personId || null,
+      groupId: opts.groupId || null,
+      headcount: opts.headcount ?? null,
+      assetId: opts.assetId || null,
+      // The date defaults to when the text arrived, in Eastern (§4) — never parsed from the
+      // message body. Ben corrects it while confirming, and that correction is what is stored.
+      visitDate: opts.visitDate || item.ReceivedDate,
+      arrivalTime: opts.arrivalTime || null,
+      durationMinutes: opts.durationMinutes ?? null,
+      reason: opts.reason ?? item.DisplayText,
+      calledAhead: opts.calledAhead ?? false,
+      notes: opts.notes || null,
+      source: 'text',
+      attachmentIds,
+      createdBy: by,
+    });
+    await pool.query('UPDATE visits SET incoming_item_id = $2 WHERE id = $1', [visit.Id, itemId]);
+    entity = 'visit'; entityId = visit.Id; label = visit.Who;
+
+  } else if (filedAs === 'receipt') {
+    // An ordinary triage-inbox expense, exactly as an emailed receipt (§5).
+    const expense = await createExpense({
+      vendor: opts.vendor || null,
+      amount: opts.amount ?? null,
+      purchaseDate: opts.purchaseDate || item.ReceivedDate,
+      taxAmount: opts.taxAmount ?? null,
+      categoryId: opts.categoryId || null,
+      fundId: opts.fundId || null,
+      assetId: opts.assetId || null,
+      notes: opts.notes ?? item.DisplayText,
+      createdBy: by,
+    });
+    await pool.query(
+      `UPDATE expenses SET source = 'text', triage_status = 'inbox', incoming_item_id = $2 WHERE id = $1`,
+      [expense.Id, itemId]
+    );
+    for (const attachmentId of attachmentIds) {
+      await linkAttachment(attachmentId, { entityType: 'expense', entityId: expense.Id });
+    }
+    entity = 'expense'; entityId = expense.Id; label = expense.Vendor || `Expense #${expense.Id}`;
+
+  } else if (filedAs === 'fix') {
+    // Where emailed work photos go: an attachment_batches row plus the links (§0.3).
+    const batch = await createMailInboundBatch({
+      subject: (item.DisplayText || '').slice(0, 120) || 'Texted photo',
+      bodyText: item.BodyText,
+      senderEmail: item.FromNumber ? `text:${item.FromNumber}` : 'text',
+      messageId: `incoming:${itemId}`,
+      receivedAt: item.ReceivedAt,
+      attachments: [],
+      targetWorkOrderId: opts.workOrderId || null,
+    });
+    // createMailInboundBatch returns a bare id, or null when its message_id already existed.
+    // Ours is derived from the item id, so a null here means this item was already filed as a
+    // fix once — which Move-to can legitimately cause.
+    const batchId = typeof batch === 'number' ? batch : (batch?.Id ?? batch?.id ?? null);
+    if (batchId) {
+      await pool.query('UPDATE attachment_batches SET incoming_item_id = $2, source = $3 WHERE id = $1',
+        [batchId, itemId, 'text']);
+    }
+    for (const attachmentId of attachmentIds) {
+      await linkAttachment(attachmentId, opts.workOrderId
+        ? { entityType: 'work_order', entityId: Number(opts.workOrderId) }
+        : { entityType: 'incoming_item', entityId: itemId });
+    }
+    entity = 'attachment_batch'; entityId = batchId; label = 'Work photos';
+
+  } else if (filedAs === 'note') {
+    if (!opts.assetId && !opts.workOrderId) {
+      const e = new Error('A note needs an asset or a work order'); e.status = 400; throw e;
+    }
+    if (opts.assetId) {
+      const note = await createAssetNote(Number(opts.assetId), {
+        note: opts.noteText || item.DisplayText,
+        attachmentIds,
+        createdBy: by,
+      });
+      // createAssetNote returns the raw row, so this is id and not Id.
+      entity = 'asset_note'; entityId = note?.id ?? note?.Id ?? null; label = 'Asset note';
+    } else {
+      const entry = await createWorkOrderLogEntry(Number(opts.workOrderId), {
+        note: opts.noteText || item.DisplayText,
+      });
+      entity = 'work_order_log_entry'; entityId = entry?.Id ?? entry?.id ?? null; label = 'Work order note';
+    }
+  } else {
+    const e = new Error(`Unknown category: ${filedAs}`); e.status = 400; throw e;
+  }
+
+  await markIncomingFiled(itemId, { filedAs, entity, entityId, by });
+  await logActivity({ action: 'filed', entityType: 'incoming_item', entityId: Number(itemId),
+    entityLabel: label, details: `as ${filedAs}` });
+  return { Item: await getIncomingItem(itemId), Entity: entity, EntityId: entityId };
+}
+
+// Move to… (§6). The item is re-filed as another category and the old destination removed —
+// unless removing it would break something, in which case the move still happens and the UI is
+// told what was left behind rather than the data being quietly damaged.
+export async function moveIncomingItem(itemId, opts) {
+  const item = await getIncomingItem(itemId);
+  if (!item) { const e = new Error('Item not found'); e.status = 404; throw e; }
+  const plan = await describeUnfilePlan(item);
+  const from = { kind: item.FiledAs, entity: item.FiledEntity, entityId: item.FiledEntityId };
+
+  let leftBehind = null;
+  if (item.Status === 'filed' && item.FiledEntity) {
+    if (plan.CanRemove) {
+      if (item.FiledEntity === 'visit') await pool.query('DELETE FROM visits WHERE id = $1', [item.FiledEntityId]);
+      else if (item.FiledEntity === 'expense') await pool.query(`UPDATE expenses SET deleted_at = now() WHERE id = $1`, [item.FiledEntityId]);
+      else if (item.FiledEntity === 'attachment_batch') await pool.query('DELETE FROM attachment_batches WHERE id = $1', [item.FiledEntityId]);
+      else if (item.FiledEntity === 'asset_note') await pool.query('DELETE FROM asset_notes WHERE id = $1', [item.FiledEntityId]);
+    } else {
+      leftBehind = plan.Reason;
+    }
+  }
+
+  await reopenIncomingItem(itemId);
+  const filed = await fileIncomingItem(itemId, opts);
+  await recordIncomingMove(itemId, {
+    fromKind: from.kind, fromEntity: from.entity, fromEntityId: from.entityId,
+    toKind: opts.filedAs, toEntity: filed.Entity, toEntityId: filed.EntityId,
+    leftBehind, by: opts.by,
+  });
+  return { ...filed, LeftBehind: leftBehind, Item: await getIncomingItem(itemId) };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 // Visitor log (text-intake brief §2)
 //
 // One store: the `visits` table. A visit is a person or a group, never free text. Calendar

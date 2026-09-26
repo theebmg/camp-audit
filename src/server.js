@@ -13,6 +13,7 @@ import mailInboundRouter from './routes/mail-inbound.js';
 import receiptInboundRouter from './routes/receipt-inbound.js';
 import mailDispatchRouter from './routes/mail-dispatch.js';
 import gcalOauthCallbackRouter from './routes/gcal-oauth-callback.js';
+import quoInboundRouter from './routes/quo-inbound.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -21,7 +22,14 @@ const app = express();
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+// The raw bytes are kept alongside the parsed body, because a webhook signature covers what
+// was sent — parsing first and re-serialising compares the signature to something the sender
+// never signed, since key order and whitespace differ. express.json() runs globally and would
+// otherwise consume the body before a webhook route could see it at all.
+app.use(express.json({
+  limit: '2mb',
+  verify: (req, res, buf) => { req.rawBody = buf; },
+}));
 app.use(cookieParser());
 // Sessions live in Postgres, not in this process (text-intake brief §8).
 //
@@ -116,6 +124,9 @@ app.use('/api/pg/receipt-inbound', receiptInboundRouter);
 // signature/idempotency checks intact) so nothing broke mid-cutover, but
 // nothing points Mailgun at them anymore once this route is live.
 app.use('/api/pg/mail-dispatch', mailDispatchRouter);
+// Quo inbound texts (§3). Mounted outside the session-protected API because it is a webhook:
+// it authenticates by HMAC signature over the raw body, not by a cookie.
+app.use('/api/quo/inbound', quoInboundRouter);
 // Google OAuth callback (Build Brief v4 Part 1) — Google redirects the
 // browser here directly, not an authenticated fetch from this app, so it's
 // mounted pre-auth at its own fully-specific path, same reasoning as the

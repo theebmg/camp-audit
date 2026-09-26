@@ -164,6 +164,9 @@ import {
   findDuplicatePeople, mergePeople, listRecordMerges,
   listPersonRoles, createPersonRole, updatePersonRole, deletePersonRole,
   listHoldings, listUnlinkedHoldings, linkHoldingToPerson, unlinkHoldingFromPerson,
+  listIncomingItems, getIncomingItem, dismissIncomingItem, reopenIncomingItem,
+  fileIncomingItem, moveIncomingItem, describeUnfilePlan,
+  getTextIntakeSettings, updateTextIntakeSettings,
   listVisits, getVisit, createVisit, updateVisit, confirmVisit, deleteVisit,
   listVisitsAwaitingConfirmation, findMatchingExpectedVisit, projectCalendarVisits,
   listGroups, getGroup, createGroup, updateGroup, deleteGroup,
@@ -3263,6 +3266,68 @@ router.get('/visits/export.csv', async (req, res, next) => {
     res.setHeader('Content-Disposition', `attachment; filename="visits-${new Date().toISOString().slice(0, 10)}.csv"`);
     res.send(lines.join('\n'));
   } catch (e) { next(e); }
+});
+
+// ---- Incoming inbox (text-intake brief §5–§7) ----
+
+router.get('/incoming', async (req, res, next) => {
+  try { res.json({ items: await listIncomingItems({ status: req.query.status || null }) }); } catch (e) { next(e); }
+});
+
+router.get('/incoming/:id(\\d+)', async (req, res, next) => {
+  try {
+    const item = await getIncomingItem(req.params.id);
+    if (!item) return res.status(404).json({ ok: false, error: 'Item not found' });
+    res.json({ item, unfile: await describeUnfilePlan(item) });
+  } catch (e) { next(e); }
+});
+
+router.post('/incoming/:id(\\d+)/dismiss', async (req, res, next) => {
+  try { res.json({ item: await dismissIncomingItem(req.params.id, { by: currentUsername() }) }); } catch (e) { next(e); }
+});
+
+router.post('/incoming/:id(\\d+)/reopen', async (req, res, next) => {
+  try { res.json({ item: await reopenIncomingItem(req.params.id) }); } catch (e) { next(e); }
+});
+
+// Confirm an item into one of the four categories (§5). Nothing here guesses: the body carries
+// exactly what Ben filled in, and the item's own text and photos come along.
+router.post('/incoming/:id(\\d+)/file', async (req, res, next) => {
+  try {
+    const result = await fileIncomingItem(req.params.id, { ...req.body, by: currentUsername() });
+    res.json(result);
+  } catch (e) { next(e); }
+});
+
+// Move to… (§6): re-file as another category, carrying the message and attachments, removing
+// the old destination when that is safe and saying so when it is not.
+router.post('/incoming/:id(\\d+)/move', async (req, res, next) => {
+  try {
+    const result = await moveIncomingItem(req.params.id, { ...req.body, by: currentUsername() });
+    res.json(result);
+  } catch (e) { next(e); }
+});
+
+// Batch confirm (§5) — several items of the same category in one action.
+router.post('/incoming/batch-file', async (req, res, next) => {
+  try {
+    const { ids, filedAs, payload } = req.body || {};
+    if (!Array.isArray(ids) || !ids.length) return res.status(400).json({ ok: false, error: 'ids are required' });
+    if (!filedAs) return res.status(400).json({ ok: false, error: 'filedAs is required' });
+    const results = [];
+    for (const id of ids) {
+      try { results.push({ id, ...await fileIncomingItem(id, { ...(payload || {}), filedAs, by: currentUsername() }) }); }
+      catch (e) { results.push({ id, error: e.message }); }
+    }
+    res.json({ results });
+  } catch (e) { next(e); }
+});
+
+router.get('/text-intake/settings', async (req, res, next) => {
+  try { res.json({ settings: await getTextIntakeSettings() }); } catch (e) { next(e); }
+});
+router.patch('/text-intake/settings', async (req, res, next) => {
+  try { res.json({ settings: await updateTextIntakeSettings(req.body || {}) }); } catch (e) { next(e); }
 });
 
 export default router;
