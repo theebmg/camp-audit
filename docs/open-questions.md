@@ -538,3 +538,88 @@ Neither is from text intake, and neither is an error in our code:
 - **`expense-detail`** logs `Viewport argument key "no;" not recognized`. It comes from embedded
   attachment content, not from our markup — every `<meta name="viewport">` in `public-pg/` is
   well-formed.
+
+---
+
+# Quo setup — done, and what it revealed
+
+## Q21 — Quo is OpenPhone, and my assumed signature scheme was wrong on every count
+
+`api.quo.com` and `api.openphone.com` return byte-identical responses for the same key. That
+turned the one genuinely uncertain part of §3 into a known quantity — and showed that all
+three of my guesses were wrong:
+
+| | I assumed | It actually is |
+|---|---|---|
+| Header | separate `quo-signature` and `quo-timestamp` | one `openphone-signature` |
+| Format | `<hex>` | `hmac;1;<timestamp-ms>;<base64 sig>` |
+| Key | the secret as a literal string | the secret **base64-decoded** to 32 raw bytes |
+| Output | hex | base64 |
+
+Every delivery would have been rejected with a perfectly correct secret. Rewritten and
+verified; the test now asserts that the exact form my first version computed is **not**
+accepted, so this cannot silently regress.
+
+## Q22 — Quo does support scoping a webhook to one number
+
+Registered with `resourceIds: ["PNbUDwbMuW"]`, so the camp line only.
+
+```
+webhook id   WHaca2f685c6514e73b614e9b32981039c
+url          https://audit.fracturedrv.com/api/quo/inbound
+events       message.received
+resourceIds  PNbUDwbMuW   (Camp Sychar, +1 740 397 4564)
+status       enabled
+```
+
+**Nothing needs doing in the Quo app.** The whole registration went through the API, and the
+signing secret came back from the registration call.
+
+The other line in the workspace is **Fractured RV Main Line, `PNG4mxk5Mp`, +1 330 529 9925**.
+It is not in the webhook's scope, and the code ignores it independently.
+
+## Q23 — Two independent defences on the receiving line
+
+Scoping is the webhook's business and could be changed in the Quo app without this system
+knowing, so the receiving line is checked in code too. Matches on the provider's line id, or
+on the number in any spelling when only a number is reported. **Fails closed**: no camp line
+configured means nothing is processed. A message to the other line is counted and dropped,
+content never stored, and `incoming_items.to_line` records which line every item arrived on so
+a mis-scope is visible after the fact rather than only in a counter.
+
+## Q24 — Portability
+
+`src/routes/quo-inbound.js` is the only provider-specific file, and its header says so.
+Everything downstream deals in a sender, a receiving line, text, a timestamp and image URLs.
+
+- Credentials: `QUO_API_KEY`, `QUO_SIGNING_SECRET` — environment only, never in the repo,
+  never logged, never returned by any route. `~/camp-audit/.env` was **mode 644** and is now
+  600; it also holds the database URL and the storage keys, so that was worth fixing anyway.
+- Numbers: both the camp line and the allowlist are editable in Text settings.
+- Endpoint: `QUO_API_BASE` is overridable.
+
+Another provider is a sibling of that one file.
+
+## Q25 — CSV export audit
+
+Of the six areas named: **four had one, two did not.** People and Groups now do.
+
+| Area | Export | Where |
+|---|---|---|
+| People | **added** | People → CSV, `/api/pg/people/export.csv` — 158 rows |
+| Groups | **added** | Groups → CSV, `/api/pg/groups/export.csv` |
+| Visits | yes | Visitor log → CSV |
+| Work orders | yes | Reports explorer |
+| Audits | yes | `/api/pg/audit-data?format=csv` |
+| Expenses | yes | Reports explorer |
+
+Also already exporting: assets (341 rows), job lines, findings, work-order log, crew sessions,
+crew hours. All verified returning `text/csv` with real rows.
+
+**Still missing, for your call** — none were on your list, so I have not added them:
+
+- **Admin tasks** — no export.
+- **Materials / stock on hand** — no export.
+- **Incoming items** — no export. Arguably wanted once texts are flowing.
+
+Each is a short addition now that there is one shared CSV writer.

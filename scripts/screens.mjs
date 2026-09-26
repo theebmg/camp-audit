@@ -597,7 +597,7 @@ for (const vp of VIEWPORTS) {
       continue;
     }
     // Landscape only carries the screens where vertical room is the question.
-    if (vp.landscape && !/^(runner-|wo-|kb-|round-detail)/.test(s.id)) continue;
+    if (vp.landscape && !/^(runner-|wo-|kb-|round-detail|people|visits|incoming)/.test(s.id)) continue;
     if (s.keyboard && !vp.kbHeight) continue;   // no keyboard on a desktop
     // A screen marked `once` changes state that later screens depend on, so it runs on the
     // primary phone viewport only.
