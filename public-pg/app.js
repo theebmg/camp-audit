@@ -868,6 +868,7 @@ const NAV_ITEMS = [
   { icon: '📦', label: 'Materials', view: 'materials' },
   { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
+  { icon: '📨', label: 'Incoming', view: 'incoming' },
   { icon: '🚪', label: 'Visitor Log', view: 'visits' },
   { icon: '🧑', label: 'People', view: 'people' },
   { icon: '👥', label: 'Groups', view: 'groups' },
@@ -1268,6 +1269,8 @@ async function render(view, params = {}, opts = {}) {
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
       adminChecklistTemplates: () => renderAdminChecklistTemplates(),
+      incoming: () => renderIncoming(params),
+      textIntakeSettings: () => renderTextIntakeSettings(),
       visits: () => renderVisits(params),
       people: () => renderPeople(params),
       personProfile: () => renderPersonProfile(params),
@@ -8797,6 +8800,367 @@ async function renderCalendarEventDetail({ id }) {
     try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderCalendarEventDetail({ id }); }
     catch (err) { toast(err.message); }
   }));
+}
+
+// ---------- Incoming (text-intake brief §5–§7) ----------
+// Every processed text lands here and waits. Nothing files itself; the first word only
+// pre-selects a category.
+
+const INCOMING_CATEGORIES = [
+  { key: 'visitor', label: 'Visitor', icon: '🚪', hint: 'logs a visit' },
+  { key: 'receipt', label: 'Receipt', icon: '🧾', hint: 'goes to receipt triage' },
+  { key: 'fix', label: 'Fix', icon: '🛠️', hint: 'work photos' },
+  { key: 'note', label: 'Note', icon: '🗒️', hint: 'a dated note' },
+];
+
+async function renderIncoming(params = {}) {
+  setChrome({ title: 'Incoming', showBack: false, showLogout: true });
+  let items = [];
+  let status = params.status || 'new';
+  const selected = new Set();
+
+  async function load() {
+    const d = await api(`/api/pg/incoming${status === 'all' ? '' : `?status=${status}`}`);
+    items = d.items || [];
+    for (const id of [...selected]) if (!items.some((i) => i.Id === id)) selected.delete(id);
+  }
+
+  function draw() {
+    const sameHint = selected.size
+      ? [...new Set(items.filter((i) => selected.has(i.Id)).map((i) => i.Hint))]
+      : [];
+    setApp(`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
+          <h3 style="margin:0">Incoming</h3>
+          <button type="button" class="btn btn-secondary" id="settingsBtn">Text settings</button>
+        </div>
+        <p class="muted" style="margin:6px 0 0">
+          Texts to the camp line. Nothing files itself — the first word just pre-selects a
+          category, and the date comes from when the text arrived, not from what it says.
+        </p>
+        <div class="view-toggle" style="margin-top:10px">
+          ${[['new', 'New'], ['filed', 'Filed'], ['dismissed', 'Dismissed'], ['all', 'All']].map(([k, l]) =>
+            `<button type="button" class="view-toggle-btn ${status === k ? 'active' : ''}" data-status="${k}">${l}</button>`).join('')}
+        </div>
+      </div>
+
+      ${selected.size ? `<div class="card" style="background:var(--accent-soft);border-color:var(--accent)">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+          <strong>${selected.size} selected</strong>
+          <div class="btn-row" style="margin:0">
+            ${sameHint.length === 1 && sameHint[0] ? `<button type="button" class="btn btn-primary" id="batchFile">Confirm all as ${escapeHtml(sameHint[0])}</button>` : ''}
+            <button type="button" class="btn btn-secondary" id="clearSel">Clear</button>
+          </div>
+        </div>
+        ${sameHint.length > 1 ? '<p class="muted" style="margin:6px 0 0;font-size:0.85rem">Batch confirm needs them all to be the same category.</p>' : ''}
+      </div>` : ''}
+
+      <div class="card">
+        ${items.length ? items.map((i) => `
+          <div class="list-item" style="display:flex;gap:10px;align-items:flex-start">
+            ${i.Status === 'new' ? `<label class="inc-pick-wrap" style="flex:0 0 auto;margin:0">
+              <input type="checkbox" class="inc-pick" data-id="${i.Id}" ${selected.has(i.Id) ? 'checked' : ''} />
+            </label>` : ''}
+            <div style="flex:1;min-width:0;cursor:pointer" data-open="${i.Id}">
+              <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
+                <div class="muted" style="font-size:0.8rem">
+                  ${escapeHtml(i.ReceivedDate)} ${escapeHtml(i.ReceivedTime || '')}
+                  ${i.FromNumber ? ` · ${escapeHtml(i.FromNumber)}` : ''}
+                </div>
+                <div>
+                  ${i.Hint ? `<span class="pill">${escapeHtml(i.Hint)}</span>` : '<span class="pill">no hint</span>'}
+                  ${i.Status !== 'new' ? `<span class="pill">${escapeHtml(i.Status)}</span>` : ''}
+                  ${i.PhotoCount ? `<span class="pill">${i.PhotoCount} 📷</span>` : ''}
+                </div>
+              </div>
+              <div style="margin-top:3px;white-space:pre-wrap">${escapeHtml(i.DisplayText || '(no text)')}</div>
+              ${i.Status === 'filed' ? `<div class="muted" style="font-size:0.8rem;margin-top:3px">filed as ${escapeHtml(i.FiledAs || '')}${i.FiledBy ? ` by ${escapeHtml(i.FiledBy)}` : ''}</div>` : ''}
+            </div>
+          </div>`).join('') : `<p class="muted">Nothing ${status === 'all' ? 'here' : status}.</p>`}
+      </div>`);
+
+    app.querySelectorAll('[data-status]').forEach((b) => b.addEventListener('click', async () => {
+      status = b.dataset.status; selected.clear(); await load(); draw();
+    }));
+    app.querySelectorAll('.inc-pick').forEach((c) => c.addEventListener('change', () => {
+      const id = Number(c.dataset.id);
+      if (c.checked) selected.add(id); else selected.delete(id);
+      draw();
+    }));
+    app.querySelectorAll('[data-open]').forEach((el) => el.addEventListener('click', () => openIncomingItem(Number(el.dataset.open), async () => { await load(); draw(); })));
+    document.getElementById('clearSel')?.addEventListener('click', () => { selected.clear(); draw(); });
+    document.getElementById('settingsBtn').addEventListener('click', () => go('textIntakeSettings'));
+    document.getElementById('batchFile')?.addEventListener('click', async () => {
+      const kind = sameHint[0];
+      if (!await confirmDialog(`Confirm ${selected.size} item(s) as ${kind}? Each keeps its own text, photos and date.`, { danger: false })) return;
+      try {
+        const r = await api('/api/pg/incoming/batch-file', {
+          method: 'POST', body: JSON.stringify({ ids: [...selected], filedAs: kind, payload: {} }),
+        });
+        const failed = (r.results || []).filter((x) => x.error);
+        toast(failed.length ? `${(r.results.length - failed.length)} filed, ${failed.length} failed` : `${r.results.length} filed`, 5000);
+        selected.clear(); await load(); draw();
+      } catch (e) { toast(e.message, 5000); }
+    });
+  }
+
+  await load();
+  draw();
+}
+
+// One item: the text beside the form, a category picker, and the right confirm form (§5).
+async function openIncomingItem(id, onChanged = () => {}) {
+  const d = await api(`/api/pg/incoming/${id}`);
+  const item = d.item;
+  const unfile = d.unfile || { CanRemove: true };
+  if (!item) return toast('That item is gone', 4000);
+  let category = item.FiledAs || item.Hint || null;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal-box addpanel" style="max-width:640px;width:95%">
+      <div class="addpanel-head">
+        <h3 style="margin:0">${item.Status === 'filed' ? 'Move this to…' : 'What is this?'}</h3>
+        <p class="muted" style="margin:4px 0 0;font-size:0.85rem">
+          Received ${escapeHtml(item.ReceivedDate)} at ${escapeHtml(item.ReceivedTime || '')} (Eastern).
+          ${item.Status === 'filed' ? `Currently filed as <strong>${escapeHtml(item.FiledAs || '')}</strong>.` : ''}
+        </p>
+      </div>
+      <div class="addpanel-body">
+        <div class="card" style="background:var(--surface-alt);margin:10px 0">
+          <div class="muted" style="font-size:0.78rem">The text, as sent</div>
+          <div style="white-space:pre-wrap">${escapeHtml(item.BodyText || '(no text)')}</div>
+          ${(item.Photos || []).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+            ${item.Photos.map((p) => `<img src="${escapeHtml(p.ThumbUrl || p.Url)}" alt="" style="width:64px;height:64px;object-fit:cover;border-radius:6px" />`).join('')}
+          </div>` : ''}
+        </div>
+
+        ${item.Status === 'filed' && !unfile.CanRemove ? `<div class="card" style="background:#fffdf5;border-color:#f0e6c8">
+          <strong style="font-size:0.9rem">Heads up</strong>
+          <p class="muted" style="margin:4px 0 0;font-size:0.85rem">${escapeHtml(unfile.Reason)}</p>
+        </div>` : ''}
+
+        ${(item.Moves || []).length ? `<div class="card">
+          <div class="muted" style="font-size:0.78rem">History</div>
+          ${item.Moves.map((m) => `<div style="font-size:0.85rem">
+            ${escapeHtml(m.FromKind || 'unfiled')} → ${escapeHtml(m.ToKind)}${m.MovedBy ? ` · ${escapeHtml(m.MovedBy)}` : ''}
+            ${m.LeftBehind ? `<div class="muted" style="font-size:0.8rem">${escapeHtml(m.LeftBehind)}</div>` : ''}
+          </div>`).join('')}
+        </div>` : ''}
+
+        <div class="chip-row" style="margin:4px 0 10px">
+          ${INCOMING_CATEGORIES.map((c) => `
+            <button type="button" class="btn ${category === c.key ? 'btn-primary' : 'btn-secondary'} inc-cat" data-cat="${c.key}">
+              ${c.icon} ${c.label}
+            </button>`).join('')}
+        </div>
+        <div id="catForm"></div>
+      </div>
+      <div class="addpanel-foot" style="justify-content:flex-end">
+        <button type="button" class="btn btn-secondary" id="incDismiss">${item.Status === 'dismissed' ? 'Re-open' : 'Dismiss'}</button>
+        <button type="button" class="btn btn-secondary modal-cancel">Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('#incDismiss').addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/incoming/${id}/${item.Status === 'dismissed' ? 'reopen' : 'dismiss'}`, { method: 'POST' });
+      overlay.remove(); toast(item.Status === 'dismissed' ? 'Re-opened' : 'Dismissed — kept on the record'); onChanged();
+    } catch (e) { toast(e.message, 5000); }
+  });
+  overlay.querySelectorAll('.inc-cat').forEach((b) => b.addEventListener('click', () => {
+    category = b.dataset.cat;
+    overlay.querySelectorAll('.inc-cat').forEach((x) => {
+      x.classList.toggle('btn-primary', x.dataset.cat === category);
+      x.classList.toggle('btn-secondary', x.dataset.cat !== category);
+    });
+    drawCatForm();
+  }));
+
+  const isMove = item.Status === 'filed';
+  const submit = async (payload) => {
+    try {
+      const r = await api(`/api/pg/incoming/${id}/${isMove ? 'move' : 'file'}`, {
+        method: 'POST', body: JSON.stringify({ filedAs: category, ...payload }),
+      });
+      overlay.remove();
+      toast(r.LeftBehind ? `Moved — ${r.LeftBehind}` : (isMove ? 'Moved' : 'Filed'), r.LeftBehind ? 8000 : 4000);
+      onChanged();
+    } catch (e) { toast(e.message, 6000); }
+  };
+
+  async function drawCatForm() {
+    const host = overlay.querySelector('#catForm');
+    if (!category) { host.innerHTML = '<p class="muted">Pick a category.</p>'; return; }
+    host.innerHTML = '<p class="muted">Loading…</p>';
+
+    if (category === 'visitor') {
+      // The visit form already does people, groups, inline add, the expected-visit match and
+      // photos — reusing it means the Incoming path and the manual path cannot drift.
+      host.innerHTML = '<p class="muted">Opening the visit form…</p>';
+      overlay.remove();
+      openVisitForm({
+        prefill: {
+          visitDate: item.ReceivedDate,
+          arrivalTime: item.ReceivedTime,
+          reason: item.DisplayText,
+          messageText: item.BodyText,
+          source: 'text',
+        },
+      }, async () => {
+        // The visit form creates the visit itself; mark the item filed against it.
+        try {
+          const latest = await api('/api/pg/visits?limit=1');
+          const v = (latest.visits || [])[0];
+          await api(`/api/pg/incoming/${id}/file`, {
+            method: 'POST',
+            body: JSON.stringify({ filedAs: 'visitor', existingVisitId: v?.Id }),
+          }).catch(() => {});
+        } catch { /* the visit is saved either way */ }
+        onChanged();
+      });
+      return;
+    }
+
+    if (category === 'receipt') {
+      const cats = await api('/api/pg/expense-categories').catch(() => ({ categories: [] }));
+      host.innerHTML = `
+        <div class="field-row"><label>Vendor</label><input type="text" id="rVendor" placeholder="Who was paid" /></div>
+        <div class="field-row"><label>Amount</label><input type="number" step="0.01" id="rAmount" placeholder="optional — triage can fill it in" /></div>
+        <div class="field-row"><label>Purchase date</label><input type="date" id="rDate" value="${escapeHtml(item.ReceivedDate)}" /></div>
+        <div class="field-row"><label>Category</label><select id="rCat">
+          <option value="">— none —</option>
+          ${(cats.categories || []).map((c) => `<option value="${c.Id}">${escapeHtml(c.Name)}</option>`).join('')}
+        </select></div>
+        <p class="muted" style="font-size:0.85rem">Lands in the receipt triage inbox exactly like an emailed receipt, with the photo attached.</p>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="rGo">${isMove ? 'Move to receipt' : 'File as receipt'}</button></div>`;
+      host.querySelector('#rGo').addEventListener('click', () => submit({
+        vendor: host.querySelector('#rVendor').value || null,
+        amount: host.querySelector('#rAmount').value ? Number(host.querySelector('#rAmount').value) : null,
+        purchaseDate: host.querySelector('#rDate').value,
+        categoryId: host.querySelector('#rCat').value ? Number(host.querySelector('#rCat').value) : null,
+      }));
+      return;
+    }
+
+    if (category === 'fix') {
+      const wos = await api('/api/pg/work-orders').catch(() => ({ workOrders: [] }));
+      host.innerHTML = `
+        <div class="field-row"><label>Attach to a work order <span class="muted">(optional)</span></label><div id="fWo"></div></div>
+        <p class="muted" style="font-size:0.85rem">With no work order it lands in the photo inbox, the same place emailed work photos go.</p>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="fGo">${isMove ? 'Move to fix' : 'File as fix'}</button></div>`;
+      let woId = null;
+      mountCombobox(host.querySelector('#fWo'), {
+        options: (wos.workOrders || []).map((w) => ({ value: w.Id, label: `#${w.WoNumber || w.Id} ${w.Title}`, sublabel: w.AssetName || null })),
+        placeholder: 'Work order…',
+        onSelect: (o) => { woId = o ? o.value : null; },
+        onClear: () => { woId = null; },
+      });
+      host.querySelector('#fGo').addEventListener('click', () => submit({ workOrderId: woId }));
+      return;
+    }
+
+    if (category === 'note') {
+      const assets = await loadAllAssets();
+      host.innerHTML = `
+        <div class="field-row"><label>Note</label><textarea id="nText" rows="3">${escapeHtml(item.DisplayText || '')}</textarea></div>
+        <div class="field-row"><label>On which cabin or asset</label><div id="nAsset"></div></div>
+        <p class="muted" style="font-size:0.85rem">Dated ${escapeHtml(item.ReceivedDate)}, from when the text arrived.</p>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="nGo">${isMove ? 'Move to note' : 'File as note'}</button></div>`;
+      let assetId = null;
+      mountCombobox(host.querySelector('#nAsset'), {
+        options: (assets || []).map(assetOptionOf),
+        placeholder: 'Cabin or asset…',
+        onSelect: (o) => { assetId = o ? o.value : null; },
+        onClear: () => { assetId = null; },
+      });
+      host.querySelector('#nGo').addEventListener('click', () => {
+        if (!assetId) return toast('Pick a cabin or asset for the note', 4000);
+        submit({ assetId, noteText: host.querySelector('#nText').value });
+      });
+    }
+  }
+
+  drawCatForm();
+}
+
+// ---------- Text intake settings (§3, §7) ----------
+async function renderTextIntakeSettings() {
+  setChrome({ title: 'Text settings', showBack: true, showLogout: true });
+  let s = null;
+
+  async function load() { s = (await api('/api/pg/text-intake/settings')).settings; }
+
+  function draw() {
+    setApp(`
+      <div class="card">
+        <h3 style="margin:0 0 4px">Text intake</h3>
+        <p class="muted" style="margin:0 0 10px">
+          Texts to the camp line land in Incoming. Only numbers on this list are processed —
+          everything else is ignored here and works normally in Quo.
+        </p>
+        <div class="field-row">
+          <label>My numbers <span class="muted">(one per line)</span></label>
+          <textarea id="sSenders" rows="3">${escapeHtml((s.AllowedSenders || []).join('\n'))}</textarea>
+          <p class="muted" style="font-size:0.8rem;margin:4px 0 0">
+            Any format — +1 555 123 4567, (555) 123-4567 — they're matched on digits.
+            ${(s.AllowedSenders || []).length ? '' : '<strong>Empty means nothing is processed at all.</strong>'}
+          </p>
+        </div>
+        <div class="field-row">
+          <label>Reply from</label>
+          <input type="tel" id="sFrom" value="${escapeHtml(s.ReplyFromNumber || '')}" placeholder="the camp line" />
+        </div>
+        <div class="field-row">
+          <label class="skill-chip" style="display:inline-flex">
+            <input type="checkbox" id="sConfirm" ${s.SendConfirmation ? 'checked' : ''} /> Send a confirmation text back
+          </label>
+          <input type="text" id="sConfirmText" value="${escapeHtml(s.ConfirmationText || '')}" style="margin-top:6px" />
+        </div>
+        <div class="btn-row"><button type="button" class="btn btn-primary" id="sSave">Save</button></div>
+      </div>
+
+      <div class="card">
+        <h3 style="margin:0 0 6px;font-size:0.95rem">Status</h3>
+        <div class="list-item" style="justify-content:space-between">
+          <span>Webhook secrets configured</span>
+          <strong>${s.WebhookConfigured ? 'yes' : 'not yet'}</strong>
+        </div>
+        <div class="list-item" style="justify-content:space-between">
+          <span>Last delivery</span>
+          <strong>${s.LastDeliveryAt ? escapeHtml(String(s.LastDeliveryAt).slice(0, 16).replace('T', ' ')) : 'none yet'}</strong>
+        </div>
+        <div class="list-item" style="justify-content:space-between">
+          <span>Ignored senders</span>
+          <strong>${s.IgnoredSenderCount || 0}</strong>
+        </div>
+        <p class="muted" style="font-size:0.8rem;margin:8px 0 0">
+          The API key and signing secret are environment variables on the server — never stored
+          here, never shown, and never sent to the browser.
+        </p>
+      </div>`);
+
+    document.getElementById('sSave').addEventListener('click', async () => {
+      try {
+        await api('/api/pg/text-intake/settings', {
+          method: 'PATCH',
+          body: JSON.stringify({
+            allowedSenders: document.getElementById('sSenders').value.split('\n').map((x) => x.trim()).filter(Boolean),
+            replyFromNumber: document.getElementById('sFrom').value,
+            sendConfirmation: document.getElementById('sConfirm').checked,
+            confirmationText: document.getElementById('sConfirmText').value,
+          }),
+        });
+        await load(); draw(); toast('Saved');
+      } catch (e) { toast(e.message, 5000); }
+    });
+  }
+
+  await load();
+  draw();
 }
 
 // ---------- Visitor log (text-intake brief §2) ----------

@@ -9076,6 +9076,21 @@ export async function fileIncomingItem(itemId, opts) {
   let entity; let entityId; let label;
 
   if (filedAs === 'visitor') {
+    // The visit form creates the visit itself when the confirm goes through it, so this path
+    // is told which one rather than making a second. Without this, confirming from Incoming
+    // would log the visit twice — once by the form, once here.
+    if (opts.existingVisitId) {
+      await pool.query('UPDATE visits SET incoming_item_id = $2, source = $3 WHERE id = $1',
+        [Number(opts.existingVisitId), itemId, 'text']);
+      for (const attachmentId of attachmentIds) {
+        await linkAttachment(attachmentId, { entityType: 'visit', entityId: Number(opts.existingVisitId) });
+      }
+      const existing = await getVisit(opts.existingVisitId);
+      await markIncomingFiled(itemId, { filedAs, entity: 'visit', entityId: Number(opts.existingVisitId), by });
+      await logActivity({ action: 'filed', entityType: 'incoming_item', entityId: Number(itemId),
+        entityLabel: existing?.Who || 'visit', details: 'as visitor' });
+      return { Item: await getIncomingItem(itemId), Entity: 'visit', EntityId: Number(opts.existingVisitId) };
+    }
     const visit = await createVisit({
       personId: opts.personId || null,
       groupId: opts.groupId || null,
