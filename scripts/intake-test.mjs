@@ -13,6 +13,28 @@ const TAG = 'ZZ-INTAKETEST';
 const fail = [];
 const ok = (cond, label) => { console.log(`  ${cond ? 'ok  ' : 'FAIL'}  ${label}`); if (!cond) fail.push(label); };
 
+// Clear anything a previous run left behind before starting. A test that cannot recover from
+// its own failure reports the residue as a new failure, which is what happened the first time
+// this hit a constraint mid-run.
+async function purge() {
+  const ids = (await db.pool.query('select id from incoming_items where external_id like $1', [`${TAG}%`])).rows.map((r) => r.id);
+  if (ids.length) {
+    await db.pool.query('delete from visits where incoming_item_id = any($1::int[])', [ids]);
+    await db.pool.query('delete from expense_allocations where expense_id in (select id from expenses where incoming_item_id = any($1::int[]))', [ids]);
+    await db.pool.query('delete from expenses where incoming_item_id = any($1::int[])', [ids]);
+    await db.pool.query('delete from attachment_batches where incoming_item_id = any($1::int[])', [ids]);
+    await db.pool.query('delete from incoming_items where id = any($1::int[])', [ids]);
+  }
+  // By vendor too: a moved receipt is soft-deleted and its link may already be gone, so the
+  // id sweep above cannot see it.
+  await db.pool.query('delete from expense_allocations where expense_id in (select id from expenses where vendor like $1)', [`${TAG}%`]);
+  await db.pool.query('delete from expenses where vendor like $1', [`${TAG}%`]);
+  await db.pool.query('delete from asset_notes where note = $1', ['moved']);
+  await db.pool.query('delete from people where name like $1', [`${TAG}%`]);
+  await db.pool.query('delete from activity_log where entity_label like $1', [`${TAG}%`]);
+}
+await purge();
+
 console.log('## timestamps (§4) — America/New_York, never the server zone');
 // 2026-07-04 21:30 Eastern is 2026-07-05 01:30 UTC. The date must stay the 4th.
 const ninePmEastern = new Date('2026-07-05T01:30:00Z');
@@ -155,17 +177,7 @@ ok((await db.getIncomingItem(r4.Item.Id)) !== null, 'and does not delete it');
 
 console.log('\n## cleanup');
 await db.updateTextIntakeSettings({ allowedSenders: before.AllowedSenders, sendConfirmation: before.SendConfirmation });
-const ids = (await db.pool.query('select id from incoming_items where external_id like $1', [`${TAG}%`])).rows.map((r) => r.id);
-if (ids.length) {
-  await db.pool.query('delete from visits where incoming_item_id = any($1::int[])', [ids]);
-  await db.pool.query('delete from expense_allocations where expense_id in (select id from expenses where incoming_item_id = any($1::int[]))', [ids]);
-  await db.pool.query('delete from expenses where incoming_item_id = any($1::int[])', [ids]);
-  await db.pool.query('delete from attachment_batches where incoming_item_id = any($1::int[])', [ids]);
-  await db.pool.query('delete from asset_notes where note = $1', ['moved']);
-  await db.pool.query('delete from incoming_items where id = any($1::int[])', [ids]);
-}
-await db.pool.query('delete from people where name like $1', [`${TAG}%`]);
-await db.pool.query('delete from activity_log where entity_label like $1', [`${TAG}%`]);
+await purge();
 const left = (await db.pool.query(
   `select (select count(*) from incoming_items where external_id like $1) i,
           (select count(*) from people where name like $1) p,
