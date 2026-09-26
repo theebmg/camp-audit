@@ -868,6 +868,8 @@ const NAV_ITEMS = [
   { icon: '📦', label: 'Materials', view: 'materials' },
   { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
+  { icon: '🧑', label: 'People', view: 'people' },
+  { icon: '👥', label: 'Groups', view: 'groups' },
   { icon: '👷', label: 'Crew', view: 'crew' },
   { icon: '🕒', label: 'Hours', view: 'crewHours' },
   { icon: '📋', label: 'Maintenance Log', view: 'maintenanceLog' },
@@ -1245,6 +1247,11 @@ async function render(view, params = {}, opts = {}) {
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
       adminChecklistTemplates: () => renderAdminChecklistTemplates(),
+      people: () => renderPeople(params),
+      personProfile: () => renderPersonProfile(params),
+      holdings: () => renderHoldings(),
+      groups: () => renderGroups(),
+      groupProfile: () => renderGroupProfile(params),
       workOrders: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderWorkOrdersDrilldown(params) : renderWorkOrders(params)),
       workOrderDetail: () => renderWorkOrderDetail(params),
       newWorkOrder: () => renderNewWorkOrder(params),
@@ -8768,6 +8775,707 @@ async function renderCalendarEventDetail({ id }) {
     try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderCalendarEventDetail({ id }); }
     catch (err) { toast(err.message); }
   }));
+}
+
+// ---------- People & Groups (text-intake brief §1) ----------
+// People are humans. Cabin HOLDINGS are the imported roster (cabin_holders) and include
+// labels, roles and organizations; a holding is linked to a person, or left unlinked.
+// "Cabin holder" is derived from having a holding, never a checkbox.
+
+// The duplicate check, shared by every inline "Add new person" (§1). Returns the chosen
+// person's id, or null if the caller should go ahead and create.
+// Server-side matching, so the rule lives in one place: /api/pg/people/duplicate-check.
+async function confirmNotADuplicate(name, { kind = 'person', excludeId = null } = {}) {
+  let matches = [];
+  try {
+    const path = kind === 'group' ? 'groups' : 'people';
+    const d = await api(`/api/pg/${path}/duplicate-check?name=${encodeURIComponent(name)}${excludeId ? `&excludeId=${excludeId}` : ''}`);
+    matches = d.matches || [];
+  } catch { return { useExisting: null, proceed: true }; }   // check failing must not block work
+  if (!matches.length) return { useExisting: null, proceed: true };
+
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" style="max-width:520px;width:95%">
+        <h3 style="margin:0 0 4px">Did you mean one of these?</h3>
+        <p class="muted" style="margin:0 0 12px">
+          ${matches.length === 1 ? 'A record' : `${matches.length} records`} already
+          ${matches.length === 1 ? 'looks' : 'look'} like <strong>${escapeHtml(name)}</strong>.
+        </p>
+        <div id="dupList">
+          ${matches.map((m) => `
+            <div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+              <div style="min-width:0">
+                <div><strong>${escapeHtml(m.Name)}</strong></div>
+                <div class="muted" style="font-size:0.82rem">
+                  ${escapeHtml([
+                    (m.Cabins || []).map((c) => c.Name).join(', '),
+                    m.Phone || '', m.Email || '',
+                    m.TypeName || '',
+                  ].filter(Boolean).join(' · ') || m.MatchReason)}
+                </div>
+              </div>
+              <button type="button" class="btn btn-secondary dup-use" data-id="${m.Id}" style="flex:0 0 auto">Use this one</button>
+            </div>`).join('')}
+        </div>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+          <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="dupCreate">Create new anyway</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const done = (v) => { overlay.remove(); resolve(v); };
+    overlay.querySelectorAll('.dup-use').forEach((b) => b.addEventListener('click', () => done({ useExisting: Number(b.dataset.id), proceed: false })));
+    overlay.querySelector('#dupCreate').addEventListener('click', () => done({ useExisting: null, proceed: true }));
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => done({ useExisting: null, proceed: false }));
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) done({ useExisting: null, proceed: false }); });
+  });
+}
+
+// Inline "Add new person" / "Add new group", for use from any picker (§1). Resolves to the
+// created-or-chosen record, or null if cancelled.
+async function addPersonInline(prefillName = '') {
+  const name = await promptDialog('Name', { value: prefillName, confirmLabel: 'Next' });
+  if (name === null) return null;
+  const clean = name.trim();
+  if (!clean) return null;
+  const { useExisting, proceed } = await confirmNotADuplicate(clean);
+  if (useExisting) { const d = await api(`/api/pg/people/${useExisting}`); return d.person; }
+  if (!proceed) return null;
+  try {
+    const d = await api('/api/pg/people', { method: 'POST', body: JSON.stringify({ name: clean }) });
+    toast(`Added ${d.person.Name}`);
+    return d.person;
+  } catch (e) { toast(e.message, 5000); return null; }
+}
+
+async function addGroupInline(prefillName = '') {
+  const name = await promptDialog('Group name', { value: prefillName, confirmLabel: 'Next' });
+  if (name === null) return null;
+  const clean = name.trim();
+  if (!clean) return null;
+  const { useExisting, proceed } = await confirmNotADuplicate(clean, { kind: 'group' });
+  if (useExisting) { const d = await api(`/api/pg/groups/${useExisting}`); return d.group; }
+  if (!proceed) return null;
+  try {
+    const d = await api('/api/pg/groups', { method: 'POST', body: JSON.stringify({ name: clean }) });
+    toast(`Added ${d.group.Name}`);
+    return d.group;
+  } catch (e) { toast(e.message, 5000); return null; }
+}
+
+// A person or group picker built on the shared combobox, with "Add new" as its extra row —
+// the same shape as adding an asset from a work order.
+function mountPersonPicker(container, { value = null, people = [], onSelect = () => {}, placeholder = 'Type a name…' } = {}) {
+  let cbx;
+  cbx = mountCombobox(container, {
+    options: people.map((p) => ({
+      value: p.Id, label: p.Name,
+      sublabel: [(p.Cabins || []).map((c) => c.Name).join(', '), p.Phone].filter(Boolean).join(' · ') || null,
+    })),
+    value, placeholder,
+    emptyText: 'No one by that name yet',
+    extraRowHtml: (typed) => (typed ? `<div class="ac-item ac-add" data-add-person="1">＋ Add new person “${escapeHtml(typed)}”</div>` : ''),
+    onExtraRow: (resultsEl, typed) => {
+      resultsEl.querySelector('[data-add-person]')?.addEventListener('mousedown', async (e) => {
+        e.preventDefault();
+        const person = await addPersonInline(typed);
+        if (!person) return;
+        people.push(person);
+        cbx.setOptions(people.map((p) => ({ value: p.Id, label: p.Name })));
+        cbx.setValue(person.Id);
+        onSelect(person);
+      });
+    },
+    onSelect: (opt) => onSelect(opt ? people.find((p) => String(p.Id) === String(opt.value)) || null : null),
+    onClear: () => onSelect(null),
+  });
+  return cbx;
+}
+
+function mountGroupPicker(container, { value = null, groups = [], onSelect = () => {}, placeholder = 'Type a group name…' } = {}) {
+  let cbx;
+  cbx = mountCombobox(container, {
+    options: groups.map((g) => ({ value: g.Id, label: g.Name, sublabel: g.TypeName || null })),
+    value, placeholder,
+    emptyText: 'No group by that name yet',
+    extraRowHtml: (typed) => (typed ? `<div class="ac-item ac-add" data-add-group="1">＋ Add new group “${escapeHtml(typed)}”</div>` : ''),
+    onExtraRow: (resultsEl, typed) => {
+      resultsEl.querySelector('[data-add-group]')?.addEventListener('mousedown', async (e) => {
+        e.preventDefault();
+        const group = await addGroupInline(typed);
+        if (!group) return;
+        groups.push(group);
+        cbx.setOptions(groups.map((g) => ({ value: g.Id, label: g.Name })));
+        cbx.setValue(group.Id);
+        onSelect(group);
+      });
+    },
+    onSelect: (opt) => onSelect(opt ? groups.find((g) => String(g.Id) === String(opt.value)) || null : null),
+    onClear: () => onSelect(null),
+  });
+  return cbx;
+}
+
+// ---------- People list ----------
+async function renderPeople(params = {}) {
+  setChrome({ title: 'People', showBack: false, showLogout: true });
+  let people = []; let roles = []; let unlinked = [];
+  let q = params.q || '';
+  let roleId = params.roleId ? Number(params.roleId) : null;
+  let onlyHolders = null;
+
+  async function load() {
+    const qs = new URLSearchParams();
+    if (q) qs.set('q', q);
+    if (roleId) qs.set('roleId', String(roleId));
+    if (onlyHolders !== null) qs.set('cabinHolder', String(onlyHolders));
+    const [p, r, u] = await Promise.all([
+      api(`/api/pg/people?${qs}`),
+      api('/api/pg/person-roles'),
+      api('/api/pg/holdings/unlinked'),
+    ]);
+    people = p.people || []; roles = r.roles || []; unlinked = u.holdings || [];
+  }
+
+  function draw() {
+    setApp(`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
+          <h3 style="margin:0">People</h3>
+          <button type="button" class="btn btn-primary" id="addPersonBtn">＋ Add person</button>
+        </div>
+        <p class="muted" style="margin:6px 0 0">
+          Actual humans. A person who holds a cabin shows the cabin; the cabin roster itself
+          lives under Holdings, because it also contains labels and organizations.
+        </p>
+        <div class="field-row"><input type="search" id="peopleQ" value="${escapeHtml(q)}" placeholder="Search name, phone or email" /></div>
+        <div class="chip-row" style="margin-top:8px">
+          <button type="button" class="btn ${roleId === null && onlyHolders === null ? 'btn-primary' : 'btn-secondary'}" data-filter="all">All ${people.length ? `(${people.length})` : ''}</button>
+          <button type="button" class="btn ${onlyHolders === true ? 'btn-primary' : 'btn-secondary'}" data-filter="holders">Cabin holders</button>
+          ${roles.map((r) => `<button type="button" class="btn ${roleId === r.Id ? 'btn-primary' : 'btn-secondary'}" data-role="${r.Id}">${escapeHtml(r.Name)}</button>`).join('')}
+        </div>
+      </div>
+
+      ${unlinked.length ? `<div class="card" style="background:#fffdf5;border-color:#f0e6c8">
+        <h3 style="margin:0 0 4px;font-size:0.95rem">Unlinked holdings (${unlinked.length})</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:0.85rem">
+          Cabin roster entries with nobody attached. Most are deliberate — Storage, OMS, a
+          crew — but a new one appears here whenever a cabin gets a holder name typed on it.
+        </p>
+        <button type="button" class="btn btn-secondary" id="holdingsBtn">Review holdings</button>
+      </div>` : ''}
+
+      <div class="card">
+        ${people.length ? `<table class="report-table" data-card="1">
+          <thead><tr><th>Name</th><th>Cabins</th><th>Roles</th><th>Contact</th><th>Visits</th></tr></thead>
+          <tbody>
+            ${people.map((p) => `
+              <tr data-id="${p.Id}" style="cursor:pointer">
+                <td><strong>${escapeHtml(p.Name)}</strong></td>
+                <td>${escapeHtml((p.Cabins || []).map((c) => c.Name).join(', ')) || '<span class="muted">—</span>'}</td>
+                <td>${[p.IsCabinHolder ? 'Cabin holder' : null, ...(p.Roles || []).map((r) => r.Name)].filter(Boolean).map((n) => `<span class="pill">${escapeHtml(n)}</span>`).join(' ') || '<span class="muted">—</span>'}</td>
+                <td>${escapeHtml([p.Phone, p.Email].filter(Boolean).join(' · ')) || '<span class="muted">—</span>'}</td>
+                <td>${p.VisitCount || 0}${p.LastVisit ? ` <span class="muted">last ${escapeHtml(p.LastVisit)}</span>` : ''}</td>
+              </tr>`).join('')}
+          </tbody>
+        </table>` : '<p class="muted">Nobody matches that.</p>'}
+      </div>`);
+
+    const qEl = document.getElementById('peopleQ');
+    let t;
+    qEl.addEventListener('input', () => { clearTimeout(t); t = setTimeout(async () => { q = qEl.value.trim(); await load(); draw(); }, 250); });
+    app.querySelectorAll('[data-role]').forEach((b) => b.addEventListener('click', async () => {
+      roleId = roleId === Number(b.dataset.role) ? null : Number(b.dataset.role);
+      onlyHolders = null; await load(); draw();
+    }));
+    app.querySelector('[data-filter="all"]')?.addEventListener('click', async () => { roleId = null; onlyHolders = null; await load(); draw(); });
+    app.querySelector('[data-filter="holders"]')?.addEventListener('click', async () => { onlyHolders = onlyHolders === true ? null : true; roleId = null; await load(); draw(); });
+    app.querySelectorAll('tbody tr[data-id]').forEach((tr) => tr.addEventListener('click', () => go('personProfile', { id: tr.dataset.id })));
+    document.getElementById('addPersonBtn').addEventListener('click', async () => {
+      const person = await addPersonInline('');
+      if (person) go('personProfile', { id: person.Id });
+    });
+    document.getElementById('holdingsBtn')?.addEventListener('click', () => go('holdings'));
+  }
+
+  await load();
+  draw();
+}
+
+// ---------- Person profile ----------
+async function renderPersonProfile({ id }) {
+  setChrome({ title: 'Person', showBack: true, showLogout: true });
+  let person = null; let roles = []; let vendors = []; let skills = [];
+
+  async function load() {
+    const [p, r, v, s] = await Promise.all([
+      api(`/api/pg/people/${id}`),
+      api('/api/pg/person-roles'),
+      api('/api/pg/vendors').catch(() => ({ vendors: [] })),
+      api('/api/pg/skills').catch(() => ({ skills: [] })),
+    ]);
+    person = p.person; roles = r.roles || []; vendors = v.vendors || []; skills = s.skills || [];
+  }
+
+  function draw() {
+    const hasRole = (name) => (person.Roles || []).some((r) => r.Name === name);
+    setApp(`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
+          <h3 style="margin:0">${escapeHtml(person.Name)}</h3>
+          <div class="btn-row">
+            <button type="button" class="btn btn-secondary" id="editBtn">✎ Edit</button>
+            <button type="button" class="btn btn-secondary" id="mergeBtn">Merge…</button>
+          </div>
+        </div>
+        <div style="margin-top:6px">
+          ${person.IsCabinHolder ? '<span class="pill">Cabin holder</span> ' : ''}
+          ${(person.Roles || []).map((r) => `<span class="pill">${escapeHtml(r.Name)}</span>`).join(' ')}
+          ${!person.IsCabinHolder && !(person.Roles || []).length ? '<span class="muted">No roles</span>' : ''}
+        </div>
+        ${person.Phone || person.Email ? `<p style="margin:8px 0 0">${escapeHtml([person.Phone, person.Email].filter(Boolean).join(' · '))}</p>` : ''}
+        ${person.Notes ? `<p class="muted" style="margin:6px 0 0">${escapeHtml(person.Notes)}</p>` : ''}
+      </div>
+
+      <div class="card">
+        <h3 style="font-size:0.95rem;margin:0 0 4px">Cabins</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:0.85rem">
+          Through the holdings on the cabin roster. "Cabin holder" is this list not being empty.
+        </p>
+        ${(person.Holdings || []).length ? (person.Holdings || []).map((h) => {
+          const cabins = (person.Cabins || []).filter(() => true);
+          return `<div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+            <div><strong>${escapeHtml(h.Name)}</strong></div>
+            <button type="button" class="btn btn-secondary unlink-holding" data-id="${h.Id}">Unlink</button>
+          </div>`;
+        }).join('') + `<div class="muted" style="margin-top:6px;font-size:0.85rem">Cabins: ${escapeHtml((person.Cabins || []).map((c) => c.Name).join(', ')) || '—'}</div>`
+          : '<p class="muted">No cabin holdings linked.</p>'}
+        <div class="btn-row" style="margin-top:8px"><button type="button" class="btn btn-secondary" id="linkHoldingBtn">Link a holding</button></div>
+      </div>
+
+      ${hasRole('Volunteer') ? `<div class="card">
+        <h3 style="font-size:0.95rem;margin:0 0 6px">Volunteer</h3>
+        <p style="margin:0">${escapeHtml((person.VolunteerSkills || []).join(', ')) || '<span class="muted">No skills recorded</span>'}</p>
+        ${person.VolunteerNotes ? `<p class="muted" style="margin:6px 0 0">${escapeHtml(person.VolunteerNotes)}</p>` : ''}
+      </div>` : ''}
+
+      ${hasRole('Vendor contact') ? `<div class="card">
+        <h3 style="font-size:0.95rem;margin:0 0 6px">Vendor contact</h3>
+        <p style="margin:0">${person.VendorName ? escapeHtml(person.VendorName) : '<span class="muted">No vendor linked</span>'}</p>
+      </div>` : ''}
+
+      ${(person.ContactForGroups || []).length ? `<div class="card">
+        <h3 style="font-size:0.95rem;margin:0 0 6px">Contact for</h3>
+        ${person.ContactForGroups.map((g) => `<div class="list-item" data-group="${g.Id}" style="cursor:pointer">${escapeHtml(g.Name)}</div>`).join('')}
+      </div>` : ''}
+
+      <div class="card">
+        <h3 style="font-size:0.95rem;margin:0 0 4px">Visits</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:0.85rem">
+          ${person.VisitCount || 0} confirmed${person.LastVisit ? `, last on ${escapeHtml(person.LastVisit)}` : ''}.
+        </p>
+        ${(person.Visits || []).length ? (person.Visits || []).map((v) => `
+          <div class="list-item">
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
+              <div><strong>${escapeHtml(v.VisitDate)}</strong>${v.ArrivalTime ? ` <span class="muted">${escapeHtml(v.ArrivalTime.slice(0, 5))}</span>` : ''}
+                ${escapeHtml(v.AssetName || v.LocationName || '')}</div>
+              <div>
+                <span class="pill">${escapeHtml(v.Status)}</span>
+                <span class="pill">${v.CalledAhead ? 'called ahead' : 'no call'}</span>
+                <span class="muted" style="font-size:0.78rem">${escapeHtml(v.Source)}</span>
+              </div>
+            </div>
+            ${v.Reason ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(v.Reason)}</div>` : ''}
+          </div>`).join('') : '<p class="muted">No visits recorded.</p>'}
+      </div>`);
+
+    document.getElementById('editBtn').addEventListener('click', () => openPersonEditor());
+    document.getElementById('mergeBtn').addEventListener('click', () => openMergeDialog('person', person));
+    document.getElementById('linkHoldingBtn').addEventListener('click', () => openHoldingLinker());
+    app.querySelectorAll('.unlink-holding').forEach((b) => b.addEventListener('click', async () => {
+      if (!await confirmDialog(`Unlink "${b.previousElementSibling?.textContent?.trim() || 'this holding'}" from ${person.Name}?`, { danger: false })) return;
+      try { await api(`/api/pg/holdings/${b.dataset.id}/link/${person.Id}`, { method: 'DELETE' }); await load(); draw(); toast('Unlinked'); }
+      catch (e) { toast(e.message, 5000); }
+    }));
+    app.querySelectorAll('[data-group]').forEach((el) => el.addEventListener('click', () => go('groupProfile', { id: el.dataset.group })));
+  }
+
+  function openPersonEditor() {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" style="max-width:560px;width:95%">
+        <h3 style="margin:0 0 10px">Edit person</h3>
+        <div class="field-row"><label>Name</label><input type="text" id="pName" value="${escapeHtml(person.Name)}" /></div>
+        <div class="field-row"><label>Phone</label><input type="tel" id="pPhone" value="${escapeHtml(person.Phone || '')}" /></div>
+        <div class="field-row"><label>Email</label><input type="email" id="pEmail" value="${escapeHtml(person.Email || '')}" /></div>
+        <div class="field-row"><label>Notes</label><textarea id="pNotes" rows="2">${escapeHtml(person.Notes || '')}</textarea></div>
+        <div class="field-row">
+          <label>Roles</label>
+          <div class="skill-chips">
+            ${roles.map((r) => `<label class="skill-chip"><input type="checkbox" class="p-role" value="${r.Id}" ${(person.Roles || []).some((x) => x.Id === r.Id) ? 'checked' : ''} /> ${escapeHtml(r.Name)}</label>`).join('')}
+          </div>
+          <p class="muted" style="font-size:0.8rem;margin:4px 0 0">
+            Cabin holder isn't here — it's derived from having a linked holding, so there's one
+            source of truth for it.
+          </p>
+        </div>
+        <div class="field-row" id="volWrap" hidden>
+          <label>Volunteer skills</label>
+          <div class="skill-chips">
+            ${skills.map((s) => `<label class="skill-chip"><input type="checkbox" class="p-skill" value="${escapeHtml(s.Name)}" ${(person.VolunteerSkills || []).includes(s.Name) ? 'checked' : ''} /> ${escapeHtml(s.Name)}</label>`).join('') || '<span class="muted">No skills in the catalog yet</span>'}
+          </div>
+          <label style="margin-top:6px">Volunteer notes</label>
+          <textarea id="pVolNotes" rows="2">${escapeHtml(person.VolunteerNotes || '')}</textarea>
+        </div>
+        <div class="field-row" id="vendWrap" hidden>
+          <label>Vendor</label>
+          <select id="pVendor">
+            <option value="">— none —</option>
+            ${vendors.map((v) => `<option value="${v.Id}" ${person.VendorId === v.Id ? 'selected' : ''}>${escapeHtml(v.Name)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+          <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="pSave">Save</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const roleName = (id2) => roles.find((r) => r.Id === Number(id2))?.Name;
+    const syncConditional = () => {
+      const checked = [...overlay.querySelectorAll('.p-role:checked')].map((c) => roleName(c.value));
+      overlay.querySelector('#volWrap').hidden = !checked.includes('Volunteer');
+      overlay.querySelector('#vendWrap').hidden = !checked.includes('Vendor contact');
+    };
+    overlay.querySelectorAll('.p-role').forEach((c) => c.addEventListener('change', syncConditional));
+    syncConditional();
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
+    overlay.querySelector('#pSave').addEventListener('click', async () => {
+      const body = {
+        name: overlay.querySelector('#pName').value,
+        phone: overlay.querySelector('#pPhone').value,
+        email: overlay.querySelector('#pEmail').value,
+        notes: overlay.querySelector('#pNotes').value,
+        roleIds: [...overlay.querySelectorAll('.p-role:checked')].map((c) => Number(c.value)),
+        volunteerSkills: [...overlay.querySelectorAll('.p-skill:checked')].map((c) => c.value),
+        volunteerNotes: overlay.querySelector('#pVolNotes')?.value ?? null,
+        vendorId: overlay.querySelector('#pVendor')?.value ? Number(overlay.querySelector('#pVendor').value) : null,
+      };
+      try {
+        await api(`/api/pg/people/${person.Id}`, { method: 'PATCH', body: JSON.stringify(body) });
+        overlay.remove(); await load(); draw(); toast('Saved');
+      } catch (e) { toast(e.message, 5000); }
+    });
+  }
+
+  async function openHoldingLinker() {
+    const d = await api('/api/pg/holdings/unlinked');
+    const holdings = d.holdings || [];
+    if (!holdings.length) return toast('Every holding is already linked', 4000);
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" style="max-width:520px;width:95%">
+        <h3 style="margin:0 0 4px">Link a holding</h3>
+        <p class="muted" style="margin:0 0 10px">Unlinked entries from the cabin roster.</p>
+        <div id="holdPick"></div>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+          <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
+    mountCombobox(overlay.querySelector('#holdPick'), {
+      options: holdings.map((h) => ({ value: h.Id, label: h.Name, sublabel: (h.Cabins || []).map((c) => c.Name).join(', ') || null })),
+      placeholder: 'Type a holding name…',
+      onSelect: async (opt) => {
+        if (!opt) return;
+        try {
+          await api(`/api/pg/holdings/${opt.value}/link`, { method: 'POST', body: JSON.stringify({ personId: person.Id }) });
+          overlay.remove(); await load(); draw(); toast('Linked');
+        } catch (e) { toast(e.message, 5000); }
+      },
+    });
+  }
+
+  await load();
+  if (!person) { setApp('<div class="card"><p class="muted">That person no longer exists.</p></div>'); return; }
+  draw();
+}
+
+// ---------- Merge (§1) ----------
+// Keep one, absorb the other. The server does the repointing and refuses to finish if
+// anything would be left pointing at the removed record.
+async function openMergeDialog(kind, record) {
+  const path = kind === 'group' ? 'groups' : 'people';
+  const d = await api(`/api/pg/${path}`);
+  const others = (kind === 'group' ? d.groups : d.people).filter((r) => r.Id !== record.Id);
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal-box" style="max-width:560px;width:95%">
+      <h3 style="margin:0 0 4px">Merge into ${escapeHtml(record.Name)}</h3>
+      <p class="muted" style="margin:0 0 10px">
+        Pick the duplicate to absorb. Its visits, calendar entries, group contacts, roles and
+        cabin holdings move here, then the duplicate is deleted. The cabin roster itself and
+        anything funded through it are not touched — those belong to the holding, not the person.
+      </p>
+      <div id="mergePick"></div>
+      <div id="mergePreview" class="muted" style="margin-top:10px;font-size:0.85rem"></div>
+      <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+        <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+        <button type="button" class="btn btn-danger" id="mergeGo" disabled>Merge</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
+  let chosen = null;
+  mountCombobox(overlay.querySelector('#mergePick'), {
+    options: others.map((r) => ({
+      value: r.Id, label: r.Name,
+      sublabel: [(r.Cabins || []).map((c) => c.Name).join(', '), `${r.VisitCount || 0} visit(s)`].filter(Boolean).join(' · '),
+    })),
+    placeholder: `Type the duplicate ${kind}'s name…`,
+    onSelect: (opt) => {
+      chosen = opt ? others.find((r) => String(r.Id) === String(opt.value)) : null;
+      overlay.querySelector('#mergeGo').disabled = !chosen;
+      overlay.querySelector('#mergePreview').textContent = chosen
+        ? `"${chosen.Name}" will be deleted. ${chosen.VisitCount || 0} visit(s)${(chosen.Cabins || []).length ? ` and ${(chosen.Cabins || []).length} cabin(s)` : ''} move to "${record.Name}".`
+        : '';
+    },
+    onClear: () => { chosen = null; overlay.querySelector('#mergeGo').disabled = true; overlay.querySelector('#mergePreview').textContent = ''; },
+  });
+  overlay.querySelector('#mergeGo').addEventListener('click', async () => {
+    if (!chosen) return;
+    if (!await confirmDialog(`Merge "${chosen.Name}" into "${record.Name}"? The duplicate is deleted and this cannot be undone.`)) return;
+    try {
+      const r = await api(`/api/pg/${path}/merge`, { method: 'POST', body: JSON.stringify({ keptId: record.Id, removedId: chosen.Id }) });
+      overlay.remove();
+      const moved = Object.entries(r.Repointed || {}).filter(([, n]) => n).map(([k, n]) => `${k}: ${n}`).join(', ');
+      toast(`Merged — ${moved || 'nothing to move'}`, 6000);
+      render();
+    } catch (e) { toast(e.message, 6000); }
+  });
+}
+
+// ---------- Holdings (the cabin roster) ----------
+async function renderHoldings() {
+  setChrome({ title: 'Cabin holdings', showBack: true, showLogout: true });
+  let holdings = []; let people = [];
+  let onlyUnlinked = true;
+
+  async function load() {
+    const [h, p] = await Promise.all([api('/api/pg/holdings'), api('/api/pg/people')]);
+    holdings = h.holdings || []; people = p.people || [];
+  }
+
+  function draw() {
+    const shown = onlyUnlinked ? holdings.filter((h) => !(h.People || []).length) : holdings;
+    setApp(`
+      <div class="card">
+        <h3 style="margin:0 0 4px">Cabin holdings</h3>
+        <p class="muted" style="margin:0 0 8px">
+          The roster derived from each cabin's holder text. It is not a people list — it also
+          holds cabin purposes (Storage), roles (SongLeader), organizations (OMS) and crews.
+          Those stay unlinked on purpose. Link the ones that name a person.
+        </p>
+        <div class="view-toggle">
+          <button type="button" class="view-toggle-btn ${onlyUnlinked ? 'active' : ''}" data-v="unlinked">Unlinked (${holdings.filter((h) => !(h.People || []).length).length})</button>
+          <button type="button" class="view-toggle-btn ${onlyUnlinked ? '' : 'active'}" data-v="all">All (${holdings.length})</button>
+        </div>
+      </div>
+      <div class="card">
+        ${shown.length ? shown.map((h) => `
+          <div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+            <div style="min-width:0;flex:1">
+              <div><strong>${escapeHtml(h.Name)}</strong></div>
+              <div class="muted" style="font-size:0.82rem">${escapeHtml((h.Cabins || []).map((c) => c.Name).join(', ')) || 'no cabin'}</div>
+              ${(h.People || []).length ? `<div style="font-size:0.85rem">${(h.People || []).map((p) => `<span class="pill">${escapeHtml(p.Name)}</span>`).join(' ')}</div>` : ''}
+            </div>
+            ${(h.People || []).length ? '' : `<button type="button" class="btn btn-secondary link-h" data-id="${h.Id}" data-name="${escapeHtml(h.Name)}" style="flex:0 0 auto">Link to a person</button>`}
+          </div>`).join('') : '<p class="muted">Nothing here.</p>'}
+      </div>`);
+
+    app.querySelectorAll('[data-v]').forEach((b) => b.addEventListener('click', () => { onlyUnlinked = b.dataset.v === 'unlinked'; draw(); }));
+    app.querySelectorAll('.link-h').forEach((b) => b.addEventListener('click', () => openLinker(Number(b.dataset.id), b.dataset.name)));
+  }
+
+  function openLinker(holdingId, holdingName) {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" style="max-width:520px;width:95%">
+        <h3 style="margin:0 0 4px">Who holds ${escapeHtml(holdingName)}?</h3>
+        <p class="muted" style="margin:0 0 10px">Pick a person, or add one. If this is a label rather than a person — Storage, a crew, an organization — just cancel and leave it unlinked.</p>
+        <div id="linkPick"></div>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+          <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
+    mountPersonPicker(overlay.querySelector('#linkPick'), {
+      people: [...people],
+      placeholder: 'Type a name…',
+      onSelect: async (person) => {
+        if (!person) return;
+        try {
+          await api(`/api/pg/holdings/${holdingId}/link`, { method: 'POST', body: JSON.stringify({ personId: person.Id }) });
+          overlay.remove(); await load(); draw(); toast(`Linked to ${person.Name}`);
+        } catch (e) { toast(e.message, 5000); }
+      },
+    });
+  }
+
+  await load();
+  draw();
+}
+
+// ---------- Groups ----------
+async function renderGroups() {
+  setChrome({ title: 'Groups', showBack: false, showLogout: true });
+  let groups = []; let types = [];
+  let q = ''; let typeId = null;
+
+  async function load() {
+    const qs = new URLSearchParams();
+    if (q) qs.set('q', q);
+    if (typeId) qs.set('typeId', String(typeId));
+    const [g, t] = await Promise.all([api(`/api/pg/groups?${qs}`), api('/api/pg/group-types')]);
+    groups = g.groups || []; types = t.types || [];
+  }
+
+  function draw() {
+    setApp(`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
+          <h3 style="margin:0">Groups</h3>
+          <button type="button" class="btn btn-primary" id="addGroupBtn">＋ Add group</button>
+        </div>
+        <p class="muted" style="margin:6px 0 0">Youth groups, churches, work teams — anything that visits as a group rather than a person.</p>
+        <div class="field-row"><input type="search" id="groupQ" value="${escapeHtml(q)}" placeholder="Search group name" /></div>
+        <div class="chip-row" style="margin-top:8px">
+          <button type="button" class="btn ${typeId === null ? 'btn-primary' : 'btn-secondary'}" data-type="">All</button>
+          ${types.map((t) => `<button type="button" class="btn ${typeId === t.Id ? 'btn-primary' : 'btn-secondary'}" data-type="${t.Id}">${escapeHtml(t.Name)}</button>`).join('')}
+        </div>
+      </div>
+      <div class="card">
+        ${groups.length ? groups.map((g) => `
+          <div class="list-item" data-id="${g.Id}" style="cursor:pointer;display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
+            <div style="min-width:0">
+              <div><strong>${escapeHtml(g.Name)}</strong> ${g.TypeName ? `<span class="pill">${escapeHtml(g.TypeName)}</span>` : ''}</div>
+              <div class="muted" style="font-size:0.82rem">${escapeHtml(g.ContactPersonName || 'no contact')}</div>
+            </div>
+            <div class="muted" style="font-size:0.85rem">
+              ${g.VisitCount || 0} visit(s)${g.TypicalHeadcount ? `, usually ~${g.TypicalHeadcount}` : ''}${g.LastVisit ? ` · last ${escapeHtml(g.LastVisit)}` : ''}
+            </div>
+          </div>`).join('') : '<p class="muted">No groups yet.</p>'}
+      </div>`);
+
+    const qEl = document.getElementById('groupQ');
+    let t;
+    qEl.addEventListener('input', () => { clearTimeout(t); t = setTimeout(async () => { q = qEl.value.trim(); await load(); draw(); }, 250); });
+    app.querySelectorAll('[data-type]').forEach((b) => b.addEventListener('click', async () => {
+      typeId = b.dataset.type ? Number(b.dataset.type) : null; await load(); draw();
+    }));
+    app.querySelectorAll('.list-item[data-id]').forEach((el) => el.addEventListener('click', () => go('groupProfile', { id: el.dataset.id })));
+    document.getElementById('addGroupBtn').addEventListener('click', async () => {
+      const group = await addGroupInline('');
+      if (group) go('groupProfile', { id: group.Id });
+    });
+  }
+
+  await load();
+  draw();
+}
+
+async function renderGroupProfile({ id }) {
+  setChrome({ title: 'Group', showBack: true, showLogout: true });
+  let group = null; let types = []; let people = [];
+
+  async function load() {
+    const [g, t, p] = await Promise.all([api(`/api/pg/groups/${id}`), api('/api/pg/group-types'), api('/api/pg/people')]);
+    group = g.group; types = t.types || []; people = p.people || [];
+  }
+
+  function draw() {
+    setApp(`
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
+          <h3 style="margin:0">${escapeHtml(group.Name)} ${group.TypeName ? `<span class="pill">${escapeHtml(group.TypeName)}</span>` : ''}</h3>
+          <div class="btn-row">
+            <button type="button" class="btn btn-secondary" id="editBtn">✎ Edit</button>
+            <button type="button" class="btn btn-secondary" id="mergeBtn">Merge…</button>
+          </div>
+        </div>
+        <p style="margin:8px 0 0">Contact: ${group.ContactPersonName ? `<a href="#" id="contactLink">${escapeHtml(group.ContactPersonName)}</a>` : '<span class="muted">none</span>'}</p>
+        ${group.Notes ? `<p class="muted" style="margin:6px 0 0">${escapeHtml(group.Notes)}</p>` : ''}
+      </div>
+      <div class="card">
+        <h3 style="font-size:0.95rem;margin:0 0 4px">Visits</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:0.85rem">
+          ${group.VisitCount || 0} confirmed${group.TypicalHeadcount ? `, usually ~${group.TypicalHeadcount} people` : ''}${group.LastVisit ? `, last on ${escapeHtml(group.LastVisit)}` : ''}.
+        </p>
+        ${(group.Visits || []).length ? (group.Visits || []).map((v) => `
+          <div class="list-item">
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
+              <div><strong>${escapeHtml(v.VisitDate)}</strong>${v.Headcount ? ` <span class="muted">${v.Headcount} people</span>` : ''} ${escapeHtml(v.AssetName || v.LocationName || '')}</div>
+              <div><span class="pill">${escapeHtml(v.Status)}</span> <span class="pill">${v.CalledAhead ? 'called ahead' : 'no call'}</span></div>
+            </div>
+            ${v.Reason ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(v.Reason)}</div>` : ''}
+          </div>`).join('') : '<p class="muted">No visits recorded.</p>'}
+      </div>`);
+
+    document.getElementById('editBtn').addEventListener('click', () => openGroupEditor());
+    document.getElementById('mergeBtn').addEventListener('click', () => openMergeDialog('group', group));
+    document.getElementById('contactLink')?.addEventListener('click', (e) => { e.preventDefault(); go('personProfile', { id: group.ContactPersonId }); });
+  }
+
+  function openGroupEditor() {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" style="max-width:520px;width:95%">
+        <h3 style="margin:0 0 10px">Edit group</h3>
+        <div class="field-row"><label>Name</label><input type="text" id="gName" value="${escapeHtml(group.Name)}" /></div>
+        <div class="field-row"><label>Type</label><select id="gType">
+          <option value="">— none —</option>
+          ${types.map((t) => `<option value="${t.Id}" ${group.TypeId === t.Id ? 'selected' : ''}>${escapeHtml(t.Name)}</option>`).join('')}
+        </select></div>
+        <div class="field-row"><label>Contact person</label><div id="gContact"></div></div>
+        <div class="field-row"><label>Notes</label><textarea id="gNotes" rows="2">${escapeHtml(group.Notes || '')}</textarea></div>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+          <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="gSave">Save</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    let contactId = group.ContactPersonId;
+    mountPersonPicker(overlay.querySelector('#gContact'), {
+      people: [...people], value: contactId,
+      placeholder: 'Type a name, or add a person…',
+      onSelect: (p) => { contactId = p ? p.Id : null; },
+    });
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
+    overlay.querySelector('#gSave').addEventListener('click', async () => {
+      try {
+        await api(`/api/pg/groups/${group.Id}`, { method: 'PATCH', body: JSON.stringify({
+          name: overlay.querySelector('#gName').value,
+          typeId: overlay.querySelector('#gType').value ? Number(overlay.querySelector('#gType').value) : null,
+          contactPersonId: contactId,
+          notes: overlay.querySelector('#gNotes').value,
+        }) });
+        overlay.remove(); await load(); draw(); toast('Saved');
+      } catch (e) { toast(e.message, 5000); }
+    });
+  }
+
+  await load();
+  if (!group) { setApp('<div class="card"><p class="muted">That group no longer exists.</p></div>'); return; }
+  draw();
 }
 
 // ---------- Admin: Checklist Templates ----------

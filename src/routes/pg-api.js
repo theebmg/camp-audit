@@ -160,6 +160,12 @@ import {
   useMaterialFromStock,
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
+  listPeople, getPerson, createPerson, updatePerson, deletePerson,
+  findDuplicatePeople, mergePeople, listRecordMerges,
+  listPersonRoles, createPersonRole, updatePersonRole, deletePersonRole,
+  listHoldings, listUnlinkedHoldings, linkHoldingToPerson, unlinkHoldingFromPerson,
+  listGroups, getGroup, createGroup, updateGroup, deleteGroup,
+  findDuplicateGroups, mergeGroups, listGroupTypes, createGroupType, updateGroupType,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
 import crypto from 'crypto';
@@ -2991,6 +2997,156 @@ router.get('/activity-log', async (req, res, next) => {
 
 router.get('/dashboard/wo-summary', async (req, res, next) => {
   try { res.json(await getWorkOrderSummary()); } catch (e) { next(e); }
+});
+
+// ---- People & Groups (text-intake brief §1) ----
+// `people` is humans; `cabin_holders` is cabin HOLDINGS. The two are joined by
+// cabin_holder_people, and "cabin holder" is derived from that link, never stored.
+
+router.get('/people', async (req, res, next) => {
+  try {
+    const { q, roleId, cabinHolder, includeInactive } = req.query;
+    res.json({
+      people: await listPeople({
+        q: q || null,
+        roleId: roleId ? Number(roleId) : null,
+        cabinHolder: cabinHolder === 'true' ? true : cabinHolder === 'false' ? false : null,
+        includeInactive: includeInactive === 'true',
+      }),
+    });
+  } catch (e) { next(e); }
+});
+
+// The duplicate check (§1). A GET, because it decides nothing — the UI shows what comes back
+// and the person still chooses Use existing or Create new anyway.
+router.get('/people/duplicate-check', async (req, res, next) => {
+  try {
+    const { name, excludeId } = req.query;
+    res.json({ matches: await findDuplicatePeople(name || '', { excludeId: excludeId ? Number(excludeId) : null }) });
+  } catch (e) { next(e); }
+});
+
+router.get('/people/:id(\\d+)', async (req, res, next) => {
+  try {
+    const person = await getPerson(req.params.id);
+    if (!person) return res.status(404).json({ ok: false, error: 'Person not found' });
+    res.json({ person });
+  } catch (e) { next(e); }
+});
+
+router.post('/people', async (req, res, next) => {
+  try {
+    res.json({ person: await createPerson({ ...req.body, createdBy: currentUsername() }) });
+  } catch (e) { next(e); }
+});
+
+router.patch('/people/:id(\\d+)', async (req, res, next) => {
+  try {
+    const person = await updatePerson(req.params.id, req.body || {});
+    if (!person) return res.status(404).json({ ok: false, error: 'Person not found' });
+    res.json({ person });
+  } catch (e) { next(e); }
+});
+
+router.delete('/people/:id(\\d+)', async (req, res, next) => {
+  try { res.json(await deletePerson(req.params.id) || { ok: true }); } catch (e) { next(e); }
+});
+
+router.post('/people/merge', async (req, res, next) => {
+  try {
+    const { keptId, removedId } = req.body || {};
+    if (!keptId || !removedId) return res.status(400).json({ ok: false, error: 'keptId and removedId are both required' });
+    res.json(await mergePeople({ keptId: Number(keptId), removedId: Number(removedId), by: currentUsername() }));
+  } catch (e) { next(e); }
+});
+
+router.get('/merges', async (req, res, next) => {
+  try { res.json({ merges: await listRecordMerges({ kind: req.query.kind || null }) }); } catch (e) { next(e); }
+});
+
+// ---- Person roles (admin-editable; "Cabin holder" is deliberately not one) ----
+router.get('/person-roles', async (req, res, next) => {
+  try { res.json({ roles: await listPersonRoles({ includeInactive: req.query.includeInactive === 'true' }) }); } catch (e) { next(e); }
+});
+router.post('/person-roles', async (req, res, next) => {
+  try { res.json({ role: await createPersonRole(req.body || {}) }); } catch (e) { next(e); }
+});
+router.patch('/person-roles/:id(\\d+)', async (req, res, next) => {
+  try { res.json({ role: await updatePersonRole(req.params.id, req.body || {}) }); } catch (e) { next(e); }
+});
+router.delete('/person-roles/:id(\\d+)', async (req, res, next) => {
+  try { res.json(await deletePersonRole(req.params.id)); } catch (e) { next(e); }
+});
+
+// ---- Holdings ----
+// Read-only apart from the person link: holdings are derived from asset text by
+// syncCabinHoldersFromAssets() and are not edited here.
+router.get('/holdings', async (req, res, next) => {
+  try { res.json({ holdings: await listHoldings({ q: req.query.q || null }) }); } catch (e) { next(e); }
+});
+router.get('/holdings/unlinked', async (req, res, next) => {
+  try { res.json({ holdings: await listUnlinkedHoldings() }); } catch (e) { next(e); }
+});
+router.post('/holdings/:id(\\d+)/link', async (req, res, next) => {
+  try {
+    const { personId } = req.body || {};
+    if (!personId) return res.status(400).json({ ok: false, error: 'personId is required' });
+    res.json({ person: await linkHoldingToPerson(Number(req.params.id), Number(personId)) });
+  } catch (e) { next(e); }
+});
+router.delete('/holdings/:id(\\d+)/link/:personId(\\d+)', async (req, res, next) => {
+  try { res.json({ person: await unlinkHoldingFromPerson(Number(req.params.id), Number(req.params.personId)) }); } catch (e) { next(e); }
+});
+
+// ---- Groups ----
+router.get('/groups', async (req, res, next) => {
+  try {
+    const { q, typeId, includeInactive } = req.query;
+    res.json({ groups: await listGroups({ q: q || null, typeId: typeId ? Number(typeId) : null, includeInactive: includeInactive === 'true' }) });
+  } catch (e) { next(e); }
+});
+router.get('/groups/duplicate-check', async (req, res, next) => {
+  try {
+    const { name, excludeId } = req.query;
+    res.json({ matches: await findDuplicateGroups(name || '', { excludeId: excludeId ? Number(excludeId) : null }) });
+  } catch (e) { next(e); }
+});
+router.get('/groups/:id(\\d+)', async (req, res, next) => {
+  try {
+    const group = await getGroup(req.params.id);
+    if (!group) return res.status(404).json({ ok: false, error: 'Group not found' });
+    res.json({ group });
+  } catch (e) { next(e); }
+});
+router.post('/groups', async (req, res, next) => {
+  try { res.json({ group: await createGroup(req.body || {}) }); } catch (e) { next(e); }
+});
+router.patch('/groups/:id(\\d+)', async (req, res, next) => {
+  try {
+    const group = await updateGroup(req.params.id, req.body || {});
+    if (!group) return res.status(404).json({ ok: false, error: 'Group not found' });
+    res.json({ group });
+  } catch (e) { next(e); }
+});
+router.delete('/groups/:id(\\d+)', async (req, res, next) => {
+  try { res.json(await deleteGroup(req.params.id) || { ok: true }); } catch (e) { next(e); }
+});
+router.post('/groups/merge', async (req, res, next) => {
+  try {
+    const { keptId, removedId } = req.body || {};
+    if (!keptId || !removedId) return res.status(400).json({ ok: false, error: 'keptId and removedId are both required' });
+    res.json(await mergeGroups({ keptId: Number(keptId), removedId: Number(removedId), by: currentUsername() }));
+  } catch (e) { next(e); }
+});
+
+router.get('/group-types', async (req, res, next) => {
+  try { res.json({ types: await listGroupTypes({ includeInactive: req.query.includeInactive === 'true' }) }); } catch (e) { next(e); }
+});
+router.post('/group-types', async (req, res, next) => {
+  try { res.json({ type: await createGroupType(req.body || {}) }); } catch (e) { next(e); }
+});
+router.patch('/group-types/:id(\\d+)', async (req, res, next) => {
+  try { res.json({ type: await updateGroupType(req.params.id, req.body || {}) }); } catch (e) { next(e); }
 });
 
 export default router;
