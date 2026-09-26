@@ -3069,6 +3069,654 @@ export async function createAssetQuick({ name, locationId, assetType }) {
   return { Id: r.id, Name: r.name, assetType: r.asset_type, locationId: r.location_id, locationName: null };
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// People & Groups (text-intake brief §1)
+//
+// `people` is actual humans. `cabin_holders` is cabin HOLDINGS — derived from imported asset
+// text by syncCabinHoldersFromAssets(), and containing labels, roles, organizations and crews
+// as well as people. The two are joined by cabin_holder_people, and the sync never touches
+// people. See docs/text-intake-analysis.md.
+//
+// "Cabin holder" is a DERIVED role: a person with at least one linked holding is one. It is
+// deliberately not a row in person_roles, so there is one source of truth for it.
+// ══════════════════════════════════════════════════════════════════════════
+
+function personRowShape(r) {
+  return {
+    Id: r.id,
+    Name: r.name,
+    Phone: r.phone,
+    Email: r.email,
+    Notes: r.notes,
+    VolunteerSkills: r.volunteer_skills || [],
+    VolunteerNotes: r.volunteer_notes,
+    VendorId: r.vendor_id,
+    VendorName: r.vendor_name ?? null,
+    Active: r.active,
+    Roles: r.roles || [],
+    // Derived, never stored.
+    IsCabinHolder: Number(r.holding_count || 0) > 0,
+    HoldingCount: Number(r.holding_count || 0),
+    Holdings: r.holdings || [],
+    Cabins: r.cabins || [],
+    VisitCount: Number(r.visit_count || 0),
+    LastVisit: r.last_visit || null,
+    CreatedAt: r.created_at,
+    UpdatedAt: r.updated_at,
+  };
+}
+
+function groupRowShape(r) {
+  return {
+    Id: r.id,
+    Name: r.name,
+    TypeId: r.type_id,
+    TypeName: r.type_name ?? null,
+    ContactPersonId: r.contact_person_id,
+    ContactPersonName: r.contact_person_name ?? null,
+    Notes: r.notes,
+    Active: r.active,
+    VisitCount: Number(r.visit_count || 0),
+    LastVisit: r.last_visit || null,
+    TypicalHeadcount: r.typical_headcount == null ? null : Math.round(Number(r.typical_headcount)),
+    CreatedAt: r.created_at,
+    UpdatedAt: r.updated_at,
+  };
+}
+
+// ── The duplicate check (§1) ──────────────────────────────────────────────
+// Plain string work, no AI and no external service. The job is to recognise that
+// "Lapp, Jen", "Jen Lapp" and "LAPP , JEN" are one person, without deciding that "Spain,
+// Sandy" and "Spain, Randy" are.
+//
+// Parenthesised asides and stray stars are dropped — the roster has "Murphy, Seth (Kristen
+// Spain)" and "Wolgemuth. ***". Titles go too. Then split on the separators this data actually
+// uses — comma, ampersand, the word "and", slash, plus — sort the parts and compare sets, so
+// word order cannot matter.
+export function personNameParts(raw) {
+  return String(raw || '')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\*+/g, ' ')
+    .replace(/\b(rev|mr|mrs|ms|dr|pastor)\.?\b/gi, ' ')
+    .toLowerCase()
+    .split(/[,&/+]| and /)
+    .flatMap((s) => s.split(/\s+/))
+    .map((s) => s.replace(/[^a-z0-9]/g, ''))
+    .filter((s) => s.length > 1);
+}
+
+export function personNameKey(raw) {
+  return personNameParts(raw).slice().sort().join(' ');
+}
+
+// Candidate duplicates for a name, strongest first. Never blocks: §1 ends in "create new
+// anyway", which is why people.name has no unique constraint.
+export async function findDuplicatePeople(name, { excludeId = null, limit = 8 } = {}) {
+  const key = personNameKey(name);
+  const parts = personNameParts(name);
+  if (!key) return [];
+  const { rows } = await pool.query(
+    `SELECT p.id, p.name, p.phone, p.email,
+            COALESCE(json_agg(DISTINCT jsonb_build_object('Id', ch.id, 'Name', ch.name))
+                     FILTER (WHERE ch.id IS NOT NULL), '[]') AS holdings,
+            COALESCE(json_agg(DISTINCT jsonb_build_object('Id', a.id, 'Name', a.name))
+                     FILTER (WHERE a.id IS NOT NULL), '[]') AS cabins
+     FROM people p
+     LEFT JOIN cabin_holder_people chp ON chp.person_id = p.id
+     LEFT JOIN cabin_holders ch ON ch.id = chp.cabin_holder_id
+     LEFT JOIN assets a ON a.cabin_holder_id = ch.id
+     WHERE p.active AND ($1::int IS NULL OR p.id <> $1)
+     GROUP BY p.id, p.name, p.phone, p.email`,
+    [excludeId]
+  );
+  const scored = [];
+  for (const r of rows) {
+    const otherKey = personNameKey(r.name);
+    const otherParts = personNameParts(r.name);
+    let score = 0;
+    let why = '';
+    if (otherKey === key) {
+      score = 100;
+      why = 'same name, written differently';
+    } else if (parts.length && otherParts.length) {
+      const shared = parts.filter((p) => otherParts.includes(p));
+      // Every part of the shorter name appears in the longer one: "Dearth" inside
+      // "Dearth, Wyatt / Sandy", or "Jen Lapp" inside "Lapp, Jen Marie".
+      const shorter = parts.length <= otherParts.length ? parts : otherParts;
+      if (shared.length === shorter.length && shared.length > 0) {
+        score = 70;
+        why = shorter === parts ? 'this name is contained in that one' : 'that name is contained in this one';
+      } else if (shared.length >= 2) {
+        score = 50;
+        why = `${shared.length} name parts in common`;
+      }
+    }
+    if (score) scored.push({ ...personRowShape(r), MatchScore: score, MatchReason: why });
+  }
+  scored.sort((a, b) => b.MatchScore - a.MatchScore || a.Name.localeCompare(b.Name));
+  return scored.slice(0, limit);
+}
+
+export async function findDuplicateGroups(name, { excludeId = null, limit = 8 } = {}) {
+  const key = personNameKey(name);
+  if (!key) return [];
+  const { rows } = await pool.query(
+    `SELECT g.*, gt.name AS type_name FROM groups g
+     LEFT JOIN group_types gt ON gt.id = g.type_id
+     WHERE g.active AND ($1::int IS NULL OR g.id <> $1)`,
+    [excludeId]
+  );
+  return rows
+    .map((r) => ({ r, k: personNameKey(r.name) }))
+    .filter(({ k }) => k === key || k.includes(key) || key.includes(k))
+    .map(({ r, k }) => ({ ...groupRowShape(r), MatchScore: k === key ? 100 : 70,
+      MatchReason: k === key ? 'same name, written differently' : 'one name contains the other' }))
+    .sort((a, b) => b.MatchScore - a.MatchScore)
+    .slice(0, limit);
+}
+
+// ── People reads ──────────────────────────────────────────────────────────
+// One query shape for both the list and a single profile, so a profile can never disagree
+// with the row that led to it.
+const PERSON_SELECT = `
+  SELECT p.*, v.name AS vendor_name,
+         COALESCE(r.roles, '[]')      AS roles,
+         COALESCE(h.holdings, '[]')   AS holdings,
+         COALESCE(h.cabins, '[]')     AS cabins,
+         COALESCE(h.holding_count, 0) AS holding_count,
+         COALESCE(vi.visit_count, 0)  AS visit_count,
+         vi.last_visit
+  FROM people p
+  LEFT JOIN vendors v ON v.id = p.vendor_id
+  LEFT JOIN (
+    SELECT pra.person_id,
+           json_agg(jsonb_build_object('Id', pr.id, 'Name', pr.name) ORDER BY pr.sort_order) AS roles
+    FROM person_role_assignments pra JOIN person_roles pr ON pr.id = pra.role_id
+    GROUP BY pra.person_id
+  ) r ON r.person_id = p.id
+  LEFT JOIN (
+    SELECT chp.person_id,
+           count(DISTINCT ch.id) AS holding_count,
+           json_agg(DISTINCT jsonb_build_object('Id', ch.id, 'Name', ch.name)) AS holdings,
+           COALESCE(json_agg(DISTINCT jsonb_build_object('Id', a.id, 'Name', a.name))
+                    FILTER (WHERE a.id IS NOT NULL), '[]') AS cabins
+    FROM cabin_holder_people chp
+    JOIN cabin_holders ch ON ch.id = chp.cabin_holder_id
+    LEFT JOIN assets a ON a.cabin_holder_id = ch.id
+    GROUP BY chp.person_id
+  ) h ON h.person_id = p.id
+  LEFT JOIN (
+    SELECT person_id, count(*) AS visit_count, max(visit_date)::text AS last_visit
+    FROM visits WHERE status <> 'no_show' AND person_id IS NOT NULL GROUP BY person_id
+  ) vi ON vi.person_id = p.id
+`;
+
+export async function listPeople({ q = null, roleId = null, cabinHolder = null, includeInactive = false, limit = 500 } = {}) {
+  const where = [];
+  const vals = [];
+  if (!includeInactive) where.push('p.active');
+  if (q) { vals.push(`%${q}%`); where.push(`(p.name ILIKE $${vals.length} OR p.phone ILIKE $${vals.length} OR p.email ILIKE $${vals.length})`); }
+  if (roleId) { vals.push(roleId); where.push(`EXISTS (SELECT 1 FROM person_role_assignments x WHERE x.person_id = p.id AND x.role_id = $${vals.length})`); }
+  if (cabinHolder === true) where.push('COALESCE(h.holding_count, 0) > 0');
+  if (cabinHolder === false) where.push('COALESCE(h.holding_count, 0) = 0');
+  vals.push(limit);
+  const { rows } = await pool.query(
+    `${PERSON_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+     ORDER BY lower(p.name) LIMIT $${vals.length}`,
+    vals
+  );
+  return rows.map(personRowShape);
+}
+
+export async function getPerson(id) {
+  const { rows } = await pool.query(`${PERSON_SELECT} WHERE p.id = $1`, [id]);
+  if (!rows[0]) return null;
+  const person = personRowShape(rows[0]);
+  // Visit history, newest first — the list, not just the count.
+  const { rows: visits } = await pool.query(
+    `SELECT v.id, v.visit_date::text AS visit_date, v.arrival_time::text AS arrival_time,
+            v.duration_minutes, v.headcount, v.reason, v.called_ahead, v.status, v.source,
+            v.notes, a.name AS asset_name, l.name AS location_name
+     FROM visits v
+     LEFT JOIN assets a ON a.id = v.asset_id
+     LEFT JOIN locations l ON l.id = v.location_id
+     WHERE v.person_id = $1
+     ORDER BY v.visit_date DESC, v.id DESC`,
+    [id]
+  );
+  person.Visits = visits.map((v) => ({
+    Id: v.id, VisitDate: v.visit_date, ArrivalTime: v.arrival_time, DurationMinutes: v.duration_minutes,
+    Headcount: v.headcount, Reason: v.reason, CalledAhead: v.called_ahead, Status: v.status,
+    Source: v.source, Notes: v.notes, AssetName: v.asset_name, LocationName: v.location_name,
+  }));
+  // Groups this person is the contact for.
+  const { rows: groups } = await pool.query(
+    `SELECT g.id, g.name FROM groups g WHERE g.contact_person_id = $1 ORDER BY lower(g.name)`, [id]
+  );
+  person.ContactForGroups = groups.map((g) => ({ Id: g.id, Name: g.name }));
+  return person;
+}
+
+// ── People writes ─────────────────────────────────────────────────────────
+export async function createPerson({
+  name, phone, email, notes, roleIds = [], volunteerSkills = [], volunteerNotes = null,
+  vendorId = null, cabinHolderIds = [], createdBy = null,
+}) {
+  const clean = String(name || '').trim();
+  if (!clean) { const e = new Error('A person needs a name'); e.status = 400; throw e; }
+  const client = await pool.connect();
+  let id;
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO people (name, phone, email, notes, volunteer_skills, volunteer_notes, vendor_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [clean, phone?.trim() || null, email?.trim() || null, notes?.trim() || null,
+        volunteerSkills, volunteerNotes?.trim() || null, vendorId || null]
+    );
+    id = rows[0].id;
+    await writePersonRoles(client, id, roleIds);
+    await writePersonHoldings(client, id, cabinHolderIds);
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  await logActivity({ action: 'created', entityType: 'person', entityId: id, entityLabel: clean, details: createdBy ? `by ${createdBy}` : null });
+  return getPerson(id);
+}
+
+export async function updatePerson(id, {
+  name, phone, email, notes, roleIds, volunteerSkills, volunteerNotes, vendorId, cabinHolderIds, active,
+}) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sets = []; const vals = [id]; let i = 2;
+    const set = (col, val) => { sets.push(`${col} = $${i++}`); vals.push(val); };
+    if (name !== undefined) {
+      const clean = String(name).trim();
+      if (!clean) { const e = new Error('A person needs a name'); e.status = 400; throw e; }
+      set('name', clean);
+    }
+    if (phone !== undefined) set('phone', phone?.trim() || null);
+    if (email !== undefined) set('email', email?.trim() || null);
+    if (notes !== undefined) set('notes', notes?.trim() || null);
+    if (volunteerSkills !== undefined) set('volunteer_skills', volunteerSkills || []);
+    if (volunteerNotes !== undefined) set('volunteer_notes', volunteerNotes?.trim() || null);
+    if (vendorId !== undefined) set('vendor_id', vendorId || null);
+    if (active !== undefined) set('active', !!active);
+    if (sets.length) await client.query(`UPDATE people SET ${sets.join(', ')} WHERE id = $1`, vals);
+    if (roleIds !== undefined) await writePersonRoles(client, id, roleIds);
+    if (cabinHolderIds !== undefined) await writePersonHoldings(client, id, cabinHolderIds);
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  const person = await getPerson(id);
+  if (person) await logActivity({ action: 'updated', entityType: 'person', entityId: Number(id), entityLabel: person.Name });
+  return person;
+}
+
+// Full overwrite, because the edit form always submits the whole set of checkboxes.
+async function writePersonRoles(client, personId, roleIds) {
+  await client.query('DELETE FROM person_role_assignments WHERE person_id = $1', [personId]);
+  for (const roleId of [...new Set((roleIds || []).map(Number).filter(Boolean))]) {
+    await client.query(
+      'INSERT INTO person_role_assignments (person_id, role_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [personId, roleId]
+    );
+  }
+}
+
+async function writePersonHoldings(client, personId, cabinHolderIds) {
+  await client.query('DELETE FROM cabin_holder_people WHERE person_id = $1', [personId]);
+  for (const holdingId of [...new Set((cabinHolderIds || []).map(Number).filter(Boolean))]) {
+    await client.query(
+      'INSERT INTO cabin_holder_people (cabin_holder_id, person_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [holdingId, personId]
+    );
+  }
+}
+
+export async function deletePerson(id) {
+  const { rows: existing } = await pool.query('SELECT name FROM people WHERE id = $1', [id]);
+  if (!existing[0]) return;
+  // A person with visits is history, not a mistake — deactivate instead of losing the record.
+  const { rows: v } = await pool.query('SELECT count(*)::int n FROM visits WHERE person_id = $1', [id]);
+  if (v[0].n > 0) {
+    await pool.query('UPDATE people SET active = false WHERE id = $1', [id]);
+    await logActivity({ action: 'deactivated', entityType: 'person', entityId: Number(id), entityLabel: existing[0].name, details: `${v[0].n} visit(s) on record` });
+    return { Deactivated: true, VisitCount: v[0].n };
+  }
+  await pool.query('DELETE FROM people WHERE id = $1', [id]);
+  await logActivity({ action: 'deleted', entityType: 'person', entityId: Number(id), entityLabel: existing[0].name });
+  return { Deleted: true };
+}
+
+// ── Holdings ──────────────────────────────────────────────────────────────
+// The "Unlinked holdings" list (§1): holdings with no person. New ones appear here whenever
+// the sync derives a holding from freshly typed asset text.
+export async function listUnlinkedHoldings() {
+  const { rows } = await pool.query(`
+    SELECT ch.id, ch.name,
+           COALESCE(json_agg(jsonb_build_object('Id', a.id, 'Name', a.name))
+                    FILTER (WHERE a.id IS NOT NULL), '[]') AS cabins
+    FROM cabin_holders ch
+    LEFT JOIN assets a ON a.cabin_holder_id = ch.id
+    WHERE NOT EXISTS (SELECT 1 FROM cabin_holder_people l WHERE l.cabin_holder_id = ch.id)
+    GROUP BY ch.id, ch.name
+    ORDER BY lower(ch.name)`);
+  return rows.map((r) => ({ Id: r.id, Name: r.name, Cabins: r.cabins }));
+}
+
+export async function listHoldings({ q = null, limit = 500 } = {}) {
+  const vals = [];
+  let filter = '';
+  if (q) { vals.push(`%${q}%`); filter = `WHERE ch.name ILIKE $${vals.length}`; }
+  vals.push(limit);
+  const { rows } = await pool.query(`
+    SELECT ch.id, ch.name,
+           COALESCE(json_agg(DISTINCT jsonb_build_object('Id', a.id, 'Name', a.name))
+                    FILTER (WHERE a.id IS NOT NULL), '[]') AS cabins,
+           COALESCE(json_agg(DISTINCT jsonb_build_object('Id', p.id, 'Name', p.name))
+                    FILTER (WHERE p.id IS NOT NULL), '[]') AS people
+    FROM cabin_holders ch
+    LEFT JOIN assets a ON a.cabin_holder_id = ch.id
+    LEFT JOIN cabin_holder_people l ON l.cabin_holder_id = ch.id
+    LEFT JOIN people p ON p.id = l.person_id
+    ${filter}
+    GROUP BY ch.id, ch.name ORDER BY lower(ch.name) LIMIT $${vals.length}`, vals);
+  return rows.map((r) => ({ Id: r.id, Name: r.name, Cabins: r.cabins, People: r.people }));
+}
+
+export async function linkHoldingToPerson(cabinHolderId, personId) {
+  await pool.query(
+    'INSERT INTO cabin_holder_people (cabin_holder_id, person_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+    [cabinHolderId, personId]
+  );
+  const { rows } = await pool.query(
+    'SELECT ch.name holding, p.name person FROM cabin_holders ch, people p WHERE ch.id = $1 AND p.id = $2',
+    [cabinHolderId, personId]
+  );
+  if (rows[0]) {
+    await logActivity({ action: 'linked', entityType: 'person', entityId: Number(personId),
+      entityLabel: rows[0].person, details: `to holding "${rows[0].holding}"` });
+  }
+  return getPerson(personId);
+}
+
+export async function unlinkHoldingFromPerson(cabinHolderId, personId) {
+  await pool.query('DELETE FROM cabin_holder_people WHERE cabin_holder_id = $1 AND person_id = $2', [cabinHolderId, personId]);
+  return getPerson(personId);
+}
+
+// ── Roles admin ───────────────────────────────────────────────────────────
+export async function listPersonRoles({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(
+    `SELECT * FROM person_roles ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`
+  );
+  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Active: r.active }));
+}
+export async function createPersonRole({ name, sortOrder = 100 }) {
+  const { rows } = await pool.query(
+    'INSERT INTO person_roles (name, sort_order) VALUES ($1,$2) RETURNING *', [String(name).trim(), sortOrder]
+  );
+  await logActivity({ action: 'created', entityType: 'person_role', entityId: rows[0].id, entityLabel: rows[0].name });
+  return { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, Active: rows[0].active };
+}
+export async function updatePersonRole(id, { name, sortOrder, active }) {
+  const { rows } = await pool.query(
+    `UPDATE person_roles SET name = COALESCE($2, name), sort_order = COALESCE($3, sort_order),
+            active = COALESCE($4, active) WHERE id = $1 RETURNING *`,
+    [id, name?.trim() || null, sortOrder ?? null, active ?? null]
+  );
+  return rows[0] ? { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, Active: rows[0].active } : null;
+}
+export async function deletePersonRole(id) {
+  const { rows: inUse } = await pool.query('SELECT count(*)::int n FROM person_role_assignments WHERE role_id = $1', [id]);
+  if (inUse[0].n > 0) {
+    // Deactivate rather than delete: the role is on real people, and removing it would edit
+    // their records to tidy a list.
+    await pool.query('UPDATE person_roles SET active = false WHERE id = $1', [id]);
+    return { Deactivated: true, InUse: inUse[0].n };
+  }
+  await pool.query('DELETE FROM person_roles WHERE id = $1', [id]);
+  return { Deleted: true };
+}
+
+// ── Groups ────────────────────────────────────────────────────────────────
+const GROUP_SELECT = `
+  SELECT g.*, gt.name AS type_name, cp.name AS contact_person_name,
+         COALESCE(v.visit_count, 0) AS visit_count, v.last_visit, v.typical_headcount
+  FROM groups g
+  LEFT JOIN group_types gt ON gt.id = g.type_id
+  LEFT JOIN people cp ON cp.id = g.contact_person_id
+  LEFT JOIN (
+    SELECT group_id, count(*) AS visit_count, max(visit_date)::text AS last_visit,
+           avg(headcount) AS typical_headcount
+    FROM visits WHERE status <> 'no_show' AND group_id IS NOT NULL GROUP BY group_id
+  ) v ON v.group_id = g.id
+`;
+
+export async function listGroups({ q = null, typeId = null, includeInactive = false, limit = 500 } = {}) {
+  const where = []; const vals = [];
+  if (!includeInactive) where.push('g.active');
+  if (q) { vals.push(`%${q}%`); where.push(`g.name ILIKE $${vals.length}`); }
+  if (typeId) { vals.push(typeId); where.push(`g.type_id = $${vals.length}`); }
+  vals.push(limit);
+  const { rows } = await pool.query(
+    `${GROUP_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+     ORDER BY lower(g.name) LIMIT $${vals.length}`, vals
+  );
+  return rows.map(groupRowShape);
+}
+
+export async function getGroup(id) {
+  const { rows } = await pool.query(`${GROUP_SELECT} WHERE g.id = $1`, [id]);
+  if (!rows[0]) return null;
+  const group = groupRowShape(rows[0]);
+  const { rows: visits } = await pool.query(
+    `SELECT v.id, v.visit_date::text AS visit_date, v.arrival_time::text AS arrival_time,
+            v.duration_minutes, v.headcount, v.reason, v.called_ahead, v.status, v.source,
+            v.notes, a.name AS asset_name, l.name AS location_name
+     FROM visits v
+     LEFT JOIN assets a ON a.id = v.asset_id
+     LEFT JOIN locations l ON l.id = v.location_id
+     WHERE v.group_id = $1 ORDER BY v.visit_date DESC, v.id DESC`, [id]
+  );
+  group.Visits = visits.map((v) => ({
+    Id: v.id, VisitDate: v.visit_date, ArrivalTime: v.arrival_time, DurationMinutes: v.duration_minutes,
+    Headcount: v.headcount, Reason: v.reason, CalledAhead: v.called_ahead, Status: v.status,
+    Source: v.source, Notes: v.notes, AssetName: v.asset_name, LocationName: v.location_name,
+  }));
+  return group;
+}
+
+export async function createGroup({ name, typeId = null, contactPersonId = null, notes = null }) {
+  const clean = String(name || '').trim();
+  if (!clean) { const e = new Error('A group needs a name'); e.status = 400; throw e; }
+  const { rows } = await pool.query(
+    'INSERT INTO groups (name, type_id, contact_person_id, notes) VALUES ($1,$2,$3,$4) RETURNING id',
+    [clean, typeId || null, contactPersonId || null, notes?.trim() || null]
+  );
+  await logActivity({ action: 'created', entityType: 'group', entityId: rows[0].id, entityLabel: clean });
+  return getGroup(rows[0].id);
+}
+
+export async function updateGroup(id, { name, typeId, contactPersonId, notes, active }) {
+  const sets = []; const vals = [id]; let i = 2;
+  const set = (col, val) => { sets.push(`${col} = $${i++}`); vals.push(val); };
+  if (name !== undefined) {
+    const clean = String(name).trim();
+    if (!clean) { const e = new Error('A group needs a name'); e.status = 400; throw e; }
+    set('name', clean);
+  }
+  if (typeId !== undefined) set('type_id', typeId || null);
+  if (contactPersonId !== undefined) set('contact_person_id', contactPersonId || null);
+  if (notes !== undefined) set('notes', notes?.trim() || null);
+  if (active !== undefined) set('active', !!active);
+  if (sets.length) await pool.query(`UPDATE groups SET ${sets.join(', ')} WHERE id = $1`, vals);
+  const group = await getGroup(id);
+  if (group) await logActivity({ action: 'updated', entityType: 'group', entityId: Number(id), entityLabel: group.Name });
+  return group;
+}
+
+export async function deleteGroup(id) {
+  const { rows: existing } = await pool.query('SELECT name FROM groups WHERE id = $1', [id]);
+  if (!existing[0]) return;
+  const { rows: v } = await pool.query('SELECT count(*)::int n FROM visits WHERE group_id = $1', [id]);
+  if (v[0].n > 0) {
+    await pool.query('UPDATE groups SET active = false WHERE id = $1', [id]);
+    await logActivity({ action: 'deactivated', entityType: 'group', entityId: Number(id), entityLabel: existing[0].name, details: `${v[0].n} visit(s) on record` });
+    return { Deactivated: true, VisitCount: v[0].n };
+  }
+  await pool.query('DELETE FROM groups WHERE id = $1', [id]);
+  await logActivity({ action: 'deleted', entityType: 'group', entityId: Number(id), entityLabel: existing[0].name });
+  return { Deleted: true };
+}
+
+export async function listGroupTypes({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(
+    `SELECT * FROM group_types ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`
+  );
+  return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Active: r.active }));
+}
+export async function createGroupType({ name, sortOrder = 100 }) {
+  const { rows } = await pool.query(
+    'INSERT INTO group_types (name, sort_order) VALUES ($1,$2) RETURNING *', [String(name).trim(), sortOrder]
+  );
+  return { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, Active: rows[0].active };
+}
+export async function updateGroupType(id, { name, sortOrder, active }) {
+  const { rows } = await pool.query(
+    `UPDATE group_types SET name = COALESCE($2, name), sort_order = COALESCE($3, sort_order),
+            active = COALESCE($4, active) WHERE id = $1 RETURNING *`,
+    [id, name?.trim() || null, sortOrder ?? null, active ?? null]
+  );
+  return rows[0] ? { Id: rows[0].id, Name: rows[0].name, SortOrder: rows[0].sort_order, Active: rows[0].active } : null;
+}
+
+// ── Merge ─────────────────────────────────────────────────────────────────
+// The reference list is EXPLICIT, not derived from foreign keys. Following keys was the right
+// answer for the fixture cleanup; here it is not, because funding points at cabin_holders
+// through an unconstrained (funding_source, funding_ref_id) pair that no key describes — and
+// because two of these need a union rather than a repoint, since they have composite primary
+// keys that a blind UPDATE would collide on.
+//
+// Every entry is exercised by the merge test. If a new table ever references people, it goes
+// here, and the zero-references check below fails until it does.
+const PERSON_REFERENCES = [
+  // [table, column, mode]
+  ['visits',                  'person_id',         'repoint'],
+  ['calendar_events',         'person_id',         'repoint'],
+  ['groups',                  'contact_person_id', 'repoint'],
+  // Composite PK (person_id, role_id) / (cabin_holder_id, person_id): a plain UPDATE would
+  // violate the key when both people share a role or a holding, so these move what does not
+  // already exist and drop the rest.
+  ['person_role_assignments', 'person_id',         'union'],
+  ['cabin_holder_people',     'person_id',         'union'],
+];
+
+const GROUP_REFERENCES = [
+  ['visits',          'group_id', 'repoint'],
+  ['calendar_events', 'group_id', 'repoint'],
+];
+
+// Note on cabin_holders: a merge does NOT touch it, assets.lodge_holder, or the funding
+// columns. Those point at HOLDINGS, not people, and holdings are not what is being merged.
+// That is the whole reason the separate-table design removed the need for an alias table.
+
+async function mergeRecords({ kind, keptId, removedId, refs, table, by }) {
+  if (Number(keptId) === Number(removedId)) {
+    const e = new Error('Pick two different records'); e.status = 400; throw e;
+  }
+  const client = await pool.connect();
+  const repointed = {};
+  let keptName; let removedName;
+  try {
+    await client.query('BEGIN');
+    // Lock both rows so a concurrent edit cannot slip between the repoint and the delete.
+    const { rows: both } = await client.query(
+      `SELECT id, name FROM ${table} WHERE id = ANY($1::int[]) FOR UPDATE`, [[keptId, removedId]]
+    );
+    keptName = both.find((r) => Number(r.id) === Number(keptId))?.name;
+    removedName = both.find((r) => Number(r.id) === Number(removedId))?.name;
+    if (!keptName || !removedName) { const e = new Error('One of those records no longer exists'); e.status = 404; throw e; }
+
+    for (const [refTable, refCol, mode] of refs) {
+      if (mode === 'union') {
+        // Move only the rows that would not collide, then drop the remainder — the kept record
+        // already has that role or that holding.
+        const moved = await client.query(
+          `UPDATE ${refTable} t SET ${refCol} = $1 WHERE t.${refCol} = $2
+             AND NOT EXISTS (
+               SELECT 1 FROM ${refTable} x
+               WHERE x.${refCol} = $1
+                 AND (to_jsonb(x) - '${refCol}' - 'created_at') = (to_jsonb(t) - '${refCol}' - 'created_at')
+             )`,
+          [keptId, removedId]
+        );
+        const dropped = await client.query(`DELETE FROM ${refTable} WHERE ${refCol} = $1`, [removedId]);
+        repointed[`${refTable}.${refCol}`] = moved.rowCount;
+        if (dropped.rowCount) repointed[`${refTable}.${refCol} (already on kept record)`] = dropped.rowCount;
+      } else {
+        const r = await client.query(
+          `UPDATE ${refTable} SET ${refCol} = $1 WHERE ${refCol} = $2`, [keptId, removedId]
+        );
+        repointed[`${refTable}.${refCol}`] = r.rowCount;
+      }
+    }
+
+    // Nothing may still point at the removed record. Checked inside the transaction, so a
+    // missed reference rolls the whole merge back instead of orphaning data.
+    const leftovers = [];
+    for (const [refTable, refCol] of refs) {
+      const { rows } = await client.query(
+        `SELECT count(*)::int n FROM ${refTable} WHERE ${refCol} = $1`, [removedId]
+      );
+      if (rows[0].n > 0) leftovers.push(`${refTable}.${refCol}=${rows[0].n}`);
+    }
+    if (leftovers.length) {
+      const e = new Error(`Merge aborted — references remain: ${leftovers.join(', ')}`);
+      e.status = 500; throw e;
+    }
+
+    await client.query(`DELETE FROM ${table} WHERE id = $1`, [removedId]);
+    await client.query(
+      `INSERT INTO record_merges (kind, kept_id, kept_name, removed_id, removed_name, repointed, merged_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [kind, keptId, keptName, removedId, removedName, JSON.stringify(repointed), by || null]
+    );
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+
+  await logActivity({
+    action: 'merged', entityType: kind, entityId: Number(keptId), entityLabel: keptName,
+    details: `absorbed "${removedName}" (#${removedId}) — ${Object.entries(repointed).filter(([, n]) => n).map(([k, n]) => `${k}: ${n}`).join(', ') || 'nothing to repoint'}`,
+  });
+  return { KeptId: Number(keptId), KeptName: keptName, RemovedId: Number(removedId), RemovedName: removedName, Repointed: repointed };
+}
+
+export async function mergePeople({ keptId, removedId, by = null }) {
+  const result = await mergeRecords({ kind: 'person', keptId, removedId, refs: PERSON_REFERENCES, table: 'people', by });
+  return { ...result, Person: await getPerson(keptId) };
+}
+
+export async function mergeGroups({ keptId, removedId, by = null }) {
+  const result = await mergeRecords({ kind: 'group', keptId, removedId, refs: GROUP_REFERENCES, table: 'groups', by });
+  return { ...result, Group: await getGroup(keptId) };
+}
+
+export async function listRecordMerges({ kind = null, limit = 100 } = {}) {
+  const vals = []; let filter = '';
+  if (kind) { vals.push(kind); filter = `WHERE kind = $${vals.length}`; }
+  vals.push(limit);
+  const { rows } = await pool.query(
+    `SELECT * FROM record_merges ${filter} ORDER BY merged_at DESC LIMIT $${vals.length}`, vals
+  );
+  return rows.map((r) => ({
+    Id: r.id, Kind: r.kind, KeptId: r.kept_id, KeptName: r.kept_name,
+    RemovedId: r.removed_id, RemovedName: r.removed_name, Repointed: r.repointed,
+    MergedBy: r.merged_by, MergedAt: r.merged_at,
+  }));
+}
+
 // ── Interactive Map — pins are assets with map_x/map_y set (image-pixel
 //    coords on the base map image — see CAMP_MAP_IMAGE in public-pg/app.js
 //    for the current file — not lat/lng). A pin's color is derived, never
