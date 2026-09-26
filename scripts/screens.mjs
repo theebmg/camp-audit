@@ -92,7 +92,71 @@ function screensFor(ids) {
     { id: 'audit-rounds',     view: 'auditRounds' },
     { id: 'audit-new-round',  view: 'auditRounds', open: async (p) => { await tap(p, '#newRoundBtn'); } },
     { id: 'audit-form-builder', view: 'auditRounds', open: async (p) => { await tap(p, '.edit-form'); } },
-    { id: 'map',              view: 'map' },
+    // The map, with an explicit check that it still renders cabins and their holders exactly
+    // as before — People did not move cabin_holders, and this is the proof rather than the
+    // claim. Ben asked for it by name.
+    { id: 'map',              view: 'map',
+      extra: async (p) => p.evaluate(async () => {
+        // The map draws into an inline <svg id="mapSvg"> via createElementNS — there is no
+        // .map-pin class and no <img>. An earlier version of this check looked for both and
+        // reported an empty map that was in fact fine.
+        const svg = document.getElementById('mapSvg');
+        const api = async (u) => { try { const r = await fetch(u); return r.ok ? r.json() : null; } catch { return null; } };
+        const pins = await api('/api/pg/map/pins');
+        // listMapPins returns holderName (camelCase, from assets.lodge_holder) — not a
+        // PascalCase key like most row shapes here, which is why this took two tries.
+        const withHolder = (pins?.pins || []).filter((x) => x.holderName);
+        return {
+          svgPresent: !!svg,
+          baseImagePresent: !!svg?.querySelector('image'),
+          svgShapes: svg ? svg.querySelectorAll('circle, path, polygon, rect, text').length : 0,
+          apiPinCount: (pins?.pins || []).length,
+          apiPinsWithHolder: withHolder.length,
+        };
+      }) },
+
+    // ---- People & Groups (§1) ----
+    { id: 'people',           view: 'people',
+      extra: async (p) => p.evaluate(() => ({
+        rows: document.querySelectorAll('table[data-card="1"] tbody tr').length,
+        unlinkedBannerShown: /Unlinked holdings/i.test(document.body.textContent),
+        cabinHolderPills: [...document.querySelectorAll('.pill')].filter((e) => /cabin holder/i.test(e.textContent)).length,
+      })) },
+    { id: 'person-profile',   view: 'people',
+      open: async (p) => { await tap(p, 'table[data-card="1"] tbody tr', 5000); await wait(p, 900); },
+      extra: async (p) => p.evaluate(() => ({
+        hasCabinsSection: /Cabins/i.test(document.body.textContent),
+        hasVisitsSection: /Visits/i.test(document.body.textContent),
+        hasMergeButton: !!document.getElementById('mergeBtn'),
+      })) },
+    { id: 'person-edit',      view: 'people',
+      open: async (p) => {
+        await tap(p, 'table[data-card="1"] tbody tr', 5000); await wait(p, 900);
+        await tap(p, '#editBtn', 4000); await wait(p, 700);
+      },
+      extra: async (p) => p.evaluate(() => ({
+        roleCheckboxes: document.querySelectorAll('.p-role').length,
+        // The derived role must NOT be offered as a checkbox.
+        offersCabinHolderCheckbox: [...document.querySelectorAll('.skill-chip')].some((l) => /cabin holder/i.test(l.textContent)),
+        volunteerFieldsHiddenByDefault: document.getElementById('volWrap')?.hidden ?? null,
+      })),
+      after: async (p) => { await tap(p, '.modal-cancel', 1500).catch(() => {}); } },
+    { id: 'person-merge',     view: 'people',
+      open: async (p) => {
+        await tap(p, 'table[data-card="1"] tbody tr', 5000); await wait(p, 900);
+        await tap(p, '#mergeBtn', 4000); await wait(p, 900);
+      },
+      after: async (p) => { await tap(p, '.modal-cancel', 1500).catch(() => {}); } },
+    { id: 'holdings',         view: 'holdings',
+      extra: async (p) => p.evaluate(() => ({
+        unlinkedCount: (document.body.textContent.match(/Unlinked \((\d+)\)/) || [])[1] || null,
+        allCount: (document.body.textContent.match(/All \((\d+)\)/) || [])[1] || null,
+      })) },
+    { id: 'groups',           view: 'groups' },
+    { id: 'group-new',        view: 'groups',
+      open: async (p) => { await tap(p, '#addGroupBtn', 4000); await wait(p, 700); },
+      after: async (p) => { await tap(p, '.modal-cancel', 1500).catch(() => {}); } },
+
     { id: 'notes',            view: 'notes' },
     { id: 'expenses',         view: 'expenses' },
     { id: 'expense-detail',   view: 'expenses', open: async (p) => { await tap(p, '.list-item'); } },
