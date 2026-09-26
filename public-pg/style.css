@@ -1027,3 +1027,21 @@ label {
   top: auto; bottom: 100%;
   margin-top: 0; margin-bottom: 4px;
 }
+
+/* Nav badge (§8): how many things are actually waiting — new Incoming items and visits
+   needing a "did they show up?" answer. Sits at the end of the row so it never pushes the
+   label around. */
+.nav-item { position: relative; }
+.nav-count {
+  margin-left: auto;
+  min-width: 20px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--danger, #dc2626);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.5;
+  text-align: center;
+  flex: 0 0 auto;
+}

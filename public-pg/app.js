@@ -879,6 +879,21 @@ const NAV_ITEMS = [
 ];
 const NAV_ITEM_BY_VIEW = Object.fromEntries(NAV_ITEMS.map((n) => [n.view, n]));
 
+// Nav badge counts (§8): new Incoming items, and visits waiting on "did they show up?".
+// Refreshed after every navigation, and deliberately failure-tolerant — a badge is a nudge,
+// so a count that cannot be fetched shows nothing rather than breaking the nav.
+let navBadges = {};
+async function refreshNavBadges() {
+  const next = {};
+  await Promise.all([
+    api('/api/pg/visits/awaiting').then((d) => { next.visits = (d.visits || []).length; }).catch(() => {}),
+    api('/api/pg/incoming?status=new').then((d) => { next.incoming = (d.items || []).length; }).catch(() => {}),
+  ]);
+  const changed = JSON.stringify(next) !== JSON.stringify(navBadges);
+  navBadges = next;
+  return changed;
+}
+
 // Default grouping. Headers are fixed; items move freely between sections in
 // the sidebar's reorder mode, and the result is saved to display_settings
 // (nav_layout). The trailing null-header section renders without a label.
@@ -983,8 +998,10 @@ function renderSidebar(activeView) {
       const item = NAV_ITEM_BY_VIEW[view];
       const label = escapeHtml(item.label);
       if (!navEditMode) {
+        const count = navBadges[view] || 0;
         return `<button class="nav-item ${view === activeView ? 'active' : ''}" data-view="${view}">
           <span class="nav-icon">${item.icon}</span><span>${label}</span>
+          ${count ? `<span class="nav-count" aria-label="${count} needing attention">${count > 99 ? '99+' : count}</span>` : ''}
         </button>`;
       }
       return `<div class="nav-item nav-item-editing" data-view="${view}" draggable="true">
@@ -1202,6 +1219,9 @@ async function render(view, params = {}, opts = {}) {
     if (!state.user) { await renderLogin(); return fadeInApp(); }
     if (!state.options) state.options = await api('/api/pg/options');
     renderSidebar(view);
+    // Badges are fetched after the sidebar is drawn, then redrawn only if a count changed —
+    // so navigation is never waiting on two extra requests, and the nav does not flicker.
+    refreshNavBadges().then((changed) => { if (changed) renderSidebar(view); }).catch(() => {});
     setChrome({ title: '', showBack: state.stack.length > 1, showLogout: true });
     renderBreadcrumbs();
     const handlers = {

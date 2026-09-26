@@ -4,6 +4,16 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <title>Sychar Operations</title>
+  <!-- Home-screen install (§8). apple-touch-icon is what iOS actually uses; the manifest is
+       what everything else reads, and it is what makes "Add to Home Screen" open without
+       Safari's chrome. -->
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Sychar" />
+  <meta name="theme-color" content="#1e2230" />
   <link rel="stylesheet" href="/style.css" />
   <style>
     /* Small additions specific to this page — kept separate from the
