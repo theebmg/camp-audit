@@ -153,6 +153,36 @@ function screensFor(ids) {
         allCount: (document.body.textContent.match(/All \((\d+)\)/) || [])[1] || null,
       })) },
     { id: 'groups',           view: 'groups' },
+
+    // ---- Visitor log (§2) and Incoming (§5) ----
+    { id: 'visits',           view: 'visits',
+      extra: async (p) => p.evaluate(() => ({
+        queueShown: /Did they show up/i.test(document.body.textContent),
+        rows: document.querySelectorAll('[data-visit]').length,
+        hasCsvLink: !!document.getElementById('csvLink'),
+      })) },
+    { id: 'visits-filters',   view: 'visits',
+      open: async (p) => { await tap(p, '#filterToggle', 4000); await wait(p, 700); } },
+    { id: 'visit-new',        view: 'visits',
+      open: async (p) => { await tap(p, '#quickAddBtn', 4000); await wait(p, 1200); },
+      extra: async (p) => p.evaluate(() => ({
+        // A visit is a person or a group, never free text — the form must say so.
+        hasPersonGroupToggle: document.querySelectorAll('[data-who]').length === 2,
+        datePrefilled: !!document.querySelector('#vDate')?.value,
+        calledAheadDefaultsNo: document.querySelector('#vCalled')?.value === 'false',
+      })),
+      after: async (p) => { await tap(p, '.modal-cancel', 1500).catch(() => {}); } },
+    { id: 'incoming',         view: 'incoming',
+      extra: async (p) => p.evaluate(() => ({
+        tabs: document.querySelectorAll('[data-status]').length,
+        hasSettingsButton: !!document.getElementById('settingsBtn'),
+      })) },
+    { id: 'text-settings',    view: 'textIntakeSettings',
+      extra: async (p) => p.evaluate(() => ({
+        // The secrets must never reach the browser — only whether they are set.
+        showsConfiguredFlag: /Webhook secrets configured/i.test(document.body.textContent),
+        leaksSecret: /QUO_SIGNING_SECRET|QUO_API_KEY|sk_|Bearer /i.test(document.body.innerHTML),
+      })) },
     { id: 'group-new',        view: 'groups',
       open: async (p) => { await tap(p, '#addGroupBtn', 4000); await wait(p, 700); },
       after: async (p) => { await tap(p, '.modal-cancel', 1500).catch(() => {}); } },

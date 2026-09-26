@@ -416,3 +416,99 @@ treats both orders as equal, so nothing depends on the stored order.
 `cabin_holders.name` is `UNIQUE`; `people.name` is not. Two real people can share a name, and
 §1's duplicate check ends in "create new anyway", which a unique constraint would refuse. The
 check is a warning, not an enforcement.
+
+---
+
+# Text intake — what I need from Ben, and what was decided
+
+## BLOCKED — the Quo API key and signing secret
+
+Everything that can be built without them is built, deployed and tested. What remains is
+exactly this:
+
+**1. Two environment variables on the server.** They are read from the environment, never
+stored in the database, never logged, and never sent to the browser — the settings screen only
+reports whether they are set.
+
+```
+QUO_SIGNING_SECRET=…     # verifies every delivery's signature
+QUO_API_KEY=…            # fetches media, and sends the confirmation reply
+```
+
+Add them to the camp-audit service's environment in `/root/nocodb/docker-compose.yml` and
+recreate the container. Say the word and I will do it — I have not, because putting a secret
+on a machine is your call.
+
+**2. The webhook registered with Quo**, for `message.received` only, pinned to the current API
+version, pointing at:
+
+```
+https://audit.fracturedrv.com/api/quo/inbound
+```
+
+That route is live now and returns 401 to anything unsigned, so registering it early is safe.
+
+**3. Your cell number and the camp line**, entered in **Incoming → Text settings**. Until the
+allowlist has a number in it, **nothing is processed at all** — the allowlist fails closed on
+purpose, because an empty list meaning "accept everything" is how a webhook becomes an open
+door. The screen says so.
+
+**4. Then a real test text**, which is the part no amount of local testing replaces.
+
+### What I could NOT verify without the key
+
+- The exact shape of Quo's `message.received` payload. The reader accepts the common spellings
+  of every field (`from`/`sender`/`from_number`, `text`/`body`/`message`, and the same for
+  media), so it should survive whichever one Quo uses — but it is written against
+  documentation, not against a real delivery.
+- The exact signature scheme. It is implemented as HMAC-SHA256 over `"{timestamp}.{rawBody}"`,
+  hex, accepting a bare or `sha256=`-prefixed value and tolerating several space-separated
+  candidates during a key rotation. **If Quo signs differently, this is the one function that
+  needs changing** — `verifyQuoSignature` in `src/routes/quo-inbound.js`, which is exported and
+  unit-tested, so correcting it is a small, contained change.
+- Media URL expiry and whether the media fetch needs the API key as a bearer token. It sends
+  one if present.
+- The outbound reply endpoint. `POST https://api.quo.com/v1/messages` with `{from, to, text}`
+  is the assumed shape; a failed reply is logged and never fails the delivery, so a wrong
+  endpoint degrades to "no confirmation text" rather than to lost messages.
+
+Everything else — signature verification logic, replay rejection, idempotency, the allowlist,
+Eastern timestamps, hint parsing, all four filing paths, Move-to, and dismiss — is tested
+against the real database by `scripts/intake-test.mjs`, 41 assertions, all passing.
+
+## Q15 — `expenses.source` did not allow 'text'
+
+Found by the intake test, not in production: the column was constrained to `manual` and
+`email`, so filing a texted receipt failed. Migration 0098 widens it to include `text`.
+**Widened rather than dropped** — the point of the constraint is that source is a known set,
+and an unconstrained column lets a typo through silently.
+
+## Q16 — A visit that arrives by text defaults to "no call"
+
+§2 says a visit with no matching expected visit defaults to called-ahead = no. That is what
+filing from Incoming does, and the form shows it as an editable dropdown with the reason
+underneath. If an expected visit matches within two days, the form offers to confirm that one
+instead of creating a second row.
+
+## Q17 — Visit counts mean visits that happened
+
+Caught by the merge test. A profile counted `expected` visits as visits — but an expected visit
+has not happened yet, which is the whole reason the "Did they show up?" queue exists, and a
+no-show did not happen at all. People and groups now count **confirmed only**, so "3 visits
+this year, usually ~15" cannot include a visit nobody made.
+
+## Q18 — The Visitor Activity report gained an identity it never had
+
+Repointing the report at the visit log fixed a weakness on the way. The old builder had no
+identity for a one-off visitor, so it grouped by normalising the spelling of a typed name —
+two spellings of one person counted as two visitors. Every visitor is now a person or a group
+record, so grouping is by id.
+
+**Cabin Holders** still means people who hold a cabin, now derived from `cabin_holder_people`.
+**Groups sit with Other Visitors** rather than getting a third section, because the report's
+renderers do not know about one; the group's headcount and typical size come through, and
+`groupVisits` is reported separately for whenever you want that split made visible.
+
+I nearly shipped this as a regression: the builder keys its split off `CabinHolderId`, which my
+first version of the new shape set to `null`. Every visit would have landed under Other
+Visitors.
