@@ -3798,7 +3798,7 @@ async function renderNotes() {
 
   function noteCardHtml(n) {
     return `<div class="list-item" style="align-items:flex-start;flex-wrap:wrap;gap:10px;${n.done ? 'opacity:0.6' : ''}">
-      <input type="checkbox" class="note-done" data-id="${n.id}" ${n.done ? 'checked' : ''} style="margin-top:4px" />
+      <label class="cb-wrap" style="flex:0 0 auto;margin:0"><input type="checkbox" class="note-done" data-id="${n.id}" ${n.done ? 'checked' : ''} /></label>
       <div style="flex:1;min-width:180px">
         <div><strong style="${n.done ? 'text-decoration:line-through' : ''}">${escapeHtml(n.title)}</strong> <span class="pill">${escapeHtml(n.category || 'General')}</span></div>
         ${n.body ? `<div class="muted" style="white-space:pre-wrap">${escapeHtml(n.body)}</div>` : ''}
@@ -13823,7 +13823,7 @@ function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
 
   return `<details class="card jl-card" data-id="${jl.Id}">
     <summary style="cursor:pointer;display:flex;align-items:center;gap:10px;list-style:none">
-      <input type="checkbox" class="jl-split-select" value="${jl.Id}" title="Select to split off into a new work order" onclick="event.stopPropagation()" style="width:18px;height:18px;flex-shrink:0" />
+      <label class="cb-wrap" style="flex:0 0 auto;margin:0" onclick="event.stopPropagation()"><input type="checkbox" class="jl-split-select" value="${jl.Id}" title="Select to split off into a new work order" style="width:18px;height:18px;flex-shrink:0" /></label>
       ${statusPillHtml(jl.StatusName, jl.StatusColor)}
       <span style="flex:1;${jl.StatusIsTerminal ? 'text-decoration:line-through;color:var(--muted)' : ''}">
         <strong>${escapeHtml(jl.Title)}</strong>

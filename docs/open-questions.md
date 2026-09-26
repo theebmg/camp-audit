@@ -512,3 +512,29 @@ renderers do not know about one; the group's headcount and typical size come thr
 I nearly shipped this as a regression: the builder keys its split off `CabinHolderId`, which my
 first version of the new shape set to `null`. Every visit would have landed under Other
 Visitors.
+
+## Q19 — A phone in landscape is wider than the mobile breakpoint
+
+Found by the final harness run, and **pre-existing** rather than caused by this work.
+
+The mobile rules live in `@media (max-width: 760px)`. A phone held sideways is 852px wide, so
+**none of them apply**: at 852×393 the work-order screen reports 86 sub-44px controls and the
+accent swatches are back to 22px, while the same phone upright reports 2.
+
+**The fix is one line** — widen the query to `@media (max-width: 760px), (pointer: coarse)`, so
+it keys off "this is a touch device" as well as "this is a narrow window". That is almost
+certainly right, and it would also cover an iPad.
+
+**I have not made the change**, because it applies the mobile layout to every touch device at
+any width, including a touchscreen laptop, and that is a visible decision about how the app
+looks rather than a bug fix. Say the word and it is one line.
+
+## Q20 — Two console warnings that predate this work
+
+Neither is from text intake, and neither is an error in our code:
+
+- **`audit-new-round`** logs a 404 for some resource at every width. Worth a look during the
+  next audit-engine pass.
+- **`expense-detail`** logs `Viewport argument key "no;" not recognized`. It comes from embedded
+  attachment content, not from our markup — every `<meta name="viewport">` in `public-pg/` is
+  well-formed.
