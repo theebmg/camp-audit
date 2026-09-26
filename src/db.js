@@ -4648,7 +4648,7 @@ async function getWorkOrderCrewRoster(woId) {
 //    finding, the before shot on the job line, and the reference image on
 //    the asset simultaneously, uploaded once. ──────────────────────────────
 
-const ATTACHMENT_ENTITY_TYPES = new Set(['asset', 'work_order', 'job_line', 'condition_finding', 'asset_component', 'maintenance_request', 'asset_note', 'expense', 'admin_task']);
+const ATTACHMENT_ENTITY_TYPES = new Set(['asset', 'work_order', 'job_line', 'condition_finding', 'asset_component', 'maintenance_request', 'asset_note', 'expense', 'admin_task', 'visit', 'incoming_item']);
 
 function attachmentRowShape(a) {
   return {
@@ -8411,6 +8411,10 @@ function calendarEventRowShape(r) {
     VisitorName: r.visitor_name, VisitPurpose: r.visit_purpose, VisitorContact: r.visitor_contact,
     CabinHolderId: r.cabin_holder_id, CabinHolderName: r.cabin_holder_name,
     AssetId: r.asset_id, AssetName: r.asset_name,
+    // A visit event names a person or a group (§2). visitor_name stays because the Google sync
+    // builds its summary from it, but these are what the visit projection reads.
+    PersonId: r.person_id ?? null, PersonName: r.person_name ?? null,
+    GroupId: r.group_id ?? null, GroupName: r.group_name ?? null,
   };
 }
 
@@ -8464,7 +8468,8 @@ function expandRecurrence(event, rangeStart, rangeEnd) {
 
 const CALENDAR_EVENT_SELECT = `
   SELECT e.*, w.title AS wo_title, jl.title AS job_line_title, t.name AS type_name, t.gcal_color_id AS type_gcal_color_id,
-         a.name AS asset_name, ch.name AS cabin_holder_name
+         a.name AS asset_name, ch.name AS cabin_holder_name,
+         vp.name AS person_name, vg.name AS group_name
   FROM calendar_events e
   LEFT JOIN LATERAL (
     SELECT ea.dest_type, ea.dest_id FROM expense_allocations ea
@@ -8474,6 +8479,8 @@ const CALENDAR_EVENT_SELECT = `
   LEFT JOIN work_orders w ON d.dest_type = 'work_order' AND w.id = d.dest_id
   LEFT JOIN job_lines jl ON d.dest_type = 'job_line' AND jl.id = d.dest_id
   LEFT JOIN calendar_event_types t ON t.id = e.type_id
+  LEFT JOIN people vp ON vp.id = e.person_id
+  LEFT JOIN groups vg ON vg.id = e.group_id
   LEFT JOIN assets a ON a.id = e.asset_id
   LEFT JOIN cabin_holders ch ON ch.id = e.cabin_holder_id`;
 
@@ -8798,16 +8805,311 @@ export async function listVisitorConflicts({ date, assetId, jobLineId }) {
     }));
 }
 
-// Visitor Activity report's raw material — every visit occurrence in range.
-// A visit is any calendar event with a visitor_name, regardless of type:
-// Constituent Visitation is the expected type, but a Volunteer Workday
-// someone logs against a specific visitor/cabin is still a visit. Expanded
-// per occurrence (a recurring monthly visit counts once per month), and a
-// multi-day stay counts once, on its start date's occurrence.
+// ══════════════════════════════════════════════════════════════════════════
+// Visitor log (text-intake brief §2)
+//
+// One store: the `visits` table. A visit is a person or a group, never free text. Calendar
+// visit events SCHEDULE a visit, which lands here as `expected` and waits in the "Did they
+// show up?" queue once its date has passed.
+// ══════════════════════════════════════════════════════════════════════════
+
+function visitRowShape(r) {
+  return {
+    Id: r.id,
+    PersonId: r.person_id,
+    PersonName: r.person_name ?? null,
+    GroupId: r.group_id,
+    GroupName: r.group_name ?? null,
+    GroupTypeName: r.group_type_name ?? null,
+    // One label for "who", so no screen has to work it out again.
+    Who: r.person_name || r.group_name || '(unknown)',
+    IsGroup: !!r.group_id,
+    Headcount: r.headcount,
+    AssetId: r.asset_id,
+    AssetName: r.asset_name ?? null,
+    LocationId: r.location_id,
+    LocationName: r.location_name ?? null,
+    Where: r.asset_name || r.location_name || null,
+    VisitDate: r.visit_date_text ?? (r.visit_date ? String(r.visit_date).slice(0, 10) : null),
+    ArrivalTime: r.arrival_time ? String(r.arrival_time).slice(0, 5) : null,
+    DurationMinutes: r.duration_minutes,
+    Reason: r.reason,
+    CalledAhead: r.called_ahead,
+    Notes: r.notes,
+    Status: r.status,
+    Source: r.source,
+    CalendarEventId: r.calendar_event_id,
+    CalendarEventTitle: r.calendar_event_title ?? null,
+    OccurrenceDate: r.occurrence_date_text ?? null,
+    ConfirmedBy: r.confirmed_by,
+    ConfirmedAt: r.confirmed_at,
+    CreatedBy: r.created_by,
+    CreatedAt: r.created_at,
+    PhotoCount: Number(r.photo_count || 0),
+  };
+}
+
+const VISIT_SELECT = `
+  SELECT v.*, v.visit_date::text AS visit_date_text, v.occurrence_date::text AS occurrence_date_text,
+         p.name AS person_name, g.name AS group_name, gt.name AS group_type_name,
+         a.name AS asset_name, l.name AS location_name, ce.title AS calendar_event_title,
+         (SELECT count(*) FROM attachment_links al
+           WHERE al.entity_type = 'visit' AND al.entity_id = v.id) AS photo_count
+  FROM visits v
+  LEFT JOIN people p ON p.id = v.person_id
+  LEFT JOIN groups g ON g.id = v.group_id
+  LEFT JOIN group_types gt ON gt.id = g.type_id
+  LEFT JOIN assets a ON a.id = v.asset_id
+  LEFT JOIN locations l ON l.id = v.location_id
+  LEFT JOIN calendar_events ce ON ce.id = v.calendar_event_id
+`;
+
+export async function listVisits({
+  personId = null, groupId = null, roleId = null, assetId = null, locationId = null,
+  from = null, to = null, calledAhead = null, status = null, source = null, limit = 500,
+} = {}) {
+  const where = []; const vals = [];
+  const add = (sql, val) => { vals.push(val); where.push(sql.replace('?', `$${vals.length}`)); };
+  if (personId) add('v.person_id = ?', personId);
+  if (groupId) add('v.group_id = ?', groupId);
+  if (roleId) add('EXISTS (SELECT 1 FROM person_role_assignments x WHERE x.person_id = v.person_id AND x.role_id = ?)', roleId);
+  if (assetId) add('v.asset_id = ?', assetId);
+  if (locationId) add('v.location_id = ?', locationId);
+  if (from) add('v.visit_date >= ?', from);
+  if (to) add('v.visit_date <= ?', to);
+  if (calledAhead !== null) add('v.called_ahead = ?', calledAhead);
+  if (status) add('v.status = ?', status);
+  if (source) add('v.source = ?', source);
+  vals.push(limit);
+  const { rows } = await pool.query(
+    `${VISIT_SELECT} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+     ORDER BY v.visit_date DESC, v.id DESC LIMIT $${vals.length}`, vals
+  );
+  return rows.map(visitRowShape);
+}
+
+export async function getVisit(id) {
+  const { rows } = await pool.query(`${VISIT_SELECT} WHERE v.id = $1`, [id]);
+  if (!rows[0]) return null;
+  const visit = visitRowShape(rows[0]);
+  visit.Photos = await listAttachmentsForEntity('visit', id);
+  return visit;
+}
+
+// The "Did they show up?" queue (§2): expected visits whose date has passed. Uses the
+// database's own date so it cannot disagree with what the projection wrote.
+export async function listVisitsAwaitingConfirmation() {
+  const { rows } = await pool.query(
+    `${VISIT_SELECT} WHERE v.status = 'expected' AND v.visit_date < current_date
+     ORDER BY v.visit_date ASC, v.id ASC`
+  );
+  return rows.map(visitRowShape);
+}
+
+export async function createVisit({
+  personId = null, groupId = null, headcount = null, assetId = null, locationId = null,
+  visitDate, arrivalTime = null, durationMinutes = null, reason = null,
+  calledAhead = null, notes = null, status = 'confirmed', source = 'manual',
+  calendarEventId = null, occurrenceDate = null, attachmentIds = [], createdBy = null,
+}) {
+  if (!personId && !groupId) { const e = new Error('A visit needs a person or a group'); e.status = 400; throw e; }
+  if (personId && groupId) { const e = new Error('A visit is either a person or a group, not both'); e.status = 400; throw e; }
+  if (!visitDate) { const e = new Error('A visit needs a date'); e.status = 400; throw e; }
+
+  // Called-ahead defaults from how the visit arrived, not from a guess: a calendar event IS
+  // calling ahead; a text or a manual entry with no matching expectation is not (§2).
+  const called = calledAhead === null ? source === 'calendar' : !!calledAhead;
+
+  const client = await pool.connect();
+  let id;
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO visits (person_id, group_id, headcount, asset_id, location_id, visit_date,
+         arrival_time, duration_minutes, reason, called_ahead, notes, status, source,
+         calendar_event_id, occurrence_date, confirmed_by, confirmed_at, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id`,
+      [personId || null, groupId || null, headcount ?? null, assetId || null, locationId || null,
+        visitDate, arrivalTime || null, durationMinutes ?? null, reason?.trim() || null, called,
+        notes?.trim() || null, status, source, calendarEventId || null, occurrenceDate || null,
+        status === 'confirmed' ? createdBy : null, status === 'confirmed' ? new Date() : null, createdBy]
+    );
+    id = rows[0].id;
+    for (const attachmentId of attachmentIds || []) {
+      await linkAttachment(attachmentId, { entityType: 'visit', entityId: id }, client);
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  const visit = await getVisit(id);
+  await logActivity({ action: 'created', entityType: 'visit', entityId: id, entityLabel: visit.Who,
+    details: `${visit.VisitDate}${visit.Where ? ` at ${visit.Where}` : ''} (${source})` });
+  return visit;
+}
+
+export async function updateVisit(id, fields) {
+  const map = {
+    personId: 'person_id', groupId: 'group_id', headcount: 'headcount', assetId: 'asset_id',
+    locationId: 'location_id', visitDate: 'visit_date', arrivalTime: 'arrival_time',
+    durationMinutes: 'duration_minutes', reason: 'reason', calledAhead: 'called_ahead',
+    notes: 'notes', status: 'status', source: 'source',
+  };
+  const sets = []; const vals = [id]; let i = 2;
+  for (const [key, col] of Object.entries(map)) {
+    if (fields[key] === undefined) continue;
+    let v = fields[key];
+    if (typeof v === 'string' && ['reason', 'notes'].includes(key)) v = v.trim() || null;
+    if (v === '') v = null;
+    sets.push(`${col} = $${i++}`); vals.push(v);
+  }
+  if (!sets.length) return getVisit(id);
+  const { rows } = await pool.query(`UPDATE visits SET ${sets.join(', ')} WHERE id = $1 RETURNING id`, vals);
+  if (!rows[0]) return null;
+  const visit = await getVisit(id);
+  await logActivity({ action: 'updated', entityType: 'visit', entityId: Number(id), entityLabel: visit.Who });
+  return visit;
+}
+
+// Answering the queue (§2). Three answers, one call, because "different day" is a confirm with
+// a corrected date rather than a separate concept.
+export async function confirmVisit(id, {
+  showedUp, visitDate = null, arrivalTime = null, durationMinutes = null,
+  notes = null, headcount = null, attachmentIds = [], by = null,
+}) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const sets = ['status = $2', 'confirmed_by = $3', 'confirmed_at = now()'];
+    const vals = [id, showedUp ? 'confirmed' : 'no_show', by || null];
+    let i = 4;
+    if (visitDate) { sets.push(`visit_date = $${i++}`); vals.push(visitDate); }
+    if (arrivalTime !== null) { sets.push(`arrival_time = $${i++}`); vals.push(arrivalTime || null); }
+    if (durationMinutes !== null) { sets.push(`duration_minutes = $${i++}`); vals.push(durationMinutes); }
+    if (notes !== null) { sets.push(`notes = $${i++}`); vals.push(notes?.trim() || null); }
+    if (headcount !== null) { sets.push(`headcount = $${i++}`); vals.push(headcount); }
+    const { rows } = await client.query(`UPDATE visits SET ${sets.join(', ')} WHERE id = $1 RETURNING id`, vals);
+    if (!rows[0]) { const e = new Error('Visit not found'); e.status = 404; throw e; }
+    for (const attachmentId of attachmentIds || []) {
+      await linkAttachment(attachmentId, { entityType: 'visit', entityId: Number(id) }, client);
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+  const visit = await getVisit(id);
+  await logActivity({ action: showedUp ? 'confirmed' : 'marked no-show', entityType: 'visit',
+    entityId: Number(id), entityLabel: visit.Who, details: visit.VisitDate });
+  return visit;
+}
+
+export async function deleteVisit(id) {
+  const { rows } = await pool.query('SELECT id FROM visits WHERE id = $1', [id]);
+  if (!rows[0]) return;
+  const visit = await getVisit(id);
+  await pool.query('DELETE FROM visits WHERE id = $1', [id]);
+  await logActivity({ action: 'deleted', entityType: 'visit', entityId: Number(id), entityLabel: visit.Who });
+}
+
+// A visit logged from a text or by hand may already be expected (§2). Same person or group,
+// within a day or two, still expected — offer to confirm that instead of making a second row.
+export async function findMatchingExpectedVisit({ personId = null, groupId = null, visitDate, windowDays = 2 }) {
+  if (!personId && !groupId) return null;
+  const { rows } = await pool.query(
+    `${VISIT_SELECT}
+     WHERE v.status = 'expected'
+       AND ($1::int IS NULL OR v.person_id = $1)
+       AND ($2::int IS NULL OR v.group_id = $2)
+       AND abs(v.visit_date - $3::date) <= $4
+     ORDER BY abs(v.visit_date - $3::date), v.visit_date LIMIT 1`,
+    [personId, groupId, visitDate, windowDays]
+  );
+  return rows[0] ? visitRowShape(rows[0]) : null;
+}
+
+// ── Calendar → expected visits (§2) ───────────────────────────────────────
+// Every visit calendar event in range becomes an expected visit, one per occurrence, so a
+// recurring monthly visit produces one row a month. Idempotent: the unique index on
+// (calendar_event_id, occurrence_date) means re-running updates rather than duplicating.
+//
+// A visit event is one that names a person or a group. visitor_name alone is not enough any
+// more — §2 says visit events pick a person or a group, never free text — but an event that
+// still only has the old text is reported so it can be fixed rather than silently skipped.
+export async function projectCalendarVisits({ from = null, to = null } = {}) {
+  const start = from || new Date().toISOString().slice(0, 10);
+  const end = to || new Date(Date.now() + 400 * 86400000).toISOString().slice(0, 10);
+  const occurrences = await listCalendarEventOccurrences(start, end);
+
+  const created = []; const skipped = [];
+  for (const occ of occurrences) {
+    const personId = occ.PersonId || null;
+    const groupId = occ.GroupId || null;
+    if (!personId && !groupId) {
+      if (occ.VisitorName) skipped.push({ EventId: occ.Id, Title: occ.Title, Date: occ.OccurrenceDate, Why: 'names a visitor as text but no person or group' });
+      continue;
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO visits (person_id, group_id, asset_id, visit_date, reason, called_ahead,
+                           status, source, calendar_event_id, occurrence_date, created_by)
+       VALUES ($1,$2,$3,$4,$5,true,'expected','calendar',$6,$7,'calendar projection')
+       ON CONFLICT (calendar_event_id, occurrence_date) WHERE calendar_event_id IS NOT NULL
+       DO UPDATE SET person_id = EXCLUDED.person_id,
+                     group_id  = EXCLUDED.group_id,
+                     asset_id  = EXCLUDED.asset_id,
+                     visit_date = EXCLUDED.visit_date,
+                     reason    = EXCLUDED.reason
+       -- Only while still expected. Once it is confirmed or a no-show it is a record of what
+       -- happened, and editing the calendar afterwards must not rewrite that.
+       WHERE visits.status = 'expected'
+       RETURNING id`,
+      [personId, groupId, occ.AssetId || null, occ.OccurrenceDate, occ.VisitPurpose || null,
+        occ.Id, occ.OccurrenceDate]
+    );
+    if (rows[0]) created.push(rows[0].id);
+  }
+  return { Projected: created.length, Skipped: skipped };
+}
+
+// Visitor Activity report (§2) — repointed from calendar occurrences to the visit log. The old
+// getVisitorActivityRawData filtered calendar events by visitor_name; it now reads real visits,
+// so a visit logged from a text counts and an expected one that never happened does not.
 export async function getVisitorActivityRawData({ from, to }) {
-  return (await listCalendarEventOccurrences(from, to))
-    .filter((o) => o.VisitorName)
-    .sort((a, b) => a.OccurrenceDate.localeCompare(b.OccurrenceDate));
+  // Written out rather than patched onto VISIT_SELECT: string surgery on a shared query is
+  // how you get a report that silently stops matching the screens.
+  const { rows } = await pool.query(
+    `SELECT v.*, v.visit_date::text AS visit_date_text,
+            p.name AS person_name, g.name AS group_name,
+            a.name AS asset_name, l.name AS location_name,
+            EXISTS (SELECT 1 FROM cabin_holder_people chp WHERE chp.person_id = v.person_id) AS is_cabin_holder
+     FROM visits v
+     LEFT JOIN people p ON p.id = v.person_id
+     LEFT JOIN groups g ON g.id = v.group_id
+     LEFT JOIN assets a ON a.id = v.asset_id
+     LEFT JOIN locations l ON l.id = v.location_id
+     WHERE v.status = 'confirmed' AND v.visit_date BETWEEN $1 AND $2
+     ORDER BY v.visit_date, v.id`,
+    [from, to]
+  );
+  return rows.map((r) => {
+    const v = visitRowShape(r);
+    return {
+      VisitId: v.Id,
+      OccurrenceDate: v.VisitDate,
+      VisitorName: v.Who,
+      // Every visitor now has a real identity, so grouping is by id rather than by
+      // normalising the spelling of a typed name — which is what the old version had to do,
+      // and why two spellings of one visitor used to count as two visitors.
+      PersonId: v.PersonId,
+      GroupId: v.GroupId,
+      IsGroup: v.IsGroup,
+      // "Cabin holder" is derived from holding a cabin, not from a column on the event.
+      IsCabinHolder: !!r.is_cabin_holder,
+      AssetId: v.AssetId,
+      AssetName: v.AssetName,
+      Where: v.Where,
+      VisitPurpose: v.Reason,
+      Headcount: v.Headcount,
+      CalledAhead: v.CalledAhead,
+      Source: v.Source,
+      Status: v.Status,
+    };
+  });
 }
 
 export async function deleteCalendarEvent(id) {

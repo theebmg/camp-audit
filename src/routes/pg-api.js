@@ -164,6 +164,8 @@ import {
   findDuplicatePeople, mergePeople, listRecordMerges,
   listPersonRoles, createPersonRole, updatePersonRole, deletePersonRole,
   listHoldings, listUnlinkedHoldings, linkHoldingToPerson, unlinkHoldingFromPerson,
+  listVisits, getVisit, createVisit, updateVisit, confirmVisit, deleteVisit,
+  listVisitsAwaitingConfirmation, findMatchingExpectedVisit, projectCalendarVisits,
   listGroups, getGroup, createGroup, updateGroup, deleteGroup,
   findDuplicateGroups, mergeGroups, listGroupTypes, createGroupType, updateGroupType,
 } from '../db.js';
@@ -3147,6 +3149,120 @@ router.post('/group-types', async (req, res, next) => {
 });
 router.patch('/group-types/:id(\\d+)', async (req, res, next) => {
   try { res.json({ type: await updateGroupType(req.params.id, req.body || {}) }); } catch (e) { next(e); }
+});
+
+// ---- Visitor log (text-intake brief §2) ----
+
+router.get('/visits', async (req, res, next) => {
+  try {
+    const q = req.query;
+    res.json({
+      visits: await listVisits({
+        personId: q.personId ? Number(q.personId) : null,
+        groupId: q.groupId ? Number(q.groupId) : null,
+        roleId: q.roleId ? Number(q.roleId) : null,
+        assetId: q.assetId ? Number(q.assetId) : null,
+        locationId: q.locationId ? Number(q.locationId) : null,
+        from: q.from || null,
+        to: q.to || null,
+        calledAhead: q.calledAhead === 'true' ? true : q.calledAhead === 'false' ? false : null,
+        status: q.status || null,
+        source: q.source || null,
+      }),
+    });
+  } catch (e) { next(e); }
+});
+
+// The "Did they show up?" queue — expected visits whose date has passed.
+router.get('/visits/awaiting', async (req, res, next) => {
+  try { res.json({ visits: await listVisitsAwaitingConfirmation() }); } catch (e) { next(e); }
+});
+
+// Is this visit already expected? Asked before creating one from a text or by hand, so a
+// confirmed visit updates the expectation instead of sitting beside it (§2).
+router.get('/visits/matching-expected', async (req, res, next) => {
+  try {
+    const { personId, groupId, visitDate } = req.query;
+    if (!visitDate) return res.status(400).json({ ok: false, error: 'visitDate is required' });
+    res.json({
+      match: await findMatchingExpectedVisit({
+        personId: personId ? Number(personId) : null,
+        groupId: groupId ? Number(groupId) : null,
+        visitDate,
+      }),
+    });
+  } catch (e) { next(e); }
+});
+
+router.get('/visits/:id(\\d+)', async (req, res, next) => {
+  try {
+    const visit = await getVisit(req.params.id);
+    if (!visit) return res.status(404).json({ ok: false, error: 'Visit not found' });
+    res.json({ visit });
+  } catch (e) { next(e); }
+});
+
+router.post('/visits', async (req, res, next) => {
+  try { res.json({ visit: await createVisit({ ...req.body, createdBy: currentUsername() }) }); } catch (e) { next(e); }
+});
+
+router.patch('/visits/:id(\\d+)', async (req, res, next) => {
+  try {
+    const visit = await updateVisit(req.params.id, req.body || {});
+    if (!visit) return res.status(404).json({ ok: false, error: 'Visit not found' });
+    res.json({ visit });
+  } catch (e) { next(e); }
+});
+
+// Answering the queue: yes, no, or yes-but-a-different-day (which is a confirm with a
+// corrected date, not a separate concept).
+router.post('/visits/:id(\\d+)/confirm', async (req, res, next) => {
+  try {
+    const { showedUp } = req.body || {};
+    if (showedUp === undefined) return res.status(400).json({ ok: false, error: 'showedUp is required' });
+    res.json({ visit: await confirmVisit(req.params.id, { ...req.body, by: currentUsername() }) });
+  } catch (e) { next(e); }
+});
+
+router.delete('/visits/:id(\\d+)', async (req, res, next) => {
+  try { await deleteVisit(req.params.id); res.json({ ok: true }); } catch (e) { next(e); }
+});
+
+// Re-run the calendar projection. Idempotent, so it is safe to call on a page load.
+router.post('/visits/project-calendar', async (req, res, next) => {
+  try { res.json(await projectCalendarVisits(req.body || {})); } catch (e) { next(e); }
+});
+
+// CSV export (§2). Same shape as the on-screen filters.
+router.get('/visits/export.csv', async (req, res, next) => {
+  try {
+    const q = req.query;
+    const visits = await listVisits({
+      personId: q.personId ? Number(q.personId) : null,
+      groupId: q.groupId ? Number(q.groupId) : null,
+      roleId: q.roleId ? Number(q.roleId) : null,
+      assetId: q.assetId ? Number(q.assetId) : null,
+      from: q.from || null, to: q.to || null,
+      calledAhead: q.calledAhead === 'true' ? true : q.calledAhead === 'false' ? false : null,
+      status: q.status || null, source: q.source || null,
+      limit: 10000,
+    });
+    const cell = (v) => {
+      const s = v === null || v === undefined ? '' : String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const header = ['Date', 'Arrival', 'Who', 'Person or group', 'Headcount', 'Where',
+      'Reason', 'Called ahead', 'Status', 'Source', 'Duration (min)', 'Notes', 'Confirmed by'];
+    const lines = [header.join(',')];
+    for (const v of visits) {
+      lines.push([v.VisitDate, v.ArrivalTime || 'not stated', v.Who, v.IsGroup ? 'group' : 'person',
+        v.Headcount, v.Where, v.Reason, v.CalledAhead ? 'yes' : 'no', v.Status, v.Source,
+        v.DurationMinutes, v.Notes, v.ConfirmedBy].map(cell).join(','));
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="visits-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(lines.join('\n'));
+  } catch (e) { next(e); }
 });
 
 export default router;

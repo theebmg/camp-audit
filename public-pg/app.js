@@ -868,6 +868,7 @@ const NAV_ITEMS = [
   { icon: '📦', label: 'Materials', view: 'materials' },
   { icon: '💰', label: 'Capital Plan', view: 'capitalPlan' },
   { icon: '🧰', label: 'Requests', view: 'requests' },
+  { icon: '🚪', label: 'Visitor Log', view: 'visits' },
   { icon: '🧑', label: 'People', view: 'people' },
   { icon: '👥', label: 'Groups', view: 'groups' },
   { icon: '👷', label: 'Crew', view: 'crew' },
@@ -1247,6 +1248,7 @@ async function render(view, params = {}, opts = {}) {
       newCalendarEvent: () => renderNewCalendarEvent(params),
       calendarEventDetail: () => renderCalendarEventDetail(params),
       adminChecklistTemplates: () => renderAdminChecklistTemplates(),
+      visits: () => renderVisits(params),
       people: () => renderPeople(params),
       personProfile: () => renderPersonProfile(params),
       holdings: () => renderHoldings(),
@@ -8775,6 +8777,412 @@ async function renderCalendarEventDetail({ id }) {
     try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderCalendarEventDetail({ id }); }
     catch (err) { toast(err.message); }
   }));
+}
+
+// ---------- Visitor log (text-intake brief §2) ----------
+
+const VISIT_STATUS_LABEL = { expected: 'expected', confirmed: 'confirmed', no_show: 'no-show' };
+
+function visitRowHtml(v, { showStatus = true } = {}) {
+  return `
+    <div class="list-item" data-visit="${v.Id}" style="cursor:pointer">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">
+        <div style="min-width:0">
+          <div><strong>${escapeHtml(v.Who)}</strong>${v.IsGroup ? ` <span class="pill">group${v.Headcount ? ` · ${v.Headcount}` : ''}</span>` : ''}</div>
+          <div class="muted" style="font-size:0.85rem">
+            ${escapeHtml(v.VisitDate)}${v.ArrivalTime ? ` at ${escapeHtml(v.ArrivalTime)}` : ' <span style="opacity:0.7">(time not stated)</span>'}
+            ${v.Where ? ` · ${escapeHtml(v.Where)}` : ''}
+            ${v.DurationMinutes ? ` · ${v.DurationMinutes} min` : ''}
+          </div>
+          ${v.Reason ? `<div style="font-size:0.88rem">${escapeHtml(v.Reason)}</div>` : ''}
+        </div>
+        <div style="flex:0 0 auto;text-align:right">
+          ${showStatus ? `<span class="pill">${escapeHtml(VISIT_STATUS_LABEL[v.Status] || v.Status)}</span>` : ''}
+          <span class="pill">${v.CalledAhead ? 'called ahead' : 'no call'}</span>
+          <div class="muted" style="font-size:0.75rem;margin-top:2px">${escapeHtml(v.Source)}${v.PhotoCount ? ` · ${v.PhotoCount} photo${v.PhotoCount === 1 ? '' : 's'}` : ''}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function renderVisits(params = {}) {
+  setChrome({ title: 'Visitor log', showBack: false, showLogout: true });
+  let visits = []; let awaiting = []; let people = []; let groups = []; let roles = [];
+  const f = {
+    personId: params.personId ? Number(params.personId) : null,
+    groupId: null, roleId: null, assetId: null,
+    from: null, to: null, calledAhead: null, status: null, source: null,
+  };
+  let showFilters = false;
+
+  const qs = () => {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(f)) if (v !== null && v !== '') p.set(k, String(v));
+    return p;
+  };
+
+  async function load() {
+    // Projecting first means a calendar visit added five minutes ago is already in the queue.
+    // Idempotent, so calling it on every load costs nothing but a no-op upsert.
+    try { await api('/api/pg/visits/project-calendar', { method: 'POST', body: '{}' }); } catch { /* the log still works */ }
+    const [v, a, p, g, r] = await Promise.all([
+      api(`/api/pg/visits?${qs()}`),
+      api('/api/pg/visits/awaiting'),
+      api('/api/pg/people'),
+      api('/api/pg/groups'),
+      api('/api/pg/person-roles'),
+    ]);
+    visits = v.visits || []; awaiting = a.visits || [];
+    people = p.people || []; groups = g.groups || []; roles = r.roles || [];
+  }
+
+  const activeFilterCount = () => Object.entries(f).filter(([k, v]) => v !== null && v !== '' && k !== 'personId').length
+    + (f.personId ? 1 : 0);
+
+  function draw() {
+    setApp(`
+      ${awaiting.length ? `<div class="card" style="background:#fffdf5;border-color:#f0e6c8">
+        <h3 style="margin:0 0 4px;font-size:1rem">Did they show up? (${awaiting.length})</h3>
+        <p class="muted" style="margin:0 0 10px;font-size:0.85rem">
+          Visits that were on the calendar and whose date has passed. Answering keeps the record
+          honest — a no-show is kept, because it is part of the pattern.
+        </p>
+        ${awaiting.map((v) => `
+          <div class="list-item">
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center">
+              <div style="min-width:0">
+                <div><strong>Did ${escapeHtml(v.Who)} show up on ${escapeHtml(formatVisitDay(v.VisitDate))}?</strong></div>
+                <div class="muted" style="font-size:0.82rem">
+                  ${v.Where ? escapeHtml(v.Where) : 'no cabin recorded'}${v.CalendarEventTitle ? ` · ${escapeHtml(v.CalendarEventTitle)}` : ''}
+                </div>
+              </div>
+              <div class="btn-row" style="flex:0 0 auto">
+                <button type="button" class="btn btn-primary q-yes" data-id="${v.Id}">Yes</button>
+                <button type="button" class="btn btn-secondary q-no" data-id="${v.Id}">No</button>
+                <button type="button" class="btn btn-secondary q-day" data-id="${v.Id}">Different day</button>
+              </div>
+            </div>
+          </div>`).join('')}
+      </div>` : ''}
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
+          <h3 style="margin:0">Visitor log</h3>
+          <div class="btn-row">
+            <button type="button" class="btn btn-primary" id="quickAddBtn">＋ Log a visit</button>
+            <button type="button" class="btn btn-secondary addpanel-filtertoggle" id="filterToggle">
+              Filters${activeFilterCount() ? ` (${activeFilterCount()})` : ''}
+            </button>
+            <a class="btn btn-secondary" id="csvLink" href="/api/pg/visits/export.csv?${qs()}">CSV</a>
+          </div>
+        </div>
+        <div id="filterWrap" ${showFilters ? '' : 'hidden'} style="margin-top:10px">
+          <div class="field-row"><label>Person</label><div id="fPerson"></div></div>
+          <div class="field-row"><label>Group</label><div id="fGroup"></div></div>
+          <div class="field-row" style="display:flex;gap:8px;flex-wrap:wrap">
+            <div style="flex:1 1 140px"><label>From</label><input type="date" id="fFrom" value="${f.from || ''}" /></div>
+            <div style="flex:1 1 140px"><label>To</label><input type="date" id="fTo" value="${f.to || ''}" /></div>
+          </div>
+          <div class="field-row"><label>Role</label><select id="fRole">
+            <option value="">Any role</option>
+            ${roles.map((r) => `<option value="${r.Id}" ${f.roleId === r.Id ? 'selected' : ''}>${escapeHtml(r.Name)}</option>`).join('')}
+          </select></div>
+          <div class="field-row"><label>Status</label><select id="fStatus">
+            <option value="">Any status</option>
+            ${['expected', 'confirmed', 'no_show'].map((s) => `<option value="${s}" ${f.status === s ? 'selected' : ''}>${VISIT_STATUS_LABEL[s]}</option>`).join('')}
+          </select></div>
+          <div class="field-row"><label>Source</label><select id="fSource">
+            <option value="">Any source</option>
+            ${['text', 'manual', 'calendar'].map((s) => `<option value="${s}" ${f.source === s ? 'selected' : ''}>${s}</option>`).join('')}
+          </select></div>
+          <div class="field-row"><label>Called ahead</label><select id="fCalled">
+            <option value="">Either</option>
+            <option value="true" ${f.calledAhead === true ? 'selected' : ''}>Yes</option>
+            <option value="false" ${f.calledAhead === false ? 'selected' : ''}>No</option>
+          </select></div>
+          <div class="btn-row"><button type="button" class="btn btn-secondary" id="clearFilters">Clear filters</button></div>
+        </div>
+      </div>
+
+      <div class="card">
+        ${visits.length ? visits.map((v) => visitRowHtml(v)).join('') : '<p class="muted">No visits match.</p>'}
+      </div>`);
+
+    document.getElementById('filterToggle').addEventListener('click', () => { showFilters = !showFilters; draw(); });
+    document.getElementById('quickAddBtn').addEventListener('click', () => openVisitForm({}, async () => { await load(); draw(); }));
+    document.getElementById('clearFilters')?.addEventListener('click', async () => {
+      for (const k of Object.keys(f)) f[k] = null;
+      await load(); draw();
+    });
+    app.querySelectorAll('[data-visit]').forEach((el) => el.addEventListener('click', async () => {
+      const d = await api(`/api/pg/visits/${el.dataset.visit}`);
+      openVisitForm({ visit: d.visit }, async () => { await load(); draw(); });
+    }));
+
+    if (showFilters) {
+      mountPersonPicker(document.getElementById('fPerson'), {
+        people: [...people], value: f.personId,
+        onSelect: async (p) => { f.personId = p ? p.Id : null; await load(); draw(); },
+      });
+      mountGroupPicker(document.getElementById('fGroup'), {
+        groups: [...groups], value: f.groupId,
+        onSelect: async (g) => { f.groupId = g ? g.Id : null; await load(); draw(); },
+      });
+      const bind = (id, key, cast = (v) => v || null) => {
+        document.getElementById(id)?.addEventListener('change', async (e) => {
+          f[key] = cast(e.target.value); await load(); draw();
+        });
+      };
+      bind('fFrom', 'from'); bind('fTo', 'to');
+      bind('fRole', 'roleId', (v) => (v ? Number(v) : null));
+      bind('fStatus', 'status'); bind('fSource', 'source');
+      bind('fCalled', 'calledAhead', (v) => (v === '' ? null : v === 'true'));
+    }
+
+    // The queue's three answers.
+    app.querySelectorAll('.q-yes').forEach((b) => b.addEventListener('click', () => openConfirmForm(Number(b.dataset.id), { showedUp: true })));
+    app.querySelectorAll('.q-no').forEach((b) => b.addEventListener('click', async () => {
+      if (!await confirmDialog('Mark this as a no-show? It stays on the record — no-shows are part of the pattern.', { danger: false, confirmLabel: 'No-show' })) return;
+      try {
+        await api(`/api/pg/visits/${b.dataset.id}/confirm`, { method: 'POST', body: JSON.stringify({ showedUp: false }) });
+        toast('Marked no-show'); await load(); draw();
+      } catch (e) { toast(e.message, 5000); }
+    }));
+    app.querySelectorAll('.q-day').forEach((b) => b.addEventListener('click', () => openConfirmForm(Number(b.dataset.id), { showedUp: true, askDate: true })));
+  }
+
+  // Confirming from the queue. "Different day" is this same form with the date open for
+  // editing — a corrected date, not a separate concept.
+  function openConfirmForm(visitId, { showedUp, askDate = false }) {
+    const v = awaiting.find((x) => x.Id === visitId);
+    if (!v) return;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" style="max-width:520px;width:95%">
+        <h3 style="margin:0 0 4px">${escapeHtml(v.Who)} — ${askDate ? 'which day?' : 'confirm the visit'}</h3>
+        <p class="muted" style="margin:0 0 10px;font-size:0.85rem">Expected ${escapeHtml(v.VisitDate)}.</p>
+        <div class="field-row"><label>Date</label><input type="date" id="cDate" value="${escapeHtml(v.VisitDate)}" /></div>
+        <div class="field-row"><label>Arrival time <span class="muted">(leave blank for “not stated”)</span></label><input type="time" id="cTime" /></div>
+        <div class="field-row"><label>Duration (minutes)</label><input type="number" id="cDur" min="1" placeholder="optional" /></div>
+        ${v.IsGroup ? `<div class="field-row"><label>Headcount</label><input type="number" id="cHead" min="1" value="${v.Headcount || ''}" /></div>` : ''}
+        <div class="field-row"><label>Notes</label><textarea id="cNotes" rows="2">${escapeHtml(v.Notes || '')}</textarea></div>
+        <div class="field-row"><label class="muted" style="font-size:0.85rem">📷 Photos
+          <input type="file" id="cPhotos" accept="image/*" multiple style="display:none" /></label>
+          <div id="cPhotoNames" class="muted" style="font-size:0.8rem"></div>
+        </div>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+          <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary" id="cSave">Confirm visit</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const fileEl = overlay.querySelector('#cPhotos');
+    fileEl.addEventListener('change', () => {
+      overlay.querySelector('#cPhotoNames').textContent = [...fileEl.files].map((x) => x.name).join(', ');
+    });
+    overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
+    overlay.querySelector('#cSave').addEventListener('click', async () => {
+      const attachmentIds = await uploadVisitPhotos(fileEl);
+      try {
+        await api(`/api/pg/visits/${visitId}/confirm`, {
+          method: 'POST',
+          body: JSON.stringify({
+            showedUp,
+            visitDate: overlay.querySelector('#cDate').value || null,
+            arrivalTime: overlay.querySelector('#cTime').value || null,
+            durationMinutes: overlay.querySelector('#cDur').value ? Number(overlay.querySelector('#cDur').value) : null,
+            headcount: overlay.querySelector('#cHead')?.value ? Number(overlay.querySelector('#cHead').value) : null,
+            notes: overlay.querySelector('#cNotes').value,
+            attachmentIds,
+          }),
+        });
+        overlay.remove(); toast('Visit confirmed'); await load(); draw();
+      } catch (e) { toast(e.message, 5000); }
+    });
+  }
+
+  await load();
+  draw();
+}
+
+function formatVisitDay(iso) {
+  if (!iso) return '';
+  // "Thu Oct 30" — the queue asks about a day, and a weekday is how anyone remembers one.
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(y, m - 1, d);
+  return dt.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+async function uploadVisitPhotos(fileEl) {
+  if (!fileEl || !fileEl.files || !fileEl.files.length) return [];
+  const ids = [];
+  for (const file of fileEl.files) {
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const r = await fetch('/api/pg/attachments', { method: 'POST', body: fd });
+      if (!r.ok) throw new Error('upload failed');
+      const d = await r.json();
+      if (d.attachment?.Id) ids.push(d.attachment.Id);
+    } catch { toast(`Could not upload ${file.name}`, 4000); }
+  }
+  return ids;
+}
+
+// One form for logging a visit and for editing one. Used by the quick entry, by a row tap, and
+// by the Incoming confirm screen in §5.
+async function openVisitForm({ visit = null, prefill = {} } = {}, onSaved = () => {}) {
+  // loadAllAssets()/assetOptionOf are the app's existing asset-picker plumbing — cached
+  // across the session, so opening this form repeatedly costs one fetch.
+  const [p, g, assets] = await Promise.all([
+    api('/api/pg/people'), api('/api/pg/groups'), loadAllAssets(),
+  ]);
+  const people = p.people || []; const groups = g.groups || [];
+  const editing = !!visit;
+  const today = new Date();
+  const isoToday = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  const hhmm = `${String(today.getHours()).padStart(2, '0')}:${String(today.getMinutes()).padStart(2, '0')}`;
+
+  let personId = visit?.PersonId ?? prefill.personId ?? null;
+  let groupId = visit?.GroupId ?? prefill.groupId ?? null;
+  let assetId = visit?.AssetId ?? prefill.assetId ?? null;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal-box" style="max-width:560px;width:95%">
+      <h3 style="margin:0 0 10px">${editing ? 'Edit visit' : 'Log a visit'}</h3>
+      ${prefill.messageText ? `<div class="card" style="margin:0 0 10px;background:var(--surface-alt)">
+        <div class="muted" style="font-size:0.78rem">The text this came from</div>
+        <div style="font-size:0.9rem;white-space:pre-wrap">${escapeHtml(prefill.messageText)}</div>
+      </div>` : ''}
+      <div class="view-toggle" style="margin-bottom:8px">
+        <button type="button" class="view-toggle-btn ${groupId ? '' : 'active'}" data-who="person">A person</button>
+        <button type="button" class="view-toggle-btn ${groupId ? 'active' : ''}" data-who="group">A group</button>
+      </div>
+      <div class="field-row" id="whoPersonWrap" ${groupId ? 'hidden' : ''}><label>Who</label><div id="vPerson"></div></div>
+      <div class="field-row" id="whoGroupWrap" ${groupId ? '' : 'hidden'}><label>Which group</label><div id="vGroup"></div></div>
+      <div class="field-row" id="headWrap" ${groupId ? '' : 'hidden'}><label>Headcount</label><input type="number" id="vHead" min="1" value="${visit?.Headcount || prefill.headcount || ''}" /></div>
+      <div class="field-row"><label>Where <span class="muted">(cabin or area)</span></label><div id="vAsset"></div></div>
+      <div class="field-row" style="display:flex;gap:8px;flex-wrap:wrap">
+        <div style="flex:1 1 140px"><label>Date</label><input type="date" id="vDate" value="${escapeHtml(visit?.VisitDate || prefill.visitDate || isoToday)}" /></div>
+        <div style="flex:1 1 140px"><label>Arrival <span class="muted">(optional)</span></label><input type="time" id="vTime" value="${escapeHtml(visit?.ArrivalTime || prefill.arrivalTime || (editing ? '' : hhmm))}" /></div>
+      </div>
+      <div class="field-row"><label>Duration (minutes)</label><input type="number" id="vDur" min="1" value="${visit?.DurationMinutes || ''}" placeholder="optional" /></div>
+      <div class="field-row"><label>Reason</label><input type="text" id="vReason" value="${escapeHtml(visit?.Reason || prefill.reason || '')}" placeholder="e.g. cleaning out his cabin" /></div>
+      <div class="field-row"><label>Called ahead?</label><select id="vCalled">
+        <option value="false" ${visit ? (visit.CalledAhead ? '' : 'selected') : 'selected'}>No</option>
+        <option value="true" ${visit?.CalledAhead ? 'selected' : ''}>Yes</option>
+      </select>
+      <p class="muted" style="font-size:0.8rem;margin:4px 0 0">Defaults to no — a visit nobody scheduled wasn't called ahead.</p></div>
+      <div class="field-row"><label>Notes</label><textarea id="vNotes" rows="2">${escapeHtml(visit?.Notes || '')}</textarea></div>
+      <div class="field-row"><label class="muted" style="font-size:0.85rem">📷 Photos
+        <input type="file" id="vPhotos" accept="image/*" multiple style="display:none" /></label>
+        <div id="vPhotoNames" class="muted" style="font-size:0.8rem"></div>
+      </div>
+      <div id="expectedHint" class="muted" style="font-size:0.85rem"></div>
+      <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+        ${editing ? '<button type="button" class="btn btn-danger" id="vDelete">Delete</button>' : ''}
+        <button type="button" class="btn btn-secondary modal-cancel">Cancel</button>
+        <button type="button" class="btn btn-primary" id="vSave">${editing ? 'Save' : 'Log visit'}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+
+  const setWho = (kind) => {
+    overlay.querySelector('#whoPersonWrap').hidden = kind !== 'person';
+    overlay.querySelector('#whoGroupWrap').hidden = kind !== 'group';
+    overlay.querySelector('#headWrap').hidden = kind !== 'group';
+    if (kind === 'person') groupId = null; else personId = null;
+    overlay.querySelectorAll('[data-who]').forEach((b) => b.classList.toggle('active', b.dataset.who === kind));
+  };
+  overlay.querySelectorAll('[data-who]').forEach((b) => b.addEventListener('click', () => setWho(b.dataset.who)));
+
+  mountPersonPicker(overlay.querySelector('#vPerson'), {
+    people: [...people], value: personId,
+    onSelect: (p2) => { personId = p2 ? p2.Id : null; checkExpected(); },
+  });
+  mountGroupPicker(overlay.querySelector('#vGroup'), {
+    groups: [...groups], value: groupId,
+    onSelect: (g2) => { groupId = g2 ? g2.Id : null; checkExpected(); },
+  });
+  mountCombobox(overlay.querySelector('#vAsset'), {
+    options: (assets || []).map(assetOptionOf),
+    value: assetId, placeholder: 'Cabin or area…',
+    onSelect: (opt) => { assetId = opt ? opt.value : null; },
+    onClear: () => { assetId = null; },
+  });
+
+  // If this visit is already expected, offer to confirm that one instead of adding a second
+  // row beside it (§2).
+  let matched = null;
+  async function checkExpected() {
+    const hint = overlay.querySelector('#expectedHint');
+    hint.textContent = '';
+    matched = null;
+    if (editing) return;
+    const date = overlay.querySelector('#vDate').value;
+    if (!date || (!personId && !groupId)) return;
+    try {
+      const params = new URLSearchParams({ visitDate: date });
+      if (personId) params.set('personId', String(personId));
+      if (groupId) params.set('groupId', String(groupId));
+      const d = await api(`/api/pg/visits/matching-expected?${params}`);
+      if (!d.match) return;
+      matched = d.match;
+      hint.innerHTML = `This was already expected on <strong>${escapeHtml(matched.VisitDate)}</strong>.
+        <button type="button" class="btn btn-secondary" id="useExpected" style="margin-left:6px">Confirm that one instead</button>`;
+      overlay.querySelector('#useExpected').addEventListener('click', async () => {
+        const attachmentIds = await uploadVisitPhotos(overlay.querySelector('#vPhotos'));
+        try {
+          await api(`/api/pg/visits/${matched.Id}/confirm`, {
+            method: 'POST',
+            body: JSON.stringify({
+              showedUp: true, visitDate: date,
+              arrivalTime: overlay.querySelector('#vTime').value || null,
+              notes: overlay.querySelector('#vNotes').value, attachmentIds,
+            }),
+          });
+          overlay.remove(); toast('Confirmed the expected visit'); onSaved();
+        } catch (e) { toast(e.message, 5000); }
+      });
+    } catch { /* the hint is a convenience */ }
+  }
+  overlay.querySelector('#vDate').addEventListener('change', checkExpected);
+
+  const fileEl = overlay.querySelector('#vPhotos');
+  fileEl.addEventListener('change', () => {
+    overlay.querySelector('#vPhotoNames').textContent = [...fileEl.files].map((x) => x.name).join(', ');
+  });
+  overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
+  overlay.querySelector('#vDelete')?.addEventListener('click', async () => {
+    if (!await confirmDialog('Delete this visit? This cannot be undone.')) return;
+    try { await api(`/api/pg/visits/${visit.Id}`, { method: 'DELETE' }); overlay.remove(); toast('Deleted'); onSaved(); }
+    catch (e) { toast(e.message, 5000); }
+  });
+  overlay.querySelector('#vSave').addEventListener('click', async () => {
+    if (!personId && !groupId) return toast('Pick a person or a group', 4000);
+    const attachmentIds = editing ? [] : await uploadVisitPhotos(fileEl);
+    const body = {
+      personId, groupId,
+      headcount: overlay.querySelector('#vHead')?.value ? Number(overlay.querySelector('#vHead').value) : null,
+      assetId,
+      visitDate: overlay.querySelector('#vDate').value,
+      arrivalTime: overlay.querySelector('#vTime').value || null,
+      durationMinutes: overlay.querySelector('#vDur').value ? Number(overlay.querySelector('#vDur').value) : null,
+      reason: overlay.querySelector('#vReason').value,
+      calledAhead: overlay.querySelector('#vCalled').value === 'true',
+      notes: overlay.querySelector('#vNotes').value,
+      source: visit?.Source || prefill.source || 'manual',
+      attachmentIds,
+    };
+    try {
+      if (editing) await api(`/api/pg/visits/${visit.Id}`, { method: 'PATCH', body: JSON.stringify(body) });
+      else await api('/api/pg/visits', { method: 'POST', body: JSON.stringify(body) });
+      overlay.remove(); toast(editing ? 'Saved' : 'Visit logged'); onSaved();
+    } catch (e) { toast(e.message, 5000); }
+  });
 }
 
 // ---------- People & Groups (text-intake brief §1) ----------

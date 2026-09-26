@@ -228,28 +228,41 @@ export async function buildWorkPerformedReportPg({ from, to }) {
 // against a roster.
 export async function buildVisitorActivityReportPg({ from, to }) {
   const visits = await getVisitorActivityRawData({ from, to });
-  const byPerson = new Map();
+  const byVisitor = new Map();
   for (const v of visits) {
-    const isHolder = !!v.CabinHolderId;
-    const key = isHolder ? `holder:${v.CabinHolderId}` : `visitor:${v.VisitorName.trim().toLowerCase().replace(/\s+/g, ' ')}`;
-    if (!byPerson.has(key)) {
-      byPerson.set(key, {
-        name: isHolder ? (v.CabinHolderName || v.VisitorName) : v.VisitorName.trim(),
-        isCabinHolder: isHolder, visits: [], assetCounts: new Map(),
+    // Group by identity. Every visitor is now a person or a group record, so this no longer
+    // has to normalise the spelling of a typed name to guess that two rows are one visitor.
+    const key = v.IsGroup ? `group:${v.GroupId}` : `person:${v.PersonId}`;
+    if (!byVisitor.has(key)) {
+      byVisitor.set(key, {
+        name: v.VisitorName,
+        isCabinHolder: !!v.IsCabinHolder,
+        isGroup: !!v.IsGroup,
+        visits: [], assetCounts: new Map(), headcounts: [],
       });
     }
-    const person = byPerson.get(key);
-    person.visits.push({
-      date: v.OccurrenceDate, endDate: v.OccurrenceEndDate !== v.OccurrenceDate ? v.OccurrenceEndDate : null,
-      assetName: v.AssetName, purpose: v.VisitPurpose, visitorName: v.VisitorName, eventId: v.Id,
+    const visitor = byVisitor.get(key);
+    visitor.visits.push({
+      date: v.OccurrenceDate, endDate: null,
+      assetName: v.AssetName || v.Where, purpose: v.VisitPurpose, visitorName: v.VisitorName,
+      visitId: v.VisitId, headcount: v.Headcount, calledAhead: v.CalledAhead, source: v.Source,
     });
-    const assetLabel = v.AssetName || 'No asset recorded';
-    person.assetCounts.set(assetLabel, (person.assetCounts.get(assetLabel) || 0) + 1);
+    if (v.Headcount) visitor.headcounts.push(v.Headcount);
+    const assetLabel = v.AssetName || v.Where || 'No asset recorded';
+    visitor.assetCounts.set(assetLabel, (visitor.assetCounts.get(assetLabel) || 0) + 1);
   }
-  const people = [...byPerson.values()].map((p) => ({
-    name: p.name, isCabinHolder: p.isCabinHolder, visitCount: p.visits.length, visits: p.visits,
+  const people = [...byVisitor.values()].map((p) => ({
+    name: p.name, isCabinHolder: p.isCabinHolder, isGroup: p.isGroup,
+    visitCount: p.visits.length, visits: p.visits,
+    // "usually ~15" for a group, from the visits that recorded a headcount.
+    typicalHeadcount: p.headcounts.length
+      ? Math.round(p.headcounts.reduce((a, b) => a + b, 0) / p.headcounts.length) : null,
+    totalPeople: p.headcounts.length ? p.headcounts.reduce((a, b) => a + b, 0) : null,
     assets: [...p.assetCounts.entries()].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)),
   })).sort((a, b) => b.visitCount - a.visitCount || a.name.localeCompare(b.name));
+  // Cabin Holders stays what it always was: people who hold a cabin. A group holds none, so
+  // groups sit with the other visitors rather than inventing a third section the report's
+  // renderers do not know about.
   const holders = people.filter((p) => p.isCabinHolder);
   const oneOff = people.filter((p) => !p.isCabinHolder);
   return {
@@ -257,6 +270,7 @@ export async function buildVisitorActivityReportPg({ from, to }) {
     totalVisits: visits.length,
     holderVisits: holders.reduce((s, p) => s + p.visitCount, 0),
     oneOffVisits: oneOff.reduce((s, p) => s + p.visitCount, 0),
+    groupVisits: people.filter((p) => p.isGroup).reduce((s, p) => s + p.visitCount, 0),
   };
 }
 
