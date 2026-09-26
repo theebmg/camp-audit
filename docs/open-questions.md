@@ -349,3 +349,70 @@ The authoritative five, from `information_schema`: `job_lines`,
 `work_order_template_lines`, `audit_remedies`, `audit_answer_remedies`,
 `expense_allocations`. **Zero rows in any of them are funded by a cabin holder today**, so the
 merge risk is latent, not live — but it would be silent when it arrived.
+
+---
+
+# Redesign: people separate from holdings — decided, pending Ben's review
+
+Q9 (alias table) and the `not_a_person` flag are **withdrawn**. Ben's redesign removes the
+premise they were patching: `cabin_holders` is a list of cabin *holdings*, derived from
+imported asset text, containing labels, roles, organizations and crews as well as humans.
+People now live in their own table, linked to holdings by `cabin_holder_people`. The sync keeps
+running untouched because it only manages holdings, so nothing needs defeating.
+
+## Q11 — Variant pairings made during seeding
+
+Two holdings pairs collapse to one person each, found by normalising both names — lowercase,
+drop punctuation and anything parenthesised, split on comma / `&` / `and` / slash / plus, sort
+the parts, compare:
+
+| person | holdings | cabins |
+|---|---|---|
+| **Ben Greenawalt** | `Ben Greenawalt` + `Greenawalt, Ben` | Ebenezer 22, Peace 18 |
+| **Jill Martin** | `Martin, Jill` + `Jill Martin` | Tabernacle 13, Weatherwax 30 Upstairs |
+
+That is the complete list. 157 people from 159 non-label holdings.
+
+### Near-misses deliberately NOT linked
+
+The same pass surfaced three pairs that differ by one character. None were auto-linked,
+because two of them are probably one person and one certainly is not — and guessing wrong
+merges two real people:
+
+| pair | reading |
+|---|---|
+| `Caylee Severence` (#86) / `Severance, Caylee` (#107) | **Almost certainly one person**, spelt two ways. Left separate for Ben to merge in the UI. |
+| `Strine, Brett` (#26) / `Strike, Brett` (#160) | Could be a typo of one person, or two people. Different cabins (Olde Dorm 03, Annex 05). |
+| `Spain, Sandy` (#63) / `Spain, Randy` (#64) | **Two different people.** Included only to show the detector is loose enough to surface real pairs and was right not to act on any of them. |
+
+## Q12 — The 14 label holdings stay unlinked
+
+Same 14 as before, now simply holdings with no person rather than flagged people: `Storage`,
+`Blank Lot`, `Historical`, `Nurse's Cabin`, `Matron's Room`, `SongLeader`, `Youth Evangelist`,
+`Children's Evangelists`, `Children's Ministry - Blaine`, `Keene Crew`, `Full Cabin - Boyette`,
+`OMS`, `WGM Missions`, `Bethany Missions`.
+
+Per Ben's instruction the ambiguous ones **do** get a person: `Starbuck`, `Hill Evangelist`,
+`Rev. Greenawalt`, `Shiltz, George to Be Transitioned`, and every surname-only row (`Dearth`,
+`Grissom`, `McCoy`, `Patricks`, `Wight`, `Green`, `Grecar`, `Hutson`, `McCollough`, `Juneman`,
+`Desabato`, `Pecott`, `Kodie`).
+
+## Q13 — Person names are seeded verbatim, not reformatted
+
+A person seeded from the holding `Lapp, Jen` is named `Lapp, Jen`, not `Jen Lapp`. About 100 of
+the 157 are in `Last, First` order, so a People list will read that way.
+
+**Decided: leave them.** Reformatting 157 names is a judgement about how Ben wants his own
+people list to read, and it is trivially done later with one UPDATE once he says so — whereas
+un-reformatting a name that was actually `Last, First` for a reason is not. The two variant
+pairs are the exception: they take the natural `First Last` spelling, because a name had to be
+chosen between the two.
+
+**If Ben wants them normalised:** say so and it is one migration. The duplicate check already
+treats both orders as equal, so nothing depends on the stored order.
+
+## Q14 — `people.name` is deliberately not unique
+
+`cabin_holders.name` is `UNIQUE`; `people.name` is not. Two real people can share a name, and
+§1's duplicate check ends in "create new anyway", which a unique constraint would refuse. The
+check is a warning, not an enforcement.

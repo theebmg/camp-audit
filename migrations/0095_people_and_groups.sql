@@ -1,39 +1,45 @@
--- People & Groups (text-intake brief §1).
+-- People & Groups (text-intake brief §1, redesigned).
 --
--- cabin_holders BECOMES the people table. It is not renamed and nothing is migrated out of
--- it, because two real foreign keys (assets.cabin_holder_id, calendar_events.cabin_holder_id)
--- and one soft reference with no FK at all (funding_ref_id where funding_source =
--- 'cabin_holder', on six tables) all point at it today. The UI calls them People; the table
--- keeps its name so none of that has to move. See docs/text-intake-analysis.md §0.2.
+-- cabin_holders is NOT the people table and is not touched here. It is a list of cabin
+-- HOLDINGS, derived from imported asset text by syncCabinHoldersFromAssets(), and it contains
+-- labels, roles, organizations and crews as well as humans. Converting it into a people table
+-- needed a not-a-person flag, an alias table, and a fight with the sync — three patches for
+-- one wrong premise. So people live in their own table and a link table joins them to the
+-- holdings they hold.
 --
--- Additive only. Every existing row keeps working with no roles and no contact details.
+-- Unchanged by this migration: cabin_holders rows, the sync, assets.cabin_holder_id,
+-- assets.lodge_holder, and funding (funding_source = 'cabin_holder' keeps pointing at
+-- cabin_holders). The sync can keep running because it only ever manages holdings.
+--
+-- "Cabin holder" is a DERIVED role: a person with at least one linked holding is one. It is
+-- deliberately absent from person_roles, so there is one source of truth for it.
 
 -- ── People ───────────────────────────────────────────────────────────────
-ALTER TABLE cabin_holders
-  -- The brief's basic fields; neither existed.
-  ADD COLUMN phone            text,
-  ADD COLUMN email            text,
-  -- Some of these rows are not people: cabin purposes (Storage, Nurse's Cabin), roles
-  -- (SongLeader, Youth Evangelist), organizations (OMS, WGM Missions) and placeholders
-  -- (Blank Lot). They are load-bearing — cabins point at them — so they stay, but they are
-  -- hidden from people pickers, the duplicate check and people counts.
-  ADD COLUMN not_a_person     boolean NOT NULL DEFAULT false,
-  -- Volunteer role fields. text[] of skill_catalog names, matching volunteers.skill, which
-  -- is the convention already in use rather than a new join table.
-  ADD COLUMN volunteer_skills text[] NOT NULL DEFAULT '{}',
-  ADD COLUMN volunteer_notes  text,
+CREATE TABLE people (
+  id               serial PRIMARY KEY,
+  -- NOT unique. Two real people can share a name, and §1's duplicate check ends in "create
+  -- new anyway" — which a unique constraint would refuse.
+  name             text NOT NULL,
+  phone            text,
+  email            text,
+  notes            text,
+  -- Volunteer role fields. text[] of skill_catalog names, matching volunteers.skill, which is
+  -- the convention already in use rather than a new join table.
+  volunteer_skills text[] NOT NULL DEFAULT '{}',
+  volunteer_notes  text,
   -- Vendor-contact role field. Vendors stay organizations; a person points at one.
-  ADD COLUMN vendor_id        integer REFERENCES vendors(id) ON DELETE SET NULL,
-  ADD COLUMN updated_at       timestamptz NOT NULL DEFAULT now();
-
-CREATE TRIGGER trg_cabin_holders_updated_at BEFORE UPDATE ON cabin_holders
+  vendor_id        integer REFERENCES vendors(id) ON DELETE SET NULL,
+  active           boolean NOT NULL DEFAULT true,
+  created_at       timestamptz NOT NULL DEFAULT now(),
+  updated_at       timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER trg_people_updated_at BEFORE UPDATE ON people
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-
--- Case-insensitive name lookup for the duplicate check and the picker's substring search.
-CREATE INDEX idx_cabin_holders_name_lower ON cabin_holders (lower(name));
-CREATE INDEX idx_cabin_holders_is_person ON cabin_holders (not_a_person) WHERE NOT not_a_person;
+-- Substring search in the picker, and the duplicate check.
+CREATE INDEX idx_people_name_lower ON people (lower(name));
 
 -- ── Roles: admin-editable, like every other list in this system ───────────
+-- No "Cabin holder" row: that role is derived from cabin_holder_people.
 CREATE TABLE person_roles (
   id          serial PRIMARY KEY,
   name        text NOT NULL UNIQUE,
@@ -42,26 +48,28 @@ CREATE TABLE person_roles (
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 INSERT INTO person_roles (name, sort_order) VALUES
-  ('Cabin holder',   10),
-  ('Volunteer',      20),
-  ('Camp attendee',  30),
-  ('Vendor contact', 40);
+  ('Volunteer',      10),
+  ('Camp attendee',  20),
+  ('Vendor contact', 30);
 
 CREATE TABLE person_role_assignments (
-  person_id  integer NOT NULL REFERENCES cabin_holders(id) ON DELETE CASCADE,
-  role_id    integer NOT NULL REFERENCES person_roles(id)  ON DELETE CASCADE,
+  person_id  integer NOT NULL REFERENCES people(id)       ON DELETE CASCADE,
+  role_id    integer NOT NULL REFERENCES person_roles(id) ON DELETE CASCADE,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (person_id, role_id)
 );
 CREATE INDEX idx_person_role_assignments_role ON person_role_assignments (role_id);
 
--- Anyone a cabin actually points at is a cabin holder. Derived from the data rather than
--- assumed: 174 of 340 assets carry a cabin_holder_id.
-INSERT INTO person_role_assignments (person_id, role_id)
-SELECT DISTINCT a.cabin_holder_id, (SELECT id FROM person_roles WHERE name = 'Cabin holder')
-FROM assets a
-WHERE a.cabin_holder_id IS NOT NULL
-ON CONFLICT DO NOTHING;
+-- ── People ↔ holdings ────────────────────────────────────────────────────
+-- Many-to-many both ways on purpose: a person can hold two cabins (two of them do today), and
+-- a holding can name more than one person later. A label holding simply has no row here.
+CREATE TABLE cabin_holder_people (
+  cabin_holder_id integer NOT NULL REFERENCES cabin_holders(id) ON DELETE CASCADE,
+  person_id       integer NOT NULL REFERENCES people(id)        ON DELETE CASCADE,
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (cabin_holder_id, person_id)
+);
+CREATE INDEX idx_cabin_holder_people_person ON cabin_holder_people (person_id);
 
 -- ── Groups ───────────────────────────────────────────────────────────────
 CREATE TABLE group_types (
@@ -80,9 +88,8 @@ INSERT INTO group_types (name, sort_order) VALUES
 CREATE TABLE groups (
   id                serial PRIMARY KEY,
   name              text NOT NULL,
-  type_id           integer REFERENCES group_types(id)   ON DELETE SET NULL,
-  -- Optional contact person, from People.
-  contact_person_id integer REFERENCES cabin_holders(id) ON DELETE SET NULL,
+  type_id           integer REFERENCES group_types(id) ON DELETE SET NULL,
+  contact_person_id integer REFERENCES people(id)      ON DELETE SET NULL,
   notes             text,
   active            boolean NOT NULL DEFAULT true,
   created_at        timestamptz NOT NULL DEFAULT now(),
@@ -93,33 +100,9 @@ CREATE TRIGGER trg_groups_updated_at BEFORE UPDATE ON groups
 CREATE INDEX idx_groups_name_lower ON groups (lower(name));
 CREATE INDEX idx_groups_contact ON groups (contact_person_id);
 
--- ── Name aliases — what makes a merge stick ──────────────────────────────
--- cabin_holders is a DERIVED roster: syncCabinHoldersFromAssets() runs before every list
--- read and re-inserts a row for every distinct assets.lodge_holder text. All 173 holders are
--- backed by that text today — not one was hand-made. So a merge that only repointed keys
--- would be silently undone on the next page load, because the sync would recreate the row it
--- had just removed.
---
--- The fix is an alias, not a rewrite of assets.lodge_holder. lodge_holder is the original
--- imported text and should stay as it was typed; what changes is which person that text
--- resolves to. A merge records the removed name as an alias of the kept person, the sync
--- stops inventing a row for an aliased name, and a future import of the same variant lands on
--- the right person by itself.
-CREATE TABLE cabin_holder_aliases (
-  id         serial PRIMARY KEY,
-  -- The spelling seen in the wild (e.g. 'Lapp, Jen'). Matched case-insensitively, trimmed.
-  name       text NOT NULL,
-  person_id  integer NOT NULL REFERENCES cabin_holders(id) ON DELETE CASCADE,
-  -- Why the alias exists, for the audit trail.
-  source     text NOT NULL DEFAULT 'merge' CHECK (source IN ('merge', 'manual')),
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE UNIQUE INDEX idx_cabin_holder_aliases_name ON cabin_holder_aliases (lower(btrim(name)));
-CREATE INDEX idx_cabin_holder_aliases_person ON cabin_holder_aliases (person_id);
-
 -- ── Merge log ────────────────────────────────────────────────────────────
--- Every merge is recorded, including exactly what was repointed and how many rows, because
--- the polymorphic funding references cannot be reconstructed afterwards from the schema.
+-- Every merge is recorded with what was repointed and how many rows, because a merge spans
+-- tables that no single foreign key describes.
 CREATE TABLE record_merges (
   id           serial PRIMARY KEY,
   kind         text NOT NULL CHECK (kind IN ('person', 'group')),
@@ -127,36 +110,76 @@ CREATE TABLE record_merges (
   kept_name    text NOT NULL,
   removed_id   integer NOT NULL,
   removed_name text NOT NULL,
-  -- { "table.column": rows_repointed, … } — the audit trail for a merge.
+  -- { "table.column": rows_repointed, … }
   repointed    jsonb NOT NULL DEFAULT '{}'::jsonb,
   merged_by    text,
   merged_at    timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_record_merges_kept ON record_merges (kind, kept_id);
 
--- ── Flag the rows that are not people ────────────────────────────────────
--- Chosen by reading all 173 names, not by pattern match. Purposes, roles, organizations and
--- placeholders. Listed in docs/open-questions.md for Ben's review; anything ambiguous —
--- surname-only rows like Starbuck or Dearth, "Hill Evangelist", "Rev. Greenawalt",
--- "Shiltz, George to Be Transitioned" — is deliberately LEFT as a person.
-UPDATE cabin_holders SET not_a_person = true WHERE name IN (
-  'Storage',                      -- cabin purpose
-  'Blank Lot',                    -- placeholder
-  'Historical',                   -- cabin purpose
-  'Nurse''s Cabin',               -- cabin purpose
-  'Matron''s Room',               -- cabin purpose
-  'SongLeader',                   -- role
-  'Youth Evangelist',             -- role
-  'Children''s Evangelists',      -- role
-  'Children''s Ministry - Blaine', -- ministry/purpose label
-  'Keene Crew',                   -- a crew, not a person
-  'Full Cabin - Boyette',         -- cabin label
-  'OMS',                          -- organization
-  'WGM Missions',                 -- organization
-  'Bethany Missions'              -- organization
+-- ── Calendar visit events point at people and groups ─────────────────────
+-- visitor_name / visitor_contact stay for now: they are what the Google sync builds its
+-- summary from, and the board report still reads them until §2 repoints Visitor Activity.
+ALTER TABLE calendar_events
+  ADD COLUMN person_id integer REFERENCES people(id) ON DELETE SET NULL,
+  ADD COLUMN group_id  integer REFERENCES groups(id) ON DELETE SET NULL;
+CREATE INDEX idx_calendar_events_person ON calendar_events (person_id) WHERE person_id IS NOT NULL;
+CREATE INDEX idx_calendar_events_group  ON calendar_events (group_id)  WHERE group_id  IS NOT NULL;
+
+-- ── Seed one person per holding that names a human ───────────────────────
+-- Three rules, in order:
+--   1. The 14 label holdings get no person. Matched by exact name — chosen by reading all 173,
+--      not by pattern: cabin purposes, roles, organizations, a crew, two labels.
+--   2. Two exact variant pairs collapse to one person each, because the same human holds two
+--      cabins under two spellings. Found by normalising: lowercase, drop punctuation, split on
+--      comma / & / and / slash / plus, sort the parts, compare.
+--   3. Everything else gets one person, named exactly as the holding is named. Names are NOT
+--      reformatted — "Lapp, Jen" stays "Lapp, Jen" — because silently rewriting 157 names is
+--      Ben's call, not a migration's. Logged as a question.
+CREATE TEMP TABLE seed_map (cabin_holder_id integer, person_name text) ON COMMIT DROP;
+
+INSERT INTO seed_map (cabin_holder_id, person_name)
+SELECT c.id,
+       CASE
+         -- Ben Greenawalt: Ebenezer 22 and Peace 18.
+         WHEN c.name IN ('Ben Greenawalt', 'Greenawalt, Ben') THEN 'Ben Greenawalt'
+         -- Jill Martin: Tabernacle 13 and Weatherwax 30 Upstairs.
+         WHEN c.name IN ('Martin, Jill', 'Jill Martin')       THEN 'Jill Martin'
+         ELSE c.name
+       END
+FROM cabin_holders c
+WHERE c.name NOT IN (
+  'Storage',                       -- cabin purpose
+  'Blank Lot',                     -- placeholder
+  'Historical',                    -- cabin purpose
+  'Nurse''s Cabin',                -- cabin purpose
+  'Matron''s Room',                -- cabin purpose
+  'SongLeader',                    -- role
+  'Youth Evangelist',              -- role
+  'Children''s Evangelists',       -- role
+  'Children''s Ministry - Blaine',  -- ministry/purpose label
+  'Keene Crew',                    -- a crew, not a person
+  'Full Cabin - Boyette',          -- cabin label
+  'OMS',                           -- organization
+  'WGM Missions',                  -- organization
+  'Bethany Missions'               -- organization
 );
 
--- A row that is not a person cannot hold a role.
-DELETE FROM person_role_assignments pra
-USING cabin_holders c
-WHERE c.id = pra.person_id AND c.not_a_person;
+INSERT INTO people (name)
+SELECT DISTINCT person_name FROM seed_map;
+
+INSERT INTO cabin_holder_people (cabin_holder_id, person_id)
+SELECT s.cabin_holder_id, p.id
+FROM seed_map s
+JOIN people p ON p.name = s.person_name;
+
+-- ── Convert the one existing visit to a person link ──────────────────────
+-- Event 18, "Rebecca Conley Visit", 2026-09-17, visitor_name 'Conley, Rebecca',
+-- cabin_holder_id 51. Resolved through the holding link rather than by name matching, so it
+-- lands on the person that holding just seeded.
+UPDATE calendar_events e
+SET person_id = chp.person_id
+FROM cabin_holder_people chp
+WHERE e.cabin_holder_id = chp.cabin_holder_id
+  AND e.visitor_name IS NOT NULL
+  AND e.person_id IS NULL;
