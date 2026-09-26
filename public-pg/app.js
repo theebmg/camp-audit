@@ -9758,7 +9758,10 @@ async function renderPeople(params = {}) {
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
           <h3 style="margin:0">People</h3>
-          <button type="button" class="btn btn-primary" id="addPersonBtn">＋ Add person</button>
+          <div class="btn-row" style="margin:0">
+            <a class="btn btn-secondary" id="peopleCsv" href="/api/pg/people/export.csv">CSV</a>
+            <button type="button" class="btn btn-primary" id="addPersonBtn">＋ Add person</button>
+          </div>
         </div>
         <p class="muted" style="margin:6px 0 0">
           Actual humans. A person who holds a cabin shows the cabin; the cabin roster itself
@@ -10166,7 +10169,10 @@ async function renderGroups() {
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
           <h3 style="margin:0">Groups</h3>
-          <button type="button" class="btn btn-primary" id="addGroupBtn">＋ Add group</button>
+          <div class="btn-row" style="margin:0">
+            <a class="btn btn-secondary" id="groupsCsv" href="/api/pg/groups/export.csv">CSV</a>
+            <button type="button" class="btn btn-primary" id="addGroupBtn">＋ Add group</button>
+          </div>
         </div>
         <p class="muted" style="margin:6px 0 0">Youth groups, churches, work teams — anything that visits as a group rather than a person.</p>
         <div class="field-row"><input type="search" id="groupQ" value="${escapeHtml(q)}" placeholder="Search group name" /></div>

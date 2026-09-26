@@ -1050,6 +1050,22 @@ router.get('/maintenance-log', async (req, res, next) => {
 //    scoped to a faceted filter + CSV export, with another entity addable
 //    later by following the same pattern (see reports.js). ────────────────
 
+
+// ---- CSV ----
+// One writer for every hand-rolled export, so quoting and escaping cannot differ between
+// them. The reports explorer has its own for user-chosen columns; this is for the fixed-shape
+// lists (people, groups, visits) that are not reporting surfaces.
+function sendCsv(res, filename, header, rows) {
+  const cell = (v) => {
+    const t = v === null || v === undefined ? '' : String(v);
+    return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+  };
+  const body = [header.join(','), ...rows.map((r) => r.map(cell).join(','))].join('\n');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}-${new Date().toISOString().slice(0, 10)}.csv"`);
+  res.send(body);
+}
+
 async function getReportRowsAndSpecs(entity) {
   if (entity === 'assets') {
     const raw = await getAssetsReportRawData();
@@ -3250,21 +3266,14 @@ router.get('/visits/export.csv', async (req, res, next) => {
       status: q.status || null, source: q.source || null,
       limit: 10000,
     });
-    const cell = (v) => {
-      const s = v === null || v === undefined ? '' : String(v);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const header = ['Date', 'Arrival', 'Who', 'Person or group', 'Headcount', 'Where',
-      'Reason', 'Called ahead', 'Status', 'Source', 'Duration (min)', 'Notes', 'Confirmed by'];
-    const lines = [header.join(',')];
-    for (const v of visits) {
-      lines.push([v.VisitDate, v.ArrivalTime || 'not stated', v.Who, v.IsGroup ? 'group' : 'person',
+    sendCsv(res, 'visits',
+      ['Date', 'Arrival', 'Who', 'Person or group', 'Headcount', 'Where',
+        'Reason', 'Called ahead', 'Status', 'Source', 'Duration (min)', 'Notes', 'Confirmed by'],
+      visits.map((v) => [
+        v.VisitDate, v.ArrivalTime || 'not stated', v.Who, v.IsGroup ? 'group' : 'person',
         v.Headcount, v.Where, v.Reason, v.CalledAhead ? 'yes' : 'no', v.Status, v.Source,
-        v.DurationMinutes, v.Notes, v.ConfirmedBy].map(cell).join(','));
-    }
-    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="visits-${new Date().toISOString().slice(0, 10)}.csv"`);
-    res.send(lines.join('\n'));
+        v.DurationMinutes, v.Notes, v.ConfirmedBy,
+      ]));
   } catch (e) { next(e); }
 });
 
@@ -3328,6 +3337,48 @@ router.get('/text-intake/settings', async (req, res, next) => {
 });
 router.patch('/text-intake/settings', async (req, res, next) => {
   try { res.json({ settings: await updateTextIntakeSettings(req.body || {}) }); } catch (e) { next(e); }
+});
+
+
+// People and Groups had no CSV export; everything else Ben named did. Added rather than just
+// reported, because "confirm every major area has one" has a two-word answer otherwise.
+router.get('/people/export.csv', async (req, res, next) => {
+  try {
+    const people = await listPeople({
+      q: req.query.q || null,
+      roleId: req.query.roleId ? Number(req.query.roleId) : null,
+      includeInactive: req.query.includeInactive === 'true',
+      limit: 10000,
+    });
+    sendCsv(res, 'people',
+      ['Name', 'Phone', 'Email', 'Cabin holder', 'Roles', 'Cabins', 'Holdings',
+        'Volunteer skills', 'Visits', 'Last visit', 'Notes'],
+      people.map((p) => [
+        p.Name, p.Phone, p.Email, p.IsCabinHolder ? 'yes' : 'no',
+        (p.Roles || []).map((r) => r.Name).join('; '),
+        (p.Cabins || []).map((c) => c.Name).join('; '),
+        (p.Holdings || []).map((h) => h.Name).join('; '),
+        (p.VolunteerSkills || []).join('; '),
+        p.VisitCount || 0, p.LastVisit, p.Notes,
+      ]));
+  } catch (e) { next(e); }
+});
+
+router.get('/groups/export.csv', async (req, res, next) => {
+  try {
+    const groups = await listGroups({
+      q: req.query.q || null,
+      typeId: req.query.typeId ? Number(req.query.typeId) : null,
+      includeInactive: req.query.includeInactive === 'true',
+      limit: 10000,
+    });
+    sendCsv(res, 'groups',
+      ['Name', 'Type', 'Contact', 'Visits', 'Last visit', 'Typical headcount', 'Notes'],
+      groups.map((g) => [
+        g.Name, g.TypeName, g.ContactPersonName, g.VisitCount || 0, g.LastVisit,
+        g.TypicalHeadcount, g.Notes,
+      ]));
+  } catch (e) { next(e); }
 });
 
 export default router;
