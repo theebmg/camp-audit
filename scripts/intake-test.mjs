@@ -7,7 +7,7 @@
 // is NOT covered without Ben's key is listed in docs/open-questions.md.
 import crypto from 'crypto';
 import * as db from '/app/src/db.js';
-import { verifyQuoSignature } from '/app/src/routes/quo-inbound.js';
+import { verifyQuoSignature, readQuoMessage } from '/app/src/routes/quo-inbound.js';
 
 const TAG = 'ZZ-INTAKETEST';
 const fail = [];
@@ -64,37 +64,89 @@ const forms = ['+15551234567', '(555) 123-4567', '555.123.4567', '5551234567', '
 const normalized = forms.map(db.normalizePhone);
 ok(new Set(normalized).size === 1, `every spelling normalizes the same (got ${JSON.stringify([...new Set(normalized)])})`);
 
-console.log('\n## webhook signature (§3)');
-const SECRET = 'test-secret-not-the-real-one';
-const payload = JSON.stringify({ type: 'message.received', data: { from: '+15551234567', text: 'hello' } });
+console.log('\n## webhook signature (§3) — the real scheme, not the one I first assumed');
+// hmac;1;<timestamp-ms>;<base64 sig>, HMAC-SHA256 over "<ts>.<rawBody>", keyed with the
+// signing secret BASE64-DECODED, output base64. Confirmed against the live webhook.
+const SECRET = Buffer.from('a'.repeat(32)).toString('base64');
+const payload = JSON.stringify({ type: 'message.received', data: { object: { from: '+15551234567', to: '+17403974564', text: 'hello' } } });
 const rawBody = Buffer.from(payload);
-const ts = Math.floor(Date.now() / 1000);
-const sign = (body, t, secret = SECRET) =>
-  crypto.createHmac('sha256', secret).update(`${t}.`).update(body).digest('hex');
+const nowMs = Date.now();
+const sign = (body, ts, secret = SECRET) => {
+  const mac = crypto.createHmac('sha256', Buffer.from(secret, 'base64'))
+    .update(`${ts}.`).update(body).digest('base64');
+  return `hmac;1;${ts};${mac}`;
+};
 
-ok(verifyQuoSignature({ rawBody, signature: sign(rawBody, ts), timestamp: ts, secret: SECRET }).ok,
+ok(verifyQuoSignature({ rawBody, signatureHeader: sign(rawBody, nowMs), secret: SECRET, now: nowMs }).ok,
   'a correctly signed delivery is accepted');
-ok(verifyQuoSignature({ rawBody, signature: `sha256=${sign(rawBody, ts)}`, timestamp: ts, secret: SECRET }).ok,
-  'the sha256= prefixed form is accepted too');
-ok(!verifyQuoSignature({ rawBody, signature: sign(rawBody, ts, 'wrong'), timestamp: ts, secret: SECRET }).ok,
+ok(!verifyQuoSignature({ rawBody, signatureHeader: sign(rawBody, nowMs, Buffer.from('b'.repeat(32)).toString('base64')), secret: SECRET, now: nowMs }).ok,
   'a signature from the wrong secret is rejected');
-ok(!verifyQuoSignature({ rawBody, signature: sign(Buffer.from('tampered'), ts), timestamp: ts, secret: SECRET }).ok,
+ok(!verifyQuoSignature({ rawBody, signatureHeader: sign(Buffer.from('tampered'), nowMs), secret: SECRET, now: nowMs }).ok,
   'a body that does not match its signature is rejected');
-ok(!verifyQuoSignature({ rawBody, signature: sign(rawBody, ts), timestamp: ts, secret: null }).ok,
+ok(!verifyQuoSignature({ rawBody, signatureHeader: sign(rawBody, nowMs), secret: null, now: nowMs }).ok,
   'no configured secret means nothing is accepted');
-ok(!verifyQuoSignature({ rawBody, signature: null, timestamp: ts, secret: SECRET }).ok,
+ok(!verifyQuoSignature({ rawBody, signatureHeader: null, secret: SECRET, now: nowMs }).ok,
   'an unsigned delivery is rejected');
-const oldTs = ts - 3600;
-ok(!verifyQuoSignature({ rawBody, signature: sign(rawBody, oldTs), timestamp: oldTs, secret: SECRET }).ok,
+const oldMs = nowMs - 3600_000;
+ok(!verifyQuoSignature({ rawBody, signatureHeader: sign(rawBody, oldMs), secret: SECRET, now: nowMs }).ok,
   'a correctly signed but hour-old delivery is rejected as a replay');
+ok(!verifyQuoSignature({ rawBody, signatureHeader: `hmac;2;${nowMs};abc`, secret: SECRET, now: nowMs }).ok,
+  'an unknown signature version is rejected rather than guessed at');
+ok(!verifyQuoSignature({ rawBody, signatureHeader: 'not-the-right-shape', secret: SECRET, now: nowMs }).ok,
+  'a malformed header is rejected');
+// The trap my first implementation fell into: hex instead of base64, and the secret used raw.
+const hexSig = crypto.createHmac('sha256', SECRET).update(`${nowMs}.`).update(rawBody).digest('hex');
+ok(!verifyQuoSignature({ rawBody, signatureHeader: `hmac;1;${nowMs};${hexSig}`, secret: SECRET, now: nowMs }).ok,
+  'the hex-with-raw-secret form my first version computed is NOT accepted');
+
+console.log('\n## payload reading — the one place that knows the provider shape');
+const parsed = readQuoMessage(JSON.parse(payload));
+ok(parsed.from === '+15551234567', 'reads the sender');
+ok(parsed.to === '+17403974564', 'reads the receiving line');
+ok(parsed.text === 'hello', 'reads the text');
 
 console.log('\n## allowlist (§3) — fails closed');
-const before = await db.getTextIntakeSettings();
 await db.updateTextIntakeSettings({ allowedSenders: [] });
 ok(!await db.isAllowedSender('+15551234567'), 'an empty allowlist accepts nobody');
 await db.updateTextIntakeSettings({ allowedSenders: ['(555) 123-4567'] });
 ok(await db.isAllowedSender('+15551234567'), 'a number on the list is accepted in a different spelling');
 ok(!await db.isAllowedSender('+15559999999'), 'a number not on the list is not');
+
+const before = await db.getTextIntakeSettings();
+console.log('\n## the camp line filter — same workspace, two lines');
+const CAMP_ID = 'PN-camp-test';
+const OTHER_ID = 'PN-business-test';
+// Fails closed first: with no camp line set, nothing is the camp line.
+await db.updateTextIntakeSettings({ campLineId: null, campLineNumber: null });
+const unset = await db.getTextIntakeSettings();
+ok(!unset.CampLineId && !unset.CampLineNumber, 'the camp line can be cleared');
+// The route's rule, asserted directly: no camp line configured means no match is possible.
+const lineMatches = (settings, msg) => {
+  if (!settings.CampLineId && !settings.CampLineNumber) return false;
+  return (settings.CampLineId && msg.lineId && settings.CampLineId === msg.lineId)
+    || (settings.CampLineNumber && msg.to && db.normalizePhone(settings.CampLineNumber) === db.normalizePhone(msg.to));
+};
+ok(!lineMatches(unset, { lineId: CAMP_ID, to: '+17403974564' }),
+  'with no camp line configured, even the real camp line does not match — fails closed');
+
+await db.updateTextIntakeSettings({ campLineId: CAMP_ID, campLineNumber: '+17403974564' });
+const set = await db.getTextIntakeSettings();
+ok(lineMatches(set, { lineId: CAMP_ID, to: '+17403974564' }), 'a text to the camp line matches');
+ok(lineMatches(set, { lineId: null, to: '(740) 397-4564' }),
+  'and matches on the number in another spelling when no line id is reported');
+ok(!lineMatches(set, { lineId: OTHER_ID, to: '+13305299925' }),
+  'a text to the business line does NOT match, even though it is the same workspace');
+ok(!lineMatches(set, { lineId: null, to: '+13305299925' }), 'nor by its number');
+
+// And the end-to-end shape of it: a text from Ben's own cell to the OTHER line creates nothing.
+const wrongBefore = (await db.pool.query("select count(*)::int n from incoming_items where external_id like $1", [`${TAG}-wrongline%`])).rows[0].n;
+const msgToOther = { lineId: OTHER_ID, to: '+13305299925', from: '+15551234567' };
+if (!lineMatches(set, msgToOther)) {
+  await db.countWrongLine();   // what the route does instead of storing
+}
+const wrongAfter = (await db.pool.query("select count(*)::int n from incoming_items where external_id like $1", [`${TAG}-wrongline%`])).rows[0].n;
+ok(wrongAfter === wrongBefore, 'a text from my cell to the other workspace line creates NO incoming item');
+ok((await db.getTextIntakeSettings()).WrongLineCount > 0, 'and is counted for debugging instead');
 
 console.log('\n## idempotency (§3) — a retry changes nothing');
 const first = await db.createIncomingItem({
@@ -176,7 +228,7 @@ ok(dismissed.Status === 'dismissed', 'dismiss marks the item');
 ok((await db.getIncomingItem(r4.Item.Id)) !== null, 'and does not delete it');
 
 console.log('\n## cleanup');
-await db.updateTextIntakeSettings({ allowedSenders: before.AllowedSenders, sendConfirmation: before.SendConfirmation });
+await db.updateTextIntakeSettings({ allowedSenders: before.AllowedSenders, sendConfirmation: before.SendConfirmation, campLineId: before.CampLineId, campLineNumber: before.CampLineNumber });
 await purge();
 const left = (await db.pool.query(
   `select (select count(*) from incoming_items where external_id like $1) i,

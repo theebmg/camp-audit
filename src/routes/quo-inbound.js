@@ -1,72 +1,89 @@
 // Quo inbound webhook — message.received only (text-intake brief §3).
 //
-// Deliberately shaped like mail-dispatch.js, which has been doing this job for email: verify
-// the signature against the RAW body, check idempotency once, then hand off. The differences
-// are that Quo signs with an HMAC over a timestamped payload rather than Mailgun's token
-// scheme, and that a text has no Message-Id — so idempotency keys on the `webhook-id` header,
-// held by a UNIQUE column rather than by this file remembering to look.
+// THIS FILE IS THE ONLY QUO-SPECIFIC CODE IN THE SYSTEM. Everything downstream of it
+// (createIncomingItem, the settings, the Incoming inbox, filing) is provider-agnostic: it
+// deals in a sender, a receiving line, some text, a timestamp and some image URLs. Swapping
+// Quo for another texting provider means writing a sibling of this file and changing nothing
+// else.
 //
-// Secrets: QUO_SIGNING_SECRET and QUO_API_KEY are environment variables. They are never
-// written to the database, never logged, and never returned by any route.
+// Deliberately kept out of here, for that reason:
+//   - credentials            → environment variables (QUO_API_KEY, QUO_SIGNING_SECRET)
+//   - which numbers matter   → text_intake_settings, editable in the UI
+//   - what a message becomes → db.js's filing layer, which knows nothing about texting
+//
+// Quo is OpenPhone underneath: api.quo.com and api.openphone.com return byte-identical
+// responses for the same key. The signature scheme below is OpenPhone's, confirmed against
+// the real registered webhook rather than assumed.
 import express from 'express';
 import crypto from 'crypto';
 import {
-  createIncomingItem, isAllowedSender, countIgnoredSender, noteDelivery,
-  getTextIntakeSettings, normalizePhone,
+  createIncomingItem, isAllowedSender, countIgnoredSender, countWrongLine, noteDelivery,
+  getTextIntakeSettings, normalizePhone, linkAttachment, createAttachment,
 } from '../db.js';
 import { storeAttachment } from '../storage.js';
-import { createAttachment } from '../db.js';
 
 const router = express.Router();
 
-// A delivery older than this is refused even with a good signature, so a captured request
-// cannot be replayed later. Same window the mail ingest uses.
-const REPLAY_WINDOW_SECONDS = 5 * 60;
+const API_BASE = process.env.QUO_API_BASE || 'https://api.quo.com/v1';
+// A delivery older than this is refused even with a valid signature, so a captured request
+// cannot be replayed later.
+const REPLAY_WINDOW_MS = 5 * 60 * 1000;
 
-// Verify against the raw bytes. Parsing first and re-serialising would compare a signature to
-// something the sender never signed — key ordering and whitespace would differ.
-export function verifyQuoSignature({ rawBody, signature, timestamp, secret }) {
+// ── Signature ─────────────────────────────────────────────────────────────
+// Quo sends one header carrying everything:
+//
+//   openphone-signature: hmac;1;<timestamp-ms>;<base64 signature>
+//
+// The signature is HMAC-SHA256 over "<timestamp>.<rawBody>", keyed with the signing secret
+// BASE64-DECODED to its 32 raw bytes, and the result is base64 — not hex, and not the secret
+// used as a literal string. My first version got all three wrong, which would have rejected
+// every delivery while the secret was perfectly correct.
+export function verifyQuoSignature({ rawBody, signatureHeader, secret, now = Date.now() }) {
   if (!secret) return { ok: false, why: 'QUO_SIGNING_SECRET is not set' };
-  if (!signature) return { ok: false, why: 'no signature header' };
-  if (!timestamp) return { ok: false, why: 'no timestamp header' };
+  if (!signatureHeader) return { ok: false, why: 'no signature header' };
 
-  const age = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp));
-  if (!Number.isFinite(age)) return { ok: false, why: 'unparseable timestamp' };
-  if (age > REPLAY_WINDOW_SECONDS) return { ok: false, why: `timestamp ${age}s outside the replay window` };
+  const parts = String(signatureHeader).split(';');
+  if (parts.length !== 4) return { ok: false, why: 'signature header is not the expected 4 fields' };
+  const [scheme, version, timestamp, provided] = parts;
+  if (scheme !== 'hmac') return { ok: false, why: `unexpected scheme ${scheme}` };
+  if (version !== '1') return { ok: false, why: `unexpected signature version ${version}` };
 
-  const expected = crypto.createHmac('sha256', secret)
-    .update(`${timestamp}.`).update(rawBody).digest('hex');
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts)) return { ok: false, why: 'unparseable timestamp' };
+  const age = Math.abs(now - ts);
+  if (age > REPLAY_WINDOW_MS) return { ok: false, why: `timestamp ${Math.round(age / 1000)}s outside the replay window` };
 
-  // Providers send this variously as hex, as "sha256=hex", or as several space-separated
-  // candidates during a key rotation. Accept any that matches, in constant time.
-  const candidates = String(signature).split(/[\s,]+/).map((s) => s.replace(/^sha256=/i, '').trim()).filter(Boolean);
-  const expectedBuf = Buffer.from(expected, 'hex');
-  for (const cand of candidates) {
-    let candBuf;
-    try { candBuf = Buffer.from(cand, 'hex'); } catch { continue; }
-    if (candBuf.length === expectedBuf.length && crypto.timingSafeEqual(candBuf, expectedBuf)) {
-      return { ok: true };
-    }
-  }
-  return { ok: false, why: 'signature mismatch' };
+  const keyBytes = Buffer.from(secret, 'base64');
+  if (!keyBytes.length) return { ok: false, why: 'signing secret decoded to nothing' };
+
+  const expected = crypto.createHmac('sha256', keyBytes)
+    .update(`${timestamp}.`).update(rawBody).digest();
+
+  const providedBytes = Buffer.from(provided, 'base64');
+  if (providedBytes.length !== expected.length) return { ok: false, why: 'signature length mismatch' };
+  if (!crypto.timingSafeEqual(providedBytes, expected)) return { ok: false, why: 'signature mismatch' };
+  return { ok: true };
 }
 
-// Quo's shapes vary by API version; read defensively rather than assuming one.
-function readMessage(body) {
-  const d = body?.data || body?.message || body || {};
-  const from = d.from || d.sender || d.from_number || d.fromNumber
-    || (typeof d.participant === 'string' ? d.participant : d.participant?.number) || null;
-  const text = d.text ?? d.body ?? d.message ?? d.content ?? '';
-  const at = d.created_at || d.createdAt || d.timestamp || d.sent_at || body?.created_at || null;
-  const media = d.media || d.attachments || d.media_urls || d.mediaUrls || [];
-  const mediaUrls = (Array.isArray(media) ? media : [media])
-    .map((m) => (typeof m === 'string' ? m : m?.url || m?.uri || m?.href))
-    .filter(Boolean);
+// The one place that knows Quo's payload shape. Returns the provider-neutral fields the rest
+// of the system works in.
+export function readQuoMessage(body) {
+  const d = body?.data?.object || body?.data || body || {};
+  // `to` is the line it arrived ON; `from` is who sent it. phoneNumberId names the workspace
+  // line, which is the reliable identifier — a number can be formatted several ways.
+  const toRaw = Array.isArray(d.to) ? d.to[0] : d.to;
+  const media = d.media || d.attachments || [];
   return {
-    from,
-    text: typeof text === 'string' ? text : String(text ?? ''),
-    receivedAt: at ? new Date(at) : new Date(),
-    mediaUrls,
+    from: d.from || d.participants?.[0] || null,
+    to: toRaw || null,
+    lineId: d.phoneNumberId || d.phone_number_id || null,
+    direction: d.direction || null,
+    text: typeof d.text === 'string' ? d.text : (d.body || ''),
+    receivedAt: (d.createdAt || d.created_at) ? new Date(d.createdAt || d.created_at) : new Date(),
+    mediaUrls: (Array.isArray(media) ? media : [media])
+      .map((m) => (typeof m === 'string' ? m : m?.url))
+      .filter(Boolean),
+    externalId: body?.id || d.id || null,
   };
 }
 
@@ -75,14 +92,14 @@ async function ingestMedia(urls) {
   const ids = [];
   for (const url of urls.slice(0, 10)) {
     try {
-      const res = await fetch(url, { headers: process.env.QUO_API_KEY ? { Authorization: `Bearer ${process.env.QUO_API_KEY}` } : {} });
-      if (!res.ok) { console.warn(`[quo] media fetch ${res.status} for one attachment`); continue; }
-      const buf = Buffer.from(await res.arrayBuffer());
+      const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+      if (!res.ok) { console.warn(`[quo] media fetch ${res.status}`); continue; }
       const contentType = res.headers.get('content-type') || 'image/jpeg';
       if (!/^image\//.test(contentType)) { console.warn(`[quo] skipping non-image ${contentType}`); continue; }
+      const buf = Buffer.from(await res.arrayBuffer());
       const ext = contentType.split('/')[1]?.split(';')[0] || 'jpg';
-      // Same pipeline and the same option shape as the email photo ingest, so resizing and
-      // storage behave identically for a texted photo and an emailed one.
+      // Same pipeline and option shape as the email photo ingest, so a texted photo and an
+      // emailed one are resized and stored identically.
       const meta = await storeAttachment(buf, {
         filename: `text-${Date.now()}-${ids.length}.${ext}`,
         mimetype: contentType,
@@ -100,17 +117,17 @@ async function ingestMedia(urls) {
 
 // The confirmation reply (§7). Best effort: a failed reply must never fail the delivery, or
 // Quo retries a message that was already stored.
-async function sendConfirmation(toNumber) {
+async function sendConfirmation(toNumber, settings) {
   try {
-    const s = await getTextIntakeSettings();
-    if (!s.SendConfirmation) return;
+    if (!settings.SendConfirmation) return;
     if (!process.env.QUO_API_KEY) { console.warn('[quo] no API key, skipping confirmation'); return; }
-    const from = s.ReplyFromNumber;
-    if (!from) { console.warn('[quo] no reply-from number set, skipping confirmation'); return; }
-    const res = await fetch('https://api.quo.com/v1/messages', {
+    const from = settings.CampLineNumber || settings.ReplyFromNumber;
+    if (!from) { console.warn('[quo] no camp line number set, skipping confirmation'); return; }
+    const res = await fetch(`${API_BASE}/messages`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${process.env.QUO_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from, to: toNumber, text: s.ConfirmationText }),
+      body: JSON.stringify({ from, to: [toNumber], content: settings.ConfirmationText }),
+      signal: AbortSignal.timeout(15000),
     });
     if (!res.ok) console.warn(`[quo] confirmation reply failed: ${res.status}`);
   } catch (e) {
@@ -118,74 +135,98 @@ async function sendConfirmation(toNumber) {
   }
 }
 
-// req.rawBody is stashed by the global express.json() verify hook in server.js. Using
-// express.raw() here would be too late — the JSON parser has already consumed the stream, and
-// req.body would be a parsed object, so every signature check would fail.
+// req.rawBody is stashed by the global express.json() verify hook in server.js. Reading
+// req.body here instead would compare the signature against a re-serialised object the sender
+// never signed — key order and whitespace differ.
 router.post('/', async (req, res) => {
   const rawBody = Buffer.isBuffer(req.rawBody) ? req.rawBody
     : Buffer.from(typeof req.body === 'string' ? req.body : JSON.stringify(req.body ?? {}));
-  const signature = req.get('quo-signature') || req.get('x-quo-signature') || req.get('webhook-signature');
-  const timestamp = req.get('quo-timestamp') || req.get('x-quo-timestamp') || req.get('webhook-timestamp');
-  const webhookId = req.get('webhook-id') || req.get('quo-webhook-id') || req.get('x-quo-webhook-id');
+  const signatureHeader = req.get('openphone-signature') || req.get('quo-signature') || req.get('x-quo-signature');
+  const webhookId = req.get('webhook-id') || req.get('x-webhook-id');
 
-  const verdict = verifyQuoSignature({ rawBody, signature, timestamp, secret: process.env.QUO_SIGNING_SECRET });
+  const verdict = verifyQuoSignature({ rawBody, signatureHeader, secret: process.env.QUO_SIGNING_SECRET });
   if (!verdict.ok) {
-    // Never say which check failed to the caller; an attacker learns nothing from a 401.
+    // The caller is told nothing beyond 401; the reason goes to our log only.
     console.warn(`[quo] rejected delivery: ${verdict.why}`);
     return res.status(401).json({ ok: false });
   }
 
   let body;
-  try { body = req.body && typeof req.body === 'object' ? req.body : JSON.parse(rawBody.toString('utf8')); }
-  catch { console.warn('[quo] body was not JSON'); return res.status(400).json({ ok: false }); }
+  try {
+    body = (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body))
+      ? req.body : JSON.parse(rawBody.toString('utf8'));
+  } catch { console.warn('[quo] body was not JSON'); return res.status(400).json({ ok: false }); }
 
-  const eventType = body?.type || body?.event || body?.event_type || '';
-  if (eventType && !/message[._]received/i.test(eventType)) {
-    // Subscribed to message.received only, but acknowledge anything else so it is not retried.
+  const eventType = body?.type || body?.event || '';
+  if (eventType && !/message\.received/i.test(eventType)) {
+    // Subscribed to message.received only; acknowledge anything else so it is not retried.
     return res.json({ ok: true, ignored: `event ${eventType}` });
   }
 
   await noteDelivery();
-  const msg = readMessage(body);
+  const msg = readQuoMessage(body);
+  const settings = await getTextIntakeSettings();
 
-  // Sender allowlist (§3). Anything else is counted and dropped — no content is stored, and
-  // the message keeps working normally in Quo because this system simply did nothing with it.
+  // An outbound message echoed back is not an intake event.
+  if (msg.direction && msg.direction !== 'incoming') {
+    return res.json({ ok: true, ignored: `direction ${msg.direction}` });
+  }
+
+  // ── Which line did this arrive on? ──────────────────────────────────────
+  // The camp line and Ben's business line share a Quo workspace, and this API key can see
+  // both. The webhook is scoped to the camp number, which is the first line of defence — but
+  // a webhook can be re-scoped in the Quo app without this system knowing, so the receiving
+  // line is checked here too. Fails closed: no camp line configured means nothing is
+  // processed, the same rule the sender allowlist follows.
+  if (!settings.CampLineId && !settings.CampLineNumber) {
+    await countWrongLine();
+    console.warn('[quo] no camp line configured — nothing is processed until one is set');
+    return res.json({ ok: true, ignored: 'camp line not configured' });
+  }
+  const lineMatches = (settings.CampLineId && msg.lineId && settings.CampLineId === msg.lineId)
+    || (settings.CampLineNumber && msg.to && normalizePhone(settings.CampLineNumber) === normalizePhone(msg.to));
+  if (!lineMatches) {
+    await countWrongLine();
+    console.log('[quo] ignored a message addressed to another line in the workspace');
+    return res.json({ ok: true, ignored: 'not the camp line' });
+  }
+
+  // ── Who sent it? ────────────────────────────────────────────────────────
   if (!await isAllowedSender(msg.from)) {
     await countIgnoredSender();
-    console.log(`[quo] ignored a message from a sender not on the allowlist`);
+    console.log('[quo] ignored a message from a sender not on the allowlist');
     return res.json({ ok: true, ignored: 'sender not allowed' });
   }
 
   try {
-    // Idempotency: the UNIQUE external_id means a retry finds the existing row. Media is only
+    // Idempotency: a UNIQUE external_id means a retry finds the existing row. Media is only
     // fetched when the row is actually new, so a retry cannot duplicate attachments either.
-    const existing = await createIncomingItem({
-      externalId: webhookId || `quo:${msg.from}:${msg.receivedAt.toISOString()}`,
+    const result = await createIncomingItem({
+      externalId: webhookId || msg.externalId || `quo:${msg.from}:${msg.receivedAt.toISOString()}`,
       fromNumber: normalizePhone(msg.from),
+      toLine: msg.lineId || normalizePhone(msg.to),
       bodyText: msg.text,
       receivedAt: msg.receivedAt,
       source: 'text',
     });
-    if (!existing.Created) {
+    if (!result.Created) {
       console.log('[quo] duplicate delivery ignored');
-      return res.json({ ok: true, duplicate: true, itemId: existing.Item?.Id });
+      return res.json({ ok: true, duplicate: true, itemId: result.Item?.Id });
     }
 
     if (msg.mediaUrls.length) {
-      const ids = await ingestMedia(msg.mediaUrls);
-      const { linkAttachment } = await import('../db.js');
-      for (const id of ids) {
-        await linkAttachment(id, { entityType: 'incoming_item', entityId: existing.Item.Id });
+      for (const id of await ingestMedia(msg.mediaUrls)) {
+        await linkAttachment(id, { entityType: 'incoming_item', entityId: result.Item.Id });
       }
     }
 
     // After storing, never before: a reply that claims "in Incoming" has to be true.
-    await sendConfirmation(msg.from);
-    return res.json({ ok: true, itemId: existing.Item.Id });
+    await sendConfirmation(msg.from, settings);
+    return res.json({ ok: true, itemId: result.Item.Id });
   } catch (e) {
     console.error('[quo] ingest failed:', e.message);
-    // A 500 asks Quo to retry, which is right: the message is not stored and idempotency
-    // makes the retry safe.
+    // A 500 asks Quo to retry, which is right: nothing was stored, and idempotency makes the
+    // retry safe.
     return res.status(500).json({ ok: false });
   }
 });

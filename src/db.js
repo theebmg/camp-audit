@@ -8849,6 +8849,7 @@ function incomingRowShape(r) {
     Source: r.source,
     ExternalId: r.external_id,
     FromNumber: r.from_number,
+    ToLine: r.to_line ?? null,
     BodyText: r.body_text,
     // What to show: the message without the hint word, since the hint is already a chip.
     DisplayText: display || r.body_text,
@@ -8902,7 +8903,7 @@ export async function getIncomingItem(id) {
 
 // Idempotent by externalId: a retried delivery finds the row and changes nothing (§3).
 export async function createIncomingItem({
-  externalId = null, fromNumber = null, bodyText = '', receivedAt = new Date(),
+  externalId = null, fromNumber = null, toLine = null, bodyText = '', receivedAt = new Date(),
   source = 'text', attachmentIds = [],
 }) {
   const { hint } = parseIncomingHint(bodyText);
@@ -8912,12 +8913,12 @@ export async function createIncomingItem({
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO incoming_items (source, external_id, from_number, body_text, hint,
+      `INSERT INTO incoming_items (source, external_id, from_number, to_line, body_text, hint,
                                    received_at, received_date, received_time)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        ON CONFLICT (external_id) DO NOTHING
        RETURNING id`,
-      [source, externalId, fromNumber, bodyText, hint, receivedAt, parts.date, parts.time]
+      [source, externalId, fromNumber, toLine, bodyText, hint, receivedAt, parts.date, parts.time]
     );
     if (rows[0]) { id = rows[0].id; created = true; }
     else {
@@ -8971,21 +8972,30 @@ export async function getTextIntakeSettings() {
     SendConfirmation: r.send_confirmation ?? true,
     ConfirmationText: r.confirmation_text || 'Got it — in Incoming.',
     ReplyFromNumber: r.reply_from_number || null,
+    // Which line counts. Both the camp line and Ben's business line live in one Quo
+    // workspace, so "a text arrived" is not the same as "a text arrived here".
+    CampLineId: r.camp_line_id || null,
+    CampLineNumber: r.camp_line_number || null,
     IgnoredSenderCount: r.ignored_sender_count || 0,
     LastIgnoredAt: r.last_ignored_at || null,
+    WrongLineCount: r.wrong_line_count || 0,
+    LastWrongLineAt: r.last_wrong_line_at || null,
     LastDeliveryAt: r.last_delivery_at || null,
     // Never returned: the API key and signing secret. They are environment variables.
     WebhookConfigured: !!(process.env.QUO_SIGNING_SECRET && process.env.QUO_API_KEY),
   };
 }
 
-export async function updateTextIntakeSettings({ allowedSenders, sendConfirmation, confirmationText, replyFromNumber }) {
+export async function updateTextIntakeSettings({ allowedSenders, sendConfirmation, confirmationText, replyFromNumber, campLineId, campLineNumber }) {
   const sets = []; const vals = []; let i = 1;
   const set = (col, v) => { sets.push(`${col} = $${i++}`); vals.push(v); };
   if (allowedSenders !== undefined) set('allowed_senders', (allowedSenders || []).map(normalizePhone).filter(Boolean));
   if (sendConfirmation !== undefined) set('send_confirmation', !!sendConfirmation);
   if (confirmationText !== undefined) set('confirmation_text', String(confirmationText || '').trim() || 'Got it — in Incoming.');
   if (replyFromNumber !== undefined) set('reply_from_number', normalizePhone(replyFromNumber) || null);
+  // The line id is the provider's own opaque identifier, so it is stored as typed.
+  if (campLineId !== undefined) set('camp_line_id', String(campLineId || '').trim() || null);
+  if (campLineNumber !== undefined) set('camp_line_number', normalizePhone(campLineNumber) || null);
   if (!sets.length) return getTextIntakeSettings();
   await pool.query(`UPDATE text_intake_settings SET ${sets.join(', ')} WHERE id = 1`, vals);
   return getTextIntakeSettings();
@@ -9016,6 +9026,15 @@ export async function countIgnoredSender() {
   await pool.query(
     `UPDATE text_intake_settings SET ignored_sender_count = ignored_sender_count + 1,
             last_ignored_at = now() WHERE id = 1`
+  );
+}
+
+// A message to another line in the same workspace. Counted for debugging; the content is
+// never stored, the same treatment an unknown sender gets.
+export async function countWrongLine() {
+  await pool.query(
+    `UPDATE text_intake_settings SET wrong_line_count = wrong_line_count + 1,
+            last_wrong_line_at = now() WHERE id = 1`
   );
 }
 

@@ -853,7 +853,12 @@ label {
 
 /* Full-screen panels on phones. A centred modal at 393px wastes the edges and puts its
    footer below the fold with nothing to scroll. */
-@media (max-width: 760px) {
+/* The mobile rules apply to a narrow window OR to a phone held sideways. A phone in landscape
+   is 852px wide, so max-width alone missed it entirely — the work-order screen reported 86
+   sub-44px controls sideways against 2 upright. The second query is deliberately narrow:
+   (pointer: coarse) AND (max-height: 500px) is a phone on its side, not a tablet and not a
+   touchscreen laptop, both of which are taller than that in any orientation. */
+@media (max-width: 760px), ((pointer: coarse) and (max-height: 500px)) {
   .modal-overlay {
     padding: 0;
     align-items: stretch;

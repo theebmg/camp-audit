@@ -9111,8 +9111,23 @@ async function renderTextIntakeSettings() {
           </p>
         </div>
         <div class="field-row">
-          <label>Reply from</label>
-          <input type="tel" id="sFrom" value="${escapeHtml(s.ReplyFromNumber || '')}" placeholder="the camp line" />
+          <label>Camp line ID</label>
+          <input type="text" id="sLineId" value="${escapeHtml(s.CampLineId || '')}" placeholder="the provider's id for the camp number" />
+          <p class="muted" style="font-size:0.8rem;margin:4px 0 0">
+            Only texts sent <em>to</em> this line are processed. The camp line and the Fractured
+            RV line share one Quo workspace, so a text to the business number is ignored even
+            when it comes from your cell.
+            ${s.CampLineId || s.CampLineNumber ? '' : '<strong>Blank means nothing is processed at all.</strong>'}
+          </p>
+        </div>
+        <div class="field-row">
+          <label>Camp line number</label>
+          <input type="tel" id="sLineNumber" value="${escapeHtml(s.CampLineNumber || '')}" placeholder="+1 740 397 4564" />
+          <p class="muted" style="font-size:0.8rem;margin:4px 0 0">Used to match when the provider reports a number rather than an id, and as the reply-from.</p>
+        </div>
+        <div class="field-row">
+          <label>Reply from <span class="muted">(if different)</span></label>
+          <input type="tel" id="sFrom" value="${escapeHtml(s.ReplyFromNumber || '')}" placeholder="defaults to the camp line" />
         </div>
         <div class="field-row">
           <label class="skill-chip" style="display:inline-flex">
@@ -9137,6 +9152,10 @@ async function renderTextIntakeSettings() {
           <span>Ignored senders</span>
           <strong>${s.IgnoredSenderCount || 0}</strong>
         </div>
+        <div class="list-item" style="justify-content:space-between">
+          <span>Ignored — wrong line</span>
+          <strong>${s.WrongLineCount || 0}</strong>
+        </div>
         <p class="muted" style="font-size:0.8rem;margin:8px 0 0">
           The API key and signing secret are environment variables on the server — never stored
           here, never shown, and never sent to the browser.
@@ -9149,6 +9168,8 @@ async function renderTextIntakeSettings() {
           method: 'PATCH',
           body: JSON.stringify({
             allowedSenders: document.getElementById('sSenders').value.split('\n').map((x) => x.trim()).filter(Boolean),
+            campLineId: document.getElementById('sLineId').value,
+            campLineNumber: document.getElementById('sLineNumber').value,
             replyFromNumber: document.getElementById('sFrom').value,
             sendConfirmation: document.getElementById('sConfirm').checked,
             confirmationText: document.getElementById('sConfirmText').value,
