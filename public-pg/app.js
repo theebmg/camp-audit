@@ -899,10 +899,10 @@ async function refreshNavBadges() {
 // the sidebar's reorder mode, and the result is saved to display_settings
 // (nav_layout). The trailing null-header section renders without a label.
 const DEFAULT_NAV_LAYOUT = [
-  { header: 'Daily', items: ['dashboard', 'workOrders', 'calendar', 'inbox', 'adminTasks'] },
-  { header: 'Field', items: ['auditPicker', 'map', 'locations', 'notes'] },
-  { header: 'Money', items: ['expenses', 'capitalPlan'] },
-  { header: 'Records', items: ['requests', 'crew', 'crewHours', 'maintenanceLog'] },
+  { header: 'Daily', items: ['dashboard', 'workOrders', 'incoming', 'calendar', 'inbox', 'adminTasks'] },
+  { header: 'Field', items: ['auditPicker', 'auditRounds', 'map', 'locations', 'notes', 'visits'] },
+  { header: 'Money', items: ['expenses', 'materials', 'capitalPlan'] },
+  { header: 'Records', items: ['people', 'groups', 'requests', 'crew', 'crewHours', 'maintenanceLog'] },
   { header: null, items: ['reports', 'admin'] },
 ];
 
@@ -926,6 +926,15 @@ function reconcileNavLayout(saved) {
   DEFAULT_NAV_LAYOUT.forEach((sec, i) => sec.items.forEach((view) => {
     if (!placed.has(view)) { layout[i].items.push(view); placed.add(view); }
   }));
+  // Anything in NAV_ITEMS that no section claims still has to appear somewhere, or adding a
+  // screen to NAV_ITEMS and forgetting DEFAULT_NAV_LAYOUT makes it unreachable from the menu
+  // with no error anywhere — which is exactly what happened to Incoming, Visitor Log, People
+  // and Groups. The comment above already promised this; now it is true.
+  for (const item of NAV_ITEMS) {
+    if (placed.has(item.view)) continue;
+    layout[layout.length - 1].items.push(item.view);
+    placed.add(item.view);
+  }
   return layout;
 }
 
