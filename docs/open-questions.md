@@ -623,3 +623,39 @@ crew hours. All verified returning `text/csv` with real rows.
 - **Incoming items** — no export. Arguably wanted once texts are flowing.
 
 Each is a short addition now that there is one shared CSV writer.
+
+---
+
+## Q26 — "busy" events on Google Calendar: not a sync bug
+
+**Reported:** every event pushed from the CMMS shows up in Google Calendar titled `busy`.
+
+**Diagnosed by asking Google what it actually holds.** The events are correct:
+
+| CMMS event | Google `summary` |
+|---|---|
+| Plumber coming for gas line | `Other — Plumber coming for gas line` |
+| Tim and Laurie visiting | `Constituent Visitation — Johnson, Tim, Bethlehem 09` |
+| Ralph coming to drop siding off | `Constituent Visitation — Waggoner, Ralph` |
+| Leaf raking day | `Other — Leaf raking day` |
+
+All `status: confirmed`, `visibility: (default)`, `transparency: (default)`, `privateCopy:
+false`. Nothing is hidden and nothing is malformed.
+
+**The cause is a viewing permission.** `busy` is the literal placeholder Google shows for a
+calendar you can only see **free/busy** on. The sync writes to:
+
+- calendar **Sychar Events** (`c_cc8763…@group.calendar.google.com`)
+- as **bgreenawalt@campsychar.org**, which is **owner** of it
+
+So the account doing the writing sees everything. Whichever account Ben is *looking* at it in
+has been given "See only free/busy (hide details)" instead of "See all event details".
+
+**No code change made.** The fix is in Google Calendar's sharing settings, and changing our
+payload to work around a permission would be papering over it.
+
+**Worth noting for later:** the connection cannot read its own sharing list — the ACL call
+returns 403 for missing scope, because the OAuth consent requests three granular scopes and
+`calendar.acls` is not among them. Adding it would let the app *tell* Ben his sharing is
+wrong instead of leaving him to find out from the word "busy", but it forces a re-consent for
+a diagnostic convenience. Offered, not done.
