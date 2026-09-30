@@ -271,8 +271,14 @@ async function processSync(item, ctx) {
       try {
         await updateEvent(ctx.accessToken, ctx.calendarId, gcalEventId, body);
       } catch (e) {
-        if (e.status !== 404) throw e;
-        gcalEventId = null; // hand-deleted on Google's side; fall through to a fresh insert
+        // 404: hand-deleted on Google's side, or — the case that matters when the sync target
+        // moves to a different account or calendar — an id that belongs to the OLD calendar
+        // and means nothing on the new one. 410 Gone is the same situation once Google has
+        // finished tidying up, and the delete path has always treated the two together; the
+        // update path only handled 404, so a switched calendar could stick on a permanent
+        // error instead of re-creating the event.
+        if (e.status !== 404 && e.status !== 410) throw e;
+        gcalEventId = null; // fall through to a fresh insert on the current calendar
       }
     }
     if (!gcalEventId) {
