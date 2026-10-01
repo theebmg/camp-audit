@@ -1076,3 +1076,17 @@ label {
 .rte-body li { margin: 0 0 4px; }
 .rte-body p { margin: 0 0 10px; }
 .rte-body a { color: var(--accent-dark); }
+
+/* A save that failed, said next to the field it failed on rather than as a toast that is
+   gone before it is read. The field keeps what was typed, so it can be corrected in place. */
+.field-error {
+  margin: 4px 0 0;
+  font-size: 0.84rem;
+  color: #b4232a;
+  line-height: 1.35;
+}
+.field-error:empty { display: none; }
+input.has-error, select.has-error, textarea.has-error {
+  border-color: #b4232a;
+  background: #fff8f8;
+}

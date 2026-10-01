@@ -518,6 +518,35 @@ function mountCabinHolderCombobox(container, { initialHolder = null, onSelect = 
   };
 }
 
+// ---------- saying why a save failed ----------
+// A field that silently snaps back to its old value is the worst of both worlds: the work is
+// lost and nothing says so. These put the reason next to the field and leave what was typed
+// alone, so it can be corrected rather than retyped.
+function saveErrorMessage(err) {
+  if (!err) return "Couldn't save — try again.";
+  if (/not authenticated/i.test(err.message || '')) return 'Your session has expired. Sign in again, then try once more.';
+  // fetch() rejects with a TypeError and no status when the request never reached the server.
+  if (!err.status) return "Couldn't save — check your connection and try again.";
+  if (err.status >= 500) return "Couldn't save — the server had a problem. Try again in a moment.";
+  if (err.status === 404) return "Couldn't save — this record no longer exists. Reload the page.";
+  return err.message || "Couldn't save — try again.";
+}
+
+function showFieldError(inputId, message) {
+  const input = document.getElementById(inputId);
+  const slot = document.getElementById(`${inputId}-err`);
+  if (input) input.classList.add('has-error');
+  if (slot) slot.textContent = message;
+  else if (message) toast(message, 8000);     // no slot on this field: say it loudly instead
+}
+
+function clearFieldError(inputId) {
+  const input = document.getElementById(inputId);
+  const slot = document.getElementById(`${inputId}-err`);
+  if (input) input.classList.remove('has-error');
+  if (slot) slot.textContent = '';
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) } });
   if (res.status === 401) {
@@ -5472,6 +5501,8 @@ async function renderBoardReport() {
             <span class="muted">to</span>
             <input type="date" id="brTo" value="${report.PeriodEnd}" ${published ? 'disabled' : ''} />
           </div>
+          <p class="field-error" id="brFrom-err"></p>
+          <p class="field-error" id="brTo-err"></p>
         </div>
         <div class="field-row"><label>Looking ahead</label>
           <div class="report-date-range">
@@ -5479,6 +5510,8 @@ async function renderBoardReport() {
             <span class="muted">to</span>
             <input type="date" id="brFwdTo" value="${report.ForwardEnd}" ${published ? 'disabled' : ''} />
           </div>
+          <p class="field-error" id="brFwdFrom-err"></p>
+          <p class="field-error" id="brFwdTo-err"></p>
           <p class="muted" style="margin-top:2px;font-size:0.8rem">Defaults to the same length as the period covered.</p>
         </div>
         ${published ? '' : `<div class="btn-row">
@@ -5506,6 +5539,7 @@ async function renderBoardReport() {
           <div id="brNotes" class="rte-body" ${published ? '' : 'contenteditable="true"'}
                data-placeholder="What the board should know about this period…"></div>
         </div>
+        <p class="field-error" id="brSummary-err"></p>
       </div>
 
       <div class="card" id="brPhotosCard">
@@ -5548,8 +5582,14 @@ async function renderBoardReport() {
     wire(published);
   }
 
+  // THE BUG THE DATE FIELDS HAD: this threw the response away. The save succeeded, but the
+  // local `report` still held the old dates, and the redraw that followed rebuilt the inputs
+  // from it — so a correctly saved date flashed and snapped back to the previous one, with
+  // nothing to explain it. The server returns the updated report; use it.
   async function patchReport(fields) {
-    await api(`/api/pg/board-reports/${report.Id}`, { method: 'PATCH', body: JSON.stringify(fields) });
+    const r = await api(`/api/pg/board-reports/${report.Id}`, { method: 'PATCH', body: JSON.stringify(fields) });
+    if (r && r.report) report = r.report;
+    return r;
   }
 
   async function refresh() {
@@ -5646,31 +5686,83 @@ async function renderBoardReport() {
 
     if (published) return;
 
-    for (const [id, field] of [['brFrom', 'periodStart'], ['brTo', 'periodEnd'], ['brFwdFrom', 'forwardStart'], ['brFwdTo', 'forwardEnd']]) {
+    // Only the two unambiguous rules are enforced. Whether the look-ahead window may overlap
+    // the period is a judgement call, not an error, so it is left alone rather than blocked.
+    const DATE_FIELDS = [
+      ['brFrom', 'periodStart', 'Start date'],
+      ['brTo', 'periodEnd', 'End date'],
+      ['brFwdFrom', 'forwardStart', 'Look-ahead start date'],
+      ['brFwdTo', 'forwardEnd', 'Look-ahead end date'],
+    ];
+    function dateProblem(field, value) {
+      const v = { periodStart: report.PeriodStart, periodEnd: report.PeriodEnd,
+        forwardStart: report.ForwardStart, forwardEnd: report.ForwardEnd, [field]: value };
+      if (v.periodStart && v.periodEnd && v.periodEnd < v.periodStart) {
+        return field === 'periodEnd'
+          ? `End date can't be before the start date (${v.periodStart}). Pick a later date.`
+          : `Start date can't be after the end date (${v.periodEnd}). Pick an earlier date.`;
+      }
+      if (v.forwardStart && v.forwardEnd && v.forwardEnd < v.forwardStart) {
+        return field === 'forwardEnd'
+          ? `Look-ahead end date can't be before its start date (${v.forwardStart}). Pick a later date.`
+          : `Look-ahead start date can't be after its end date (${v.forwardEnd}). Pick an earlier date.`;
+      }
+      return null;
+    }
+
+    for (const [id, field, label] of DATE_FIELDS) {
       document.getElementById(id).addEventListener('change', async (e) => {
-        await patchReport({ [field]: e.target.value });
-        await refresh();
+        const value = e.target.value;
+        clearFieldError(id);
+        // Every path below that fails returns WITHOUT redrawing, so the typed date stays in the
+        // field and can be corrected rather than typed again.
+        if (!value) { showFieldError(id, `${label} can't be empty. Pick a date.`); return; }
+        const problem = dateProblem(field, value);
+        if (problem) { showFieldError(id, problem); return; }
+        try {
+          await patchReport({ [field]: value });
+          await refresh();
+        } catch (err) {
+          showFieldError(id, saveErrorMessage(err));
+        }
       });
     }
-    mountSummaryEditor(report, (html) => patchReport({ summaryNotes: html }));
+    mountSummaryEditor(report, async (html) => {
+      // "Saved as you type" was true only when it worked; a failure said nothing at all.
+      try { await patchReport({ summaryNotes: html }); clearFieldError('brSummary'); }
+      catch (err) { showFieldError('brSummary', saveErrorMessage(err)); }
+    });
     loadReportPhotos(report.Id);
     app.querySelectorAll('.br-expand').forEach((b) => b.addEventListener('click', () => {
       const id = Number(b.dataset.wo);
       if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
       draw();
     }));
+    // These had the same silence: api() throws, the rejection goes nowhere, and the control
+    // keeps showing a state that was never saved.
     app.querySelectorAll('.br-check').forEach((cb) => cb.addEventListener('change', async () => {
-      const r = await api(`/api/pg/board-reports/${report.Id}/items/${cb.dataset.item}`, {
-        method: 'PATCH', body: JSON.stringify({ included: cb.checked }),
-      });
-      items = r.items; draw();
+      try {
+        const r = await api(`/api/pg/board-reports/${report.Id}/items/${cb.dataset.item}`, {
+          method: 'PATCH', body: JSON.stringify({ included: cb.checked }),
+        });
+        items = r.items; draw();
+      } catch (err) {
+        // Nothing was typed here, so putting the tick back is honest — with a reason.
+        cb.checked = !cb.checked;
+        toast(saveErrorMessage(err), 8000);
+      }
     }));
-    app.querySelectorAll('.br-mode').forEach((sel) => sel.addEventListener('change', async () => {
-      const r = await api(`/api/pg/board-reports/${report.Id}/items/${sel.dataset.item}`, {
-        method: 'PATCH', body: JSON.stringify({ displayMode: sel.value }),
+    app.querySelectorAll('.br-mode').forEach((sel) => {
+      const was = sel.value;
+      sel.addEventListener('change', async () => {
+        try {
+          const r = await api(`/api/pg/board-reports/${report.Id}/items/${sel.dataset.item}`, {
+            method: 'PATCH', body: JSON.stringify({ displayMode: sel.value }),
+          });
+          items = r.items; draw();
+        } catch (err) { sel.value = was; toast(saveErrorMessage(err), 8000); }
       });
-      items = r.items; draw();
-    }));
+    });
     app.querySelectorAll('.br-note').forEach((el) => el.addEventListener('click', async (e) => {
       e.preventDefault();
       const it = items.find((x) => String(x.Id) === el.dataset.item);
@@ -5679,10 +5771,26 @@ async function renderBoardReport() {
         placeholder: 'Shown to the board — separate from the work order\'s own notes',
       });
       if (note === null) return;
-      const r = await api(`/api/pg/board-reports/${report.Id}/items/${el.dataset.item}`, {
-        method: 'PATCH', body: JSON.stringify({ reportNote: note }),
-      });
-      items = r.items; draw();
+      // A failed save must not cost Ben the note he just typed, so the dialog comes back
+      // holding it, with the reason on top.
+      let pending = note;
+      let why = null;
+      for (;;) {
+        try {
+          const r = await api(`/api/pg/board-reports/${report.Id}/items/${el.dataset.item}`, {
+            method: 'PATCH', body: JSON.stringify({ reportNote: pending }),
+          });
+          items = r.items; draw();
+          return;
+        } catch (err) {
+          why = saveErrorMessage(err);
+        }
+        const retry = await promptDialog(`${why}\n\nYour note is below — fix it and try again, or cancel.`, {
+          value: pending, multiline: true,
+        });
+        if (retry === null) { toast('Note not saved.', 6000); return; }
+        pending = retry;
+      }
     }));
   }
 

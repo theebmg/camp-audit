@@ -2141,6 +2141,36 @@ router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
     // later reader has to remember to clean it (Part 2D).
     const summaryNotes = req.body && 'summaryNotes' in req.body
       ? sanitizeSummaryHtml(req.body.summaryNotes) : undefined;
+    // Validated here as well as on the screen: the browser is not the authority on what may be
+    // stored, and the messages are written to be shown to Ben as they are.
+    const current = await getBoardReport(req.params.id);
+    if (!current) return res.status(404).json({ ok: false, error: 'Not found' });
+    const merged = {
+      periodStart: periodStart ?? current.PeriodStart,
+      periodEnd: periodEnd ?? current.PeriodEnd,
+      forwardStart: forwardStart ?? current.ForwardStart,
+      forwardEnd: forwardEnd ?? current.ForwardEnd,
+    };
+    const badDate = (v) => v != null && !/^\d{4}-\d{2}-\d{2}$/.test(String(v));
+    for (const [key, label] of [['periodStart', 'Start date'], ['periodEnd', 'End date'],
+      ['forwardStart', 'Look-ahead start date'], ['forwardEnd', 'Look-ahead end date']]) {
+      if (badDate(req.body?.[key])) {
+        return res.status(400).json({ ok: false, error: `${label} isn't a valid date. Use the date picker.` });
+      }
+    }
+    if (merged.periodStart && merged.periodEnd && merged.periodEnd < merged.periodStart) {
+      return res.status(400).json({
+        ok: false,
+        error: `End date can't be before the start date (${merged.periodStart}). Pick a later date.`,
+      });
+    }
+    if (merged.forwardStart && merged.forwardEnd && merged.forwardEnd < merged.forwardStart) {
+      return res.status(400).json({
+        ok: false,
+        error: `Look-ahead end date can't be before its start date (${merged.forwardStart}). Pick a later date.`,
+      });
+    }
+
     const report = await updateBoardReport(req.params.id, {
       title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes,
     });
