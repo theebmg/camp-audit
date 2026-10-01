@@ -51,13 +51,16 @@ export function mailIsConfigured() {
 // Generic send. `from`/`fromName` default to the MAIL_FROM_* env vars (the
 // alias), falling back to GMAIL_USER itself if those aren't set, so existing
 // callers (reports) keep working unconfigured-alias-wise.
-export async function sendMail({ to, subject, html, text, replyTo }) {
+// `attachments` is nodemailer's shape. A board report passes inline images with a `cid`, which
+// is what makes a photo render in the body rather than only as a file at the bottom.
+export async function sendMail({ to, subject, html, text, replyTo, attachments }) {
   const t = getTransporter();
   const fromAddress = process.env.MAIL_FROM_ADDRESS || process.env.GMAIL_USER;
   const fromName = process.env.MAIL_FROM_NAME;
   const from = fromName ? `"${fromName}" <${fromAddress}>` : fromAddress;
   return t.sendMail({
     from, to, subject, html, text,
+    ...(attachments && attachments.length ? { attachments } : {}),
     replyTo: replyTo || process.env.MAIL_REPLY_TO || fromAddress,
   });
 }

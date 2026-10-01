@@ -6,8 +6,10 @@ import {
   getWorkPerformedRawData, getDeferredFindingsBacklogRawData, getVisitorActivityRawData, getAdminTasksWorkPerformedRawData,
   getAdminTasksBoardReportRawData,
   getBoardReport, listBoardReportItems, listBoardReportAggregates, computeBoardReportAggregates,
+  listSelectedReportPhotos, stampReportPhotoLabels,
 } from './db.js';
 import { renderBoardReportItemsHtml, renderBoardReportItemsText } from './reportRender.js';
+import { buildEmailCopy, buildPhotoLabel } from './reportPhotos.js';
 import { currentComponentState } from './components.js';
 import { FUNDING_SOURCE_LABELS } from './reports.js';
 
@@ -301,7 +303,9 @@ export async function buildDeferredBacklogReportPg() {
 // Renders a board report from its OWN rows. A draft recomputes its aggregates first so
 // the money header is current; a published report never does, because its figures were
 // frozen at publish and recomputing them would defeat the freeze.
-export async function renderBoardReportFromItems(reportId) {
+// `withPhotos` builds the email copies — resized and captioned — and returns them as inline
+// attachments. Off by default so the on-screen preview stays instant; the send path turns it on.
+export async function renderBoardReportFromItems(reportId, { withPhotos = false } = {}) {
   const report = await getBoardReport(reportId);
   if (!report) return null;
   if (report.Status === 'draft') await computeBoardReportAggregates(reportId);
@@ -309,6 +313,43 @@ export async function renderBoardReportFromItems(reportId) {
     listBoardReportItems(reportId),
     listBoardReportAggregates(reportId),
   ]);
-  const data = { report, items, aggregates };
-  return { html: renderBoardReportItemsHtml(data), text: renderBoardReportItemsText(data), data };
+
+  let inlineAttachments = [];
+  let reportPhotos = [];
+  if (withPhotos) {
+    const selected = await listSelectedReportPhotos(reportId);
+    const labels = {};
+    for (const photo of selected) {
+      // The caption is built from the role and the description, then stamped so a published
+      // report keeps what it went out with (§2C).
+      const label = photo.SnapLabel
+        || buildPhotoLabel({ rolePrefix: photo.RolePrefix, description: photo.Description });
+      labels[photo.Id] = label;
+      const copy = await buildEmailCopy(photo.Url, label);
+      if (!copy) continue;   // one unavailable photo must not stop the report going out
+      // cid: references, so the picture renders in the body rather than only as an attachment.
+      const cid = `photo${photo.Id}@sychar`;
+      inlineAttachments.push({
+        filename: `${String(label || 'photo').replace(/[^a-zA-Z0-9 _-]/g, '').slice(0, 48) || 'photo'}.jpg`,
+        content: copy.buffer, cid, contentType: 'image/jpeg',
+      });
+      const withCid = { ...photo, Cid: cid, Label: label };
+      if (photo.ItemId) {
+        const item = items.find((i) => i.Id === photo.ItemId);
+        if (item) { item.Photos = item.Photos || []; item.Photos.push(withCid); }
+        else reportPhotos.push(withCid);
+      } else {
+        reportPhotos.push(withCid);
+      }
+    }
+    await stampReportPhotoLabels(reportId, labels);
+  }
+
+  const data = { report, items, aggregates, reportPhotos };
+  return {
+    html: renderBoardReportItemsHtml(data),
+    text: renderBoardReportItemsText(data),
+    data,
+    inlineAttachments,
+  };
 }

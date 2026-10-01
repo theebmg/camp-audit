@@ -6039,6 +6039,132 @@ function fmtMoneyPlain(n) {
   return `$${Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 }
 
+// ── Board report photos (Oct 2026 brief, Part 2A) ─────────────────────────
+//
+// Which photos go with the report, and under which item. A photo is offered for every work
+// order and job line already on the report; Ben ticks the ones the board should see.
+
+// Everything available to put on this report, grouped by the item it belongs under. Photos
+// linked to a JOB LINE are offered under that line's parent work order, because that is where
+// the board reads about the work (§2C's labelling uses the same relationship).
+export async function listBoardReportPhotoCandidates(reportId) {
+  const { rows } = await pool.query(
+    `WITH items AS (
+       SELECT i.id AS item_id, i.item_type, i.item_id AS entity_id, i.snap_title,
+              i.parent_work_order_id
+       FROM board_report_items i
+       WHERE i.report_id = $1 AND i.included
+     )
+     SELECT it.item_id, it.item_type, it.snap_title,
+            a.id AS attachment_id, a.url, a.thumb_url, a.width, a.height, a.file_size,
+            a.caption, a.taken_at,
+            r.name AS role_name, r.report_label_prefix, r.report_stage_order,
+            r.default_include_in_report,
+            al.entity_type AS linked_to, al.entity_id AS linked_id,
+            jl.title AS job_line_title,
+            p.id AS selection_id, p.included AS selected
+     FROM items it
+     JOIN attachment_links al
+       ON (al.entity_type = 'work_order' AND it.item_type = 'work_order' AND al.entity_id = it.entity_id)
+       OR (al.entity_type = 'job_line'
+           AND it.item_type = 'work_order'
+           AND al.entity_id IN (SELECT id FROM job_lines WHERE work_order_id = it.entity_id))
+       OR (al.entity_type = 'job_line' AND it.item_type = 'job_line' AND al.entity_id = it.entity_id)
+     JOIN attachments a ON a.id = al.attachment_id AND a.deleted_at IS NULL AND a.kind = 'image'
+     LEFT JOIN attachment_roles r ON r.id = al.role_id
+     LEFT JOIN job_lines jl ON al.entity_type = 'job_line' AND jl.id = al.entity_id
+     LEFT JOIN board_report_photos p ON p.report_id = $1 AND p.attachment_id = a.id
+     ORDER BY it.item_id, COALESCE(r.report_stage_order, 99), a.taken_at NULLS LAST, a.id`,
+    [reportId]
+  );
+
+  const byItem = new Map();
+  for (const r of rows) {
+    if (!byItem.has(r.item_id)) {
+      byItem.set(r.item_id, { ItemId: r.item_id, ItemType: r.item_type, Title: r.snap_title, Photos: [] });
+    }
+    byItem.get(r.item_id).Photos.push({
+      AttachmentId: r.attachment_id,
+      Url: r.url, ThumbUrl: r.thumb_url,
+      Width: r.width, Height: r.height, FileSize: r.file_size != null ? Number(r.file_size) : null,
+      RoleName: r.role_name, RolePrefix: r.report_label_prefix, StageOrder: r.report_stage_order,
+      // What the caption will say: the job line's own description when the photo is linked to
+      // one, otherwise the work order's title (§2C).
+      Description: r.job_line_title || r.caption || r.snap_title,
+      LinkedTo: r.linked_to,
+      SelectionId: r.selection_id,
+      // Unselected photos default to the roles that are already marked for the report — which
+      // is Before and After out of the box, and is admin-editable rather than a hardcoded rule.
+      Selected: r.selection_id ? r.selected : !!r.default_include_in_report,
+      Stored: r.selection_id != null,
+    });
+  }
+  return [...byItem.values()];
+}
+
+export async function setBoardReportPhoto(reportId, attachmentId, { itemId = null, included = true, sortOrder = 0 }) {
+  await pool.query(
+    `INSERT INTO board_report_photos (report_id, attachment_id, item_id, included, sort_order)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (report_id, attachment_id) DO UPDATE SET
+       included = EXCLUDED.included,
+       item_id = COALESCE(EXCLUDED.item_id, board_report_photos.item_id),
+       sort_order = EXCLUDED.sort_order`,
+    [reportId, attachmentId, itemId, !!included, sortOrder]
+  );
+}
+
+// Report-level photos: general progress shots that are not about one particular job (§2A).
+export async function addReportLevelPhoto(reportId, attachmentId) {
+  await setBoardReportPhoto(reportId, attachmentId, { itemId: null, included: true });
+}
+
+export async function removeBoardReportPhoto(reportId, attachmentId) {
+  await pool.query('DELETE FROM board_report_photos WHERE report_id = $1 AND attachment_id = $2', [reportId, attachmentId]);
+}
+
+// What is actually going out, in the order the email lays it out: grouped by item, and within
+// an item before → during → after (§2C).
+export async function listSelectedReportPhotos(reportId) {
+  const { rows } = await pool.query(
+    `SELECT p.id, p.item_id, p.attachment_id, p.snap_label,
+            a.url, a.thumb_url, a.width, a.height, a.file_size, a.caption,
+            r.name AS role_name, r.report_label_prefix, r.report_stage_order,
+            i.snap_title AS item_title,
+            jl.title AS job_line_title
+     FROM board_report_photos p
+     JOIN attachments a ON a.id = p.attachment_id AND a.deleted_at IS NULL
+     LEFT JOIN board_report_items i ON i.id = p.item_id
+     LEFT JOIN attachment_links al ON al.attachment_id = a.id AND al.entity_type = 'job_line'
+     LEFT JOIN job_lines jl ON jl.id = al.entity_id
+     LEFT JOIN attachment_roles r ON r.id = al.role_id
+     WHERE p.report_id = $1 AND p.included
+     ORDER BY p.item_id NULLS LAST, COALESCE(r.report_stage_order, 99), p.sort_order, p.id`,
+    [reportId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, ItemId: r.item_id, AttachmentId: r.attachment_id,
+    Url: r.url, ThumbUrl: r.thumb_url,
+    Width: r.width, Height: r.height, FileSize: r.file_size != null ? Number(r.file_size) : null,
+    RoleName: r.role_name, RolePrefix: r.report_label_prefix, StageOrder: r.report_stage_order ?? 99,
+    ItemTitle: r.item_title,
+    Description: r.job_line_title || r.caption || r.item_title,
+    SnapLabel: r.snap_label,
+  }));
+}
+
+// Stamped at send time, so a published report keeps the captions it went out with (§2C).
+export async function stampReportPhotoLabels(reportId, labelsById) {
+  for (const [id, label] of Object.entries(labelsById)) {
+    await pool.query('UPDATE board_report_photos SET snap_label = $2 WHERE id = $1', [Number(id), label]);
+  }
+}
+
+export async function getReportEmailBudgetMb() {
+  const { rows } = await pool.query('SELECT report_email_budget_mb FROM display_settings WHERE id = 1');
+  return Number(rows[0]?.report_email_budget_mb) || 15;
+}
+
 async function suggestFlaggedItems(reportId, passId, reported) {
   const monthOf = (d) => new Date(d).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   let n = 0;

@@ -15,6 +15,7 @@ import {
   renderVisitorActivityHtml, renderVisitorActivityText,
 } from '../reportRender.js';
 import { storeAttachment } from '../storage.js';
+import { estimateEmailBytes, formatBytes } from '../reportPhotos.js';
 import { renderChecklistPdf, renderWorkOrderScopePdf } from '../pdf.js';
 import { currentUsername, currentRole } from '../requestContext.js';
 import {
@@ -162,6 +163,8 @@ import {
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
   listFundingSources, createFundingSource, updateFundingSource,
+  listBoardReportPhotoCandidates, setBoardReportPhoto, removeBoardReportPhoto,
+  listSelectedReportPhotos, addReportLevelPhoto, getReportEmailBudgetMb,
   listPeople, getPerson, createPerson, updatePerson, deletePerson,
   findDuplicatePeople, mergePeople, listRecordMerges,
   listPersonRoles, createPersonRole, updatePersonRole, deletePersonRole,
@@ -2223,11 +2226,29 @@ router.post('/board-reports/:id(\\d+)/output', async (req, res, next) => {
       });
     }
 
-    const { html, text } = await renderBoardReportFromItems(report.Id);
+    // Photos are built only for a send: resizing and captioning every selected image is real
+    // work, and a download or a preview does not need it.
+    const { html, text, inlineAttachments } = await renderBoardReportFromItems(report.Id, {
+      withPhotos: kind === 'email',
+    });
     const baseSubject = subject || `Camp Sychar — Board Report (${report.Title})`;
     const finalSubject = isDraft ? `DRAFT — ${baseSubject}` : baseSubject;
 
-    if (kind === 'email') await sendMail({ to: recipient, subject: finalSubject, html, text });
+    if (kind === 'email') {
+      const budgetMb = await getReportEmailBudgetMb();
+      const bytes = (inlineAttachments || []).reduce((t, a) => t + (a.content?.length || 0), 0);
+      if (bytes > budgetMb * 1024 * 1024) {
+        // Refused rather than attempted: a message over the limit is bounced by the receiving
+        // server, and a bounce is far harder to notice than an error here.
+        return res.status(413).json({
+          ok: false,
+          error: `The selected photos come to ${formatBytes(bytes)}, over the ${budgetMb} MB limit. `
+            + 'Deselect some photos, or raise the limit in Admin.',
+          bytes, budgetMb,
+        });
+      }
+      await sendMail({ to: recipient, subject: finalSubject, html, text, attachments: inlineAttachments });
+    }
 
     const output = await recordBoardReportOutput(report.Id, {
       kind, recipients: kind === 'email' ? recipient : null, subject: finalSubject,
@@ -3405,6 +3426,46 @@ router.patch('/funding-sources/:id(\\d+)', async (req, res, next) => {
 // with the renderer.
 router.post('/board-reports/summary-preview', async (req, res, next) => {
   try { res.json({ html: plainSummaryToHtml(String((req.body || {}).text || '')) }); } catch (e) { next(e); }
+});
+
+
+// ---- Board report photos (Part 2A/2B) ----
+router.get('/board-reports/:id(\\d+)/photos', async (req, res, next) => {
+  try {
+    const [groups, selected, budgetMb] = await Promise.all([
+      listBoardReportPhotoCandidates(req.params.id),
+      listSelectedReportPhotos(req.params.id),
+      getReportEmailBudgetMb(),
+    ]);
+    // The meter estimates from the stored file size rather than building every copy, because it
+    // has to answer while Ben is ticking boxes. Real copies come out smaller, so it warns early
+    // rather than late.
+    const estimatedBytes = selected.reduce((t, p) => t + estimateEmailBytes(p.FileSize, p.Width), 0);
+    res.json({
+      groups, selected, budgetMb,
+      estimatedBytes,
+      estimatedLabel: formatBytes(estimatedBytes),
+      overBudget: estimatedBytes > budgetMb * 1024 * 1024,
+    });
+  } catch (e) { next(e); }
+});
+
+router.post('/board-reports/:id(\\d+)/photos', async (req, res, next) => {
+  try {
+    const { attachmentId, itemId, included, sortOrder } = req.body || {};
+    if (!attachmentId) return res.status(400).json({ ok: false, error: 'attachmentId is required' });
+    await setBoardReportPhoto(req.params.id, Number(attachmentId), {
+      itemId: itemId ? Number(itemId) : null,
+      included: included !== false,
+      sortOrder: sortOrder ?? 0,
+    });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+router.delete('/board-reports/:id(\\d+)/photos/:attachmentId(\\d+)', async (req, res, next) => {
+  try { await removeBoardReportPhoto(req.params.id, Number(req.params.attachmentId)); res.json({ ok: true }); }
+  catch (e) { next(e); }
 });
 
 export default router;

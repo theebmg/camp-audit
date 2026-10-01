@@ -420,6 +420,46 @@ function moneyHeaderHtml(aggregates) {
     </table>`;
 }
 
+// Photos under a report item (Part 2C).
+//
+// Grouped by the item, ordered before → during → after, and when an item has both a before and
+// an after they go SIDE BY SIDE — before left, after right — stacking on a narrow screen. No
+// attempt is made to pair particular shots: the brief says group by work order and order by
+// stage, which is what a reader needs to follow.
+//
+// Laid out with a table and width percentages rather than flex or grid, because Outlook's
+// rendering engine is Word and supports neither.
+function photoFigureHtml(photo, { half = false } = {}) {
+  const label = photo.SnapLabel || photo.Label || '';
+  const width = half ? '100%' : '100%';
+  return `
+    <td style="width:${half ? '50%' : '100%'};padding:0 6px 10px;vertical-align:top;">
+      <img src="cid:${escapeHtml(photo.Cid)}" alt="${escapeHtml(label)}"
+           width="100%" style="width:${width};max-width:100%;height:auto;display:block;border-radius:8px;border:1px solid #e5e7f0;" />
+      ${label ? `<div style="color:#6b7086;font-size:0.8rem;margin-top:4px;line-height:1.3;">${escapeHtml(label)}</div>` : ''}
+    </td>`;
+}
+
+function itemPhotosHtml(photos) {
+  if (!photos || !photos.length) return '';
+  const rows = [];
+  // A before and an after sit together; anything else runs full width.
+  const before = photos.filter((p) => p.StageOrder === 1);
+  const after = photos.filter((p) => p.StageOrder === 3);
+  const rest = photos.filter((p) => p.StageOrder !== 1 && p.StageOrder !== 3);
+  const pairs = Math.min(before.length, after.length);
+  for (let i = 0; i < pairs; i++) {
+    rows.push(`<tr>${photoFigureHtml(before[i], { half: true })}${photoFigureHtml(after[i], { half: true })}</tr>`);
+  }
+  for (const p of [...before.slice(pairs), ...rest, ...after.slice(pairs)]) {
+    rows.push(`<tr>${photoFigureHtml(p)}</tr>`);
+  }
+  return `
+    <table role="presentation" width="100%" style="width:100%;border-collapse:collapse;margin:8px 0 4px;">
+      ${rows.join('')}
+    </table>`;
+}
+
 function itemLineHtml(it) {
   // Dates read as a span rather than a single stamp (decisions §7): when something started
   // and whether it has finished is more use to a board than one undated figure.
@@ -457,6 +497,7 @@ function itemLineHtml(it) {
       ${bits.length ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(bits.join(' · '))}</div>` : ''}
       ${funding ? `<div style="color:#6b7086;font-size:0.85rem;">Funded by ${escapeHtml(funding)}</div>` : ''}
       ${it.SnapProgress ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(it.SnapProgress)}</div>` : ''}
+      ${itemPhotosHtml(it.Photos)}
       ${it.ReportNote ? `<div style="margin-top:4px;font-size:0.9rem;">${escapeHtml(it.ReportNote)}</div>` : ''}
     </div>`;
 }
@@ -492,7 +533,7 @@ function visibleItems(items) {
     && !(i.ItemType === 'job_line' && summaryWoIds.has(i.ParentWorkOrderId)));
 }
 
-export function renderBoardReportItemsHtml({ report, items, aggregates }) {
+export function renderBoardReportItemsHtml({ report, items, aggregates, reportPhotos = [] }) {
   const sections = ['done', 'coming_up', 'overdue', 'admin_work'];
   const visible = visibleItems(items);
   const grandHours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
@@ -504,6 +545,9 @@ export function renderBoardReportItemsHtml({ report, items, aggregates }) {
     ${moneyHeaderHtml(aggregates)}
     ${report.SummaryNotes ? `<div style="background:#fbfbfe;border:1px solid #eef0f6;border-radius:10px;padding:14px;margin-bottom:6px;">${plainSummaryToHtml(report.SummaryNotes)}</div>` : ''}
     ${sections.map((sec) => sectionHtml(sec, items)).join('')}
+    ${Array.isArray(reportPhotos) && reportPhotos.length ? `
+      <h2 style="margin:26px 0 4px;font-size:1.1rem;border-top:2px solid #eef0f6;padding-top:14px;">Around camp</h2>
+      ${itemPhotosHtml(reportPhotos)}` : ''}
     <div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
       Total — ${visible.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}
     </div>
