@@ -6047,6 +6047,35 @@ function fmtMoneyPlain(n) {
 // Everything available to put on this report, grouped by the item it belongs under. Photos
 // linked to a JOB LINE are offered under that line's parent work order, because that is where
 // the board reads about the work (§2C's labelling uses the same relationship).
+// The candidate list pre-ticks the roles marked for the report (Before / After out of the box).
+// Those ticks have to be REAL, or the report goes out with no photos while the screen shows
+// them selected — the send path reads the table, not the default rule. So the defaults are
+// materialised the first time the list is read, and the table is the single source of truth
+// for the checkboxes, the meter and the email alike.
+//
+// Writes nothing for a photo Ben has already decided about: ON CONFLICT DO NOTHING means an
+// unticked Before stays unticked.
+export async function seedDefaultReportPhotos(reportId) {
+  const { rowCount } = await pool.query(
+    `INSERT INTO board_report_photos (report_id, attachment_id, item_id, included, sort_order)
+     SELECT $1, a.id, it.item_id, true, 0
+     FROM (
+       SELECT i.id AS item_id, i.item_type, i.item_id AS entity_id
+       FROM board_report_items i WHERE i.report_id = $1 AND i.included
+     ) it
+     JOIN attachment_links al
+       ON (al.entity_type = 'work_order' AND it.item_type = 'work_order' AND al.entity_id = it.entity_id)
+       OR (al.entity_type = 'job_line' AND it.item_type = 'work_order'
+           AND al.entity_id IN (SELECT id FROM job_lines WHERE work_order_id = it.entity_id))
+       OR (al.entity_type = 'job_line' AND it.item_type = 'job_line' AND al.entity_id = it.entity_id)
+     JOIN attachments a ON a.id = al.attachment_id AND a.deleted_at IS NULL AND a.kind = 'image'
+     JOIN attachment_roles r ON r.id = al.role_id AND r.default_include_in_report
+     ON CONFLICT (report_id, attachment_id) DO NOTHING`,
+    [reportId]
+  );
+  return rowCount;
+}
+
 export async function listBoardReportPhotoCandidates(reportId) {
   const { rows } = await pool.query(
     `WITH items AS (
@@ -6079,7 +6108,13 @@ export async function listBoardReportPhotoCandidates(reportId) {
   );
 
   const byItem = new Map();
+  const seen = new Set();
   for (const r of rows) {
+    // The join's OR matches a photo linked to the work order AND to one of its job lines, which
+    // would otherwise list the same picture twice under the same heading.
+    const key = `${r.item_id}:${r.attachment_id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     if (!byItem.has(r.item_id)) {
       byItem.set(r.item_id, { ItemId: r.item_id, ItemType: r.item_type, Title: r.snap_title, Photos: [] });
     }
@@ -6135,8 +6170,18 @@ export async function listSelectedReportPhotos(reportId) {
      FROM board_report_photos p
      JOIN attachments a ON a.id = p.attachment_id AND a.deleted_at IS NULL
      LEFT JOIN board_report_items i ON i.id = p.item_id
-     LEFT JOIN attachment_links al ON al.attachment_id = a.id AND al.entity_type = 'job_line'
-     LEFT JOIN job_lines jl ON jl.id = al.entity_id
+     -- One link per photo, and it must be the one carrying the role: restricting this to
+     -- 'job_line' dropped the role off every photo attached to a work order directly, which
+     -- cost those captions their BEFORE / AFTER prefix. A photo can have several links, so
+     -- prefer a link that has a role, then a job line (its title is the better caption).
+     LEFT JOIN LATERAL (
+       SELECT al.role_id, al.entity_type, al.entity_id
+       FROM attachment_links al
+       WHERE al.attachment_id = a.id
+       ORDER BY (al.role_id IS NULL), (al.entity_type <> 'job_line'), al.id
+       LIMIT 1
+     ) al ON true
+     LEFT JOIN job_lines jl ON al.entity_type = 'job_line' AND jl.id = al.entity_id
      LEFT JOIN attachment_roles r ON r.id = al.role_id
      WHERE p.report_id = $1 AND p.included
      ORDER BY p.item_id NULLS LAST, COALESCE(r.report_stage_order, 99), p.sort_order, p.id`,

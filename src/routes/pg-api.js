@@ -163,7 +163,8 @@ import {
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
   listFundingSources, createFundingSource, updateFundingSource,
-  listBoardReportPhotoCandidates, setBoardReportPhoto, removeBoardReportPhoto,
+  listBoardReportPhotoCandidates,
+  seedDefaultReportPhotos, setBoardReportPhoto, removeBoardReportPhoto,
   listSelectedReportPhotos, addReportLevelPhoto, getReportEmailBudgetMb,
   listPeople, getPerson, createPerson, updatePerson, deletePerson,
   findDuplicatePeople, mergePeople, listRecordMerges,
@@ -3432,6 +3433,9 @@ router.post('/board-reports/summary-preview', async (req, res, next) => {
 // ---- Board report photos (Part 2A/2B) ----
 router.get('/board-reports/:id(\\d+)/photos', async (req, res, next) => {
   try {
+    // Materialise the default ticks first, so the checkboxes, the meter and the email all read
+    // the same table rather than the screen showing a selection the send path cannot see.
+    await seedDefaultReportPhotos(req.params.id);
     const [groups, selected, budgetMb] = await Promise.all([
       listBoardReportPhotoCandidates(req.params.id),
       listSelectedReportPhotos(req.params.id),
