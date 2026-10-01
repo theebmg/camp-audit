@@ -87,6 +87,23 @@ for (const vp of [{ n: '393', w: 393, h: 852 }, { n: '1440', w: 1440, h: 900 }])
           sel: document.querySelector('.br-photo-role').value,
         }));
         ok(back.sel === '', 'choosing "no role" sticks');
+        // Untick it again, so the test leaves the real report exactly as it found it: seeding
+        // created a selection row and clearing the role does not remove it.
+        if (back.checked) {
+          await p.locator('.br-photo-pick').first().uncheck();
+          await p.waitForTimeout(2500);
+          const final = await p.evaluate(() => document.getElementById('brPhotoMeter').textContent.replace(/\s+/g, ' ').trim());
+          ok(/^0 selected/.test(final), `left as found: "${final}"`);
+        }
+        // Unticking leaves a row saying "no" — which is the point, so re-roling a photo does
+        // not silently re-tick it. For the test that is state the next pass would inherit, so
+        // the row itself is removed.
+        const att = await p.evaluate(() => document.querySelector('.br-photo-pick').dataset.att);
+        const del = await p.evaluate(async (a) => {
+          const r = await fetch(`/api/pg/board-reports/1/photos/${a}`, { method: 'DELETE', credentials: 'same-origin' });
+          return r.status;
+        }, att);
+        ok(del === 200, `the selection row was removed, leaving no trace (HTTP ${del})`);
       }
     }
     await p.locator('#brPhotosCard').screenshot({ path: `/tmp/photos-${vp.n}.png` });

@@ -8920,6 +8920,18 @@ async function renderCalendarEventDetail({ id }) {
 }
 
 // ---------- Board report photos (Part 2A / 2B) ----------
+// Object storage hands back the occasional 503 — seen on these very thumbnails, one request
+// failing while the next succeeds. A broken-image icon would read as a lost photo, so a
+// failed thumbnail is retried twice before it is allowed to look broken.
+window.brRetryThumb = function brRetryThumb(img) {
+  const tries = Number(img.dataset.tries || 0);
+  if (tries >= 2) { img.style.background = '#eee'; return; }
+  img.dataset.tries = String(tries + 1);
+  const base = img.src.split('#')[0];
+  setTimeout(() => { img.src = `${base}#r${tries + 1}`; }, 500 * (tries + 1));
+};
+
+
 async function loadReportPhotos(reportId) {
   const host = document.getElementById('brPhotos');
   const meter = document.getElementById('brPhotoMeter');
@@ -8945,7 +8957,8 @@ async function loadReportPhotos(reportId) {
           ${g.Photos.map((ph) => `
             <div class="br-photo" style="flex:0 0 auto;width:124px">
               <label style="cursor:pointer;display:block">
-                <img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt=""
+                <img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt="" data-tries="0"
+                     onerror="brRetryThumb(this)"
                      style="width:124px;height:92px;object-fit:cover;border-radius:6px;display:block;
                             border:3px solid ${ph.Selected ? 'var(--accent)' : 'transparent'}" />
                 <span style="display:flex;align-items:center;gap:5px;margin-top:3px;font-size:0.76rem">
