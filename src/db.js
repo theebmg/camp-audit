@@ -5101,6 +5101,41 @@ export async function getFundBalances() {
 
 // ── Expense categories (Build Brief v3 Part 1, §1.2) — admin-editable,
 //    same freetext-never-promoted rule as `causes`. ─────────────────────────
+// Who paid (§2b). Admin-editable like every other vocabulary here.
+export async function listFundingSources({ includeInactive = false } = {}) {
+  const { rows } = await pool.query(
+    `SELECT * FROM funding_sources ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`
+  );
+  return rows.map((r) => ({
+    Id: r.id, Name: r.name, CountsAsCampSpend: r.counts_as_camp_spend,
+    IsContribution: r.is_contribution, IsInKind: r.is_in_kind,
+    SortOrder: r.sort_order, Active: r.active,
+  }));
+}
+export async function createFundingSource({ name, countsAsCampSpend = false, isContribution = false, isInKind = false, sortOrder = 100 }) {
+  const { rows } = await pool.query(
+    `INSERT INTO funding_sources (name, counts_as_camp_spend, is_contribution, is_in_kind, sort_order)
+     VALUES ($1,$2,$3,$4,$5) RETURNING id`,
+    [String(name).trim(), !!countsAsCampSpend, !!isContribution, !!isInKind, sortOrder]
+  );
+  return (await listFundingSources({ includeInactive: true })).find((f) => f.Id === rows[0].id);
+}
+export async function updateFundingSource(id, { name, countsAsCampSpend, isContribution, isInKind, sortOrder, active }) {
+  await pool.query(
+    `UPDATE funding_sources SET
+       name = COALESCE($2, name),
+       counts_as_camp_spend = COALESCE($3, counts_as_camp_spend),
+       is_contribution = COALESCE($4, is_contribution),
+       is_in_kind = COALESCE($5, is_in_kind),
+       sort_order = COALESCE($6, sort_order),
+       active = COALESCE($7, active)
+     WHERE id = $1`,
+    [id, name?.trim() || null, countsAsCampSpend ?? null, isContribution ?? null,
+      isInKind ?? null, sortOrder ?? null, active ?? null]
+  );
+  return (await listFundingSources({ includeInactive: true })).find((f) => f.Id === Number(id));
+}
+
 export async function listExpenseCategories({ includeInactive = false } = {}) {
   const { rows } = await pool.query(`SELECT id, name, sort_order, active FROM expense_categories ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`);
   return rows.map((r) => ({ Id: r.id, Name: r.name, SortOrder: r.sort_order, Active: r.active }));
@@ -5134,6 +5169,9 @@ export async function deleteExpenseCategory(id) {
 function expenseRowToApi(r) {
   return {
     Id: r.id, Vendor: r.vendor, Amount: r.amount != null ? Number(r.amount) : null, PurchaseDate: r.purchase_date,
+    FundingSourceId: r.funding_source_id ?? null,
+    FundingSourceName: r.funding_source_name ?? null,
+    InKindNote: r.in_kind_note ?? null,
     TaxAmount: r.tax_amount != null ? Number(r.tax_amount) : null, TaxChargedInError: r.tax_charged_in_error,
     RegularPrice: r.regular_price != null ? Number(r.regular_price) : null,
     CategoryId: r.category_id, CategoryName: r.category_name || null,
@@ -5156,11 +5194,12 @@ function expenseRowToApi(r) {
 // plain-text alone is unreliable); plain text stays available as a
 // fallback toggle in the UI.
 const EXPENSE_SELECT = `
-  SELECT e.*, ec.name AS category_name, f.name AS fund_name, d.dest_id,
+  SELECT e.*, ec.name AS category_name, f.name AS fund_name, fsrc.name AS funding_source_name, d.dest_id,
          jl.title AS job_line_title, wo.title AS work_order_title, a.name AS asset_name,
          b.subject AS batch_subject, b.sender_email AS batch_sender_email, b.received_at AS batch_received_at,
          b.body_text AS batch_body_text, b.body_html AS batch_body_html
   FROM expenses e
+  LEFT JOIN funding_sources fsrc ON fsrc.id = e.funding_source_id
   LEFT JOIN expense_categories ec ON ec.id = e.category_id
   LEFT JOIN funds f ON f.id = e.fund_id
   -- The destination is an allocation now. The row shape still exposes a single
@@ -5266,13 +5305,15 @@ async function inheritedFundId(jobLineId, fundId) {
 
 export async function createExpense({
   vendor, amount, purchaseDate, taxAmount, taxChargedInError, categoryId, fundId, jobLineId, workOrderId, assetId, notes, regularPrice, createdBy,
+  fundingSourceId = null, inKindNote = null,
 }) {
   const resolvedFundId = await inheritedFundId(jobLineId, fundId);
   const { rows } = await pool.query(
-    `INSERT INTO expenses (vendor, amount, purchase_date, tax_amount, tax_charged_in_error, category_id, fund_id, asset_id, notes, regular_price, triage_status, source, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'triaged','manual',$11) RETURNING id`,
+    `INSERT INTO expenses (vendor, amount, purchase_date, tax_amount, tax_charged_in_error, category_id, fund_id, asset_id, notes, regular_price, triage_status, source, created_by, funding_source_id, in_kind_note)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'triaged','manual',$11,$12,$13) RETURNING id`,
     [vendor || null, amount ?? null, purchaseDate || null, taxAmount ?? null, !!taxChargedInError, categoryId || null,
-      resolvedFundId ?? null, assetId || null, notes || null, regularPrice ?? null, createdBy || null]
+      resolvedFundId ?? null, assetId || null, notes || null, regularPrice ?? null, createdBy || null,
+      fundingSourceId || null, inKindNote?.trim() || null]
   );
   const id = rows[0].id;
   // The ordinary form's single destination is just a one-way split — written here so
@@ -5351,6 +5392,8 @@ const EXPENSE_UPDATE_COLUMNS = {
   vendor: 'vendor', amount: 'amount', purchaseDate: 'purchase_date', taxAmount: 'tax_amount',
   taxChargedInError: 'tax_charged_in_error', categoryId: 'category_id',
   assetId: 'asset_id', notes: 'notes', regularPrice: 'regular_price',
+  // Who paid (§2b). Editable after the fact, which is how Ben marks the personal ones.
+  fundingSourceId: 'funding_source_id', inKindNote: 'in_kind_note',
 };
 // jobLineId/workOrderId are deliberately absent — they're allocations now (0078),
 // written by setExpenseDestination below.
@@ -5794,7 +5837,17 @@ async function suggestAdminTasks(reportId, passId, reported, { periodStart, peri
       itemType: 'admin_task', itemId: t.Id, section: 'admin_work', sortIndex: i,
       included: t.IncludeInBoardReport,
       snapTitle: t.Title, snapSubtitle: null, snapStatus: t.StatusName,
-      snapDate: t.TaskDate, snapHours: t.Hours,
+      // Only a span when there genuinely is one — a task with one date reads as one date.
+      snapStartDate: t.CompletedDate ? t.TaskDate : null,
+      // task_date is the start; completed_date is the finish. Where a task has only the one
+      // date it keeps reading exactly as it does now.
+      snapDate: t.CompletedDate || t.TaskDate, snapHours: t.Hours,
+      // The saving is stated from the record rather than retyped into a note (§5).
+      snapProgress: t.RecurringMonthlySavings
+        ? `Saving ${fmtMoneyPlain(t.RecurringMonthlySavings)}/month (${fmtMoneyPlain(t.RecurringMonthlySavings * 12)}/year)`
+          + (t.SavingOldCost != null && t.SavingNewCost != null
+            ? ` — was ${fmtMoneyPlain(t.SavingOldCost)}, now ${fmtMoneyPlain(t.SavingNewCost)}` : '')
+        : null,
     });
   }
   return rows.length;
@@ -10376,10 +10429,13 @@ export async function deleteAdminTaskStatus(id) {
 function adminTaskRowShape(r) {
   return {
     Id: r.id, Title: r.title, Description: r.description, TaskDate: r.task_date_text,
+    CompletedDate: r.completed_date_text ?? null,
     Hours: r.hours != null ? Number(r.hours) : null,
     StatusId: r.status_id, StatusName: r.status_name, StatusCountsAsWorkPerformed: r.status_counts_as_work_performed,
     CategoryId: r.category_id, CategoryName: r.category_name,
     RecurringMonthlySavings: r.recurring_monthly_savings != null ? Number(r.recurring_monthly_savings) : null,
+    SavingOldCost: r.saving_old_cost != null ? Number(r.saving_old_cost) : null,
+    SavingNewCost: r.saving_new_cost != null ? Number(r.saving_new_cost) : null,
     IncludeInBoardReport: r.include_in_board_report,
     AttachmentCount: r.attachment_count != null ? Number(r.attachment_count) : undefined,
     CreatedBy: r.created_by, CreatedAt: r.created_at, UpdatedAt: r.updated_at,
@@ -10390,11 +10446,20 @@ function adminTaskRowShape(r) {
 // comes back on the task, now read through this subquery rather than a column. One
 // recurring monthly entry per task is the invariant writeAdminTaskSaving maintains.
 const ADMIN_TASK_SELECT = `
-  SELECT t.*, t.task_date::text AS task_date_text, s.name AS status_name, s.counts_as_work_performed AS status_counts_as_work_performed, c.name AS category_name,
+  SELECT t.*, t.task_date::text AS task_date_text, t.completed_date::text AS completed_date_text,
+         s.name AS status_name, s.counts_as_work_performed AS status_counts_as_work_performed, c.name AS category_name,
          (SELECT se.amount FROM savings_entries se
           WHERE se.source_type = 'admin_task' AND se.source_id = t.id
             AND se.kind = 'recurring' AND se.period = 'monthly'
           ORDER BY se.id LIMIT 1) AS recurring_monthly_savings,
+         (SELECT se.old_cost FROM savings_entries se
+          WHERE se.source_type = 'admin_task' AND se.source_id = t.id
+            AND se.kind = 'recurring' AND se.period = 'monthly'
+          ORDER BY se.id LIMIT 1) AS saving_old_cost,
+         (SELECT se.new_cost FROM savings_entries se
+          WHERE se.source_type = 'admin_task' AND se.source_id = t.id
+            AND se.kind = 'recurring' AND se.period = 'monthly'
+          ORDER BY se.id LIMIT 1) AS saving_new_cost,
          (SELECT count(*) FROM attachment_links al JOIN attachments a ON a.id = al.attachment_id AND a.deleted_at IS NULL
           WHERE al.entity_type = 'admin_task' AND al.entity_id = t.id) AS attachment_count
   FROM admin_tasks t
@@ -10433,14 +10498,15 @@ async function resolveAdminTaskStatusId(statusId) {
   if (!rows[0]) { const e = new Error('No active admin task statuses — add one in Admin'); e.status = 400; throw e; }
   return rows[0].id;
 }
-export async function createAdminTask({ title, description, taskDate, hours, statusId, categoryId, recurringMonthlySavings, includeInBoardReport = true, createdBy }) {
+export async function createAdminTask({ title, description, taskDate, completedDate, hours, statusId, categoryId, recurringMonthlySavings, savingOldCost, savingNewCost, includeInBoardReport = true, createdBy }) {
   const resolvedStatusId = await resolveAdminTaskStatusId(statusId);
   const { rows } = await pool.query(
     `INSERT INTO admin_tasks (title, description, task_date, hours, status_id, category_id, include_in_board_report, created_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id`,
     [title, description || null, taskDate || null, hours ?? null, resolvedStatusId, categoryId || null, includeInBoardReport !== false, createdBy || null]
   );
-  await writeAdminTaskSaving(rows[0].id, recurringMonthlySavings ?? null, taskDate || null);
+  await writeAdminTaskSaving(rows[0].id, recurringMonthlySavings ?? null, taskDate || null,
+    { oldCost: savingOldCost ?? null, newCost: savingNewCost ?? null });
   await logActivity({ action: 'created', entityType: 'admin_task', entityId: rows[0].id, entityLabel: title });
   return getAdminTask(rows[0].id);
 }
@@ -10448,8 +10514,14 @@ export async function createAdminTask({ title, description, taskDate, hours, sta
 // One recurring monthly savings entry per admin task. null/0 removes it, so clearing
 // the field clears the saving rather than leaving a stale row the report would keep
 // counting. occurredOn follows the task's date — when the saving was secured.
-export async function writeAdminTaskSaving(taskId, amount, taskDate) {
-  const n = amount == null || amount === '' ? null : Number(amount);
+// A saving can be entered two ways (§5): straight in as an amount, or as old cost and new
+// cost with the difference computed. When both costs are given they win, and both are stored
+// so the screen can show its working and be edited without the arithmetic being retyped.
+export async function writeAdminTaskSaving(taskId, amount, taskDate, { oldCost = null, newCost = null } = {}) {
+  const num = (v) => (v == null || v === '' ? null : Number(v));
+  const o = num(oldCost); const nw = num(newCost);
+  const computed = (o != null && nw != null) ? o - nw : null;
+  const n = computed != null ? computed : num(amount);
   await pool.query(
     `DELETE FROM savings_entries
      WHERE source_type = 'admin_task' AND source_id = $1 AND kind = 'recurring' AND period = 'monthly'`,
@@ -10457,14 +10529,36 @@ export async function writeAdminTaskSaving(taskId, amount, taskDate) {
   );
   if (n == null || !(n > 0)) return;
   await pool.query(
-    `INSERT INTO savings_entries (kind, amount, period, source_type, source_id, occurred_on)
-     VALUES ('recurring', $1, 'monthly', 'admin_task', $2, COALESCE($3::date, CURRENT_DATE))`,
-    [n, taskId, taskDate || null]
+    `INSERT INTO savings_entries (kind, amount, period, source_type, source_id, occurred_on, old_cost, new_cost)
+     VALUES ('recurring', $1, 'monthly', 'admin_task', $2, COALESCE($3::date, CURRENT_DATE), $4, $5)`,
+    [n, taskId, taskDate || null, o, nw]
   );
 }
 
+// The saving recorded against an admin task, so the report can state it from the record
+// instead of Ben typing the figure into a note as well (§5).
+export async function getAdminTaskSaving(taskId) {
+  const { rows } = await pool.query(
+    `SELECT amount, period, old_cost, new_cost FROM savings_entries
+     WHERE source_type = 'admin_task' AND source_id = $1 AND kind = 'recurring'
+     ORDER BY id DESC LIMIT 1`,
+    [taskId]
+  );
+  if (!rows[0]) return null;
+  const r = rows[0];
+  return {
+    Amount: Number(r.amount), Period: r.period,
+    OldCost: r.old_cost != null ? Number(r.old_cost) : null,
+    NewCost: r.new_cost != null ? Number(r.new_cost) : null,
+    Annualized: r.period === 'monthly' ? Number(r.amount) * 12 : Number(r.amount),
+  };
+}
+
 const ADMIN_TASK_COLUMNS = {
-  title: 'title', description: 'description', taskDate: 'task_date', hours: 'hours',
+  title: 'title', description: 'description', taskDate: 'task_date',
+  // task_date is when the work started; this is when it finished (§7). One task with both,
+  // rather than two tasks for the beginning and the end of the same piece of work.
+  completedDate: 'completed_date', hours: 'hours',
   statusId: 'status_id', categoryId: 'category_id',
   includeInBoardReport: 'include_in_board_report',
 };
@@ -10476,10 +10570,11 @@ export async function updateAdminTask(id, fields) {
     vals.push(fields[key]);
     setCols.push(`${col} = $${vals.length}`);
   }
-  if ('recurringMonthlySavings' in fields) {
+  if ('recurringMonthlySavings' in fields || 'savingOldCost' in fields || 'savingNewCost' in fields) {
     const cur = await getAdminTask(id);
     if (!cur) return null;
-    await writeAdminTaskSaving(id, fields.recurringMonthlySavings, fields.taskDate ?? cur.TaskDate);
+    await writeAdminTaskSaving(id, fields.recurringMonthlySavings, fields.taskDate ?? cur.TaskDate,
+      { oldCost: fields.savingOldCost, newCost: fields.savingNewCost });
   }
   if (!setCols.length) return getAdminTask(id);
   vals.push(id);

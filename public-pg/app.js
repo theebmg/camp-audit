@@ -4527,6 +4527,9 @@ async function renderExpenseDetail({ id } = {}) {
   if (id && !expense) { app.innerHTML = '<div class="card"><p class="muted">Expense not found.</p></div>'; return; }
   const funds = state.options.funds || [];
   const expenseCategories = state.options.expenseCategories || [];
+  // Who paid (§2b). Fetched rather than read from state.options so a source added in Admin
+  // appears without a reload.
+  const fundingSources = (await api('/api/pg/funding-sources').catch(() => ({ sources: [] }))).sources || [];
 
   app.innerHTML = `
     <div class="card">
@@ -4543,6 +4546,21 @@ async function renderExpenseDetail({ id } = {}) {
           Tax charged in error (camp is tax-exempt — flags this for the quarterly recovery list)
         </label>
         <div class="field-row"><label>Category</label><select name="categoryId">${categoryPickerOptionsHtml(expenseCategories, expense?.CategoryId)}</select></div>
+        <div class="field-row"><label>Who paid</label>
+          <select name="fundingSourceId" id="expFundingSource">
+            <option value="">— not set —</option>
+            ${fundingSources.map((f) => `<option value="${f.Id}" ${expense?.FundingSourceId === f.Id ? 'selected' : ''}>${escapeHtml(f.Name)}</option>`).join('')}
+          </select>
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">
+            Camp money is reported as camp spend; personal, donated and in-kind are reported
+            separately, so a contribution is never counted as the camp spending.
+          </p>
+        </div>
+        <div class="field-row" id="inKindRow" ${expense?.InKindNote ? '' : 'hidden'}>
+          <label>What was contributed</label>
+          <input name="inKindNote" value="${escapeHtml(expense?.InKindNote || '')}" placeholder="e.g. 6 hours of volunteer labour, donated lumber" />
+          <p class="muted" style="margin-top:2px;font-size:0.8rem">In-kind has no receipt, so the amount above is its estimated value.</p>
+        </div>
         <div class="field-row"><label>Fund</label><select name="fundId">${fundPickerOptionsHtml(funds, expense?.FundId)}</select>
           <p class="muted" style="margin-top:2px;font-size:0.8rem">A reference line, not a cap — going over always saves, it just shows as a warning on the Expenses page.</p>
         </div>
@@ -4759,7 +4777,11 @@ async function renderAdminTaskDetail({ id } = {}) {
       <form id="adminTaskForm">
         <div class="field-row"><label>Title</label><input name="title" required value="${escapeHtml(task?.Title || '')}" placeholder="e.g. Cancelled unused Verizon line" /></div>
         <div class="field-row"><label>Description</label><textarea name="description" rows="4">${escapeHtml(task?.Description || '')}</textarea></div>
-        <div class="field-row"><label>Date</label><input name="taskDate" type="date" required value="${escapeHtml(task?.TaskDate || isoDate(new Date()))}" /></div>
+        <div class="field-row" style="display:flex;gap:8px;flex-wrap:wrap">
+          <div style="flex:1 1 150px"><label>Started</label><input name="taskDate" type="date" required value="${escapeHtml(task?.TaskDate || isoDate(new Date()))}" /></div>
+          <div style="flex:1 1 150px"><label>Completed <span class="muted">(optional)</span></label><input name="completedDate" type="date" value="${escapeHtml(task?.CompletedDate || '')}" /></div>
+        </div>
+        <p class="muted" style="margin:-10px 0 14px;font-size:0.8rem">One task with both dates, rather than one for starting and another for finishing.</p>
         <div class="field-row"><label>Hours</label><input name="hours" type="number" step="any" min="0" value="${task?.Hours ?? ''}" /></div>
         <div class="field-row"><label>Status</label><select name="statusId" required>
           ${statusChoices.map((st) => `<option value="${st.Id}" ${st.Id === defaultStatus ? 'selected' : ''}>${escapeHtml(st.Name)}${st.Active ? '' : ' (inactive)'}</option>`).join('')}
@@ -4767,9 +4789,22 @@ async function renderAdminTaskDetail({ id } = {}) {
           <p class="muted" style="margin-top:2px;font-size:0.8rem">Statuses marked "counts as work performed" in Admin put the task in the Work Performed report.</p>
         </div>
         <div class="field-row"><label>Category (optional)</label><select name="categoryId">${categoryPickerOptionsHtml(categoryChoices, task?.CategoryId)}</select></div>
-        <div class="field-row"><label>Recurring monthly savings (optional)</label>
-          <input name="recurringMonthlySavings" type="number" step="0.01" min="0" value="${task?.RecurringMonthlySavings ?? ''}" placeholder="Leave blank unless this cut a recurring cost" />
-          <p class="muted" style="margin-top:2px;font-size:0.8rem">Only when the task eliminated or reduced a recurring cost — e.g. a cancelled $45/month subscription. The report totals it monthly and annualized.</p>
+        <div class="field-row">
+          <label>Recurring monthly savings (optional)</label>
+          <p class="muted" style="margin:0 0 6px;font-size:0.8rem">
+            Enter the old and new monthly cost and the saving is worked out, or type the saving
+            straight in. Whatever is recorded here is what the board report states — no need to
+            repeat the figure in the description.
+          </p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <div style="flex:1 1 110px"><label style="font-weight:400;font-size:0.82rem">Was / month</label>
+              <input name="savingOldCost" id="savOld" type="number" step="0.01" min="0" value="${task?.SavingOldCost ?? ''}" placeholder="e.g. 420" /></div>
+            <div style="flex:1 1 110px"><label style="font-weight:400;font-size:0.82rem">Now / month</label>
+              <input name="savingNewCost" id="savNew" type="number" step="0.01" min="0" value="${task?.SavingNewCost ?? ''}" placeholder="e.g. 143" /></div>
+            <div style="flex:1 1 110px"><label style="font-weight:400;font-size:0.82rem">Saving / month</label>
+              <input name="recurringMonthlySavings" id="savAmt" type="number" step="0.01" min="0" value="${task?.RecurringMonthlySavings ?? ''}" placeholder="or type it" /></div>
+          </div>
+          <p class="muted" id="savHint" style="margin-top:4px;font-size:0.8rem"></p>
         </div>
         <div class="field-row">
           <label class="skill-chip ${task?.IncludeInBoardReport !== false ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="includeInBoardReport" style="margin-right:6px" ${task?.IncludeInBoardReport !== false ? 'checked' : ''} />Include on board report</label>
@@ -4794,6 +4829,30 @@ async function renderAdminTaskDetail({ id } = {}) {
     });
   }
 
+  // Old and new cost compute the saving as you type, so the figure is never entered twice and
+  // the arithmetic is visible rather than done in your head.
+  const savOld = document.getElementById('savOld');
+  const savNew = document.getElementById('savNew');
+  const savAmt = document.getElementById('savAmt');
+  const savHint = document.getElementById('savHint');
+  const recomputeSaving = () => {
+    const o = parseFloat(savOld.value); const n = parseFloat(savNew.value);
+    if (Number.isFinite(o) && Number.isFinite(n)) {
+      const diff = Math.round((o - n) * 100) / 100;
+      savAmt.value = diff > 0 ? diff : '';
+      savAmt.readOnly = true;
+      savHint.textContent = diff > 0
+        ? `Saving $${diff.toFixed(2)}/month — $${(diff * 12).toFixed(2)}/year.`
+        : 'The new cost is not lower than the old one, so there is no saving to record.';
+    } else {
+      savAmt.readOnly = false;
+      const a = parseFloat(savAmt.value);
+      savHint.textContent = Number.isFinite(a) && a > 0 ? `$${(a * 12).toFixed(2)}/year.` : '';
+    }
+  };
+  [savOld, savNew, savAmt].forEach((el) => el?.addEventListener('input', recomputeSaving));
+  recomputeSaving();
+
   document.getElementById('adminTaskForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const fd = new FormData(e.target);
@@ -4805,6 +4864,9 @@ async function renderAdminTaskDetail({ id } = {}) {
       statusId: fd.get('statusId'),
       categoryId: fd.get('categoryId') || null,
       recurringMonthlySavings: fd.get('recurringMonthlySavings') === '' ? null : fd.get('recurringMonthlySavings'),
+      savingOldCost: fd.get('savingOldCost') === '' ? null : fd.get('savingOldCost'),
+      savingNewCost: fd.get('savingNewCost') === '' ? null : fd.get('savingNewCost'),
+      completedDate: fd.get('completedDate') === '' ? null : fd.get('completedDate'),
       includeInBoardReport: fd.has('includeInBoardReport'),
     };
     try {

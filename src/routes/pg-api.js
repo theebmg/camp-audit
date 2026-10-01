@@ -160,6 +160,7 @@ import {
   useMaterialFromStock,
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
+  listFundingSources, createFundingSource, updateFundingSource,
   listPeople, getPerson, createPerson, updatePerson, deletePerson,
   findDuplicatePeople, mergePeople, listRecordMerges,
   listPersonRoles, createPersonRole, updatePersonRole, deletePersonRole,
@@ -3379,6 +3380,18 @@ router.get('/groups/export.csv', async (req, res, next) => {
         g.TypicalHeadcount, g.Notes,
       ]));
   } catch (e) { next(e); }
+});
+
+
+// ---- Funding sources (who paid) ----
+router.get('/funding-sources', async (req, res, next) => {
+  try { res.json({ sources: await listFundingSources({ includeInactive: req.query.includeInactive === 'true' }) }); } catch (e) { next(e); }
+});
+router.post('/funding-sources', async (req, res, next) => {
+  try { res.json({ source: await createFundingSource(req.body || {}) }); } catch (e) { next(e); }
+});
+router.patch('/funding-sources/:id(\\d+)', async (req, res, next) => {
+  try { res.json({ source: await updateFundingSource(req.params.id, req.body || {}) }); } catch (e) { next(e); }
 });
 
 export default router;
