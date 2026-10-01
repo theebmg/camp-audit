@@ -26,36 +26,52 @@ export function escapeXml(s) {
 // "BEFORE — Replace sump pump". The prefix comes from the role vocabulary, not from a
 // hardcoded list, so renaming a role or adding one is an admin job (§2C). A role with no
 // prefix — Reference, Spec — is captioned with its description alone.
-export function buildPhotoLabel({ rolePrefix, description }, { maxLength = 72 } = {}) {
+//
+// No truncation here: how much fits depends on the width of the image it is going onto, which
+// this does not know. fitLabel() does that, once the picture has been measured.
+export function buildPhotoLabel({ rolePrefix, description }) {
   const desc = String(description || '').replace(/\s+/g, ' ').trim();
   const prefix = rolePrefix ? String(rolePrefix).trim() : null;
-  const budget = prefix ? maxLength - prefix.length - 3 : maxLength;
-  let text = desc;
-  if (text.length > budget) {
-    // Cut at a word so a truncated label does not end mid-syllable.
-    const cut = text.slice(0, Math.max(0, budget - 1));
-    const lastSpace = cut.lastIndexOf(' ');
-    text = `${(lastSpace > budget * 0.5 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
-  }
-  if (!text) return prefix || '';
-  return prefix ? `${prefix} — ${text}` : text;
+  if (!desc) return prefix || '';
+  return prefix ? `${prefix} — ${desc}` : desc;
+}
+
+// Trim a label to what will actually fit across the picture. A fixed character count cannot
+// work — the first attempt used 72 and ran off the edge of a portrait photo, because 72
+// characters at the band's font size is far wider than 1200px.
+//
+// 0.58em is a good enough average advance for DejaVu Sans Bold in mixed case; being slightly
+// pessimistic just means a shorter caption rather than one that overflows.
+const AVG_CHAR_EM = 0.58;
+export function fitLabel(label, availableWidthPx, fontSizePx) {
+  const text = String(label || '');
+  const maxChars = Math.max(8, Math.floor(availableWidthPx / (fontSizePx * AVG_CHAR_EM)));
+  if (text.length <= maxChars) return text;
+  const cut = text.slice(0, maxChars - 1);
+  const lastSpace = cut.lastIndexOf(' ');
+  // Only break at a word if that does not throw away most of the caption.
+  return `${(lastSpace > maxChars * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
 }
 
 // The caption is drawn as an SVG overlay rather than with a font library: a semi-transparent
 // dark band along the bottom with light text, which stays legible on a snowy roof and on a
 // dark basement alike (§2C).
 function captionSvg(width, height, label) {
-  const band = Math.max(MIN_BAND_PX, Math.round(height * BAND_RATIO));
-  const fontSize = Math.round(band * 0.42);
+  // The band is sized off the SHORTER edge, so a tall portrait photo does not get a band that
+  // is a third of the picture while a wide one gets a sliver.
+  const basis = Math.min(width, height);
+  const band = Math.max(MIN_BAND_PX, Math.round(basis * BAND_RATIO));
+  const fontSize = Math.round(band * 0.40);
   const padX = Math.round(band * 0.38);
   const baseline = Math.round(height - band / 2 + fontSize * 0.36);
+  const text = fitLabel(label, width - padX * 2, fontSize);
   return Buffer.from(`
     <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-      <rect x="0" y="${height - band}" width="${width}" height="${band}" fill="rgba(12,14,22,0.62)"/>
+      <rect x="0" y="${height - band}" width="${width}" height="${band}" fill="rgba(12,14,22,0.66)"/>
       <text x="${padX}" y="${baseline}"
             font-family="DejaVu Sans, Helvetica, Arial, sans-serif"
             font-size="${fontSize}" font-weight="700" fill="#ffffff"
-            letter-spacing="0.3">${escapeXml(label)}</text>
+            letter-spacing="0.3">${escapeXml(text)}</text>
     </svg>`);
 }
 
