@@ -3436,17 +3436,20 @@ router.get('/board-reports/:id(\\d+)/photos', async (req, res, next) => {
     // Materialise the default ticks first, so the checkboxes, the meter and the email all read
     // the same table rather than the screen showing a selection the send path cannot see.
     await seedDefaultReportPhotos(req.params.id);
-    const [groups, selected, budgetMb] = await Promise.all([
+    const [groups, selected, budgetMb, roles] = await Promise.all([
       listBoardReportPhotoCandidates(req.params.id),
       listSelectedReportPhotos(req.params.id),
       getReportEmailBudgetMb(),
+      // Sent with the list so the role can be set here: it is what decides the BEFORE / AFTER
+      // prefix and the default tick, and the September photos arrived without one.
+      listAttachmentRoles(),
     ]);
     // The meter estimates from the stored file size rather than building every copy, because it
     // has to answer while Ben is ticking boxes. Real copies come out smaller, so it warns early
     // rather than late.
     const estimatedBytes = selected.reduce((t, p) => t + estimateEmailBytes(p.FileSize, p.Width), 0);
     res.json({
-      groups, selected, budgetMb,
+      groups, selected, budgetMb, roles,
       estimatedBytes,
       estimatedLabel: formatBytes(estimatedBytes),
       overBudget: estimatedBytes > budgetMb * 1024 * 1024,

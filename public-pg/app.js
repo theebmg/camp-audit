@@ -8940,16 +8940,28 @@ async function loadReportPhotos(reportId) {
         <div style="font-weight:600;font-size:0.9rem">${escapeHtml(g.Title || '(untitled)')}</div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px">
           ${g.Photos.map((ph) => `
-            <label class="br-photo" style="flex:0 0 auto;width:112px;cursor:pointer;display:block">
-              <img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt=""
-                   style="width:112px;height:84px;object-fit:cover;border-radius:6px;display:block;
-                          border:3px solid ${ph.Selected ? 'var(--accent)' : 'transparent'}" />
-              <span style="display:flex;align-items:center;gap:5px;margin-top:3px;font-size:0.76rem">
-                <input type="checkbox" class="br-photo-pick" data-att="${ph.AttachmentId}"
-                       data-item="${g.ItemId}" ${ph.Selected ? 'checked' : ''} />
-                ${escapeHtml(ph.RolePrefix || ph.RoleName || 'no role')}
-              </span>
-            </label>`).join('')}
+            <div class="br-photo" style="flex:0 0 auto;width:124px">
+              <label style="cursor:pointer;display:block">
+                <img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt=""
+                     style="width:124px;height:92px;object-fit:cover;border-radius:6px;display:block;
+                            border:3px solid ${ph.Selected ? 'var(--accent)' : 'transparent'}" />
+                <span style="display:flex;align-items:center;gap:5px;margin-top:3px;font-size:0.76rem">
+                  <input type="checkbox" class="br-photo-pick" data-att="${ph.AttachmentId}"
+                         data-item="${g.ItemId}" ${ph.Selected ? 'checked' : ''} />
+                  Include
+                </span>
+              </label>
+              <select class="br-photo-role" data-link="${ph.LinkId}"
+                      style="width:124px;margin-top:3px;font-size:0.74rem;padding:2px 4px"
+                      title="What this photo shows. Decides the caption and whether it is ticked by default.">
+                <option value="">no role</option>
+                ${(data.roles || []).map((r) => `
+                  <option value="${r.Id}" ${ph.RoleName === r.Name ? 'selected' : ''}>${escapeHtml(r.Name)}</option>`).join('')}
+              </select>
+              <div class="muted" style="font-size:0.7rem;margin-top:2px;line-height:1.25">
+                ${escapeHtml(ph.RolePrefix ? `${ph.RolePrefix} — ` : '')}${escapeHtml(ph.Description || '')}
+              </div>
+            </div>`).join('')}
         </div>
       </div>`).join('');
 
@@ -8971,6 +8983,19 @@ async function loadReportPhotos(reportId) {
         data = await api(`/api/pg/board-reports/${reportId}/photos`);
         draw();
       } catch (e) { toast(e.message, 5000); cb.checked = !cb.checked; }
+    }));
+
+    // The role is what gives a caption its BEFORE / AFTER and decides the default tick, so it is
+    // editable here rather than only on the work order's attachment panel.
+    host.querySelectorAll('.br-photo-role').forEach((sel) => sel.addEventListener('change', async () => {
+      if (!sel.dataset.link || sel.dataset.link === 'null') { toast('This photo has no link to set a role on.', 4000); return; }
+      try {
+        await api(`/api/pg/attachment-links/${sel.dataset.link}`, {
+          method: 'PATCH', body: JSON.stringify({ roleId: sel.value ? Number(sel.value) : null }),
+        });
+        data = await api(`/api/pg/board-reports/${reportId}/photos`);
+        draw();
+      } catch (e) { toast(e.message, 5000); }
     }));
 
     if (over) {

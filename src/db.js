@@ -6089,7 +6089,7 @@ export async function listBoardReportPhotoCandidates(reportId) {
             a.caption, a.taken_at,
             r.name AS role_name, r.report_label_prefix, r.report_stage_order,
             r.default_include_in_report,
-            al.entity_type AS linked_to, al.entity_id AS linked_id,
+            al.id AS link_id, al.entity_type AS linked_to, al.entity_id AS linked_id,
             jl.title AS job_line_title,
             p.id AS selection_id, p.included AS selected
      FROM items it
@@ -6126,7 +6126,7 @@ export async function listBoardReportPhotoCandidates(reportId) {
       // What the caption will say: the job line's own description when the photo is linked to
       // one, otherwise the work order's title (§2C).
       Description: r.job_line_title || r.caption || r.snap_title,
-      LinkedTo: r.linked_to,
+      LinkedTo: r.linked_to, LinkId: r.link_id,
       SelectionId: r.selection_id,
       // Unselected photos default to the roles that are already marked for the report — which
       // is Before and After out of the box, and is admin-editable rather than a hardcoded rule.
