@@ -290,22 +290,47 @@ function moneyHeaderHtml(aggregates) {
       <div style="color:#6b7086;font-size:0.78rem;text-transform:uppercase;">${escapeHtml(a.Label)}</div>
       <div style="font-size:1.05rem;font-weight:700;">${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : escapeHtml(a.ValueText || '—')}</div>
     </td>`;
+  // Both rows must have the same number of cells or Outlook renders a ragged table — it does
+  // not reflow a short row the way a browser does. The shorter row gets an empty filler cell.
+  const cols = Math.max(money.length, savings.length, 1);
+  const row = (cells) => {
+    if (!cells.length) return '';
+    const filler = '<td style="padding:8px 14px;"></td>'.repeat(cols - cells.length);
+    return `<tr>${cells.map(cell).join('')}${filler}</tr>`;
+  };
   return `
-    <table style="width:100%;border-collapse:collapse;background:#f9fafc;border:1px solid #eef0f6;border-radius:10px;margin-bottom:18px;">
-      <tr>${money.map(cell).join('')}</tr>
-      ${savings.length ? `<tr>${savings.map(cell).join('')}</tr>` : ''}
+    <table role="presentation" style="width:100%;border-collapse:collapse;background:#f9fafc;border:1px solid #eef0f6;border-radius:10px;margin-bottom:18px;table-layout:fixed;">
+      ${row(money)}
+      ${row(savings)}
     </table>`;
 }
 
 function itemLineHtml(it) {
+  // Dates read as a span rather than a single stamp (decisions §7): when something started
+  // and whether it has finished is more use to a board than one undated figure.
+  const dates = it.SnapStartDate
+    ? `Started ${fmtDate(it.SnapStartDate)} · ${it.SnapDate ? `Completed ${fmtDate(it.SnapDate)}` : 'In progress'}`
+    : (it.SnapDate ? fmtDate(it.SnapDate) : null);
   const bits = [
-    it.SnapAssetName, it.SnapStatus, it.SnapDate ? fmtDate(it.SnapDate) : null,
+    it.SnapAssetName, it.SnapStatus, dates,
     it.SnapHours != null ? fmtHours(it.SnapHours) : null,
     it.SnapCost != null ? fmtMoney(it.SnapCost) : null,
   ].filter(Boolean);
+  // The em-dash suffix is for things the detail line does not already say. Printing the
+  // asset there as well gave "Front Gate Repair — Red Gate" above "Red Gate · Done · …",
+  // and an admin task's category turned into "Fixed NVR Hard Drive — Other", which is noise
+  // to a board reader (fix 8).
+  // An admin task's subtitle only ever carried its category, which is internal filing rather
+  // than something the board needs, so it is not printed at all. Existing snapshot rows still
+  // hold it — the upsert's COALESCE cannot clear a stored value — so the guard lives here as
+  // well as at the source.
+  const suffix = it.SnapSubtitle
+    && it.SnapSubtitle !== it.SnapAssetName
+    && it.ItemType !== 'admin_task'
+    ? it.SnapSubtitle : null;
   return `
     <div style="border-bottom:1px solid #eef0f6;padding:9px 0;">
-      <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${it.SnapSubtitle ? ` <span style="color:#6b7086;">— ${escapeHtml(it.SnapSubtitle)}</span>` : ''}</div>
+      <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${suffix ? ` <span style="color:#6b7086;">— ${escapeHtml(suffix)}</span>` : ''}</div>
       ${bits.length ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(bits.join(' · '))}</div>` : ''}
       ${it.SnapProgress ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(it.SnapProgress)}</div>` : ''}
       ${it.ReportNote ? `<div style="margin-top:4px;font-size:0.9rem;">${escapeHtml(it.ReportNote)}</div>` : ''}
@@ -315,12 +340,11 @@ function itemLineHtml(it) {
 // A summary work order prints one line and swallows its job lines; an itemized one
 // prints its lines instead. Summary is the default for every WO (§6).
 function sectionHtml(section, items) {
-  const rows = items.filter((i) => i.Section === section && i.Included);
-  if (!rows.length) return '';
-  const summaryWoIds = new Set(
-    rows.filter((i) => i.ItemType === 'work_order' && i.DisplayMode === 'summary').map((i) => i.ItemId)
-  );
-  const visible = rows.filter((i) => !(i.ItemType === 'job_line' && summaryWoIds.has(i.ParentWorkOrderId)));
+  if (!items.some((i) => i.Section === section && i.Included)) return '';
+  // One rule, shared with the footer, so a section subtotal and the grand total can never
+  // disagree about what counts again.
+  const visible = visibleItems(items).filter((i) => i.Section === section);
+  if (!visible.length) return '';
   const hours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
   const cost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
   const sub = [hours ? fmtHours(hours) : null, cost ? fmtMoney(cost) : null].filter(Boolean).join(' · ');
@@ -332,11 +356,23 @@ function sectionHtml(section, items) {
     ${visible.map(itemLineHtml).join('')}`;
 }
 
+// What the reader can actually see: included, minus the job lines their work order is
+// summarising away. sectionHtml() has always applied this to its own subtotals; the grand
+// footer did not, so it counted and totalled 15 rows nobody could see.
+function visibleItems(items) {
+  const summaryWoIds = new Set(
+    items.filter((i) => i.Included && i.ItemType === 'work_order' && i.DisplayMode === 'summary')
+      .map((i) => i.ItemId)
+  );
+  return items.filter((i) => i.Included
+    && !(i.ItemType === 'job_line' && summaryWoIds.has(i.ParentWorkOrderId)));
+}
+
 export function renderBoardReportItemsHtml({ report, items, aggregates }) {
   const sections = ['done', 'coming_up', 'overdue', 'admin_work'];
-  const included = items.filter((i) => i.Included);
-  const grandHours = included.reduce((t, i) => t + (i.SnapHours || 0), 0);
-  const grandCost = included.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const visible = visibleItems(items);
+  const grandHours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
+  const grandCost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
   return htmlShell(
     `Board Report — ${report.Title}`,
     `${report.PeriodStart} to ${report.PeriodEnd} · looking ahead to ${report.ForwardEnd}${report.Status === 'draft' ? ' · DRAFT' : ''}`,
@@ -345,7 +381,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates }) {
     ${report.SummaryNotes ? `<div style="background:#fbfbfe;border:1px solid #eef0f6;border-radius:10px;padding:14px;margin-bottom:6px;white-space:pre-wrap;">${escapeHtml(report.SummaryNotes)}</div>` : ''}
     ${sections.map((sec) => sectionHtml(sec, items)).join('')}
     <div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
-      Total — ${included.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)}` : ''}
+      Total — ${visible.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}
     </div>
     <div style="margin-top:8px;color:#9298b0;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
   `
@@ -359,12 +395,9 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     lines.push(`${a.Label}: ${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : (a.ValueText || '—')}`);
   }
   if (report.SummaryNotes) lines.push('', report.SummaryNotes);
-  const summaryWoIds = new Set(
-    items.filter((i) => i.Included && i.ItemType === 'work_order' && i.DisplayMode === 'summary').map((i) => i.ItemId)
-  );
+  const visible = visibleItems(items);
   for (const sec of ['done', 'coming_up', 'overdue', 'admin_work']) {
-    const rows = items.filter((i) => i.Section === sec && i.Included
-      && !(i.ItemType === 'job_line' && summaryWoIds.has(i.ParentWorkOrderId)));
+    const rows = visible.filter((i) => i.Section === sec);
     if (!rows.length) continue;
     lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${rows.length}):`);
     for (const it of rows) {

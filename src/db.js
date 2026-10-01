@@ -5700,10 +5700,15 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
             (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
             jl.actual_hours,
             COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost,
-            w.id AS work_order_id, w.title AS wo_title, a.name AS asset_name, s.name AS status_name
+            w.id AS work_order_id, w.title AS wo_title, a.name AS asset_name, s.name AS status_name,
+            -- The work order's OWN status and dates, so the header row this pass writes
+            -- carries the same detail the board-featured path has always written (decisions §7).
+            ws.name AS wo_status, w.date_reported::text AS wo_started,
+            w.date_completed::text AS wo_completed
      FROM job_lines jl
      JOIN job_line_statuses s ON s.id = jl.status_id
      JOIN work_orders w ON w.id = jl.work_order_id
+     LEFT JOIN work_order_statuses ws ON ws.id = w.status_id
      LEFT JOIN assets a ON a.id = w.asset_id
      LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
      WHERE s.counts_as_work_performed
@@ -5727,6 +5732,10 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
       await upsertBoardReportItem(reportId, { passId,
         itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
         snapTitle: r.wo_title, snapAssetName: r.asset_name,
+        // Previously title and asset only, which is why the sump pump showed no status and
+        // no date while the board-featured front gate showed both — two paths writing a work
+        // order row with different amounts of detail (decisions §7).
+        snapStatus: r.wo_status, snapStartDate: r.wo_started, snapDate: r.wo_completed,
       });
     }
     await upsertBoardReportItem(reportId, { passId,
@@ -5757,7 +5766,7 @@ async function suggestAdminTasks(reportId, passId, reported, { periodStart, peri
     await upsertBoardReportItem(reportId, { passId,
       itemType: 'admin_task', itemId: t.Id, section: 'admin_work', sortIndex: i,
       included: t.IncludeInBoardReport,
-      snapTitle: t.Title, snapSubtitle: t.CategoryName, snapStatus: t.StatusName,
+      snapTitle: t.Title, snapSubtitle: null, snapStatus: t.StatusName,
       snapDate: t.TaskDate, snapHours: t.Hours,
     });
   }
@@ -5866,6 +5875,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
 
   const { rows: wos } = await pool.query(
     `SELECT w.id, w.title, ws.name AS status, ws.is_terminal,
+            w.date_reported::text AS started_date,
             w.date_completed::text AS completed_date, w.board_focus_set_at,
             COALESCE(a.name, l.name) AS place
      FROM work_orders w
@@ -5895,7 +5905,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
       itemType: 'work_order', itemId: r.id,
       section: (r.is_terminal || anchorsDone) ? 'done' : 'coming_up', sortIndex: 3000 + i,
       snapTitle: r.title, snapAssetName: r.place, snapStatus: r.status,
-      snapDate: r.completed_date,
+      snapStartDate: r.started_date, snapDate: r.completed_date,
       // "Featured since March" stays on open items so a stale flag reads as stale;
       // on finished work the flag is about to clear itself, so it says nothing.
       // Any OPEN item keeps "featured since March", including one sitting in Done as
@@ -6060,20 +6070,29 @@ const BOARD_REPORT_SELECT = `
          r.forward_start::text AS forward_start_text, r.forward_end::text AS forward_end_text
   FROM board_reports r`;
 
-// §4: backward runs from the last PUBLISHED report's period_end (first ever: the start
-// of this month) through today. Forward defaults to the same length, so "last 30 days /
-// next 30 days" falls out rather than being a second thing to configure.
+// The period is a WHOLE CALENDAR MONTH (Oct 2026 decisions §4). It used to run from the last
+// published report's end through today, which meant two things that were both wrong for a
+// monthly report: the end date was whatever day the draft happened to be opened — September's
+// draft ended on the 23rd and missed a $42.60 receipt — and starting from the previous end
+// overlapped that report's last day.
+//
+// The month reported is the one that has most recently finished, unless today IS inside a
+// month that has not finished, in which case the previous whole month is the right one to
+// report on. Both dates stay editable on the report screen.
 export async function defaultBoardReportPeriods() {
-  const { rows } = await pool.query(
-    `SELECT period_end::text AS period_end FROM board_reports
-     WHERE status = 'published' ORDER BY period_end DESC, id DESC LIMIT 1`
-  );
-  const todayStr = today();
-  const start = rows[0]?.period_end || `${todayStr.slice(0, 7)}-01`;
-  const spanDays = Math.max(1, Math.round((new Date(todayStr) - new Date(start)) / 86400000));
-  const forwardEnd = new Date(new Date(todayStr).getTime() + spanDays * 86400000)
-    .toISOString().slice(0, 10);
-  return { periodStart: start, periodEnd: todayStr, forwardStart: todayStr, forwardEnd };
+  const now = new Date(`${today()}T00:00:00Z`);
+  // The month just gone: step back to day 0 of this month, which is the last day of the last.
+  const lastDayOfPrevMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 0));
+  const y = lastDayOfPrevMonth.getUTCFullYear();
+  const m = lastDayOfPrevMonth.getUTCMonth();
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const periodStart = iso(new Date(Date.UTC(y, m, 1)));
+  const periodEnd = iso(lastDayOfPrevMonth);
+  // Forward runs from the day after the period, for one month — anchored to period_end rather
+  // than to today, so regenerating a draft weeks later does not move the window.
+  const forwardStart = iso(new Date(Date.UTC(y, m + 1, 1)));
+  const forwardEnd = iso(new Date(Date.UTC(y, m + 2, 0)));
+  return { periodStart, periodEnd, forwardStart, forwardEnd };
 }
 
 // One draft at a time — the partial unique index enforces it, this just makes the
@@ -6127,7 +6146,8 @@ export async function updateBoardReport(id, fields) {
 
 export async function listBoardReportItems(reportId) {
   const { rows } = await pool.query(
-    `SELECT *, item_date::text AS item_date_text, snap_date::text AS snap_date_text
+    `SELECT *, item_date::text AS item_date_text, snap_date::text AS snap_date_text,
+            snap_start_date::text AS snap_start_date_text
      FROM board_report_items WHERE report_id = $1 ORDER BY section, sort_index, id`,
     [reportId]
   );
@@ -6136,7 +6156,7 @@ export async function listBoardReportItems(reportId) {
     Section: r.section, Included: r.included, DisplayMode: r.display_mode,
     ReportNote: r.report_note, SortIndex: r.sort_index,
     SnapTitle: r.snap_title, SnapSubtitle: r.snap_subtitle, SnapAssetName: r.snap_asset_name,
-    SnapStatus: r.snap_status, SnapDate: r.snap_date_text,
+    SnapStatus: r.snap_status, SnapDate: r.snap_date_text, SnapStartDate: r.snap_start_date_text,
     SnapHours: r.snap_hours != null ? Number(r.snap_hours) : null,
     SnapCost: r.snap_cost != null ? Number(r.snap_cost) : null,
     SnapProgress: r.snap_progress,
@@ -6151,16 +6171,16 @@ export async function listBoardReportItems(reportId) {
 // set on insert unless explicitly passed.
 export async function upsertBoardReportItem(reportId, {
   itemType, itemId, itemDate = null, section, included, displayMode, reportNote, sortIndex,
-  snapTitle, snapSubtitle, snapAssetName, snapStatus, snapDate, snapHours, snapCost, snapProgress,
+  snapTitle, snapSubtitle, snapAssetName, snapStatus, snapStartDate, snapDate, snapHours, snapCost, snapProgress,
   parentWorkOrderId = null, passId = null,
 }) {
   const { rows } = await pool.query(
     `INSERT INTO board_report_items
        (report_id, item_type, item_id, item_date, section, included, display_mode, report_note, sort_index,
         snap_title, snap_subtitle, snap_asset_name, snap_status, snap_date, snap_hours, snap_cost, snap_progress,
-        parent_work_order_id, suggested_at, last_pass_id)
+        parent_work_order_id, suggested_at, last_pass_id, snap_start_date)
      VALUES ($1,$2,$3,$4,$5,COALESCE($6,true),COALESCE($7,'summary'),$8,COALESCE($9,0),
-             $10,$11,$12,$13,$14,$15,$16,$17,$18,now(),$19)
+             $10,$11,$12,$13,$14,$15,$16,$17,$18,now(),$19,$20)
      -- Matches the expression index from 0092: item_date is nullable, and NULL is
      -- DISTINCT from NULL in a plain unique constraint, so a bare column list here
      -- could never find the existing row and every pass inserted a duplicate.
@@ -6174,6 +6194,7 @@ export async function upsertBoardReportItem(reportId, {
        snap_asset_name = COALESCE(EXCLUDED.snap_asset_name, board_report_items.snap_asset_name),
        snap_status  = COALESCE(EXCLUDED.snap_status, board_report_items.snap_status),
        snap_date    = COALESCE(EXCLUDED.snap_date, board_report_items.snap_date),
+       snap_start_date = COALESCE(EXCLUDED.snap_start_date, board_report_items.snap_start_date),
        snap_hours   = COALESCE(EXCLUDED.snap_hours, board_report_items.snap_hours),
        snap_cost    = COALESCE(EXCLUDED.snap_cost, board_report_items.snap_cost),
        snap_progress= COALESCE(EXCLUDED.snap_progress, board_report_items.snap_progress),
@@ -6187,7 +6208,7 @@ export async function upsertBoardReportItem(reportId, {
     [reportId, itemType, itemId, itemDate, section, included ?? null, displayMode ?? null,
       reportNote ?? null, sortIndex ?? null, snapTitle ?? null, snapSubtitle ?? null,
       snapAssetName ?? null, snapStatus ?? null, snapDate ?? null, snapHours ?? null,
-      snapCost ?? null, snapProgress ?? null, parentWorkOrderId, passId]
+      snapCost ?? null, snapProgress ?? null, parentWorkOrderId, passId, snapStartDate ?? null]
   );
   return rows[0].id;
 }
