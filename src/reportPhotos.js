@@ -53,7 +53,7 @@ function captionSvg(width, height, label) {
     <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
       <rect x="0" y="${height - band}" width="${width}" height="${band}" fill="rgba(12,14,22,0.62)"/>
       <text x="${padX}" y="${baseline}"
-            font-family="-apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+            font-family="DejaVu Sans, Helvetica, Arial, sans-serif"
             font-size="${fontSize}" font-weight="700" fill="#ffffff"
             letter-spacing="0.3">${escapeXml(label)}</text>
     </svg>`);
