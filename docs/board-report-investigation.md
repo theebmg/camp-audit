@@ -251,6 +251,94 @@ the vocabulary rather than hardcoding a role name.
 
 ---
 
+## 7. From the rendered draft — five more things
+
+Reading the actual HTML (`toClaudeCode/DRAFT …September 2026.html`) confirms everything above
+and surfaces five more.
+
+### 7a. The root cause of the missing cost/hours/date, found exactly
+
+There are **two different code paths that write a work-order row**, and they write different
+amounts of detail.
+
+**Path 1 — a WO appears because its job lines completed** (`src/db.js:5727`):
+
+```js
+await upsertBoardReportItem(reportId, { passId,
+  itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
+  snapTitle: r.wo_title, snapAssetName: r.asset_name,     // <- that is all
+});
+```
+
+No status, no date, no hours, no cost. The comment says it plainly: the row exists so "a work
+order with new lines this period still needs its header."
+
+**Path 2 — a WO appears because it is board-featured** (`src/db.js:5895`):
+
+```js
+snapTitle: r.title, snapAssetName: r.place, snapStatus: r.status,
+snapDate: r.completed_date,
+snapSubtitle: !r.is_terminal && r.board_focus_set_at ? `featured since ${monthOf(...)}` : null,
+```
+
+Status and date included.
+
+That is the whole explanation, and it matches the draft row for row:
+
+| Row | Featured? | What it shows | Why |
+|---|---|---|---|
+| Sump Pump Replacement | **no** | title + asset only | Path 1 — on the report because its lines completed |
+| Caretaker's Renovations | yes | `Caretaker's Residence · Reported` + "featured since September 2026" | Path 2, open, so the featured-since label shows |
+| Front Gate Repair | yes | `Red Gate · Done · 2026-09-17` | Path 2, closed |
+
+So "the sump pump has no status or date at all" is not data entry and not a stale snapshot —
+it is the path that created the row never capturing them.
+
+**The snapshot upsert would accept them.** Every field uses
+`COALESCE(EXCLUDED.x, board_report_items.x)`, so a later pass supplying a date would fill it in.
+Path 1 simply never supplies one.
+
+### 7b. The money header table is ragged
+
+`moneyHeaderHtml` (`src/reportRender.js:293-297`) emits one `<tr>` per group with no colspan:
+
+```js
+<tr>${money.map(cell).join('')}</tr>       <!-- 2 cells -->
+<tr>${savings.map(cell).join('')}</tr>     <!-- 3 cells -->
+```
+
+The table is therefore three columns wide with a two-cell first row. Browsers stretch it
+acceptably; Outlook is less forgiving. Low severity, trivial to fix with a colspan on the
+shorter row.
+
+### 7c. Three different savings numbers appear in one report
+
+| Where | Figure |
+|---|---|
+| Header | **$3,240/yr** (the stored $270/month × 12) |
+| Your summary prose | "saving about **$3,300** a year" |
+| Internet item note | "**$277/month**" = $3,324/yr |
+
+Whatever the true figure is, the report currently states it three ways. Worth settling as part
+of §4.
+
+### 7d. Small rendering redundancies
+
+- **Front Gate Repair** renders as `Front Gate Repair — Red Gate` and then `Red Gate · Done ·
+  2026-09-17` directly beneath. The asset name is printed twice because `snapSubtitle` and
+  `snapAssetName` both carry it on this row.
+- **Fixed NVR Hard Drive — Other** puts the admin-task *category* in the em-dash slot, so an
+  uncategorised task reads as "— Other". For a board audience that is noise.
+
+### 7e. The summary renders literal dashes — confirming Part 2D
+
+The summary block is `white-space:pre-wrap` with `escapeHtml()`, so your `-` bullets appear as
+hyphens rather than a list. That is exactly the workaround Part 2D describes, and it confirms
+the conversion rule you asked for (lines starting `- ` become real bullets) has real content
+waiting for it in this very draft.
+
+---
+
 ## What I need from you before changing any figure
 
 1. **§2 footer** — total only what is visible? (recommended)
@@ -260,3 +348,8 @@ the vocabulary rather than hardcoding a role name.
 4. **§3 period** — default to the full calendar month?
 5. **§4 savings** — is the correct recurring saving $270/month or $277/month?
 6. **§5** — "Fixed NVR Hard Drive": leave as an admin task, or should it be a work order?
+7. **§7a** — should Path 1 capture status/date/cost like Path 2 does, so a work order on the
+   report always carries its own figures regardless of why it got there? (recommended, and it
+   is the smaller half of the §2b fix)
+8. **§7d** — drop the duplicated asset name, and stop printing the admin category in the title
+   line? (cosmetic, say the word)
