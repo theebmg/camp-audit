@@ -21,7 +21,6 @@ async function purge() {
   await db.pool.query(`DELETE FROM attachment_links WHERE attachment_id IN
     (SELECT id FROM attachments WHERE original_filename LIKE $1)`, [`${TAG}%`]);
   await db.pool.query('DELETE FROM attachments WHERE original_filename LIKE $1', [`${TAG}%`]);
-  await db.pool.query('DELETE FROM job_lines WHERE title LIKE $1', [`${TAG}%`]);
 }
 await purge();
 const photosBefore = (await db.pool.query('SELECT * FROM board_report_photos WHERE report_id=$1', [REPORT])).rows;
@@ -46,12 +45,17 @@ if (!woItem) { console.log('no work-order item on report 1 — nothing to test')
 console.log(`using item "${woItem.snap_title}" (work order ${woItem.item_id})`);
 
 try {
-  const jl = await db.createJobLine(woItem.item_id, { title: `${TAG} the line's own work` });
+  // An existing line of that work order. Adding one is refused on a closed work order, and
+  // reopening a real one to suit a test is not a trade worth making.
+  const jl = (await db.pool.query(
+    'SELECT id, title FROM job_lines WHERE work_order_id = $1 ORDER BY id LIMIT 1', [woItem.item_id])).rows[0];
+  if (!jl) { console.log('that work order has no job lines — nothing to test'); process.exit(0); }
+  console.log(`using job line "${jl.title}"`);
   const aWo = await mkAttachment('wo');
   const aJl = await mkAttachment('jl');
   const aRpt = await mkAttachment('rpt');
   await db.linkAttachment(aWo, { entityType: 'work_order', entityId: woItem.item_id, roleId: before.Id });
-  await db.linkAttachment(aJl, { entityType: 'job_line', entityId: jl.Id, roleId: after.Id });
+  await db.linkAttachment(aJl, { entityType: 'job_line', entityId: jl.id, roleId: after.Id });
 
   console.log('\n## a photo can hang off the work order as well as off a job line');
   await db.seedDefaultReportPhotos(REPORT);
@@ -73,7 +77,8 @@ try {
   console.log(`    job line  : "${jlLabel}"`);
   ok(/^BEFORE —/.test(woLabel), 'the whole-job photo is captioned BEFORE');
   ok(woLabel.includes(woItem.snap_title.slice(0, 12)), 'and named by the work order');
-  ok(jlLabel.includes(TAG), 'the job-line photo is named by the line, not the work order');
+  ok(jlLabel.includes(jl.title.slice(0, 12)) && jlLabel !== woLabel,
+    'the job-line photo is named by the line, not by the work order');
   ok(sel.findIndex((p) => p.AttachmentId === aWo) < sel.findIndex((p) => p.AttachmentId === aJl),
     'the send path keeps the whole-job photo first too');
 
@@ -113,9 +118,8 @@ try {
   }
   const left = (await db.pool.query(
     `SELECT (SELECT count(*)::int FROM attachments WHERE original_filename LIKE $1) a,
-            (SELECT count(*)::int FROM job_lines WHERE title LIKE $1) j,
             (SELECT count(*)::int FROM attachment_links WHERE entity_type='board_report') l`, [`${TAG}%`])).rows[0];
-  ok(left.a + left.j + left.l === 0, `scratch rows deleted (${JSON.stringify(left)})`);
+  ok(left.a + left.l === 0, `scratch rows deleted (${JSON.stringify(left)})`);
   const now = (await db.pool.query('SELECT count(*)::int n FROM board_report_photos WHERE report_id=$1', [REPORT])).rows[0].n;
   ok(now === photosBefore.length, `${now} selection row(s), was ${photosBefore.length}`);
 }
