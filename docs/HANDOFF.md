@@ -87,6 +87,49 @@ the blocking question above.
 
 ---
 
+## Board report photos — built, tested, deployed (step 6)
+
+The whole Part 2 feature set is in: email-sized copies, burned-in BEFORE/AFTER captions, the
+selection card with a running size meter, and the rich-text summary editor.
+
+- **Selection card** on the report screen: thumbnails grouped by work order, an Include tick and
+  a role picker per photo, and a meter reading "N selected · about X of a 15 MB limit".
+- **The role is editable there**, not just on the work order's attachment panel, because it
+  decides both the caption prefix and the default tick.
+- **Over budget refuses the send** (413) rather than letting the mail server bounce it.
+- `scripts/report-photos-test.mjs` — 21 assertions against the real September report, every
+  change restored.
+
+### Three bugs this turned up, all fixed
+
+1. **The pre-ticks were a lie.** The card pre-selected Before/After from the role vocabulary but
+   stored nothing, while the send path reads `board_report_photos`. A report would have gone out
+   with no photos while the screen showed them selected. Defaults are now materialised on first
+   read, so screen, meter and email read one table.
+2. **A role could never be cleared.** `updateAttachmentLink` ran `role_id = COALESCE($2, role_id)`,
+   so "no role" silently kept the old value. Found because a test's restore step reported success
+   while leaving two real September photos roled Before/After.
+3. **A transient 503 silently dropped a photo.** Object storage returned 503 on one photo URL and
+   200 on the next six. `buildEmailCopy` returned null and the send path `continue`d past it.
+   Now retried three times, and whatever still fails comes back as a warning on the send.
+
+### What Ben needs to know
+
+**None of the four September photos has a role**, so nothing pre-selects and all four captions
+read "Sump Pump Replacement in Caretaker's". The card now says so instead of claiming Before and
+After are pre-selected. He sets the roles on the card; that is a two-minute job and it is the
+only thing between here and a properly captioned before/after in the board's email.
+
+The photos are also small — 480×360, ~30 KB — because they arrived by text. **About 500 of them
+would fit in one email**, so the size limit is nowhere near being a problem yet.
+
+**Hosted link: proposed, not built**, per his instruction. See
+`docs/hosted-photo-page-proposal.md`. Recommendation is to hold — the real decision in it is
+whether he wants camp photos reachable on a password-free link, and the inline email already
+does the job.
+
+---
+
 ## Still to build, in his order
 
 1. ~~Fixes 1, 4, 7, 8, ragged table~~ **done**
@@ -97,8 +140,8 @@ the blocking question above.
 4. **Progress on open WOs (§2c)** — weight by estimated cost of lines; fall back to listing
    lines completed this period when too few have estimates.
 5. **Savings old/new cost entry (§5)** — UI only, per the correction above.
-6. **Part 2 of the original brief** — photo selection, email-sized copies, before/after labels,
-   rich text editor.
+6. ~~**Part 2 of the original brief** — photo selection, email-sized copies, before/after labels,
+   rich text editor~~ **done**, see above.
 
 ### Part 2 groundwork already answered
 
@@ -122,6 +165,17 @@ the final INSERT while a `catch` logged a warning nobody read.
 
 **Never swallow an ingest failure.** That bug was invisible because the handler caught and
 continued. Failures are now recorded on the row (`incoming_items.media_error`).
+
+**`COALESCE($n, column)` in an UPDATE can set a value but never clear one.** The same shape as
+the snapshot-upsert trap below, and it bit again on `attachment_links.role_id`: every "none"
+option over such a column is silently inoperative. Pass an explicit clear flag as a parameter —
+and note that building the clause with a template literal instead leaves a parameter
+unreferenced, which Postgres refuses with "could not determine data type of parameter $n".
+
+**A test that restores through the function under test does not restore.** The role-clearing bug
+meant a test reported its own cleanup as successful while leaving real rows changed, and the next
+run then adopted the polluted state as its baseline. Restore with raw SQL, and assert the restore
+rather than trusting it.
 
 **Snapshot upserts use `COALESCE(EXCLUDED.x, existing.x)`** — they can fill a null but can never
 clear a stored value. If a field must be removed, fix the source *and* guard the renderer.
@@ -157,6 +211,8 @@ ssh camp 'cd ~/camp-audit && git pull -q origin main && cd /root/nocodb \
 docker exec camp-audit node scripts/merge-test.mjs      # 22 assertions
 docker exec camp-audit node scripts/visits-test.mjs     # 35
 docker exec camp-audit node scripts/intake-test.mjs     # 41
+docker exec camp-audit node scripts/board-report-test.mjs
+docker exec camp-audit node scripts/report-photos-test.mjs  # 21, real report, restores itself
 
 # browser verification (needs a temporary admin account; delete it afterwards)
 BASE=https://audit.fracturedrv.com USER_NAME=<user> PASS=<pass> node scripts/screens.mjs <phase> [filter]
