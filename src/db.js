@@ -4839,13 +4839,14 @@ export async function updateAttachmentLink(linkId, patch = {}) {
     const include = includeInReport !== undefined ? includeInReport : (roleId !== undefined ? await resolveIncludeInReport(client, roleId, null) : undefined);
     await client.query(
       `UPDATE attachment_links SET
-         role_id = ${clearingRole ? 'NULL' : 'COALESCE($2, role_id)'},
-         include_in_report = ${clearingRole && includeInReport === undefined ? 'false' : 'COALESCE($3, include_in_report)'},
+         role_id = CASE WHEN $9::boolean THEN NULL ELSE COALESCE($2, role_id) END,
+         include_in_report = CASE WHEN $9::boolean AND $3 IS NULL THEN false
+                                  ELSE COALESCE($3, include_in_report) END,
          sort_order = COALESCE($4, sort_order), vendor_id = COALESCE($5, vendor_id),
          quoted_amount = COALESCE($6, quoted_amount), quote_date = COALESCE($7, quote_date),
          is_selected_quote = COALESCE($8, is_selected_quote)
        WHERE id = $1`,
-      [linkId, roleId ?? null, include ?? null, sortOrder ?? null, vendorId ?? null, quotedAmount ?? null, quoteDate ?? null, isSelectedQuote ?? null]
+      [linkId, roleId ?? null, include ?? null, sortOrder ?? null, vendorId ?? null, quotedAmount ?? null, quoteDate ?? null, isSelectedQuote ?? null, clearingRole]
     );
     await client.query('COMMIT');
   } catch (e) {
