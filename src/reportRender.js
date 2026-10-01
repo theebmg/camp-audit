@@ -311,11 +311,19 @@ function itemLineHtml(it) {
   const dates = it.SnapStartDate
     ? `Started ${fmtDate(it.SnapStartDate)} · ${it.SnapDate ? `Completed ${fmtDate(it.SnapDate)}` : 'In progress'}`
     : (it.SnapDate ? fmtDate(it.SnapDate) : null);
+  // Money: actual only, and only when there is one. An estimate is labelled "est." and shown
+  // on open work alongside it — never instead of it and never summed (decisions §2, §3).
+  const money = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
+  const est = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
   const bits = [
     it.SnapAssetName, it.SnapStatus, dates,
     it.SnapHours != null ? fmtHours(it.SnapHours) : null,
-    it.SnapCost != null ? fmtMoney(it.SnapCost) : null,
+    money, est,
   ].filter(Boolean);
+  // "Camp $1,000 · Personal $240" — who actually paid, from the receipts allocated to the work.
+  const funding = Array.isArray(it.SnapFunding) && it.SnapFunding.length
+    ? it.SnapFunding.map((f) => `${f.Source} ${fmtMoney(f.Amount)}`).join(' · ')
+    : null;
   // The em-dash suffix is for things the detail line does not already say. Printing the
   // asset there as well gave "Front Gate Repair — Red Gate" above "Red Gate · Done · …",
   // and an admin task's category turned into "Fixed NVR Hard Drive — Other", which is noise
@@ -332,6 +340,7 @@ function itemLineHtml(it) {
     <div style="border-bottom:1px solid #eef0f6;padding:9px 0;">
       <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${suffix ? ` <span style="color:#6b7086;">— ${escapeHtml(suffix)}</span>` : ''}</div>
       ${bits.length ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(bits.join(' · '))}</div>` : ''}
+      ${funding ? `<div style="color:#6b7086;font-size:0.85rem;">Funded by ${escapeHtml(funding)}</div>` : ''}
       ${it.SnapProgress ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(it.SnapProgress)}</div>` : ''}
       ${it.ReportNote ? `<div style="margin-top:4px;font-size:0.9rem;">${escapeHtml(it.ReportNote)}</div>` : ''}
     </div>`;

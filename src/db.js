@@ -5422,20 +5422,36 @@ export async function computeBoardReportAggregates(reportId) {
   // every receipt nobody has split yet, which is most of them. (Found the hard way:
   // this said $0 spent against 11 real receipts, because none had been split.)
   // Allocations are how spend is ATTRIBUTED — per fund, per job — not how it is totalled.
-  const spend = await pool.query(
-    `SELECT COALESCE(SUM(amount), 0) AS period FROM expenses
-     WHERE triage_status != 'void' AND deleted_at IS NULL
-       AND purchase_date BETWEEN $1 AND $2`,
-    [report.PeriodStart, report.PeriodEnd]
-  );
-  const ytd = await pool.query(
-    `SELECT COALESCE(SUM(amount), 0) AS ytd FROM expenses
-     WHERE triage_status != 'void' AND deleted_at IS NULL
-       AND purchase_date BETWEEN $1 AND $2`,
-    [yearStart, report.PeriodEnd]
-  );
-  out.push({ groupKey: 'money', label: 'Spent this period', valueNumeric: Number(spend.rows[0].period) });
-  out.push({ groupKey: 'money', label: 'Spent year to date', valueNumeric: Number(ytd.rows[0].ytd) });
+  // Camp money and contributed money are reported SEPARATELY and never summed (§2b). A gift or
+  // a personal payment is not the camp spending, and mixing them would overstate both the
+  // camp's outgoings and, by hiding it, the size of what was given.
+  //
+  // An expense with no funding source set counts as camp spend, because that is what every
+  // existing receipt is until Ben marks the personal ones — and showing a receipt as neither
+  // would quietly drop real money out of the total.
+  const CAMP = `(fs.id IS NULL OR fs.counts_as_camp_spend)`;
+  const spendSql = (where) => `
+    SELECT COALESCE(SUM(e.amount) FILTER (WHERE ${CAMP}), 0)                      AS camp,
+           COALESCE(SUM(e.amount) FILTER (WHERE fs.is_contribution), 0)           AS contributed,
+           COALESCE(SUM(e.amount) FILTER (WHERE fs.is_in_kind), 0)                AS in_kind
+    FROM expenses e
+    LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+    WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND ${where}`;
+
+  const spend = await pool.query(spendSql('e.purchase_date BETWEEN $1 AND $2'), [report.PeriodStart, report.PeriodEnd]);
+  const ytd = await pool.query(spendSql('e.purchase_date BETWEEN $1 AND $2'), [yearStart, report.PeriodEnd]);
+  const p = spend.rows[0]; const y = ytd.rows[0];
+
+  out.push({ groupKey: 'money', label: 'Camp funds spent this period', valueNumeric: Number(p.camp) });
+  out.push({ groupKey: 'money', label: 'Camp funds spent year to date', valueNumeric: Number(y.camp) });
+  // Only shown once there is something to show, so the header does not carry two permanent
+  // zeroes while Ben has not yet marked anything as contributed.
+  if (Number(p.contributed) > 0 || Number(y.contributed) > 0) {
+    out.push({ groupKey: 'money', label: 'Contributed this period', valueNumeric: Number(p.contributed) });
+  }
+  if (Number(p.in_kind) > 0 || Number(y.in_kind) > 0) {
+    out.push({ groupKey: 'money', label: 'In-kind this period', valueNumeric: Number(p.in_kind) });
+  }
 
   // Recurring is reported as an annual rate — that's how a monthly saving is worth
   // understanding — while storage keeps the monthly figure that was negotiated.
@@ -5729,13 +5745,22 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
     // were — a work order with new lines this period still needs its header.
     if (!woSeen.has(r.work_order_id) && !reported.has(reportedKey('work_order', r.work_order_id))) {
       woSeen.add(r.work_order_id);
+      const roll = await workOrderRollupForReport(r.work_order_id);
       await upsertBoardReportItem(reportId, { passId,
         itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
         snapTitle: r.wo_title, snapAssetName: r.asset_name,
         // Previously title and asset only, which is why the sump pump showed no status and
         // no date while the board-featured front gate showed both — two paths writing a work
         // order row with different amounts of detail (decisions §7).
-        snapStatus: r.wo_status, snapStartDate: r.wo_started, snapDate: r.wo_completed,
+        snapStatus: r.wo_status,
+        snapStartDate: r.wo_started || roll.firstDate,
+        snapDate: r.wo_completed || roll.lastCompleted,
+        // Real money only. The estimate rides alongside and is never summed in (§2, §3).
+        snapCost: roll.hasActual ? roll.actualCost : null,
+        snapEstCost: roll.hasEst ? roll.estCost : null,
+        snapHours: roll.actualHours || null,
+        snapFunding: roll.funding.length ? roll.funding : null,
+        snapProgress: r.wo_completed ? null : roll.progress,
       });
     }
     await upsertBoardReportItem(reportId, { passId,
@@ -5869,6 +5894,96 @@ async function suggestCalendarAndProjections(reportId, passId, reported, { forwa
 //
 // Runs LAST in the pass so its section wins: upsert assigns section unconditionally,
 // and a flag is a more deliberate statement than any date rule.
+// What a summary work-order row shows (Oct 2026 decisions §2).
+//
+// Totals are REAL MONEY ONLY: actual cost, which is hand-typed actual_cost plus any receipts
+// allocated to the line. The estimate is returned separately and is never added in — it is
+// shown as "est." on open work and kept out of every total.
+//
+// The funding split comes from the receipts, because that is where funding source lives. A
+// line with no receipts allocated contributes nothing to the split, which is why the split is
+// empty until expenses are divided onto work.
+async function workOrderRollupForReport(workOrderId) {
+  const { rows } = await pool.query(
+    `SELECT
+       COALESCE(SUM(${JOB_LINE_ACTUAL_COST_EXPR}), 0)                        AS actual_cost,
+       COUNT(*) FILTER (WHERE ${JOB_LINE_ACTUAL_COST_EXPR} IS NOT NULL)      AS lines_with_actual,
+       COALESCE(SUM(jl.estimated_cost), 0)                                   AS est_cost,
+       COUNT(*) FILTER (WHERE jl.estimated_cost IS NOT NULL)                 AS lines_with_est,
+       COALESCE(SUM(jl.actual_hours), 0)                                     AS actual_hours,
+       COUNT(*)                                                              AS line_count,
+       COUNT(*) FILTER (WHERE jls.is_terminal)                               AS lines_done,
+       MIN(COALESCE(jl.completed_date, jl.scheduled_date))::text             AS first_date,
+       MAX(COALESCE(jl.completed_date, jl.completed_at::date))::text         AS last_completed
+     FROM job_lines jl
+     JOIN job_line_statuses jls ON jls.id = jl.status_id
+     LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
+     WHERE jl.work_order_id = $1`,
+    [workOrderId]
+  );
+  const r = rows[0] || {};
+
+  // Funding split: receipts allocated to this work order's lines, grouped by who paid.
+  const { rows: funding } = await pool.query(
+    `SELECT COALESCE(fs.name, 'Unassigned') AS source,
+            COALESCE(fs.is_contribution, false) AS is_contribution,
+            SUM(ea.amount) AS amount
+     FROM expense_allocations ea
+     JOIN expenses e ON e.id = ea.expense_id
+     LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND ((ea.dest_type = 'job_line' AND ea.dest_id IN (SELECT id FROM job_lines WHERE work_order_id = $1))
+         OR (ea.dest_type = 'work_order' AND ea.dest_id = $1))
+     GROUP BY 1, 2 ORDER BY 3 DESC`,
+    [workOrderId]
+  );
+
+  // Progress, weighted by estimated cost rather than by counting lines — eight of thirteen is
+  // misleading when the lines are not the same size (§2c). Falls back to naming what finished
+  // this period when too few lines carry an estimate for the weighting to mean anything.
+  const estCoverage = Number(r.line_count) ? Number(r.lines_with_est) / Number(r.line_count) : 0;
+  let progress = null;
+  if (Number(r.line_count) > 0 && estCoverage >= 0.5 && Number(r.est_cost) > 0) {
+    const doneEst = await pool.query(
+      `SELECT COALESCE(SUM(jl.estimated_cost), 0) AS done_est
+       FROM job_lines jl JOIN job_line_statuses jls ON jls.id = jl.status_id
+       WHERE jl.work_order_id = $1 AND jls.is_terminal AND jls.counts_as_work_performed`,
+      [workOrderId]
+    );
+    const pct = Math.round((Number(doneEst.rows[0].done_est) / Number(r.est_cost)) * 100);
+    progress = `${pct}% of ~${fmtMoneyPlain(Number(r.est_cost))} est. complete (${r.lines_done} of ${r.line_count} lines)`;
+  } else if (Number(r.line_count) > 0) {
+    const done = await pool.query(
+      `SELECT jl.title FROM job_lines jl JOIN job_line_statuses jls ON jls.id = jl.status_id
+       WHERE jl.work_order_id = $1 AND jls.is_terminal AND jls.counts_as_work_performed
+       ORDER BY jl.completed_date DESC NULLS LAST, jl.id DESC LIMIT 4`,
+      [workOrderId]
+    );
+    if (done.rows.length) {
+      const titles = done.rows.map((x) => String(x.title).split(/[,.]/)[0].trim().slice(0, 40));
+      progress = `Completed: ${titles.join(', ')}${Number(r.lines_done) > titles.length ? `, +${Number(r.lines_done) - titles.length} more` : ''}`;
+    }
+  }
+
+  return {
+    actualCost: Number(r.actual_cost) || 0,
+    hasActual: Number(r.lines_with_actual) > 0,
+    estCost: Number(r.est_cost) || 0,
+    hasEst: Number(r.lines_with_est) > 0,
+    actualHours: Number(r.actual_hours) || 0,
+    lineCount: Number(r.line_count) || 0,
+    linesDone: Number(r.lines_done) || 0,
+    firstDate: r.first_date || null,
+    lastCompleted: r.last_completed || null,
+    funding: funding.map((f) => ({ Source: f.source, IsContribution: f.is_contribution, Amount: Number(f.amount) })),
+    progress,
+  };
+}
+
+function fmtMoneyPlain(n) {
+  return `$${Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+}
+
 async function suggestFlaggedItems(reportId, passId, reported) {
   const monthOf = (d) => new Date(d).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   let n = 0;
@@ -5901,11 +6016,18 @@ async function suggestFlaggedItems(reportId, passId, reported) {
       [reportId, r.id, passId]
     );
     const anchorsDone = existing[0]?.section === 'done';
+    const roll = await workOrderRollupForReport(r.id);
     await upsertBoardReportItem(reportId, { passId,
       itemType: 'work_order', itemId: r.id,
       section: (r.is_terminal || anchorsDone) ? 'done' : 'coming_up', sortIndex: 3000 + i,
       snapTitle: r.title, snapAssetName: r.place, snapStatus: r.status,
-      snapStartDate: r.started_date, snapDate: r.completed_date,
+      snapStartDate: r.started_date || roll.firstDate,
+      snapDate: r.completed_date || roll.lastCompleted,
+      snapCost: roll.hasActual ? roll.actualCost : null,
+      snapEstCost: roll.hasEst ? roll.estCost : null,
+      snapHours: roll.actualHours || null,
+      snapFunding: roll.funding.length ? roll.funding : null,
+      snapProgress: r.is_terminal ? null : roll.progress,
       // "Featured since March" stays on open items so a stale flag reads as stale;
       // on finished work the flag is about to clear itself, so it says nothing.
       // Any OPEN item keeps "featured since March", including one sitting in Done as
@@ -6157,6 +6279,8 @@ export async function listBoardReportItems(reportId) {
     ReportNote: r.report_note, SortIndex: r.sort_index,
     SnapTitle: r.snap_title, SnapSubtitle: r.snap_subtitle, SnapAssetName: r.snap_asset_name,
     SnapStatus: r.snap_status, SnapDate: r.snap_date_text, SnapStartDate: r.snap_start_date_text,
+    SnapEstCost: r.snap_est_cost != null ? Number(r.snap_est_cost) : null,
+    SnapFunding: r.snap_funding || null,
     SnapHours: r.snap_hours != null ? Number(r.snap_hours) : null,
     SnapCost: r.snap_cost != null ? Number(r.snap_cost) : null,
     SnapProgress: r.snap_progress,
@@ -6172,15 +6296,16 @@ export async function listBoardReportItems(reportId) {
 export async function upsertBoardReportItem(reportId, {
   itemType, itemId, itemDate = null, section, included, displayMode, reportNote, sortIndex,
   snapTitle, snapSubtitle, snapAssetName, snapStatus, snapStartDate, snapDate, snapHours, snapCost, snapProgress,
+  snapEstCost, snapFunding,
   parentWorkOrderId = null, passId = null,
 }) {
   const { rows } = await pool.query(
     `INSERT INTO board_report_items
        (report_id, item_type, item_id, item_date, section, included, display_mode, report_note, sort_index,
         snap_title, snap_subtitle, snap_asset_name, snap_status, snap_date, snap_hours, snap_cost, snap_progress,
-        parent_work_order_id, suggested_at, last_pass_id, snap_start_date)
+        parent_work_order_id, suggested_at, last_pass_id, snap_start_date, snap_est_cost, snap_funding)
      VALUES ($1,$2,$3,$4,$5,COALESCE($6,true),COALESCE($7,'summary'),$8,COALESCE($9,0),
-             $10,$11,$12,$13,$14,$15,$16,$17,$18,now(),$19,$20)
+             $10,$11,$12,$13,$14,$15,$16,$17,$18,now(),$19,$20,$21,$22)
      -- Matches the expression index from 0092: item_date is nullable, and NULL is
      -- DISTINCT from NULL in a plain unique constraint, so a bare column list here
      -- could never find the existing row and every pass inserted a duplicate.
@@ -6195,6 +6320,8 @@ export async function upsertBoardReportItem(reportId, {
        snap_status  = COALESCE(EXCLUDED.snap_status, board_report_items.snap_status),
        snap_date    = COALESCE(EXCLUDED.snap_date, board_report_items.snap_date),
        snap_start_date = COALESCE(EXCLUDED.snap_start_date, board_report_items.snap_start_date),
+       snap_est_cost = COALESCE(EXCLUDED.snap_est_cost, board_report_items.snap_est_cost),
+       snap_funding  = COALESCE(EXCLUDED.snap_funding, board_report_items.snap_funding),
        snap_hours   = COALESCE(EXCLUDED.snap_hours, board_report_items.snap_hours),
        snap_cost    = COALESCE(EXCLUDED.snap_cost, board_report_items.snap_cost),
        snap_progress= COALESCE(EXCLUDED.snap_progress, board_report_items.snap_progress),
@@ -6208,7 +6335,8 @@ export async function upsertBoardReportItem(reportId, {
     [reportId, itemType, itemId, itemDate, section, included ?? null, displayMode ?? null,
       reportNote ?? null, sortIndex ?? null, snapTitle ?? null, snapSubtitle ?? null,
       snapAssetName ?? null, snapStatus ?? null, snapDate ?? null, snapHours ?? null,
-      snapCost ?? null, snapProgress ?? null, parentWorkOrderId, passId, snapStartDate ?? null]
+      snapCost ?? null, snapProgress ?? null, parentWorkOrderId, passId, snapStartDate ?? null,
+      snapEstCost ?? null, snapFunding ? JSON.stringify(snapFunding) : null]
   );
   return rows[0].id;
 }
