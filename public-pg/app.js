@@ -4591,6 +4591,18 @@ async function renderExpenseDetail({ id } = {}) {
   });
 
   const form = document.getElementById('expenseForm');
+  // "What was contributed" only matters for a source with no receipt behind it.
+  {
+    const fsSel = document.getElementById('expFundingSource');
+    const inKindIds = new Set(fundingSources.filter((f) => f.IsInKind).map((f) => String(f.Id)));
+    const syncInKind = () => {
+      const row = document.getElementById('inKindRow');
+      if (row) row.hidden = !inKindIds.has(fsSel?.value || '');
+    };
+    fsSel?.addEventListener('change', syncInKind);
+    syncInKind();
+  }
+
   const woPicker = document.getElementById('expenseWoPicker');
   const lineRow = document.getElementById('expenseLineRow');
   const linePicker = document.getElementById('expenseLinePicker');
@@ -4620,6 +4632,8 @@ async function renderExpenseDetail({ id } = {}) {
       purchaseDate: fd.get('purchaseDate') || null,
       taxAmount: fd.get('taxAmount') || null,
       taxChargedInError: fd.has('taxChargedInError'),
+      fundingSourceId: fd.get('fundingSourceId') ? Number(fd.get('fundingSourceId')) : null,
+      inKindNote: fd.get('inKindNote') || null,
       categoryId: fd.get('categoryId') || null,
       fundId: fd.get('fundId') || null,
       jobLineId: linePicker.value || null,
