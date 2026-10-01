@@ -280,6 +280,121 @@ const SECTION_TITLES = {
 // live with the treasurer; this is deliberately not accounting, and says so (§7).
 const OPS_LABEL = 'Figures reflect maintenance/operations tracking, not the camp\'s official books.';
 
+// ── Summary rich text (Oct 2026 brief, Part 2D) ──────────────────────────
+//
+// The summary is the only free-form prose on the report, and it needed bullets. Stored as a
+// small subset of HTML and sanitised on the way in, because it is rendered into an email that
+// goes to the board — anything not on this list is dropped rather than escaped, so a paste
+// from Word cannot smuggle styling or script through.
+const SUMMARY_ALLOWED_TAGS = new Set(['p', 'br', 'strong', 'b', 'em', 'i', 'ul', 'ol', 'li', 'a']);
+
+// Inline styles, because Gmail strips <style> blocks and Outlook ignores much of what is left.
+// Each tag carries its own appearance or it has none.
+const SUMMARY_TAG_STYLE = {
+  p: 'margin:0 0 10px;',
+  ul: 'margin:0 0 10px;padding-left:22px;',
+  ol: 'margin:0 0 10px;padding-left:22px;',
+  li: 'margin:0 0 4px;',
+  a: 'color:#3b5bdb;',
+};
+
+export function sanitizeSummaryHtml(raw) {
+  if (!raw) return '';
+  let html = String(raw);
+
+  // Anything that can execute or load goes first, before the tag walk, so a malformed tag
+  // cannot hide one of these inside it.
+  html = html.replace(/<\s*(script|style|iframe|object|embed|link|meta)[\s\S]*?<\s*\/\s*\1\s*>/gi, '');
+  html = html.replace(/<\s*(script|style|iframe|object|embed|link|meta)\b[^>]*>/gi, '');
+
+  // A rejected <a> has to take its </a> with it, or the text keeps a stray closing tag. The
+  // counter pairs them up rather than assuming they are adjacent.
+  let droppedAnchors = 0;
+  html = html.replace(/<\/?([a-zA-Z0-9]+)([^>]*)>/g, (match, tagRaw, attrs) => {
+    const tag = tagRaw.toLowerCase();
+    if (!SUMMARY_ALLOWED_TAGS.has(tag)) return '';          // drop the tag, keep its text
+    const closing = match.startsWith('</');
+    if (closing) {
+      if (tag === 'a' && droppedAnchors > 0) { droppedAnchors -= 1; return ''; }
+      return `</${tag}>`;
+    }
+    if (tag === 'a') {
+      // Only http(s) and mailto survive, so javascript: and data: cannot ride in on a link.
+      const href = (attrs.match(/href\s*=\s*["']([^"']*)["']/i) || [])[1] || '';
+      const safe = /^(https?:|mailto:)/i.test(href.trim()) ? href.trim() : null;
+      if (!safe) { droppedAnchors += 1; return ''; }
+      return `<a href="${safe.replace(/"/g, '&quot;')}" style="${SUMMARY_TAG_STYLE.a}" target="_blank" rel="noopener noreferrer">`;
+    }
+    const style = SUMMARY_TAG_STYLE[tag];
+    return style ? `<${tag} style="${style}">` : `<${tag}>`;
+  });
+
+  return html.trim();
+}
+
+// An existing plain-text summary still has to read correctly, and Ben's workaround of typing
+// "- " at the start of a line becomes the bullets he was imitating (Part 2D). Two spaces or a
+// tab before the dash nests one level, which is as deep as the editor goes.
+export function plainSummaryToHtml(text) {
+  if (!text) return '';
+  if (/<(p|ul|ol|li|strong|em|b|i|a)\b/i.test(text)) return sanitizeSummaryHtml(text);  // already rich
+
+  const esc = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const out = [];
+  let list = null;          // 'ul' | 'ol' — the outer list, if one is open
+  let nested = false;       // is a second-level list open?
+  let liOpen = false;       // is an outer <li> still waiting to be closed?
+
+  // A nested list is a CHILD of the item above it, not its sibling. That means the outer <li>
+  // stays open until the nested list has been written and closed — writing </li> eagerly
+  // produced <ul><li>..</li><ul>..</ul></ul>, which is invalid and which Outlook renders flat.
+  const closeNested = () => { if (nested) { out.push('</ul>'); nested = false; } };
+  const closeLi = () => { closeNested(); if (liOpen) { out.push('</li>'); liOpen = false; } };
+  const closeList = () => { closeLi(); if (list) { out.push(`</${list}>`); list = null; } };
+
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    const line = rawLine.replace(/\s+$/, '');
+    if (!line.trim()) { closeList(); continue; }
+
+    const bullet = line.match(/^(\s*)[-*•]\s+(.*)$/);
+    const numbered = line.match(/^(\s*)\d+[.)]\s+(.*)$/);
+    const m = bullet || numbered;
+    if (m) {
+      const want = bullet ? 'ul' : 'ol';
+      const indented = m[1].length >= 2;
+      if (indented) {
+        if (!list) { out.push(`<${want} style="${SUMMARY_TAG_STYLE[want]}">`); list = want; }
+        if (!liOpen) { out.push(`<li style="${SUMMARY_TAG_STYLE.li}">`); liOpen = true; }
+        if (!nested) { out.push(`<ul style="${SUMMARY_TAG_STYLE.ul}">`); nested = true; }
+        out.push(`<li style="${SUMMARY_TAG_STYLE.li}">${esc(m[2])}</li>`);
+      } else {
+        closeLi();
+        if (list !== want) { closeList(); out.push(`<${want} style="${SUMMARY_TAG_STYLE[want]}">`); list = want; }
+        out.push(`<li style="${SUMMARY_TAG_STYLE.li}">${esc(m[2])}`);
+        liOpen = true;
+      }
+      continue;
+    }
+    closeList();
+    out.push(`<p style="${SUMMARY_TAG_STYLE.p}">${esc(line)}</p>`);
+  }
+  closeList();
+  return out.join('');
+}
+
+// For the plain-text half of the email, and anywhere a summary needs to be read without markup.
+export function summaryHtmlToText(html) {
+  if (!html) return '';
+  return String(html)
+    .replace(/<\/(p|div|li|ul|ol)>/gi, '\n')
+    .replace(/<li[^>]*>/gi, '  - ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 function moneyHeaderHtml(aggregates) {
   const byGroup = (g) => aggregates.filter((a) => a.GroupKey === g);
   const money = byGroup('money');
@@ -387,7 +502,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates }) {
     `${report.PeriodStart} to ${report.PeriodEnd} · looking ahead to ${report.ForwardEnd}${report.Status === 'draft' ? ' · DRAFT' : ''}`,
     `
     ${moneyHeaderHtml(aggregates)}
-    ${report.SummaryNotes ? `<div style="background:#fbfbfe;border:1px solid #eef0f6;border-radius:10px;padding:14px;margin-bottom:6px;white-space:pre-wrap;">${escapeHtml(report.SummaryNotes)}</div>` : ''}
+    ${report.SummaryNotes ? `<div style="background:#fbfbfe;border:1px solid #eef0f6;border-radius:10px;padding:14px;margin-bottom:6px;">${plainSummaryToHtml(report.SummaryNotes)}</div>` : ''}
     ${sections.map((sec) => sectionHtml(sec, items)).join('')}
     <div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
       Total — ${visible.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}
@@ -403,7 +518,7 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
   for (const a of aggregates.filter((x) => ['money', 'savings'].includes(x.GroupKey))) {
     lines.push(`${a.Label}: ${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : (a.ValueText || '—')}`);
   }
-  if (report.SummaryNotes) lines.push('', report.SummaryNotes);
+  if (report.SummaryNotes) lines.push('', summaryHtmlToText(report.SummaryNotes));
   const visible = visibleItems(items);
   for (const sec of ['done', 'coming_up', 'overdue', 'admin_work']) {
     const rows = visible.filter((i) => i.Section === sec);

@@ -9,6 +9,7 @@ import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
 import { buildCapitalPlanPg, buildBoardReportPg, renderBoardReportFromItems, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
 import {
+  sanitizeSummaryHtml, plainSummaryToHtml,
   renderBoardReportHtml, renderBoardReportText, renderPlainEmailHtml,
   renderWorkPerformedHtml, renderWorkPerformedText, renderDeferredBacklogHtml, renderDeferredBacklogText,
   renderVisitorActivityHtml, renderVisitorActivityText,
@@ -2131,7 +2132,11 @@ router.get('/board-reports/:id(\\d+)', async (req, res, next) => {
 // covers the notes field because it's a textarea inside the report form.
 router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
   try {
-    const { title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes } = req.body || {};
+    const { title, periodStart, periodEnd, forwardStart, forwardEnd } = req.body || {};
+    // Sanitised on the way IN, not on the way out, so what is stored is already safe and no
+    // later reader has to remember to clean it (Part 2D).
+    const summaryNotes = req.body && 'summaryNotes' in req.body
+      ? sanitizeSummaryHtml(req.body.summaryNotes) : undefined;
     const report = await updateBoardReport(req.params.id, {
       title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes,
     });
@@ -3392,6 +3397,14 @@ router.post('/funding-sources', async (req, res, next) => {
 });
 router.patch('/funding-sources/:id(\\d+)', async (req, res, next) => {
   try { res.json({ source: await updateFundingSource(req.params.id, req.body || {}) }); } catch (e) { next(e); }
+});
+
+
+// Converts an old plain-text summary to the HTML the editor opens with, so the "- " dashes Ben
+// typed as a workaround become real bullets (Part 2D). One implementation, server-side, shared
+// with the renderer.
+router.post('/board-reports/summary-preview', async (req, res, next) => {
+  try { res.json({ html: plainSummaryToHtml(String((req.body || {}).text || '')) }); } catch (e) { next(e); }
 });
 
 export default router;

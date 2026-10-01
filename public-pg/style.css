@@ -1050,3 +1050,27 @@ label {
   text-align: center;
   flex: 0 0 auto;
 }
+
+/* ---------- Summary rich text (board report Part 2D) ----------
+   contenteditable, no library. The toolbar is deliberately plain: five commands and a link,
+   because a board summary needs bullets, not a word processor. */
+.rte { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
+.rte-bar {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  padding: 6px; border-bottom: 1px solid var(--border); background: var(--surface-alt);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+}
+.rte-btn {
+  min-width: 44px; min-height: 36px; padding: 4px 10px;
+  border: 1px solid transparent; border-radius: 6px;
+  background: none; color: var(--text); font-size: 0.85rem; cursor: pointer;
+}
+.rte-btn:hover { background: var(--surface); border-color: var(--border); }
+.rte-btn:active { background: var(--accent-soft); }
+.rte-body { min-height: 150px; padding: 12px 14px; outline: none; line-height: 1.45; }
+.rte-body:focus { box-shadow: inset 0 0 0 2px var(--accent-soft); border-radius: 0 0 var(--radius-sm) var(--radius-sm); }
+.rte-body:empty::before { content: attr(data-placeholder); color: var(--muted); }
+.rte-body ul, .rte-body ol { margin: 0 0 10px; padding-left: 22px; }
+.rte-body li { margin: 0 0 4px; }
+.rte-body p { margin: 0 0 10px; }
+.rte-body a { color: var(--accent-dark); }

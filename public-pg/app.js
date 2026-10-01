@@ -5493,7 +5493,19 @@ async function renderBoardReport() {
       <div class="card">
         <h3>Summary</h3>
         <p class="muted">The narrative the board reads first. Saved as you type.</p>
-        <textarea id="brNotes" rows="5" ${published ? 'disabled' : ''} placeholder="What the board should know about this period…">${escapeHtml(report.SummaryNotes || '')}</textarea>
+        <div class="rte" id="brNotesWrap">
+          <div class="rte-bar" ${published ? 'hidden' : ''}>
+            <button type="button" class="rte-btn" data-cmd="bold" title="Bold"><strong>B</strong></button>
+            <button type="button" class="rte-btn" data-cmd="italic" title="Italic"><em>I</em></button>
+            <button type="button" class="rte-btn" data-cmd="insertUnorderedList" title="Bulleted list">• List</button>
+            <button type="button" class="rte-btn" data-cmd="insertOrderedList" title="Numbered list">1. List</button>
+            <button type="button" class="rte-btn" data-cmd="indent" title="Indent one level">→</button>
+            <button type="button" class="rte-btn" data-cmd="outdent" title="Outdent">←</button>
+            <button type="button" class="rte-btn" data-cmd="link" title="Add a link">Link</button>
+          </div>
+          <div id="brNotes" class="rte-body" ${published ? '' : 'contenteditable="true"'}
+               data-placeholder="What the board should know about this period…"></div>
+        </div>
       </div>
 
       ${sectionHtml('done', 'Work Completed')}
@@ -5625,11 +5637,7 @@ async function renderBoardReport() {
         await refresh();
       });
     }
-    let notesTimer;
-    document.getElementById('brNotes').addEventListener('input', (e) => {
-      clearTimeout(notesTimer);
-      notesTimer = setTimeout(() => patchReport({ summaryNotes: e.target.value }), 700);
-    });
+    mountSummaryEditor(report, (html) => patchReport({ summaryNotes: html }));
     app.querySelectorAll('.br-expand').forEach((b) => b.addEventListener('click', () => {
       const id = Number(b.dataset.wo);
       if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
@@ -8893,6 +8901,71 @@ async function renderCalendarEventDetail({ id }) {
     try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderCalendarEventDetail({ id }); }
     catch (err) { toast(err.message); }
   }));
+}
+
+// ---------- Summary rich text (board report brief, Part 2D) ----------
+//
+// contenteditable + execCommand rather than a library. The five things needed — bold, italic,
+// bullets with one level of nesting, numbered lists, links — are exactly what execCommand does
+// natively, and the frontend has no bundler, so any library would mean a CDN tag that fails on
+// bad camp wifi or a vendored blob. execCommand is deprecated but universally supported, and
+// for these commands there is no realistic replacement risk.
+//
+// The server sanitises on the way in and converts old plain-text summaries to real bullets, so
+// this only has to produce reasonable HTML, not trusted HTML.
+function mountSummaryEditor(report, onChange) {
+  const body = document.getElementById('brNotes');
+  if (!body) return;
+
+  // An old summary is plain text with "- " dashes; the server turns those into real bullets,
+  // and this asks it to, so opening the editor shows the list Ben was imitating.
+  const existing = report.SummaryNotes || '';
+  const looksRich = /<(p|ul|ol|li|strong|em|b|i|a)\b/i.test(existing);
+  if (looksRich) {
+    body.innerHTML = existing;
+  } else if (existing.trim()) {
+    api('/api/pg/board-reports/summary-preview', {
+      method: 'POST', body: JSON.stringify({ text: existing }),
+    }).then((d) => { body.innerHTML = d.html || ''; }).catch(() => {
+      // If the conversion is unavailable the text still has to be editable, just unconverted.
+      body.textContent = existing;
+    });
+  }
+
+  const bar = body.parentElement.querySelector('.rte-bar');
+  bar?.querySelectorAll('.rte-btn').forEach((btn) => {
+    // mousedown, not click: clicking moves focus out of the editable area first and the
+    // command would then apply to nothing.
+    btn.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      body.focus();
+      const cmd = btn.dataset.cmd;
+      if (cmd === 'link') {
+        const url = window.prompt('Link to…', 'https://');
+        if (url && /^(https?:|mailto:)/i.test(url)) document.execCommand('createLink', false, url);
+        return;
+      }
+      document.execCommand(cmd, false, null);
+      save();
+    });
+  });
+
+  let timer;
+  const save = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => onChange(body.innerHTML.trim() === '<br>' ? '' : body.innerHTML), 700);
+  };
+  body.addEventListener('input', save);
+  body.addEventListener('blur', () => { clearTimeout(timer); onChange(body.innerHTML); });
+
+  // Paste as plain text. A paste from Word or a browser carries fonts, colours and classes
+  // that the sanitiser would strip anyway — stripping here means what is on screen is what
+  // will be sent.
+  body.addEventListener('paste', (e) => {
+    e.preventDefault();
+    const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+    document.execCommand('insertText', false, text);
+  });
 }
 
 // ---------- Incoming (text-intake brief §5–§7) ----------
