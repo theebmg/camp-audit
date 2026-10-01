@@ -22,7 +22,9 @@ const photos = cand0.flatMap((g) => g.Photos.map((p) => ({ ...p, ItemId: g.ItemI
 if (photos.length < 2) { console.log('not enough photos on report 1 to test'); process.exit(0); }
 const [pA, pB] = photos;
 const origRoles = (await db.pool.query(
-  'SELECT id, role_id FROM attachment_links WHERE id = ANY($1)', [[pA.LinkId, pB.LinkId]])).rows;
+  'SELECT id, role_id, include_in_report FROM attachment_links WHERE id = ANY($1) ORDER BY id',
+  [[pA.LinkId, pB.LinkId]])).rows;
+console.log(`baseline: roles ${JSON.stringify(origRoles)}, ${beforeRows.length} selection row(s)`);
 
 const roles = await db.listAttachmentRoles();
 const before = roles.find((r) => r.DefaultIncludeInReport && /before/i.test(r.Name)) || roles.find((r) => r.DefaultIncludeInReport);
@@ -78,6 +80,15 @@ try {
   const fresh = (await db.pool.query('SELECT file_size, width FROM attachments WHERE id=$1', [one.AttachmentId])).rows[0];
   ok(Number(fresh.file_size) === one.FileSize && fresh.width === one.Width, 'THE ORIGINAL ROW IS UNCHANGED');
 
+  console.log('\n## a role can be taken back off');
+  await db.updateAttachmentLink(pA.LinkId, { roleId: null });
+  const cleared = (await db.pool.query('SELECT role_id, include_in_report FROM attachment_links WHERE id=$1', [pA.LinkId])).rows[0];
+  ok(cleared.role_id === null, 'choosing "no role" really clears it, rather than keeping the old one');
+  ok(cleared.include_in_report === false, 'and it stops being marked for the report');
+  await db.updateAttachmentLink(pA.LinkId, { roleId: before.Id });
+  const reset = (await db.pool.query('SELECT role_id FROM attachment_links WHERE id=$1', [pA.LinkId])).rows[0];
+  ok(reset.role_id === before.Id, 'and setting one again still works');
+
   console.log('\n## the rendered report carries the photos');
   const rendered = await renderBoardReportFromItems(REPORT, { withPhotos: true });
   ok((rendered.inlineAttachments || []).length === sel.length,
@@ -91,7 +102,13 @@ try {
   ok(est >= bytes * 0.5, 'the meter is in the right ballpark and errs high, so it warns early not late');
 } finally {
   console.log('\n## restoring the real report exactly as it was');
-  for (const r of origRoles) await db.updateAttachmentLink(r.id, { roleId: r.role_id });
+  // Raw SQL on purpose. Restoring through updateAttachmentLink is what let an earlier run
+  // report success while leaving real photos roled: the function under test cannot be trusted
+  // to undo the test.
+  for (const r of origRoles) {
+    await db.pool.query('UPDATE attachment_links SET role_id = $2, include_in_report = $3 WHERE id = $1',
+      [r.id, r.role_id, r.include_in_report]);
+  }
   await db.pool.query('DELETE FROM board_report_photos WHERE report_id=$1', [REPORT]);
   for (const r of beforeRows) {
     await db.pool.query(
@@ -99,7 +116,9 @@ try {
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
       [r.id, r.report_id, r.attachment_id, r.item_id, r.included, r.sort_order, r.snap_label]);
   }
-  const nowRoles = (await db.pool.query('SELECT id, role_id FROM attachment_links WHERE id = ANY($1)', [[pA.LinkId, pB.LinkId]])).rows;
+  const nowRoles = (await db.pool.query(
+    'SELECT id, role_id, include_in_report FROM attachment_links WHERE id = ANY($1) ORDER BY id',
+    [[pA.LinkId, pB.LinkId]])).rows;
   ok(JSON.stringify(nowRoles) === JSON.stringify(origRoles), 'photo roles are back as Ben had them');
   const nowRows = (await db.pool.query('SELECT * FROM board_report_photos WHERE report_id=$1', [REPORT])).rows;
   ok(nowRows.length === beforeRows.length, `${nowRows.length} selection row(s), was ${beforeRows.length}`);
