@@ -4840,8 +4840,8 @@ export async function updateAttachmentLink(linkId, patch = {}) {
     await client.query(
       `UPDATE attachment_links SET
          role_id = CASE WHEN $9::boolean THEN NULL ELSE COALESCE($2, role_id) END,
-         include_in_report = CASE WHEN $9::boolean AND $3 IS NULL THEN false
-                                  ELSE COALESCE($3, include_in_report) END,
+         include_in_report = CASE WHEN $9::boolean AND $3::boolean IS NULL THEN false
+                                  ELSE COALESCE($3::boolean, include_in_report) END,
          sort_order = COALESCE($4, sort_order), vendor_id = COALESCE($5, vendor_id),
          quoted_amount = COALESCE($6, quoted_amount), quote_date = COALESCE($7, quote_date),
          is_selected_quote = COALESCE($8, is_selected_quote)
