@@ -78,11 +78,34 @@ function captionSvg(width, height, label) {
 // Fetch the stored image and return a labelled, email-sized copy. Returns null rather than
 // throwing when an image cannot be fetched or decoded: one unavailable photo must not stop a
 // board report going out.
+// Object storage returns the occasional 503 under throttling — observed on these very photos,
+// one request failing and the next five succeeding. Without a retry that is a photo Ben chose
+// quietly missing from the board's report, so a transient failure is retried before it is
+// allowed to become a real one.
+const FETCH_ATTEMPTS = 3;
+const RETRYABLE = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+async function fetchPhoto(url) {
+  let last = null;
+  for (let attempt = 1; attempt <= FETCH_ATTEMPTS; attempt += 1) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+      if (res.ok) return { ok: true, body: Buffer.from(await res.arrayBuffer()) };
+      last = `HTTP ${res.status}`;
+      if (!RETRYABLE.has(res.status)) break;   // a 404 will not become a 200
+    } catch (e) {
+      last = e.message;
+    }
+    if (attempt < FETCH_ATTEMPTS) await new Promise((r) => setTimeout(r, 400 * attempt));
+  }
+  return { ok: false, error: last };
+}
+
 export async function buildEmailCopy(url, label) {
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
-    if (!res.ok) { console.warn(`[report-photos] fetch ${res.status} for ${url.slice(0, 80)}`); return null; }
-    const input = Buffer.from(await res.arrayBuffer());
+    const got = await fetchPhoto(url);
+    if (!got.ok) { console.warn(`[report-photos] ${got.error} for ${url.slice(0, 80)}`); return null; }
+    const input = got.body;
 
     const resized = await sharp(input, { failOn: 'none' })
       .rotate()                                   // honour EXIF orientation before measuring

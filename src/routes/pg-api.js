@@ -2229,7 +2229,7 @@ router.post('/board-reports/:id(\\d+)/output', async (req, res, next) => {
 
     // Photos are built only for a send: resizing and captioning every selected image is real
     // work, and a download or a preview does not need it.
-    const { html, text, inlineAttachments } = await renderBoardReportFromItems(report.Id, {
+    const { html, text, inlineAttachments, photoFailures } = await renderBoardReportFromItems(report.Id, {
       withPhotos: kind === 'email',
     });
     const baseSubject = subject || `Camp Sychar — Board Report (${report.Title})`;
@@ -2257,7 +2257,13 @@ router.post('/board-reports/:id(\\d+)/output', async (req, res, next) => {
     });
     // html comes back so a download can save the very bytes that were recorded,
     // rather than re-rendering client-side and drifting from the stored copy.
-    res.json({ ok: true, output, html, text, subject: finalSubject });
+    // Said plainly rather than left for Ben to notice a gap in the board's copy.
+    const warning = photoFailures?.length
+      ? `Sent, but ${photoFailures.length} selected photo(s) could not be included: `
+        + `${photoFailures.map((f) => f.label || `#${f.attachmentId}`).join('; ')}. `
+        + 'The image could not be fetched from storage. Try again, or deselect it.'
+      : null;
+    res.json({ ok: true, output, html, text, subject: finalSubject, photoFailures, warning });
   } catch (e) { next(e); }
 });
 

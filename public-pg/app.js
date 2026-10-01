@@ -5578,6 +5578,9 @@ async function renderBoardReport() {
       const res = await api(`/api/pg/board-reports/${report.Id}/output`, {
         method: 'POST', body: JSON.stringify({ kind, ...extra }),
       });
+      // A photo that could not be fetched is reported rather than left as a gap in the
+      // board's copy that nobody notices. Long toast: this one is worth reading.
+      if (res?.warning) toast(res.warning, 12000);
       return res;
     } catch (e) {
       // 409 = this is still a draft; ask once, then repeat with the confirmation.

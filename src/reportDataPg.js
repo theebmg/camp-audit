@@ -316,6 +316,10 @@ export async function renderBoardReportFromItems(reportId, { withPhotos = false 
 
   let inlineAttachments = [];
   let reportPhotos = [];
+  // Photos Ben selected that could not be built. Reported rather than swallowed: a selection
+  // silently missing from the board's copy is the same failure that lost a fortnight of texted
+  // photos, and object storage really does hand back the occasional 503.
+  const photoFailures = [];
   if (withPhotos) {
     const selected = await listSelectedReportPhotos(reportId);
     const labels = {};
@@ -326,7 +330,11 @@ export async function renderBoardReportFromItems(reportId, { withPhotos = false 
         || buildPhotoLabel({ rolePrefix: photo.RolePrefix, description: photo.Description });
       labels[photo.Id] = label;
       const copy = await buildEmailCopy(photo.Url, label);
-      if (!copy) continue;   // one unavailable photo must not stop the report going out
+      if (!copy) {
+        // One unavailable photo must not stop the report going out — but it must be said.
+        photoFailures.push({ attachmentId: photo.AttachmentId, label });
+        continue;
+      }
       // cid: references, so the picture renders in the body rather than only as an attachment.
       const cid = `photo${photo.Id}@sychar`;
       inlineAttachments.push({
@@ -351,5 +359,6 @@ export async function renderBoardReportFromItems(reportId, { withPhotos = false 
     text: renderBoardReportItemsText(data),
     data,
     inlineAttachments,
+    photoFailures,
   };
 }
