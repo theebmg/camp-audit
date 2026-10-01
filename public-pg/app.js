@@ -8883,7 +8883,14 @@ async function renderIncoming(params = {}) {
                   ${i.PhotoCount ? `<span class="pill">${i.PhotoCount} 📷</span>` : ''}
                 </div>
               </div>
-              <div style="margin-top:3px;white-space:pre-wrap">${escapeHtml(i.DisplayText || '(no text)')}</div>
+              ${i.DisplayText ? `<div style="margin-top:3px;white-space:pre-wrap">${escapeHtml(i.DisplayText)}</div>`
+                : '<div class="muted" style="margin-top:3px;font-style:italic">Photo only — no message text</div>'}
+              ${(i.Photos || []).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+                ${i.Photos.slice(0, 4).map((ph) => `<img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt="" style="width:56px;height:56px;object-fit:cover;border-radius:6px" />`).join('')}
+              </div>` : ''}
+              ${i.MediaError ? `<div class="muted" style="margin-top:4px;font-size:0.8rem;color:var(--danger)">
+                ${i.MediaExpected} photo${i.MediaExpected === 1 ? '' : 's'} did not come through
+              </div>` : ''}
               ${i.Status === 'filed' ? `<div class="muted" style="font-size:0.8rem;margin-top:3px">filed as ${escapeHtml(i.FiledAs || '')}${i.FiledBy ? ` by ${escapeHtml(i.FiledBy)}` : ''}</div>` : ''}
             </div>
           </div>`).join('') : `<p class="muted">Nothing ${status === 'all' ? 'here' : status}.</p>`}

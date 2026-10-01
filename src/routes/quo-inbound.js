@@ -19,6 +19,7 @@ import crypto from 'crypto';
 import {
   createIncomingItem, isAllowedSender, countIgnoredSender, countWrongLine, noteDelivery,
   getTextIntakeSettings, normalizePhone, linkAttachment, createAttachment,
+  noteIncomingMediaFailure,
 } from '../db.js';
 import { storeAttachment } from '../storage.js';
 
@@ -88,14 +89,21 @@ export function readQuoMessage(body) {
 }
 
 // Media URLs expire, so they are fetched now rather than stored as links (§3).
+//
+// Returns { ids, failures }. The failures matter: a photo that silently fails to attach looks
+// exactly like a text that never had one, and that is how a check constraint on
+// attachments.source hid every texted photo for a fortnight — fetched, resized, uploaded, then
+// rejected at the final INSERT, with a console warning nobody reads. The caller now records
+// the failure on the item itself.
 async function ingestMedia(urls) {
   const ids = [];
+  const failures = [];
   for (const url of urls.slice(0, 10)) {
     try {
       const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
-      if (!res.ok) { console.warn(`[quo] media fetch ${res.status}`); continue; }
+      if (!res.ok) { failures.push(`fetch returned ${res.status}`); continue; }
       const contentType = res.headers.get('content-type') || 'image/jpeg';
-      if (!/^image\//.test(contentType)) { console.warn(`[quo] skipping non-image ${contentType}`); continue; }
+      if (!/^image\//.test(contentType)) { failures.push(`not an image (${contentType})`); continue; }
       const buf = Buffer.from(await res.arrayBuffer());
       const ext = contentType.split('/')[1]?.split(';')[0] || 'jpg';
       // Same pipeline and option shape as the email photo ingest, so a texted photo and an
@@ -109,10 +117,11 @@ async function ingestMedia(urls) {
       const attachment = await createAttachment(meta, { source: 'text', uploadedBy: 'quo' });
       ids.push(attachment.Id);
     } catch (e) {
-      console.warn('[quo] media fetch failed:', e.message);
+      failures.push(e.message);
     }
   }
-  return ids;
+  if (failures.length) console.error('[quo] MEDIA FAILED:', failures.join(' | '));
+  return { ids, failures };
 }
 
 // The confirmation reply (§7). Best effort: a failed reply must never fail the delivery, or
@@ -215,8 +224,14 @@ router.post('/', async (req, res) => {
     }
 
     if (msg.mediaUrls.length) {
-      for (const id of await ingestMedia(msg.mediaUrls)) {
+      const { ids, failures } = await ingestMedia(msg.mediaUrls);
+      for (const id of ids) {
         await linkAttachment(id, { entityType: 'incoming_item', entityId: result.Item.Id });
+      }
+      // Written onto the item so the Incoming screen can say "2 photos didn't come through"
+      // rather than showing a message that just looks empty.
+      if (failures.length) {
+        await noteIncomingMediaFailure(result.Item.Id, msg.mediaUrls.length, failures);
       }
     }
 

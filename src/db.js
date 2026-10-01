@@ -8850,6 +8850,8 @@ function incomingRowShape(r) {
     ExternalId: r.external_id,
     FromNumber: r.from_number,
     ToLine: r.to_line ?? null,
+    MediaExpected: r.media_expected ?? 0,
+    MediaError: r.media_error ?? null,
     BodyText: r.body_text,
     // What to show: the message without the hint word, since the hint is already a chip.
     DisplayText: display || r.body_text,
@@ -8937,6 +8939,16 @@ export async function createIncomingItem({
       entityLabel: (bodyText || '').slice(0, 60) || '(no text)', details: `from ${fromNumber || 'unknown'}` });
   }
   return { Item: await getIncomingItem(id), Created: created };
+}
+
+// A photo that failed to attach has to be visible on the item. Otherwise a text whose picture
+// was lost looks exactly like a text that never had one — which is how a check constraint on
+// attachments.source hid every texted photo until Ben noticed the pictures were missing.
+export async function noteIncomingMediaFailure(id, expected, failures) {
+  await pool.query(
+    'UPDATE incoming_items SET media_expected = $2, media_error = $3 WHERE id = $1',
+    [id, expected, (failures || []).join(' | ').slice(0, 500) || null]
+  );
 }
 
 export async function markIncomingFiled(id, { filedAs, entity, entityId, by = null }, client = pool) {
