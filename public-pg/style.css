@@ -1061,7 +1061,9 @@ label {
   border-radius: var(--radius-sm) var(--radius-sm) 0 0;
 }
 .rte-btn {
-  min-width: 44px; min-height: 36px; padding: 4px 10px;
+  /* 44px, not 36 — a more specific rule than the mobile block's `button` would otherwise
+     win and leave the toolbar below the tap-target minimum on a phone. */
+  min-width: 44px; min-height: 44px; padding: 4px 10px;
   border: 1px solid transparent; border-radius: 6px;
   background: none; color: var(--text); font-size: 0.85rem; cursor: pointer;
 }
