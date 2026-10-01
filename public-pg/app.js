@@ -5513,7 +5513,7 @@ async function renderBoardReport() {
           <h3 style="margin:0">Photos</h3>
           <span class="muted" id="brPhotoMeter"></span>
         </div>
-        <p class="muted" style="margin:6px 0 0">
+        <p class="muted" style="margin:6px 0 0" id="brPhotoHint">
           Tick what the board should see. Before and After are pre-selected; each photo is
           captioned automatically from its role and the work it belongs to.
         </p>
@@ -8980,6 +8980,19 @@ async function loadReportPhotos(reportId) {
             </div>`).join('')}
         </div>
       </div>`).join('');
+
+    // Say what is actually true. Promising that Before and After are pre-selected reads as a
+    // broken feature when, as on the September photos, not one of them has a role yet.
+    const hint = document.getElementById('brPhotoHint');
+    const anyRole = groups.some((g) => g.Photos.some((ph) => ph.RoleName));
+    if (hint) {
+      hint.innerHTML = anyRole
+        ? 'Tick what the board should see. Before and After are pre-selected; each photo is '
+          + 'captioned automatically from its role and the work it belongs to.'
+        : '<strong>None of these photos has a role yet</strong>, so nothing is pre-selected and '
+          + 'every caption is just the job title. Set a role below — Before and After caption '
+          + 'the photo and tick it for you.';
+    }
 
     const over = data.overBudget;
     meter.innerHTML = `${(data.selected || []).length} selected · about
