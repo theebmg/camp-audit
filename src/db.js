@@ -5719,7 +5719,7 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
             w.id AS work_order_id, w.title AS wo_title, a.name AS asset_name, s.name AS status_name,
             -- The work order's OWN status and dates, so the header row this pass writes
             -- carries the same detail the board-featured path has always written (decisions §7).
-            ws.name AS wo_status, w.date_reported::text AS wo_started,
+            ws.name AS wo_status, ws.is_terminal AS wo_is_terminal, w.date_reported::text AS wo_started,
             w.date_completed::text AS wo_completed
      FROM job_lines jl
      JOIN job_line_statuses s ON s.id = jl.status_id
@@ -5754,7 +5754,9 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
         // order row with different amounts of detail (decisions §7).
         snapStatus: r.wo_status,
         snapStartDate: r.wo_started || roll.firstDate,
-        snapDate: r.wo_completed || roll.lastCompleted,
+        // Only a finished work order gets a finish date. Falling back to the newest completed
+        // LINE made an open WO read "Completed" because some of its lines were done.
+        snapDate: r.wo_completed || (r.wo_is_terminal ? roll.lastCompleted : null),
         // Real money only. The estimate rides alongside and is never summed in (§2, §3).
         snapCost: roll.hasActual ? roll.actualCost : null,
         snapEstCost: roll.hasEst ? roll.estCost : null,
@@ -6022,7 +6024,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
       section: (r.is_terminal || anchorsDone) ? 'done' : 'coming_up', sortIndex: 3000 + i,
       snapTitle: r.title, snapAssetName: r.place, snapStatus: r.status,
       snapStartDate: r.started_date || roll.firstDate,
-      snapDate: r.completed_date || roll.lastCompleted,
+      snapDate: r.completed_date || (r.is_terminal ? roll.lastCompleted : null),
       snapCost: roll.hasActual ? roll.actualCost : null,
       snapEstCost: roll.hasEst ? roll.estCost : null,
       snapHours: roll.actualHours || null,
