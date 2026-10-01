@@ -8866,6 +8866,7 @@ function incomingRowShape(r) {
     FiledBy: r.filed_by,
     FiledAt: r.filed_at,
     PhotoCount: Number(r.photo_count || 0),
+    Photos: r.photos || [],
     CreatedAt: r.created_at,
   };
 }
@@ -8873,7 +8874,14 @@ function incomingRowShape(r) {
 const INCOMING_SELECT = `
   SELECT i.*, i.received_date::text AS received_date_text,
          (SELECT count(*) FROM attachment_links al
-           WHERE al.entity_type = 'incoming_item' AND al.entity_id = i.id) AS photo_count
+           WHERE al.entity_type = 'incoming_item' AND al.entity_id = i.id) AS photo_count,
+         -- Thumbnails in the LIST, not only on the detail screen: a photo-only text has no
+         -- words, so without these the row renders blank.
+         COALESCE((
+           SELECT json_agg(json_build_object('Id', a.id, 'Url', a.url, 'ThumbUrl', a.thumb_url))
+           FROM attachment_links al JOIN attachments a ON a.id = al.attachment_id
+           WHERE al.entity_type = 'incoming_item' AND al.entity_id = i.id
+         ), '[]') AS photos
   FROM incoming_items i
 `;
 
