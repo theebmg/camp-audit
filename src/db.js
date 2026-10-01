@@ -4648,7 +4648,7 @@ async function getWorkOrderCrewRoster(woId) {
 //    finding, the before shot on the job line, and the reference image on
 //    the asset simultaneously, uploaded once. ──────────────────────────────
 
-const ATTACHMENT_ENTITY_TYPES = new Set(['asset', 'work_order', 'job_line', 'condition_finding', 'asset_component', 'maintenance_request', 'asset_note', 'expense', 'admin_task', 'visit', 'incoming_item']);
+const ATTACHMENT_ENTITY_TYPES = new Set(['asset', 'work_order', 'job_line', 'condition_finding', 'asset_component', 'maintenance_request', 'asset_note', 'expense', 'admin_task', 'visit', 'incoming_item', 'board_report']);
 
 function attachmentRowShape(a) {
   return {
@@ -6080,7 +6080,18 @@ export async function seedDefaultReportPhotos(reportId) {
      ON CONFLICT (report_id, attachment_id) DO NOTHING`,
     [reportId]
   );
-  return rowCount;
+  // Photos uploaded straight onto the report are in by default whatever their role: putting one
+  // here is itself the decision to show it.
+  const { rowCount: looseCount } = await pool.query(
+    `INSERT INTO board_report_photos (report_id, attachment_id, item_id, included, sort_order)
+     SELECT $1, a.id, NULL, true, 0
+     FROM attachment_links al
+     JOIN attachments a ON a.id = al.attachment_id AND a.deleted_at IS NULL AND a.kind = 'image'
+     WHERE al.entity_type = 'board_report' AND al.entity_id = $1
+     ON CONFLICT (report_id, attachment_id) DO NOTHING`,
+    [reportId]
+  );
+  return rowCount + looseCount;
 }
 
 export async function listBoardReportPhotoCandidates(reportId) {
@@ -6110,7 +6121,25 @@ export async function listBoardReportPhotoCandidates(reportId) {
      LEFT JOIN attachment_roles r ON r.id = al.role_id
      LEFT JOIN job_lines jl ON al.entity_type = 'job_line' AND jl.id = al.entity_id
      LEFT JOIN board_report_photos p ON p.report_id = $1 AND p.attachment_id = a.id
-     ORDER BY it.item_id, COALESCE(r.report_stage_order, 99), a.taken_at NULLS LAST, a.id`,
+     -- The overall shot of the job comes before the close-ups of its individual lines.
+     ORDER BY it.item_id, (al.entity_type <> 'work_order'),
+              COALESCE(r.report_stage_order, 99), a.taken_at NULLS LAST, a.id`,
+    [reportId]
+  );
+
+  // Photos put straight onto the report, belonging to no one job (§2A addition). They are
+  // their own group and print after everything else, under "Other photos this month".
+  const { rows: loose } = await pool.query(
+    `SELECT a.id AS attachment_id, a.url, a.thumb_url, a.width, a.height, a.file_size,
+            a.caption, a.taken_at,
+            al.id AS link_id, r.name AS role_name, r.report_label_prefix, r.report_stage_order,
+            p.id AS selection_id, p.included AS selected
+     FROM attachment_links al
+     JOIN attachments a ON a.id = al.attachment_id AND a.deleted_at IS NULL AND a.kind = 'image'
+     LEFT JOIN attachment_roles r ON r.id = al.role_id
+     LEFT JOIN board_report_photos p ON p.report_id = $1 AND p.attachment_id = a.id
+     WHERE al.entity_type = 'board_report' AND al.entity_id = $1
+     ORDER BY COALESCE(r.report_stage_order, 99), a.taken_at NULLS LAST, a.id`,
     [reportId]
   );
 
@@ -6141,7 +6170,29 @@ export async function listBoardReportPhotoCandidates(reportId) {
       Stored: r.selection_id != null,
     });
   }
-  return [...byItem.values()];
+
+  const groups = [...byItem.values()];
+  if (loose.length) {
+    groups.push({
+      ItemId: null, ItemType: 'report', Title: 'Other photos this month',
+      Photos: loose.map((r) => ({
+        AttachmentId: r.attachment_id,
+        Url: r.url, ThumbUrl: r.thumb_url,
+        Width: r.width, Height: r.height, FileSize: r.file_size != null ? Number(r.file_size) : null,
+        RoleName: r.role_name, RolePrefix: r.report_label_prefix, StageOrder: r.report_stage_order,
+        // A photo put straight on the report has no job to name it, so its caption is whatever
+        // Ben typed. Without one it prints uncaptioned rather than captioned with a guess.
+        Description: r.caption || '',
+        LinkedTo: 'board_report', LinkId: r.link_id,
+        SelectionId: r.selection_id,
+        // Deliberately uploaded here, so it is in by default — unlike a photo found on a work
+        // order, which has to earn its place through its role.
+        Selected: r.selection_id ? r.selected : true,
+        Stored: r.selection_id != null,
+      })),
+    });
+  }
+  return groups;
 }
 
 export async function setBoardReportPhoto(reportId, attachmentId, { itemId = null, included = true, sortOrder = 0 }) {
@@ -6173,25 +6224,40 @@ export async function listSelectedReportPhotos(reportId) {
             a.url, a.thumb_url, a.width, a.height, a.file_size, a.caption,
             r.name AS role_name, r.report_label_prefix, r.report_stage_order,
             i.snap_title AS item_title,
-            jl.title AS job_line_title
+            al.entity_type AS linked_to,
+            jl.title AS job_line_title, w.title AS work_order_title
      FROM board_report_photos p
      JOIN attachments a ON a.id = p.attachment_id AND a.deleted_at IS NULL
      LEFT JOIN board_report_items i ON i.id = p.item_id
-     -- One link per photo, and it must be the one carrying the role: restricting this to
-     -- 'job_line' dropped the role off every photo attached to a work order directly, which
-     -- cost those captions their BEFORE / AFTER prefix. A photo can have several links, so
-     -- prefer a link that has a role, then a job line (its title is the better caption).
+     -- One link per photo, chosen IN THE CONTEXT OF THE ITEM it was selected under. A photo can
+     -- be linked to several things, so the link that belongs to this item wins: the work order
+     -- the item is, or one of its job lines. Restricting this to 'job_line' once dropped the
+     -- role off every photo attached to a work order directly, costing those captions their
+     -- BEFORE / AFTER prefix.
      LEFT JOIN LATERAL (
        SELECT al.role_id, al.entity_type, al.entity_id
        FROM attachment_links al
        WHERE al.attachment_id = a.id
-       ORDER BY (al.role_id IS NULL), (al.entity_type <> 'job_line'), al.id
+       ORDER BY
+         -- links belonging to this very item first
+         (CASE
+            WHEN al.entity_type = 'board_report' AND al.entity_id = $1 THEN 0
+            WHEN i.item_type = 'work_order' AND al.entity_type = 'work_order' AND al.entity_id = i.item_id THEN 1
+            WHEN i.item_type = 'work_order' AND al.entity_type = 'job_line'
+                 AND al.entity_id IN (SELECT id FROM job_lines WHERE work_order_id = i.item_id) THEN 2
+            WHEN i.item_type = 'job_line' AND al.entity_type = 'job_line' AND al.entity_id = i.item_id THEN 1
+            ELSE 9
+          END),
+         (al.role_id IS NULL), al.id
        LIMIT 1
      ) al ON true
      LEFT JOIN job_lines jl ON al.entity_type = 'job_line' AND jl.id = al.entity_id
+     LEFT JOIN work_orders w ON al.entity_type = 'work_order' AND w.id = al.entity_id
      LEFT JOIN attachment_roles r ON r.id = al.role_id
      WHERE p.report_id = $1 AND p.included
-     ORDER BY p.item_id NULLS LAST, COALESCE(r.report_stage_order, 99), p.sort_order, p.id`,
+     -- Report-level photos last; within an item, the whole-job shot before the per-line ones.
+     ORDER BY p.item_id NULLS LAST, (al.entity_type <> 'work_order'),
+              COALESCE(r.report_stage_order, 99), p.sort_order, p.id`,
     [reportId]
   );
   return rows.map((r) => ({
@@ -6200,7 +6266,12 @@ export async function listSelectedReportPhotos(reportId) {
     Width: r.width, Height: r.height, FileSize: r.file_size != null ? Number(r.file_size) : null,
     RoleName: r.role_name, RolePrefix: r.report_label_prefix, StageOrder: r.report_stage_order ?? 99,
     ItemTitle: r.item_title,
-    Description: r.job_line_title || r.caption || r.item_title,
+    LinkedTo: r.linked_to,
+    // §2C: a job-line photo is named by the line, a whole-job photo by the work order, and a
+    // photo put straight on the report by whatever caption Ben gave it.
+    Description: r.linked_to === 'board_report'
+      ? (r.caption || '')
+      : (r.job_line_title || r.work_order_title || r.caption || r.item_title),
     SnapLabel: r.snap_label,
   }));
 }

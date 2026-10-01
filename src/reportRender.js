@@ -546,7 +546,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
     ${report.SummaryNotes ? `<div style="background:#fbfbfe;border:1px solid #eef0f6;border-radius:10px;padding:14px;margin-bottom:6px;">${plainSummaryToHtml(report.SummaryNotes)}</div>` : ''}
     ${sections.map((sec) => sectionHtml(sec, items)).join('')}
     ${Array.isArray(reportPhotos) && reportPhotos.length ? `
-      <h2 style="margin:26px 0 4px;font-size:1.1rem;border-top:2px solid #eef0f6;padding-top:14px;">Around camp</h2>
+      <h2 style="margin:26px 0 4px;font-size:1.1rem;border-top:2px solid #eef0f6;padding-top:14px;">Other photos this month</h2>
       ${itemPhotosHtml(reportPhotos)}` : ''}
     <div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
       Total — ${visible.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}

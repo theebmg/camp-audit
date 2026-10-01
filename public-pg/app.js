@@ -665,7 +665,8 @@ function attachmentThumbHtml(a) {
 // itself in place after any change — callers don't need to manage state.
 //   opts: { title, defaultRoleName, inheritedClassification, accept }
 async function renderAttachmentSection(entityType, entityId, container, opts = {}) {
-  const { title = 'Photos', defaultRoleName = null, inheritedClassification = null, accept = 'image/*,application/pdf' } = opts;
+  const { title = 'Photos', defaultRoleName = null, inheritedClassification = null,
+    accept = 'image/*,application/pdf', onChange = null } = opts;
   const roles = state.options.attachmentRoles || [];
   const defaultRole = defaultRoleName ? roles.find((r) => r.Name === defaultRoleName) : null;
   const { attachments } = await api(`/api/pg/attachments?entityType=${entityType}&entityId=${entityId}`);
@@ -694,6 +695,7 @@ async function renderAttachmentSection(entityType, entityId, container, opts = {
         await uploadAttachment(file, entityType, entityId, { roleId: defaultRole?.Id, classification: inheritedClassification });
       }
       renderAttachmentSection(entityType, entityId, container, opts);
+      if (onChange) onChange();
     } catch (err) { toast(err.message); }
   });
 
@@ -768,18 +770,21 @@ async function renderAttachmentEditPanel(a, roles, entityType, entityId, contain
         isSelectedQuote: panel.querySelector('.attach-selected-quote')?.checked || false,
       }) });
       renderAttachmentSection(entityType, entityId, container, opts);
+      if (onChange) onChange();
     } catch (err) { toast(err.message); }
   });
   panel.querySelector('.attach-detach').addEventListener('click', async () => {
     if (!await confirmDialog('Detach this file from here? The file itself is not deleted.')) return;
     await api(`/api/pg/attachment-links/${a.LinkId}`, { method: 'DELETE' });
     renderAttachmentSection(entityType, entityId, container, opts);
+    if (onChange) onChange();
   });
   // One tap, no confirm — junk arrives via email in the inbox (Phase 5) and
   // hesitation is the enemy. The file survives in Spaces either way.
   panel.querySelector('.attach-void').addEventListener('click', async () => {
     await api(`/api/pg/attachments/${a.Id}/void`, { method: 'POST' });
     renderAttachmentSection(entityType, entityId, container, opts);
+    if (onChange) onChange();
   });
   panel.querySelector('.attach-cancel').addEventListener('click', () => { panel.hidden = true; panel.innerHTML = ''; });
 }
@@ -5552,6 +5557,14 @@ async function renderBoardReport() {
           captioned automatically from its role and the work it belongs to.
         </p>
         <div id="brPhotos" style="margin-top:10px"><p class="muted">Loading photos…</p></div>
+        ${published ? '' : `<div style="margin-top:14px;padding-top:12px;border-top:1px solid #eef0f6">
+          <div id="brOwnPhotos"></div>
+          <p class="muted" style="margin:6px 0 0;font-size:0.82rem">
+            Photos that belong to the month rather than to one job — camp in the snow, a new sign,
+            a work day. They print at the end under “Other photos this month”. Tap one to add a
+            caption; without a caption it prints with none.
+          </p>
+        </div>`}
       </div>
 
       ${sectionHtml('done', 'Work Completed')}
@@ -5726,6 +5739,17 @@ async function renderBoardReport() {
           showFieldError(id, saveErrorMessage(err));
         }
       });
+    }
+    if (report.Status !== 'published') {
+      const own = document.getElementById('brOwnPhotos');
+      // Uploaded against the report itself (entity_type 'board_report'), so nothing has to exist
+      // anywhere else first. Same upload route as everywhere, so the same resize applies.
+      if (own) {
+        renderAttachmentSection('board_report', report.Id, own, {
+          title: 'Add photos to this report', accept: 'image/*',
+          onChange: () => loadReportPhotos(report.Id),
+        });
+      }
     }
     mountSummaryEditor(report, async (html) => {
       // "Saved as you type" was true only when it worked; a failure said nothing at all.
@@ -9071,7 +9095,7 @@ async function loadReportPhotos(reportId) {
                             border:3px solid ${ph.Selected ? 'var(--accent)' : 'transparent'}" />
                 <span style="display:flex;align-items:center;gap:5px;margin-top:3px;font-size:0.76rem">
                   <input type="checkbox" class="br-photo-pick" data-att="${ph.AttachmentId}"
-                         data-item="${g.ItemId}" ${ph.Selected ? 'checked' : ''} />
+                         data-item="${g.ItemId ?? ''}" ${ph.Selected ? 'checked' : ''} />
                   Include
                 </span>
               </label>
@@ -9113,7 +9137,8 @@ async function loadReportPhotos(reportId) {
           method: 'POST',
           body: JSON.stringify({
             attachmentId: Number(cb.dataset.att),
-            itemId: Number(cb.dataset.item),
+            // Empty for a photo that belongs to the report rather than to one of its items.
+            itemId: cb.dataset.item ? Number(cb.dataset.item) : null,
             included: cb.checked,
           }),
         });
@@ -14466,8 +14491,13 @@ async function renderWorkOrderDetail({ id }, container = app) {
     ${rollupHtml}
 
     <div class="card">
-      <h3>Documents</h3>
-      <p class="muted">Whole-job attachments not tied to one line — permits, invoices, warranty docs. Work photos belong on the job line they're proof of, below.</p>
+      <h3>Photos &amp; Documents</h3>
+      <p class="muted">
+        <strong>Job photos</strong> are the overall before and after of the whole job — the ones
+        the board sees first. <strong>Documents</strong> are the paperwork: permits, invoices,
+        warranties. A photo that is proof of one particular line belongs on that line, below.
+      </p>
+      <div id="woJobPhotosCard"></div>
       <div id="woPhotosCard"></div>
     </div>
 
@@ -14824,6 +14854,11 @@ async function renderWorkOrderDetail({ id }, container = app) {
     renderAttachmentSection('job_line', jlId, card.querySelector(`#jlPhotos-${jlId}`), { title: 'Photos', defaultRoleName: 'During' });
   });
 
+  // Two sections against the same work order. The data layer always allowed a photo on a work
+  // order; the screen only ever offered "Documents", defaulting to the Documentation role —
+  // which is not marked for the report — so a whole-job before/after had nowhere obvious to go
+  // and would not have been pre-selected if it got there.
+  renderAttachmentSection('work_order', id, container.querySelector('#woJobPhotosCard'), { title: 'Job photos — overall before and after', defaultRoleName: 'Before / Condition', accept: 'image/*' });
   renderAttachmentSection('work_order', id, container.querySelector('#woPhotosCard'), { title: 'Documents', defaultRoleName: 'Documentation', accept: 'image/*,application/pdf' });
 
   container.querySelector('#addLogEntryForm').addEventListener('submit', async (e) => {
