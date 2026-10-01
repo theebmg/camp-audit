@@ -689,6 +689,14 @@ async function renderAttachmentEditPanel(a, roles, entityType, entityId, contain
       <a href="${escapeHtml(a.Url)}" target="_blank" rel="noopener">${a.Kind === 'image'
         ? `<img src="${escapeHtml(a.Url)}" alt="" style="max-width:100%;border-radius:8px;display:block" />`
         : `Open file (${escapeHtml(a.OriginalFilename || a.Kind)})`}</a>
+      <!-- An explicit way out. When the inline image fails to load — a bad URL, an expired
+           link, a format the browser will not render — the panel is otherwise just a role
+           picker and a caption box with no picture and nothing to click. -->
+      <div style="margin-top:6px">
+        <a href="${escapeHtml(a.Url)}" target="_blank" rel="noopener" class="btn btn-secondary" style="display:inline-block">
+          Open full size ↗
+        </a>
+      </div>
       <div class="field-row"><label>Role</label><select class="attach-role"><option value="">— unset —</option>${roleOptions}</select></div>
       <div class="field-row"><label>Caption</label><input class="attach-caption" value="${escapeHtml(a.Caption || '')}" /></div>
       <label style="display:flex;align-items:center;gap:8px;font-weight:400;margin:8px 0"><input type="checkbox" class="attach-include" ${a.IncludeInReport ? 'checked' : ''} /> Include in board report</label>
