@@ -4821,7 +4821,12 @@ export async function createAndLinkAttachment(meta, link, opts) {
   }
 }
 
-export async function updateAttachmentLink(linkId, { roleId, classification, caption, includeInReport, sortOrder, vendorId, quotedAmount, quoteDate, isSelectedQuote }) {
+// `roleId: null` CLEARS the role; leaving roleId out leaves it alone. The blanket
+// `COALESCE($2, role_id)` this used to run could set a role but never remove one, so the
+// "no role" option in the pickers silently kept whatever was there.
+export async function updateAttachmentLink(linkId, patch = {}) {
+  const { roleId, classification, caption, includeInReport, sortOrder, vendorId, quotedAmount, quoteDate, isSelectedQuote } = patch;
+  const clearingRole = 'roleId' in patch && roleId == null;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -4834,7 +4839,8 @@ export async function updateAttachmentLink(linkId, { roleId, classification, cap
     const include = includeInReport !== undefined ? includeInReport : (roleId !== undefined ? await resolveIncludeInReport(client, roleId, null) : undefined);
     await client.query(
       `UPDATE attachment_links SET
-         role_id = COALESCE($2, role_id), include_in_report = COALESCE($3, include_in_report),
+         role_id = ${clearingRole ? 'NULL' : 'COALESCE($2, role_id)'},
+         include_in_report = ${clearingRole && includeInReport === undefined ? 'false' : 'COALESCE($3, include_in_report)'},
          sort_order = COALESCE($4, sort_order), vendor_id = COALESCE($5, vendor_id),
          quoted_amount = COALESCE($6, quoted_amount), quote_date = COALESCE($7, quote_date),
          is_selected_quote = COALESCE($8, is_selected_quote)
