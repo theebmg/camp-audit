@@ -5508,6 +5508,18 @@ async function renderBoardReport() {
         </div>
       </div>
 
+      <div class="card" id="brPhotosCard">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
+          <h3 style="margin:0">Photos</h3>
+          <span class="muted" id="brPhotoMeter"></span>
+        </div>
+        <p class="muted" style="margin:6px 0 0">
+          Tick what the board should see. Before and After are pre-selected; each photo is
+          captioned automatically from its role and the work it belongs to.
+        </p>
+        <div id="brPhotos" style="margin-top:10px"><p class="muted">Loading photos…</p></div>
+      </div>
+
       ${sectionHtml('done', 'Work Completed')}
       ${sectionHtml('coming_up', 'Coming Up')}
       ${sectionHtml('overdue', 'Overdue')}
@@ -5638,6 +5650,7 @@ async function renderBoardReport() {
       });
     }
     mountSummaryEditor(report, (html) => patchReport({ summaryNotes: html }));
+    loadReportPhotos(report.Id);
     app.querySelectorAll('.br-expand').forEach((b) => b.addEventListener('click', () => {
       const id = Number(b.dataset.wo);
       if (expanded.has(id)) expanded.delete(id); else expanded.add(id);
@@ -8901,6 +8914,77 @@ async function renderCalendarEventDetail({ id }) {
     try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderCalendarEventDetail({ id }); }
     catch (err) { toast(err.message); }
   }));
+}
+
+// ---------- Board report photos (Part 2A / 2B) ----------
+async function loadReportPhotos(reportId) {
+  const host = document.getElementById('brPhotos');
+  const meter = document.getElementById('brPhotoMeter');
+  if (!host) return;
+  let data;
+  try { data = await api(`/api/pg/board-reports/${reportId}/photos`); }
+  catch { host.innerHTML = '<p class="muted">Could not load photos.</p>'; return; }
+
+  const draw = () => {
+    const groups = data.groups || [];
+    if (!groups.length) {
+      host.innerHTML = `<p class="muted">
+        No photos on anything in this report yet. Photos attached to a work order or a job line
+        show up here automatically.
+      </p>`;
+      meter.textContent = '';
+      return;
+    }
+    host.innerHTML = groups.map((g) => `
+      <div style="margin-bottom:14px">
+        <div style="font-weight:600;font-size:0.9rem">${escapeHtml(g.Title || '(untitled)')}</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:6px">
+          ${g.Photos.map((ph) => `
+            <label class="br-photo" style="flex:0 0 auto;width:112px;cursor:pointer;display:block">
+              <img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt=""
+                   style="width:112px;height:84px;object-fit:cover;border-radius:6px;display:block;
+                          border:3px solid ${ph.Selected ? 'var(--accent)' : 'transparent'}" />
+              <span style="display:flex;align-items:center;gap:5px;margin-top:3px;font-size:0.76rem">
+                <input type="checkbox" class="br-photo-pick" data-att="${ph.AttachmentId}"
+                       data-item="${g.ItemId}" ${ph.Selected ? 'checked' : ''} />
+                ${escapeHtml(ph.RolePrefix || ph.RoleName || 'no role')}
+              </span>
+            </label>`).join('')}
+        </div>
+      </div>`).join('');
+
+    const over = data.overBudget;
+    meter.innerHTML = `${(data.selected || []).length} selected · about
+      <strong style="color:${over ? 'var(--danger)' : 'inherit'}">${escapeHtml(data.estimatedLabel || '0 B')}</strong>
+      of a ${data.budgetMb} MB limit`;
+
+    host.querySelectorAll('.br-photo-pick').forEach((cb) => cb.addEventListener('change', async () => {
+      try {
+        await api(`/api/pg/board-reports/${reportId}/photos`, {
+          method: 'POST',
+          body: JSON.stringify({
+            attachmentId: Number(cb.dataset.att),
+            itemId: Number(cb.dataset.item),
+            included: cb.checked,
+          }),
+        });
+        data = await api(`/api/pg/board-reports/${reportId}/photos`);
+        draw();
+      } catch (e) { toast(e.message, 5000); cb.checked = !cb.checked; }
+    }));
+
+    if (over) {
+      host.insertAdjacentHTML('beforeend', `
+        <div class="card" style="background:#fffdf5;border-color:#f0e6c8;margin-top:4px">
+          <strong style="font-size:0.9rem">That is over the email limit</strong>
+          <p class="muted" style="margin:4px 0 0;font-size:0.85rem">
+            Sending would almost certainly bounce. Deselect a few photos, or raise the limit in
+            Admin. A hosted photo page is the other option — see docs/board-report-investigation.md.
+          </p>
+        </div>`);
+    }
+  };
+  draw();
 }
 
 // ---------- Summary rich text (board report brief, Part 2D) ----------
