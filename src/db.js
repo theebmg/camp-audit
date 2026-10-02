@@ -5080,19 +5080,35 @@ export async function getFundBalances() {
   // the part of each receipt nobody has split yet, which still draws on the fund the
   // receipt was charged to. Summing only one half understates spend while a split is
   // half-finished.
+  // What has been drawn on each fund, by the SAME precedence the report uses: a receipt charged
+  // to a fund counts against that fund in full, however its splits happen to be labelled.
+  //
+  // The old shape added two pieces — allocations tagged 'fund', plus the unsplit remainder of
+  // fund-charged receipts — and a receipt that was charged to a fund AND fully split fell
+  // through both: its allocations inherited the destination job line's category, so they were
+  // not tagged 'fund', and its remainder was zero. $485.97 of a $952.45 fund went missing that
+  // way, and the dashboard and the board report disagreed about the same money.
   const { rows: spentRows } = await pool.query(`
     SELECT fund_id, COALESCE(SUM(spent), 0) AS spent FROM (
-      SELECT ea.funding_ref_id AS fund_id, SUM(ea.amount) AS spent
+      -- A receipt charged to a fund: the whole receipt, once.
+      SELECT e.fund_id, COALESCE(e.amount, 0) AS spent
+      FROM expenses e
+      WHERE e.fund_id IS NOT NULL AND e.triage_status != 'void' AND e.deleted_at IS NULL
+      UNION ALL
+      -- A split that names a fund, on a receipt NOT itself charged to one.
+      SELECT ea.funding_ref_id AS fund_id, ea.amount AS spent
       FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
       WHERE ea.funding_source = 'fund' AND ea.funding_ref_id IS NOT NULL
+        AND e.fund_id IS NULL
         AND e.triage_status != 'void' AND e.deleted_at IS NULL
-      GROUP BY ea.funding_ref_id
       UNION ALL
-      SELECT e.fund_id, GREATEST(COALESCE(e.amount, 0) - COALESCE(alloc.total, 0), 0) AS spent
-      FROM expenses e
-      LEFT JOIN (SELECT expense_id, SUM(amount) AS total FROM expense_allocations GROUP BY expense_id) alloc
-        ON alloc.expense_id = e.id
-      WHERE e.fund_id IS NOT NULL AND e.triage_status != 'void' AND e.deleted_at IS NULL
+      -- Work funded from a fund and paid for without a receipt at all.
+      SELECT jl.funding_ref_id AS fund_id, COALESCE(jl.actual_cost, 0) AS spent
+      FROM job_lines jl
+      WHERE jl.funding_source = 'fund' AND jl.funding_ref_id IS NOT NULL
+        AND jl.actual_cost IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM expense_allocations ea
+                         WHERE ea.dest_type = 'job_line' AND ea.dest_id = jl.id)
     ) parts
     GROUP BY fund_id
   `);
@@ -5600,14 +5616,7 @@ export async function listBoardReportFunds(reportId) {
   const choice = new Map(rows.map((r) => [r.fund_id, r.included]));
   const out = [];
   for (const f of balances) {
-    const fromLines = Number((await pool.query(
-      `SELECT COALESCE(SUM(jl.actual_cost), 0) AS total FROM job_lines jl
-       WHERE jl.funding_source = 'fund' AND jl.funding_ref_id = $1 AND jl.actual_cost IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM expense_allocations ea
-                          WHERE ea.dest_type = 'job_line' AND ea.dest_id = jl.id)`,
-      [f.Id]
-    )).rows[0].total);
-    const spent = Number(f.Spent) + fromLines;
+    const spent = Number(f.Spent);
     if (!f.Active || spent <= 0) continue;
     out.push({
       Id: f.Id, Name: f.Name, Amount: Number(f.Amount), Spent: spent,
@@ -5735,20 +5744,29 @@ export async function computeBoardReportAggregates(reportId) {
   const hiddenFunds = new Set(hiddenRows.map((r) => r.fund_id));
   for (const f of await getFundBalances()) {
     if (hiddenFunds.has(f.Id)) continue;
-    const spentFromLines = Number((await pool.query(
-      `SELECT COALESCE(SUM(jl.actual_cost), 0) AS total FROM job_lines jl
-       WHERE jl.funding_source = 'fund' AND jl.funding_ref_id = $1 AND jl.actual_cost IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM expense_allocations ea
-                          WHERE ea.dest_type = 'job_line' AND ea.dest_id = jl.id)`,
-      [f.Id]
-    )).rows[0].total);
-    const spent = Number(f.Spent) + spentFromLines;
+    // getFundBalances is the single definition of fund spend — receipts, fund-tagged splits and
+    // receiptless work alike. Adding a second helping here is how the two figures drifted apart.
+    const spent = Number(f.Spent);
     if (!f.Active || spent <= 0) continue;
     const remaining = Number(f.Amount) - spent;
+    // Fund usage and the footer's breakdown answer different questions — everything drawn on the
+    // fund, versus the part of it that landed on work this report shows. Saying how much is not
+    // yet attached to any work makes the difference legible instead of looking like an error,
+    // and it is a to-do in its own right.
+    const unlinked = Number((await pool.query(
+      `SELECT COALESCE(SUM(e.amount - COALESCE(al.total, 0)), 0) AS total
+       FROM expenses e
+       LEFT JOIN (SELECT expense_id, SUM(amount) AS total FROM expense_allocations GROUP BY expense_id) al
+         ON al.expense_id = e.id
+       WHERE e.fund_id = $1 AND e.triage_status != 'void' AND e.deleted_at IS NULL
+         AND COALESCE(al.total, 0) < e.amount`,
+      [f.Id]
+    )).rows[0].total);
     const bits = [
       `${fmtMoneyPlain(spent)} of ${fmtMoneyPlain(Number(f.Amount))} used`,
       remaining >= 0 ? `${fmtMoneyPlain(remaining)} left` : `${fmtMoneyPlain(-remaining)} over`,
     ];
+    if (unlinked > 0) bits.push(`${fmtMoneyPlain(unlinked)} not yet linked to work`);
     // Days left only while there are any — a closed window says so instead of counting down
     // past zero.
     if (f.DaysLeft != null) bits.push(f.DaysLeft >= 0 ? `${f.DaysLeft} days left` : 'window closed');
