@@ -56,10 +56,20 @@ async function getTransporter() {
     return transporter;
   }
 
-  const err = new Error(
-    'Email sending is not configured — set GMAIL_USER plus either GMAIL_APP_PASSWORD, ' +
-    'or GMAIL_OAUTH_CLIENT_ID + GMAIL_OAUTH_CLIENT_SECRET + GMAIL_OAUTH_REFRESH_TOKEN in .env'
-  );
+  // Say which piece is missing. The old blanket "set GMAIL_USER plus..." was wrong and actively
+  // misleading once OAuth arrived: the connection existed, the client was configured, and the
+  // only thing absent was the account address — which no amount of .env editing would have fixed.
+  const missing = [];
+  if (!clientId || !clientSecret) missing.push('an OAuth client (GMAIL_OAUTH_CLIENT_ID / _SECRET)');
+  if (!refreshToken && !appPassword) missing.push('a connection — use Admin → Integrations → Email (Gmail)');
+  if (refreshToken && !user) {
+    missing.push(
+      'the address of the connected account. Reconnect from Admin → Integrations → Email (Gmail): '
+      + 'the earlier grant did not include the email permission, so there is nothing to '
+      + 'authenticate as'
+    );
+  }
+  const err = new Error(`Email cannot be sent — missing ${missing.join('; and ')}.`);
   err.status = 500;
   throw err;
 }

@@ -13,9 +13,19 @@ const CLIENT_SECRET = process.env.GMAIL_OAUTH_CLIENT_SECRET || process.env.GOOGL
 // Must match a URI registered on the OAuth client in Google Cloud Console, exactly.
 export const REDIRECT_URI = 'https://audit.fracturedrv.com/api/pg/gmail/oauth/callback';
 
-// The narrowest scope that can send. NOT gmail.compose or full mail access: this app sends
-// board reports and never reads a mailbox.
-const SCOPE = 'https://www.googleapis.com/auth/gmail.send';
+// gmail.send is the narrowest scope that can send — not compose, not full mail access. This app
+// sends board reports and never reads a mailbox.
+//
+// 'openid email' is here for one reason: SMTP needs to know WHICH mailbox it is authenticating,
+// and gmail.send alone cannot tell us. The obvious route — Gmail's users.getProfile — requires a
+// READ scope this app deliberately does not ask for, so it returned nothing and the connection
+// was stored with no address against it, after which sending failed with "not configured".
+// 'email' adds no access to anything; it only puts the address in the token response.
+const SCOPE = [
+  'https://www.googleapis.com/auth/gmail.send',
+  'openid',
+  'email',
+].join(' ');
 
 export function gmailOAuthIsConfigured() {
   return Boolean(CLIENT_ID && CLIENT_SECRET);
@@ -91,16 +101,35 @@ export async function refreshAccessToken(refreshToken) {
   });
 }
 
-// Which account the token actually belongs to. Worth recording: a refresh token says nothing
-// about whose mailbox it is, and "connected" with no name attached is impossible to audit later.
+// Which account the token belongs to. Not a nicety: nodemailer needs it to authenticate, and a
+// connection stored without it cannot send at all.
+//
+// Read from the id_token Google returns alongside the access token. The payload is decoded
+// WITHOUT signature verification, which is safe here and only here: this token came straight
+// back from Google's own token endpoint over TLS in response to a request this server made with
+// its own client secret. It was never handled by a browser or a user. A token arriving by any
+// other path would have to be verified properly.
+export function emailFromIdToken(idToken) {
+  try {
+    const payload = String(idToken || '').split('.')[1];
+    if (!payload) return null;
+    const json = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return json.email || null;
+  } catch {
+    return null;
+  }
+}
+
+// Fallback for a token granted before 'email' was requested, and a belt-and-braces second
+// source. Needs a read scope, so it will simply return null on a send-only grant.
 export async function fetchGrantedEmail(accessToken) {
   try {
-    const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/profile', {
+    const res = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     if (!res.ok) return null;
     const json = await res.json();
-    return json.emailAddress || null;
+    return json.email || null;
   } catch {
     return null;
   }
