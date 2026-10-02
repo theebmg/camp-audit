@@ -353,3 +353,69 @@ waiting for it in this very draft.
    is the smaller half of the §2b fix)
 8. **§7d** — drop the duplicated asset name, and stop printing the admin category in the title
    line? (cosmetic, say the word)
+
+---
+
+# Addendum — October 2026: the date fields, and what they uncovered
+
+## 1. Why the date fields reverted (fixed)
+
+**The save was succeeding. The screen then overwrote it with a stale value.**
+
+`patchReport()` in `public-pg/app.js` sent the PATCH and threw the response away. The route
+returns the updated report, but the local `report` object still held the old dates. Every date
+change then called `refresh()`, which ends in `draw()`, which rebuilds the inputs from that
+stale object:
+
+```js
+<input type="date" id="brTo" value="${report.PeriodEnd}" …>
+```
+
+So the typed date flashed (the save and refresh happened) and snapped back (the redraw used the
+old value). Nothing was wrong with the date format, the validation, or the server. Proved by
+PATCHing `period_end` directly: stored and re-read as `"2026-09-30"`, a plain `YYYY-MM-DD`
+string, exactly as the input expects.
+
+**Fix:** `patchReport` now assigns the returned report to the local one. Verified in WebKit with
+Ben's own repro — 09-23 → 09-30 sticks, and survives a full page reload.
+
+## 2. Every editable field on that screen failed silently (fixed)
+
+`api()` throws on a non-2xx. Not one handler on the board report screen caught it: the date
+fields, the item checkbox, the display-mode select, the board-note dialog and the summary
+editor all let the rejection go nowhere. A failed save produced no message anywhere — and in the
+note dialog's case, lost what had just been typed.
+
+All of them now report the failure in plain language, keep what was typed, and never silently
+revert. Dates are validated on the screen and again on the server; the server is not allowed to
+trust the browser.
+
+## 3. Concurrent refreshes were eating the report (fixed — this one destroyed real data)
+
+Found because the item count dropped from 21 to 4 while testing the above.
+
+`refreshBoardReportSuggestions` gives each pass a `passId`, stamps every row it writes with it,
+and then deletes every row that is not stamped with it:
+
+```sql
+DELETE FROM board_report_items
+ WHERE report_id = $1 AND NOT user_touched AND manually_added = false
+   AND last_pass_id IS DISTINCT FROM $2
+```
+
+That is correct for one pass at a time and catastrophic for two. Pass A writes its rows; pass B
+writes its own and re-stamps them with B; A's prune then deletes everything carrying B. **17 of
+21 items vanished from the real September report** — the whole Caretaker's Renovations work
+order, the sump pump work order and both its lines — with nothing logged and nothing shown.
+
+The trigger is two refreshes starting close together, which the date fields do readily: the
+screen calls `refresh()` on every change and two quick edits overlap. It is not test-only.
+
+**Fix:** a Postgres advisory lock keyed on the report id serialises the whole pass, so two
+requests — or two app containers — cannot interleave. The screen also queues its own refreshes
+rather than starting a second mid-pass. `scripts/report-refresh-race-test.mjs` fires five and
+then ten concurrent refreshes and asserts not one item is lost.
+
+**The items are all back.** A single refresh restored all 21, because the rules themselves were
+never wrong. Ben's two hand-chosen admin tasks were never at risk: `user_touched` rows are
+exempt from the prune.
