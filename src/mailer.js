@@ -77,15 +77,36 @@ export async function mailIsConfigured() {
 // callers (reports) keep working unconfigured-alias-wise.
 // `attachments` is nodemailer's shape. A board report passes inline images with a `cid`, which
 // is what makes a photo render in the body rather than only as a file at the bottom.
+// The account that AUTHENTICATES and the address mail APPEARS FROM are deliberately different.
+// Gmail authenticates as ben@, and sends as cmms@ — which it permits only because cmms@ is a
+// verified "send mail as" alias on that account. Get this wrong and Google silently rewrites the
+// From header to the authenticating account, and the board sees a personal address.
+//
+// Falls back to the connected account rather than to GMAIL_USER, which is no longer where the
+// authenticating identity lives — without this, an unset MAIL_FROM_ADDRESS produced
+// "From: undefined".
+export async function resolveFromHeaders() {
+  const stored = await storedOAuth();
+  const authAccount = stored?.user || process.env.GMAIL_USER || null;
+  const fromAddress = process.env.MAIL_FROM_ADDRESS || authAccount;
+  const fromName = process.env.MAIL_FROM_NAME;
+  return {
+    authAccount,
+    fromAddress,
+    from: fromName ? `"${fromName}" <${fromAddress}>` : fromAddress,
+    // Replies to a board report belong with camp operations, not in a personal inbox, so this
+    // follows the From address unless MAIL_REPLY_TO says otherwise.
+    replyTo: process.env.MAIL_REPLY_TO || fromAddress,
+  };
+}
+
 export async function sendMail({ to, subject, html, text, replyTo, attachments }) {
   const t = await getTransporter();
-  const fromAddress = process.env.MAIL_FROM_ADDRESS || process.env.GMAIL_USER;
-  const fromName = process.env.MAIL_FROM_NAME;
-  const from = fromName ? `"${fromName}" <${fromAddress}>` : fromAddress;
+  const h = await resolveFromHeaders();
   return t.sendMail({
-    from, to, subject, html, text,
+    from: h.from, to, subject, html, text,
     ...(attachments && attachments.length ? { attachments } : {}),
-    replyTo: replyTo || process.env.MAIL_REPLY_TO || fromAddress,
+    replyTo: replyTo || h.replyTo,
   });
 }
 
