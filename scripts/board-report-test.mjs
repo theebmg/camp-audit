@@ -157,7 +157,7 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
     'the text footer states the same rolled-up total as the HTML one');
 }
 
-console.log('\n## the note goes wherever the total goes, and nowhere else');
+console.log('\n## the note appears only alongside a recorded cost');
 {
   const { renderBoardReportItemsHtml, renderBoardReportItemsText } = await import('/app/src/reportRender.js');
   const NOTE = 'Recorded cost of work shown, including work funded outside camp. '
