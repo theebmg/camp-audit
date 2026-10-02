@@ -49,6 +49,7 @@ import {
   listAttachmentsForEntity, listAttachmentsForEntities, createAttachment, createAndLinkAttachment,
   updateAttachmentLink, detachAttachment, voidAttachment,
   listAttachmentRoles, createAttachmentRole, updateAttachmentRole, deleteAttachmentRole,
+  listJobLineFundingKinds, updateJobLineFundingKind,
   listWorkOrderLogEntries, createWorkOrderLogEntry, deleteWorkOrderLogEntry,
   listCalendarEventOccurrences, getCalendarEvent, createCalendarEvent, updateCalendarEvent, deleteCalendarEvent,
   listVisitorConflicts,
@@ -3452,6 +3453,21 @@ router.get('/groups/export.csv', async (req, res, next) => {
 
 
 // ---- Funding sources (who paid) ----
+// Which budget funding sources count as camp money (Oct 2026). Read by anyone, changed by an
+// admin: it decides what the board sees as camp spend versus contributed.
+router.get('/job-line-funding-kinds', async (req, res, next) => {
+  try { res.json({ kinds: await listJobLineFundingKinds() }); } catch (e) { next(e); }
+});
+
+router.patch('/admin/job-line-funding-kinds/:source', async (req, res, next) => {
+  try {
+    const { label, countsAsCampSpend } = req.body || {};
+    const kind = await updateJobLineFundingKind(req.params.source, { label, countsAsCampSpend });
+    if (!kind) return res.status(404).json({ ok: false, error: 'No such funding kind' });
+    res.json({ ok: true, kind });
+  } catch (e) { next(e); }
+});
+
 router.get('/funding-sources', async (req, res, next) => {
   try { res.json({ sources: await listFundingSources({ includeInactive: req.query.includeInactive === 'true' }) }); } catch (e) { next(e); }
 });

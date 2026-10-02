@@ -1313,6 +1313,7 @@ async function render(view, params = {}, opts = {}) {
       adminWorkOrderStatuses: () => renderAdminWorkOrderStatuses(),
       adminJobLineStatuses: () => renderAdminJobLineStatuses(),
       adminAttachmentRoles: () => renderAdminAttachmentRoles(),
+      adminFundingKinds: () => renderAdminFundingKinds(),
       adminAssetTypeIcons: () => renderAdminAssetTypeIcons(),
       adminMapCalibration: () => renderAdminMapCalibration(),
       adminJobLineTemplates: () => renderAdminJobLineTemplates(),
@@ -1728,6 +1729,7 @@ const ADMIN_LEAF_RENDERERS = {
   adminWorkOrderStatuses: (params, container) => renderAdminWorkOrderStatuses(container),
   adminJobLineStatuses: (params, container) => renderAdminJobLineStatuses(container),
   adminAttachmentRoles: (params, container) => renderAdminAttachmentRoles(container),
+  adminFundingKinds: (params, container) => renderAdminFundingKinds(container),
   adminAssetTypeIcons: (params, container) => renderAdminAssetTypeIcons(container),
   adminMapCalibration: (params, container) => renderAdminMapCalibration(container),
   adminJobLineTemplates: (params, container) => renderAdminJobLineTemplates(container),
@@ -6466,6 +6468,7 @@ const ADMIN_CATEGORIES = {
       { view: 'adminWorkOrderStatuses', icon: '🚦', label: 'Work Order Statuses' },
       { view: 'adminJobLineStatuses', icon: '🚦', label: 'Job Line Statuses' },
       { view: 'adminAttachmentRoles', icon: '📎', label: 'Attachment Roles' },
+      { view: 'adminFundingKinds', icon: '💷', label: 'Job Line Funding' },
       { view: 'adminAssetTypeIcons', icon: '🛖', label: 'Asset Type Icons' },
     ],
   },
@@ -7892,6 +7895,51 @@ async function renderAdminCauses(container = app) {
 // report" pre-ticks the report checkbox for that role (still overridable per
 // link) — tagging something "After / Repair" is already saying "this is the
 // proof."
+async function renderAdminFundingKinds(container = app) {
+  if (container === app) setChrome({ title: 'Job Line Funding', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  const { kinds } = await api('/api/pg/job-line-funding-kinds');
+
+  const rows = kinds.map((k) => `
+    <div class="list-item" style="cursor:default">
+      <span>
+        <strong>${escapeHtml(k.Label)}</strong>
+        <span class="muted" style="font-size:0.8rem"> · ${escapeHtml(k.Source)}</span><br />
+        <span class="pill">${k.CountsAsCampSpend ? 'Camp spend' : 'Contributed (non-camp)'}</span>
+      </span>
+      <span class="btn-row" style="margin-top:0">
+        <button class="btn btn-secondary fk-toggle" data-source="${escapeHtml(k.Source)}" data-next="${!k.CountsAsCampSpend}">
+          Treat as ${k.CountsAsCampSpend ? 'contributed' : 'camp spend'}
+        </button>
+      </span>
+    </div>`).join('') || '<p class="muted">No funding kinds defined.</p>';
+
+  container.innerHTML = `
+    <div class="card"><h3>Job Line Funding</h3>
+      <p class="muted">
+        Whether money from each budget funding source counts as <strong>camp spend</strong> or as
+        <strong>contributed</strong> on the board report. This is the funding set on a job line
+        itself — used when no receipt has been split onto that line, which is how work paid for
+        directly, in cash, reaches the report at all.
+      </p>
+      <p class="muted" style="font-size:0.85rem">
+        A source not listed here counts as camp spend. That is deliberate: over-counting
+        contributions would understate what camp spent, which is the more misleading error in
+        front of a board.
+      </p>
+    </div>
+    <div class="card">${rows}</div>`;
+
+  container.querySelectorAll('.fk-toggle').forEach((btn) => btn.addEventListener('click', async () => {
+    try {
+      await api(`/api/pg/admin/job-line-funding-kinds/${encodeURIComponent(btn.dataset.source)}`, {
+        method: 'PATCH', body: JSON.stringify({ countsAsCampSpend: btn.dataset.next === 'true' }),
+      });
+      renderAdminFundingKinds(container);
+    } catch (err) { toast(saveErrorMessage(err), 8000); }
+  }));
+}
+
 async function renderAdminAttachmentRoles(container = app) {
   if (container === app) setChrome({ title: 'Attachment Roles', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;

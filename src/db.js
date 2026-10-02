@@ -5109,6 +5109,28 @@ export async function getFundBalances() {
 // ── Expense categories (Build Brief v3 Part 1, §1.2) — admin-editable,
 //    same freetext-never-promoted rule as `causes`. ─────────────────────────
 // Who paid (§2b). Admin-editable like every other vocabulary here.
+// The budget vocabulary's camp/non-camp mapping. Admin-editable: whether a designated fund or
+// an "other" category is camp money is a judgement that should not need a deploy to change.
+export async function listJobLineFundingKinds() {
+  const { rows } = await pool.query('SELECT * FROM job_line_funding_kinds ORDER BY sort_order, source');
+  return rows.map((r) => ({
+    Source: r.source, Label: r.label, CountsAsCampSpend: r.counts_as_camp_spend, SortOrder: r.sort_order,
+  }));
+}
+
+export async function updateJobLineFundingKind(source, { label, countsAsCampSpend }) {
+  const { rows } = await pool.query(
+    `UPDATE job_line_funding_kinds
+        SET label = COALESCE($2, label),
+            counts_as_camp_spend = COALESCE($3, counts_as_camp_spend)
+      WHERE source = $1 RETURNING source, label, counts_as_camp_spend`,
+    [source, label ?? null, countsAsCampSpend === undefined ? null : !!countsAsCampSpend]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'updated', entityType: 'job_line_funding_kind', entityId: 0, entityLabel: rows[0].label });
+  return { Source: rows[0].source, Label: rows[0].label, CountsAsCampSpend: rows[0].counts_as_camp_spend };
+}
+
 export async function listFundingSources({ includeInactive = false } = {}) {
   const { rows } = await pool.query(
     `SELECT * FROM funding_sources ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`
