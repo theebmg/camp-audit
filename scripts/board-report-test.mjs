@@ -23,6 +23,13 @@ async function purge() {
 }
 await purge();
 
+// The report under test is whatever draft the app would open — NOT a hardcoded id. Report 1 was
+// September's draft until it was published, at which point every call here started throwing
+// "Published reports are read-only". A test that assumes an id breaks on a button press.
+const draft = await db.getOrCreateDraftBoardReport();
+const REPORT = draft.Id;
+console.log(`report under test: #${REPORT} "${draft.Title}" (${draft.Status})`);
+
 console.log('## period defaults to a whole calendar month (§4)');
 const p = await db.defaultBoardReportPeriods();
 ok(/^\d{4}-\d{2}-01$/.test(p.periodStart), `starts on the 1st (${p.periodStart})`);
@@ -120,7 +127,7 @@ console.log('\n## a report refresh never touches a real savings record');
         OR s.source_id NOT IN (SELECT id FROM admin_tasks WHERE title LIKE $1)
      ORDER BY s.id`, [`${TAG}%`]);
   const beforeSavings = JSON.stringify((await realSavings()).rows);
-  await db.refreshBoardReportSuggestions(1);
+  await db.refreshBoardReportSuggestions(REPORT);
   const afterSavings = JSON.stringify((await realSavings()).rows);
   ok(beforeSavings === afterSavings,
     `${JSON.parse(beforeSavings).length} real savings entr(y/ies) unchanged by a refresh`);
@@ -128,13 +135,13 @@ console.log('\n## a report refresh never touches a real savings record');
   // And the report reads the entries rather than carrying its own copy of the figure. Mirrors
   // the aggregate's own rule exactly — recurring, inside the period — including this test's own
   // scratch admin task, which legitimately contributes a saving while it exists.
-  const period = (await db.pool.query('SELECT period_start::text ps, period_end::text pe FROM board_reports WHERE id = 1')).rows[0];
+  const period = (await db.pool.query('SELECT period_start::text ps, period_end::text pe FROM board_reports WHERE id = $1', [REPORT])).rows[0];
   const expected = Number((await db.pool.query(
     `SELECT COALESCE(SUM(CASE WHEN period = 'monthly' THEN amount * 12 ELSE amount END), 0) AS annualized
      FROM savings_entries WHERE kind = 'recurring' AND occurred_on BETWEEN $1 AND $2`,
     [period.ps, period.pe]
   )).rows[0].annualized);
-  const agg = (await db.listBoardReportAggregates(1)).find((a) => /Recurring savings secured this period/.test(a.Label));
+  const agg = (await db.listBoardReportAggregates(REPORT)).find((a) => /Recurring savings secured this period/.test(a.Label));
   ok(agg && Math.abs(Number(agg.ValueNumeric) - expected) < 0.005,
     `the header states $${agg?.ValueNumeric}/yr, matching the entries in the period ($${expected})`);
 }
@@ -358,7 +365,7 @@ console.log('\n## funding precedence: receipts beat the budget field, which beat
   ok(unknown.rows[0].is_camp === true, 'a source missing from the table counts as camp spend');
 
   console.log('\n## the real September line keeps its attribution');
-  const items = await db.listBoardReportItems(1);
+  const items = await db.listBoardReportItems(REPORT);
   const l71 = items.find((i) => i.ItemType === 'job_line' && i.ItemId === 71);
   if (l71) {
     ok(l71.SnapFunding?.[0]?.Source === 'Ben Greenawalt',
@@ -370,7 +377,7 @@ console.log('\n## funding precedence: receipts beat the budget field, which beat
   }
 
   console.log('\n## camp spend is never inflated by contributed money');
-  const aggs = await db.listBoardReportAggregates(1);
+  const aggs = await db.listBoardReportAggregates(REPORT);
   const camp = aggs.find((a) => a.Label === 'Camp funds spent this period');
   const tile = aggs.find((a) => a.Label === 'Contributed (non-camp)');
   if (tile) {

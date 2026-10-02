@@ -5,7 +5,7 @@
 import * as db from '/app/src/db.js';
 import { renderBoardReportFromItems } from '/app/src/reportDataPg.js';
 
-const REPORT = Number(process.argv[2]) || 1;
+const REPORT = Number(process.argv[2]) || (await db.getOrCreateDraftBoardReport()).Id;
 const money = (n) => `$${Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 await db.refreshBoardReportSuggestions(REPORT);
