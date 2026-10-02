@@ -156,7 +156,53 @@ does the job.
 
 ---
 
+## Photos at both levels, and on the report itself (Oct 2026 addition)
+
+**How it worked before, which was the question Ben asked:** the data layer always allowed a
+photo on a work order, but the WO screen's only attachment section was titled **Documents**,
+defaulted to the **Documentation** role and told you "work photos belong on the job line they're
+proof of". Documentation is not marked for the report, so a whole-job before/after had nowhere
+obvious to go and would not have been pre-selected if it got there. Not a data-model gap — a
+framing and defaults problem.
+
+Now:
+
+- **Work order screen** has **Job photos — overall before and after** (defaults to Before /
+  Condition) alongside **Documents** (unchanged, still takes PDFs).
+- **Job line** photos unchanged, defaulting to During.
+- **Board report screen** takes photos uploaded straight onto the report — `entity_type
+  'board_report'`, added to `ATTACHMENT_ENTITY_TYPES`. **No migration:**
+  `attachment_links.entity_type` has no CHECK constraint, only the JS allowlist. Same upload
+  route and resize as everywhere else, optional caption via the existing edit panel, included by
+  default, counted by the size meter.
+- **Order in the email:** per item, the whole-job photo prints before the per-line ones; the
+  report's own photos print last under **"Other photos this month"**.
+- **Labels (§2C):** job line → the line's title; work order → the WO title; report-level → the
+  caption Ben typed, or nothing.
+- Each photo's link is resolved **in the context of the item it was selected under**, so a photo
+  linked to both a work order and one of its lines is named by the right one.
+
+`scripts/report-photos-levels-test.mjs` — 20 assertions, scratch rows deleted afterwards.
+
+---
+
 ## Hard-won gotchas — do not rediscover these
+
+**A pass that stamps rows then deletes everything not stamped MUST be serialised.**
+`refreshBoardReportSuggestions` did exactly that and two concurrent passes deleted 17 of 21 real
+items off the September report, silently. Now behind a Postgres advisory lock keyed on the
+report id. Any future "write with a token, prune what lacks it" needs the same lock.
+
+**A handler that awaits `api()` without a catch fails silently.** `api()` throws on non-2xx, and
+on the board report screen not one handler caught it — a failed save said nothing and, in the
+note dialog, lost what was typed. `saveErrorMessage()` / `showFieldError()` in `app.js` are the
+shared shape for this.
+
+**Updating local state from a PATCH response is not optional** on a screen that redraws from an
+in-memory object. `patchReport` discarded the response, so correctly saved dates were repainted
+from the stale copy and appeared to revert.
+
+
 
 **Check constraints on `source` columns.** Adding a new source value means widening a CHECK.
 `expenses.source` and `attachments.source` have both bitten (migrations 0098, 0100). The second
@@ -212,7 +258,9 @@ docker exec camp-audit node scripts/merge-test.mjs      # 22 assertions
 docker exec camp-audit node scripts/visits-test.mjs     # 35
 docker exec camp-audit node scripts/intake-test.mjs     # 41
 docker exec camp-audit node scripts/board-report-test.mjs
-docker exec camp-audit node scripts/report-photos-test.mjs  # 21, real report, restores itself
+docker exec camp-audit node scripts/report-photos-test.mjs        # 21, real report, restores itself
+docker exec camp-audit node scripts/report-photos-levels-test.mjs # 20, both levels + report-level
+docker exec camp-audit node scripts/report-refresh-race-test.mjs  # concurrent refreshes lose nothing
 
 # browser verification (needs a temporary admin account; delete it afterwards)
 BASE=https://audit.fracturedrv.com USER_NAME=<user> PASS=<pass> node scripts/screens.mjs <phase> [filter]
