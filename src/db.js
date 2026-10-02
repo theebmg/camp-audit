@@ -6228,7 +6228,16 @@ export async function seedDefaultReportPhotos(reportId) {
      SELECT $1, a.id, it.item_id, true, 0
      FROM (
        SELECT i.id AS item_id, i.item_type, i.item_id AS entity_id
-       FROM board_report_items i WHERE i.report_id = $1 AND i.included
+       FROM board_report_items i
+       WHERE i.report_id = $1 AND i.included
+         -- A job line whose work order is also on this report does not collect photos of its
+         -- own: the report prints photos on the work order's row and nested lines render none,
+         -- so leaving the line to claim them ordered the whole-job shot wrongly and offered the
+         -- same picture under two headings in the picker.
+         AND NOT (i.item_type = 'job_line' AND EXISTS (
+           SELECT 1 FROM board_report_items w
+           WHERE w.report_id = $1 AND w.included AND w.item_type = 'work_order'
+             AND w.item_id = i.parent_work_order_id))
      ) it
      JOIN attachment_links al
        ON (al.entity_type = 'work_order' AND it.item_type = 'work_order' AND al.entity_id = it.entity_id)
@@ -6261,6 +6270,14 @@ export async function listBoardReportPhotoCandidates(reportId) {
               i.parent_work_order_id
        FROM board_report_items i
        WHERE i.report_id = $1 AND i.included
+         -- A job line whose work order is also on this report does not collect photos of its
+         -- own: the report prints photos on the work order's row and nested lines render none,
+         -- so leaving the line to claim them ordered the whole-job shot wrongly and offered the
+         -- same picture under two headings in the picker.
+         AND NOT (i.item_type = 'job_line' AND EXISTS (
+           SELECT 1 FROM board_report_items w
+           WHERE w.report_id = $1 AND w.included AND w.item_type = 'work_order'
+             AND w.item_id = i.parent_work_order_id))
      )
      SELECT it.item_id, it.item_type, it.snap_title,
             a.id AS attachment_id, a.url, a.thumb_url, a.width, a.height, a.file_size,
