@@ -14,7 +14,7 @@ import { renderBoardReportFromItems } from '/app/src/reportDataPg.js';
 const fail = [];
 const ok = (c, l) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${l}`); if (!c) fail.push(l); };
 
-const REPORT = Number(process.argv[2]) || 1;
+const REPORT = Number(process.argv[2]) || (await db.getOrCreateDraftBoardReport()).Id;
 // Snapshot what we are about to touch, so it can all go back.
 const beforeRows = (await db.pool.query('SELECT * FROM board_report_photos WHERE report_id=$1', [REPORT])).rows;
 const cand0 = await db.listBoardReportPhotoCandidates(REPORT);

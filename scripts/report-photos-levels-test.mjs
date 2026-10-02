@@ -9,7 +9,7 @@ import * as db from '/app/src/db.js';
 import { buildPhotoLabel } from '/app/src/reportPhotos.js';
 import { renderBoardReportFromItems } from '/app/src/reportDataPg.js';
 
-const REPORT = 1;
+const REPORT = Number(process.argv[2]) || (await db.getOrCreateDraftBoardReport()).Id;
 const TAG = 'ZZ-LEVELS';
 const fail = [];
 const ok = (c, l) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${l}`); if (!c) fail.push(l); };

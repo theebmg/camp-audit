@@ -9,7 +9,9 @@
 // and asserts the item count never drops.
 import * as db from '/app/src/db.js';
 
-const REPORT = Number(process.argv[2]) || 1;
+// Whatever draft the app would open, not a hardcoded id: a published report is read-only and
+// refreshing it throws, so assuming an id makes this test fail on a button press.
+const REPORT = Number(process.argv[2]) || (await db.getOrCreateDraftBoardReport()).Id;
 const fail = [];
 const ok = (c, l) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${l}`); if (!c) fail.push(l); };
 
