@@ -2159,8 +2159,8 @@ router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
         return res.status(400).json({ ok: false, error: `${label} isn't a valid date. Use the date picker.` });
       }
     }
-    if (showFunding !== undefined && !['off', 'non_camp', 'all'].includes(String(showFunding))) {
-      return res.status(400).json({ ok: false, error: 'Show funding must be off, non_camp or all.' });
+    if (showFunding !== undefined && !['off', 'non_general', 'all'].includes(String(showFunding))) {
+      return res.status(400).json({ ok: false, error: 'Show funding must be off, non_general or all.' });
     }
     if (merged.periodStart && merged.periodEnd && merged.periodEnd < merged.periodStart) {
       return res.status(400).json({
