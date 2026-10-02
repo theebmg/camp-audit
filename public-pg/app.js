@@ -5546,6 +5546,15 @@ async function renderBoardReport() {
           </p>
           <p class="field-error" id="brShowFunding-err"></p>
         </div>
+        <div class="field-row" id="brFundsRow" hidden>
+          <label>Approved funds to show</label>
+          <div id="brFunds"></div>
+          <p class="muted" style="margin:4px 0 0;font-size:0.8rem">
+            Only funds with spend in this period. Unticking one keeps it out of the Approved Funds
+            block — the funding tags on individual lines always show either way.
+          </p>
+          <p class="field-error" id="brFunds-err"></p>
+        </div>
         ${published ? '' : `<div class="btn-row">
           <button type="button" class="btn btn-secondary" id="brRefresh" ${busy ? 'disabled' : ''}>${busy ? 'Working…' : 'Refresh suggestions'}</button>
           <button type="button" class="btn btn-secondary" id="brAddItem">＋ Add item</button>
@@ -5797,6 +5806,7 @@ async function renderBoardReport() {
         showFieldError('brShowHours', saveErrorMessage(err));
       }
     });
+    loadReportFunds(report.Id);
     document.getElementById('brShowFunding')?.addEventListener('change', async (e) => {
       const was = report.ShowFunding;
       clearFieldError('brShowFunding');
@@ -9146,6 +9156,42 @@ async function renderCalendarEventDetail({ id }) {
   app.querySelectorAll('.checklist-step-toggle').forEach((cb) => cb.addEventListener('change', async () => {
     try { await api(`/api/pg/checklist-steps/${cb.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ done: cb.checked }) }); renderCalendarEventDetail({ id }); }
     catch (err) { toast(err.message); }
+  }));
+}
+
+// Which approved funds this report's block shows. Absent entirely when no fund has spend in
+// the period — an empty chooser is just a thing to wonder about.
+async function loadReportFunds(reportId) {
+  const row = document.getElementById('brFundsRow');
+  const host = document.getElementById('brFunds');
+  if (!row || !host) return;
+  let funds = [];
+  try { funds = (await api(`/api/pg/board-reports/${reportId}/funds`)).funds || []; }
+  catch { row.hidden = true; return; }
+  if (!funds.length) { row.hidden = true; return; }
+  row.hidden = false;
+
+  const money = (n) => `$${Number(n || 0).toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+  host.innerHTML = funds.map((f) => `
+    <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer;padding:3px 0">
+      <input type="checkbox" class="br-fund" data-fund="${f.Id}" ${f.Included ? 'checked' : ''} />
+      <span>${escapeHtml(f.Name)}
+        <span class="muted" style="font-size:0.82rem">— ${money(f.Spent)} of ${money(f.Amount)} used${
+          f.DaysLeft != null ? (f.DaysLeft >= 0 ? ` · ${f.DaysLeft} days left` : ' · window closed') : ''}</span>
+      </span>
+    </label>`).join('');
+
+  host.querySelectorAll('.br-fund').forEach((cb) => cb.addEventListener('change', async () => {
+    clearFieldError('brFunds');
+    try {
+      await api(`/api/pg/board-reports/${reportId}/funds`, {
+        method: 'POST',
+        body: JSON.stringify({ fundId: Number(cb.dataset.fund), included: cb.checked }),
+      });
+    } catch (err) {
+      cb.checked = !cb.checked;
+      showFieldError('brFunds', saveErrorMessage(err));
+    }
   }));
 }
 

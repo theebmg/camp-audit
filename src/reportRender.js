@@ -538,6 +538,34 @@ function approvedFundsHtml(aggregates, showFunding) {
     </table>`;
 }
 
+// The footer breakdown: what the work cost, and out of whose pocket.
+//
+// Built from the SAME set the total is built from, so the parts always add up to the whole. A
+// cost with no funding recorded against it lands in "Unattributed" rather than being quietly
+// dropped — a breakdown that does not reconcile with its own total is worse than none.
+//
+// The general pot is named "Camp general" here rather than by its internal label, because
+// "Operating Budget" means nothing to a board reading one line of a report.
+function fundingBreakdown(counted) {
+  const by = new Map();
+  let attributed = 0;
+  for (const it of counted) {
+    for (const f of (Array.isArray(it.SnapFunding) ? it.SnapFunding : [])) {
+      if (!f || !f.Amount) continue;
+      const label = f.IsGeneral === true ? 'Camp general' : f.Source;
+      by.set(label, (by.get(label) || 0) + Number(f.Amount));
+      attributed += Number(f.Amount);
+    }
+  }
+  const total = counted.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const gap = Math.round((total - attributed) * 100) / 100;
+  if (gap > 0) by.set('Unattributed', (by.get('Unattributed') || 0) + gap);
+  return [...by.entries()]
+    .filter(([, amount]) => Math.round(amount * 100) !== 0)   // $0 categories are not news
+    .sort((a, b) => b[1] - a[1])
+    .map(([label, amount]) => `${label} ${fmtMoney(amount)}`);
+}
+
 function itemDatesText(it) {
   if (!it.SnapStartDate) return it.SnapDate ? fmtDate(it.SnapDate) : null;
   if (!it.SnapDate) return `Started ${fmtDate(it.SnapStartDate)} · In progress`;
@@ -680,7 +708,9 @@ function sectionHtml(section, items, showHours = false, showFunding = 'non_gener
   const counted = totalledItems(items).filter((i) => i.Section === section);
   const hours = counted.reduce((t, i) => t + (i.SnapHours || 0), 0);
   const cost = counted.reduce((t, i) => t + (i.SnapCost || 0), 0);
-  const sub = [showHours && hours ? fmtHours(hours) : null, cost ? fmtMoney(cost) : null].filter(Boolean).join(' · ');
+  // No money in a section heading: the footer carries the figure, broken down by who paid, and
+  // a subtotal repeated above it invited the reader to add the two together.
+  const sub = [showHours && hours ? fmtHours(hours) : null].filter(Boolean).join(' · ');
 
   // The count is of PIECES OF WORK — work orders, admin tasks, findings — not of job lines. A
   // thirteen-line renovation is one thing the board decided to do, not thirteen. Same set the
@@ -757,19 +787,19 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
       ${itemPhotosHtml(reportPhotos)}` : ''}
     ${(() => {
       // The item count is gone from the footer: a board reads the work, not a tally of rows.
+      // What replaces the old disclaimer is the breakdown itself — saying where the money came
+      // from is more use to a board than saying what it is not.
       const parts = [
+        grandCost ? `Cost of work shown: ${fmtMoney(grandCost)}` : null,
         showHours && grandHours ? fmtHours(grandHours) : null,
-        grandCost ? `${fmtMoney(grandCost)} recorded cost of work shown` : null,
       ].filter(Boolean);
-      // The note is about MONEY. It follows the recorded cost and nothing else: a total that is
-      // only hours has no cost figure for it to qualify, and printing it there would have the
-      // note disclaiming a number that is not on the page.
-      if (!parts.length) return '<div style="margin-top:22px;padding-top:12px;border-top:2px solid #c7d2dd;"></div>';
+      if (!parts.length) return '<div style="margin-top:22px;padding-top:12px;border-top:2px solid #13432f;"></div>';
+      const split = grandCost ? fundingBreakdown(counted) : [];
       return `<div style="margin-top:22px;padding-top:12px;border-top:2px solid #13432f;font-weight:700;color:#13432f;font-size:1.02rem;">
-      Total — ${parts.join(' · ')}
+      ${parts.join(' · ')}
     </div>
-    ${grandCost ? `<div style="margin-top:5px;color:#565c78;font-size:0.8rem;line-height:1.4;">
-      Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.
+    ${split.length ? `<div style="margin-top:4px;color:#565c78;font-size:0.85rem;line-height:1.45;">
+      ${escapeHtml(split.join(' · '))}
     </div>` : ''}`;
     })()}
     <div style="margin-top:8px;color:#7a4a10;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
@@ -841,16 +871,14 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
   const grandHours = countedAll.reduce((t, i) => t + (i.SnapHours || 0), 0);
   // Same two rules as the HTML footer: no item count, and hours only when asked for.
   const totalParts = [
+    grandCost ? `COST OF WORK SHOWN: ${fmtMoney(grandCost)}` : null,
     showHours && grandHours ? fmtHours(grandHours) : null,
-    grandCost ? `${fmtMoney(grandCost)} recorded cost of work shown` : null,
   ].filter(Boolean);
-  // Same rule as the HTML: the total prints when there is anything to total, but the note only
-  // ever accompanies a recorded cost.
+  // Same shape as the HTML: the cost, then whose money it was.
   if (totalParts.length) {
-    lines.push('', `TOTAL — ${totalParts.join(' · ')}`);
-    if (grandCost) {
-      lines.push('Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.');
-    }
+    lines.push('', totalParts.join(' · '));
+    const split = grandCost ? fundingBreakdown(countedAll) : [];
+    if (split.length) lines.push(split.join(' · '));
   } else {
     lines.push('');
   }

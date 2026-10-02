@@ -5484,6 +5484,46 @@ export async function unvoidExpense(id) {
 // reported SEPARATELY and never summed: $275/month secured forever and a $40 bulk
 // discount are not the same kind of number, and adding them produces a figure that
 // means nothing.
+// Funds a report could show, with whether it is currently showing them. Only funds with
+// activity are offered: a fund nobody has drawn on is not a presentation choice, it is nothing
+// to say.
+export async function listBoardReportFunds(reportId) {
+  const balances = await getFundBalances();
+  const { rows } = await pool.query(
+    'SELECT fund_id, included FROM board_report_funds WHERE report_id = $1', [reportId]
+  );
+  const choice = new Map(rows.map((r) => [r.fund_id, r.included]));
+  const out = [];
+  for (const f of balances) {
+    const fromLines = Number((await pool.query(
+      `SELECT COALESCE(SUM(jl.actual_cost), 0) AS total FROM job_lines jl
+       WHERE jl.funding_source = 'fund' AND jl.funding_ref_id = $1 AND jl.actual_cost IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM expense_allocations ea
+                          WHERE ea.dest_type = 'job_line' AND ea.dest_id = jl.id)`,
+      [f.Id]
+    )).rows[0].total);
+    const spent = Number(f.Spent) + fromLines;
+    if (!f.Active || spent <= 0) continue;
+    out.push({
+      Id: f.Id, Name: f.Name, Amount: Number(f.Amount), Spent: spent,
+      Remaining: Number(f.Amount) - spent, DaysLeft: f.DaysLeft,
+      // No stored row means shown — so a fund that starts seeing spend turns up on its own.
+      Included: choice.has(f.Id) ? choice.get(f.Id) : true,
+    });
+  }
+  return out;
+}
+
+export async function setBoardReportFund(reportId, fundId, included) {
+  await assertReportEditable(reportId);
+  await pool.query(
+    `INSERT INTO board_report_funds (report_id, fund_id, included) VALUES ($1,$2,$3)
+     ON CONFLICT (report_id, fund_id) DO UPDATE SET included = EXCLUDED.included`,
+    [reportId, fundId, !!included]
+  );
+  return listBoardReportFunds(reportId);
+}
+
 export async function computeBoardReportAggregates(reportId) {
   const report = await getBoardReport(reportId);
   if (!report) return [];
@@ -5540,7 +5580,29 @@ export async function computeBoardReportAggregates(reportId) {
   const nonCampP = Number(p.contributed) + directP;
   const nonCampY = Number(y.contributed) + directY;
 
-  out.push({ groupKey: 'money', label: 'Camp funds spent this period', valueNumeric: Number(p.camp) });
+  // Camp money is one figure to the board but comes from more than one pot. The split says
+  // which, so "camp spent $978" does not read as "$978 out of the general budget" when most of
+  // it came from a fund the board itself earmarked. Receipts only, like the tile it sits under.
+  const { rows: campSplit } = await pool.query(
+    `SELECT COALESCE(f.name, 'General') AS source, SUM(e.amount) AS amount
+     FROM expenses e
+     LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+     LEFT JOIN funds f ON f.id = e.fund_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND e.purchase_date BETWEEN $1 AND $2
+       AND (fs.id IS NULL OR fs.counts_as_camp_spend)
+     GROUP BY 1 HAVING SUM(e.amount) <> 0
+     -- General first, then the largest fund: the reader wants the ordinary pot before the
+     -- earmarked ones.
+     ORDER BY (COALESCE(f.name, 'General') <> 'General'), SUM(e.amount) DESC`,
+    [report.PeriodStart, report.PeriodEnd]
+  );
+  out.push({
+    groupKey: 'money', label: 'Camp funds spent this period', valueNumeric: Number(p.camp),
+    note: campSplit.length > 1
+      ? campSplit.map((r) => `${r.source} ${fmtMoneyPlain(Number(r.amount))}`).join(' · ')
+      : null,
+  });
   out.push({ groupKey: 'money', label: 'Camp funds spent year to date', valueNumeric: Number(y.camp) });
   // Only shown once there is something to show, so the header does not carry a permanent zero
   // while Ben has not yet marked anything as non-camp.
@@ -5561,7 +5623,13 @@ export async function computeBoardReportAggregates(reportId) {
   // charged to it.
   //
   // Only funds with something to report. A fund nobody has drawn on is not news.
+  // Hidden funds are left out of the block entirely. No row means shown.
+  const { rows: hiddenRows } = await pool.query(
+    'SELECT fund_id FROM board_report_funds WHERE report_id = $1 AND NOT included', [reportId]
+  );
+  const hiddenFunds = new Set(hiddenRows.map((r) => r.fund_id));
   for (const f of await getFundBalances()) {
+    if (hiddenFunds.has(f.Id)) continue;
     const spentFromLines = Number((await pool.query(
       `SELECT COALESCE(SUM(jl.actual_cost), 0) AS total FROM job_lines jl
        WHERE jl.funding_source = 'fund' AND jl.funding_ref_id = $1 AND jl.actual_cost IS NOT NULL

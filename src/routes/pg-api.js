@@ -164,6 +164,7 @@ import {
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
   listFundingSources, createFundingSource, updateFundingSource,
+  listBoardReportFunds, setBoardReportFund,
   listBoardReportPhotoCandidates,
   seedDefaultReportPhotos, setBoardReportPhoto, removeBoardReportPhoto,
   listSelectedReportPhotos, addReportLevelPhoto, getReportEmailBudgetMb,
@@ -3486,6 +3487,19 @@ router.post('/board-reports/summary-preview', async (req, res, next) => {
   try { res.json({ html: plainSummaryToHtml(String((req.body || {}).text || '')) }); } catch (e) { next(e); }
 });
 
+
+// ---- Approved funds shown on a report ----
+router.get('/board-reports/:id(\\d+)/funds', async (req, res, next) => {
+  try { res.json({ funds: await listBoardReportFunds(req.params.id) }); } catch (e) { next(e); }
+});
+
+router.post('/board-reports/:id(\\d+)/funds', async (req, res, next) => {
+  try {
+    const { fundId, included } = req.body || {};
+    if (!fundId) return res.status(400).json({ ok: false, error: 'fundId is required' });
+    res.json({ ok: true, funds: await setBoardReportFund(req.params.id, Number(fundId), included !== false) });
+  } catch (e) { next(e); }
+});
 
 // ---- Board report photos (Part 2A/2B) ----
 router.get('/board-reports/:id(\\d+)/photos', async (req, res, next) => {
