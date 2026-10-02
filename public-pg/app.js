@@ -6636,7 +6636,6 @@ const ADMIN_CATEGORIES = {
       { view: 'adminJobLineStatuses', icon: '🚦', label: 'Job Line Statuses' },
       { view: 'adminAttachmentRoles', icon: '📎', label: 'Attachment Roles' },
       { view: 'adminFundingKinds', icon: '💷', label: 'Job Line Funding' },
-      { view: 'adminEmail', icon: '✉️', label: 'Email' },
       { view: 'adminAssetTypeIcons', icon: '🛖', label: 'Asset Type Icons' },
     ],
   },
@@ -6678,6 +6677,7 @@ const ADMIN_CATEGORIES = {
     icon: '🔗', title: 'Integrations', description: 'External services this system connects to',
     items: [
       { view: 'adminGcal', icon: '🗓️', label: 'Google Calendar Sync' },
+      { view: 'adminEmail', icon: '✉️', label: 'Email (Gmail)' },
     ],
   },
 };
