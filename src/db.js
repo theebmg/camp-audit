@@ -5362,6 +5362,10 @@ export async function resolveAllocationFunding({ destType, destId, fallbackFundI
   const fallback = fallbackFundId
     ? { fundingSource: 'fund', fundingRefId: fallbackFundId }
     : { fundingSource: 'operating_budget', fundingRefId: null };
+  // A receipt charged to a FUND settles it: that money left that pot, whatever budget the job
+  // it paid for was planned against. Inheriting the destination's category instead stamped
+  // fund-paid splits as ordinary operating budget and lost the fund.
+  if (fallbackFundId) return fallback;
   if (destType === 'job_line' && destId) {
     const { rows } = await pool.query('SELECT funding_source, funding_ref_id FROM job_lines WHERE id = $1', [destId]);
     if (rows[0]) return { fundingSource: rows[0].funding_source, fundingRefId: rows[0].funding_ref_id };
@@ -6149,17 +6153,41 @@ function personNameForTag(name) {
 async function jobLineFundingForReport(jobLineIds) {
   if (!jobLineIds.length) return new Map();
 
+  // Where a receipt's money came from, in order of how hard the fact is:
+  //
+  //   1. the fund the RECEIPT was charged to (expenses.fund_id) — a fund is auditable: that
+  //      money demonstrably left that pot;
+  //   2. the split's own funding (expense_allocations.funding_source/_ref_id) — which may name
+  //      a fund, a cabin holder, a campaign;
+  //   3. the receipt's category (expenses.funding_source_id) — Camp funds / Personal / Donor.
+  //
+  // The receipt's fund outranks the split's category on purpose. A split INHERITS its category
+  // from the job line it lands on, so linking a fund-charged receipt to a line budgeted against
+  // the operating budget stamped the allocation 'operating_budget' and the report then showed
+  // the money as ordinary general spend — the fund Ben had chosen on the receipt vanished.
   const { rows: allocs } = await pool.query(
     `SELECT ea.dest_id AS job_line_id,
-            COALESCE(fs.short_label, fs.name, 'Unassigned') AS source,
-            COALESCE(fs.counts_as_camp_spend, true) AS is_camp,
-            -- An unset funding source is treated as general, so it needs no tag. That matches
-            -- how it is already counted: as ordinary camp spend.
-            COALESCE(fs.is_general, true) AS is_general,
+            COALESCE(f.name, ch.name, fs.short_label, fs.name, k.label, 'Unassigned') AS source,
+            CASE WHEN f.id IS NOT NULL THEN true
+                 WHEN ch.id IS NOT NULL THEN false
+                 WHEN fs.id IS NOT NULL THEN fs.counts_as_camp_spend
+                 WHEN k.source IS NOT NULL THEN k.counts_as_camp_spend
+                 ELSE true END AS is_camp,
+            -- Only the general pot is general. A fund or a named person never is, which is what
+            -- earns them a tag.
+            CASE WHEN f.id IS NOT NULL OR ch.id IS NOT NULL THEN false
+                 WHEN fs.id IS NOT NULL THEN fs.is_general
+                 WHEN k.source IS NOT NULL THEN k.is_general
+                 ELSE true END AS is_general,
             SUM(ea.amount) AS amount
      FROM expense_allocations ea
      JOIN expenses e ON e.id = ea.expense_id
+     LEFT JOIN funds f
+       ON f.id = COALESCE(e.fund_id, CASE WHEN ea.funding_source = 'fund' THEN ea.funding_ref_id END)
+     LEFT JOIN cabin_holders ch
+       ON ea.funding_source = 'cabin_holder' AND ch.id = ea.funding_ref_id AND e.fund_id IS NULL
      LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+     LEFT JOIN job_line_funding_kinds k ON k.source = ea.funding_source
      WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
        AND ea.dest_type = 'job_line' AND ea.dest_id = ANY($1)
      GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC`,
@@ -6259,13 +6287,25 @@ async function workOrderRollupForReport(workOrderId) {
   }
   // Receipts booked against the work order itself rather than one of its lines.
   const { rows: woLevel } = await pool.query(
-    `SELECT COALESCE(fs.short_label, fs.name, 'Unassigned') AS source,
-            COALESCE(fs.counts_as_camp_spend, true) AS is_camp,
-            COALESCE(fs.is_general, true) AS is_general,
+    `SELECT COALESCE(f.name, ch.name, fs.short_label, fs.name, k.label, 'Unassigned') AS source,
+            CASE WHEN f.id IS NOT NULL THEN true
+                 WHEN ch.id IS NOT NULL THEN false
+                 WHEN fs.id IS NOT NULL THEN fs.counts_as_camp_spend
+                 WHEN k.source IS NOT NULL THEN k.counts_as_camp_spend
+                 ELSE true END AS is_camp,
+            CASE WHEN f.id IS NOT NULL OR ch.id IS NOT NULL THEN false
+                 WHEN fs.id IS NOT NULL THEN fs.is_general
+                 WHEN k.source IS NOT NULL THEN k.is_general
+                 ELSE true END AS is_general,
             SUM(ea.amount) AS amount
      FROM expense_allocations ea
      JOIN expenses e ON e.id = ea.expense_id
+     LEFT JOIN funds f
+       ON f.id = COALESCE(e.fund_id, CASE WHEN ea.funding_source = 'fund' THEN ea.funding_ref_id END)
+     LEFT JOIN cabin_holders ch
+       ON ea.funding_source = 'cabin_holder' AND ch.id = ea.funding_ref_id AND e.fund_id IS NULL
      LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+     LEFT JOIN job_line_funding_kinds k ON k.source = ea.funding_source
      WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
        AND ea.dest_type = 'work_order' AND ea.dest_id = $1
      GROUP BY 1, 2, 3`,
