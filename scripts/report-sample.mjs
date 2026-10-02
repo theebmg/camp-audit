@@ -8,7 +8,7 @@ import { renderBoardReportItemsHtml, renderBoardReportItemsText } from '/app/src
 const report = {
   Title: 'SAMPLE — September 2026', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30',
   ForwardEnd: '2026-10-15', Status: 'draft', ShowHours: false,
-  ShowFunding: process.argv.includes('all') ? 'all' : (process.argv.includes('nofunding') ? 'off' : 'non_camp'),
+  ShowFunding: process.argv.includes('all') ? 'all' : (process.argv.includes('nofunding') ? 'off' : 'non_general'),
   SummaryNotes: 'A sample of the new layout. Figures are illustrative.',
 };
 
