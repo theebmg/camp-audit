@@ -564,16 +564,16 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
         showHours && grandHours ? fmtHours(grandHours) : null,
         grandCost ? `${fmtMoney(grandCost)} recorded cost of work shown` : null,
       ].filter(Boolean);
-      // The note explains the total, so it goes wherever the total goes. With no total printed
-      // there is nothing for it to qualify, and it would read as a disclaimer about figures the
-      // reader cannot see.
+      // The note is about MONEY. It follows the recorded cost and nothing else: a total that is
+      // only hours has no cost figure for it to qualify, and printing it there would have the
+      // note disclaiming a number that is not on the page.
       if (!parts.length) return '<div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;"></div>';
       return `<div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
       Total — ${parts.join(' · ')}
     </div>
-    <div style="margin-top:5px;color:#6b7086;font-size:0.8rem;line-height:1.4;">
+    ${grandCost ? `<div style="margin-top:5px;color:#6b7086;font-size:0.8rem;line-height:1.4;">
       Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.
-    </div>`;
+    </div>` : ''}`;
     })()}
     <div style="margin-top:8px;color:#9298b0;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
   `
@@ -610,10 +610,13 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     showHours && grandHours ? fmtHours(grandHours) : null,
     grandCost ? `${fmtMoney(grandCost)} recorded cost of work shown` : null,
   ].filter(Boolean);
-  // Same pairing as the HTML: the note qualifies the total, so neither appears without the other.
+  // Same rule as the HTML: the total prints when there is anything to total, but the note only
+  // ever accompanies a recorded cost.
   if (totalParts.length) {
-    lines.push('', `TOTAL — ${totalParts.join(' · ')}`,
-      'Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.');
+    lines.push('', `TOTAL — ${totalParts.join(' · ')}`);
+    if (grandCost) {
+      lines.push('Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.');
+    }
   } else {
     lines.push('');
   }

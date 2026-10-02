@@ -183,10 +183,18 @@ console.log('\n## the note goes wherever the total goes, and nowhere else');
   ok(paidHtml.replace(/\s+/g, ' ').includes(NOTE), 'and the note comes with it');
   ok(/TOTAL\s*\u2014/.test(paidText) && paidText.includes(NOTE), 'both in the plain-text copy too');
 
-  // Hours alone are enough to produce a total — and so the note.
+  // Hours alone produce a total, but NOT the note: there is no cost figure for it to qualify.
   const hoursOnly = renderBoardReportItemsHtml({ report: { ...report, ShowHours: true }, items: bare, aggregates: [] });
+  const hoursOnlyText = renderBoardReportItemsText({ report: { ...report, ShowHours: true }, items: bare, aggregates: [] });
   ok(/Total\s*\u2014\s*1\.5h/.test(hoursOnly.replace(/\s+/g, ' ')), 'hours alone print a total');
-  ok(hoursOnly.replace(/\s+/g, ' ').includes(NOTE), 'and the note follows it');
+  ok(!hoursOnly.replace(/\s+/g, ' ').includes(NOTE), 'and NO note — the total carries no cost to qualify');
+  ok(!hoursOnlyText.includes(NOTE), 'nor in the plain-text copy');
+
+  // Hours AND money: the total carries both, and the note returns with the money.
+  const bothHtml = renderBoardReportItemsHtml({ report: { ...report, ShowHours: true }, items: paid, aggregates: [] });
+  const bothFlat = bothHtml.replace(/\s+/g, ' ');
+  ok(/Total\s*\u2014\s*1\.5h\s*·\s*\$379/.test(bothFlat), 'hours and money share one total line');
+  ok(bothFlat.includes(NOTE), 'and the note is back, because there is now a cost');
 }
 
 console.log('\n## Show hours: off by default, and off means off everywhere');
