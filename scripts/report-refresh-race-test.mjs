@@ -18,13 +18,21 @@ const ok = (c, l) => { console.log(`  ${c ? 'ok  ' : 'FAIL'}  ${l}`); if (!c) fa
 const count = async () => (await db.pool.query(
   'SELECT count(*)::int n FROM board_report_items WHERE report_id=$1', [REPORT])).rows[0].n;
 
+// The draft can legitimately be empty — anything already published is never proposed again —
+// so this makes its own item to lose rather than depending on what happens to be on the report.
+const asset = (await db.pool.query('select id from assets limit 1')).rows[0];
+const { workOrderId: scratchWo } = await db.createWorkOrder({
+  title: 'ZZ-RACE scratch', assetId: asset.id, priority: 'Medium',
+});
+await db.pool.query('UPDATE work_orders SET board_focus = true WHERE id = $1', [scratchWo]);
+
 console.log('## a single refresh settles the report');
 const t0 = Date.now();
 await db.refreshBoardReportSuggestions(REPORT);
 console.log(`    one pass takes ${Date.now() - t0}ms`);
 const settled = await count();
 console.log(`    ${settled} item(s)`);
-ok(settled > 0, 'the report has items to lose');
+ok(settled > 0, `the report has items to lose (${settled})`);
 
 console.log('\n## five refreshes at once');
 const settle = (p) => p.then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
@@ -47,8 +55,14 @@ ok(after2 === before2, `still ${after2}, was ${before2}`);
 
 console.log('\n## the items are the real ones, not an empty set that merely stayed empty');
 const items = await db.listBoardReportItems(REPORT);
-ok(items.some((i) => i.ItemType === 'work_order'), 'work orders are present');
-ok(items.some((i) => i.ItemType === 'job_line'), 'job lines are present');
+ok(items.some((i) => i.ItemType === 'work_order'), `work orders are present (${items.length} item(s))`);
+
+console.log('\n## cleanup');
+await db.pool.query(
+  'DELETE FROM board_report_items WHERE item_type = $1 AND item_id = $2', ['work_order', scratchWo]);
+await db.pool.query('DELETE FROM work_orders WHERE id = $1', [scratchWo]);
+ok((await db.pool.query('SELECT count(*)::int n FROM work_orders WHERE title = $1',
+  ['ZZ-RACE scratch'])).rows[0].n === 0, 'scratch work order deleted');
 
 console.log(`\n${fail.length ? `${fail.length} FAILURE(S): ` + fail.join(' | ') : 'all assertions passed'}`);
 process.exit(fail.length ? 1 : 0);
