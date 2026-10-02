@@ -14,14 +14,34 @@
 // mailbox, only over the Gmail account you authenticate as.
 import nodemailer from 'nodemailer';
 
+// A stored OAuth connection beats anything in the environment, because it is the one that can
+// be re-granted from the browser when Google revokes it. Read lazily and cached only for as long
+// as the credentials behind it are unchanged — reconnecting must take effect without a restart.
 let transporter = null;
-function getTransporter() {
-  if (transporter) return transporter;
+let transporterKey = null;
 
-  const user = process.env.GMAIL_USER;
-  const clientId = process.env.GMAIL_OAUTH_CLIENT_ID;
-  const clientSecret = process.env.GMAIL_OAUTH_CLIENT_SECRET;
-  const refreshToken = process.env.GMAIL_OAUTH_REFRESH_TOKEN;
+async function storedOAuth() {
+  try {
+    const db = await import('./db.js');
+    return await db.getMailOAuthToken();
+  } catch {
+    return null;   // never let a database hiccup turn into "email is not configured"
+  }
+}
+
+async function getTransporter() {
+  const stored = await storedOAuth();
+
+  const user = stored?.user || process.env.GMAIL_USER;
+  const clientId = process.env.GMAIL_OAUTH_CLIENT_ID || process.env.GOOGLE_OAUTH_CLIENT_ID;
+  const clientSecret = process.env.GMAIL_OAUTH_CLIENT_SECRET || process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+  const refreshToken = stored?.refreshToken || process.env.GMAIL_OAUTH_REFRESH_TOKEN;
+
+  // Rebuild whenever any of it changes, so a reconnect is live immediately.
+  const key = [user, clientId, refreshToken ? 'tok' : '', process.env.GMAIL_APP_PASSWORD ? 'pw' : ''].join('|');
+  if (transporter && transporterKey === key) return transporter;
+  transporter = null;
+  transporterKey = key;
   const appPassword = process.env.GMAIL_APP_PASSWORD;
 
   if (user && clientId && clientSecret && refreshToken) {
@@ -44,8 +64,12 @@ function getTransporter() {
   throw err;
 }
 
-export function mailIsConfigured() {
-  return Boolean(process.env.GMAIL_USER && (process.env.GMAIL_APP_PASSWORD || process.env.GMAIL_OAUTH_REFRESH_TOKEN));
+// Async now: a stored OAuth connection counts, and that lives in the database.
+export async function mailIsConfigured() {
+  const stored = await storedOAuth();
+  if (stored?.refreshToken) return true;
+  return Boolean(process.env.GMAIL_USER
+    && (process.env.GMAIL_APP_PASSWORD || process.env.GMAIL_OAUTH_REFRESH_TOKEN));
 }
 
 // Generic send. `from`/`fromName` default to the MAIL_FROM_* env vars (the
@@ -54,7 +78,7 @@ export function mailIsConfigured() {
 // `attachments` is nodemailer's shape. A board report passes inline images with a `cid`, which
 // is what makes a photo render in the body rather than only as a file at the bottom.
 export async function sendMail({ to, subject, html, text, replyTo, attachments }) {
-  const t = getTransporter();
+  const t = await getTransporter();
   const fromAddress = process.env.MAIL_FROM_ADDRESS || process.env.GMAIL_USER;
   const fromName = process.env.MAIL_FROM_NAME;
   const from = fromName ? `"${fromName}" <${fromAddress}>` : fromAddress;
