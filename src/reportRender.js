@@ -563,16 +563,16 @@ function sectionHtml(section, items, showHours = false) {
   // disagree about what counts again.
   const visible = visibleItems(items).filter((i) => i.Section === section);
   if (!visible.length) return '';
-  const hours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
-  const cost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const counted = totalledItems(items).filter((i) => i.Section === section);
+  const hours = counted.reduce((t, i) => t + (i.SnapHours || 0), 0);
+  const cost = counted.reduce((t, i) => t + (i.SnapCost || 0), 0);
   const sub = [showHours && hours ? fmtHours(hours) : null, cost ? fmtMoney(cost) : null].filter(Boolean).join(' · ');
 
-  // The count is of PIECES OF WORK — work orders, admin tasks, findings — not of job lines.
-  // A thirteen-line renovation is one thing the board decided to do, not thirteen.
-  const parents = visible.filter((i) => i.ItemType !== 'job_line');
-  const orphanLines = visible.filter((i) => i.ItemType === 'job_line'
-    && !parents.some((p) => p.ItemType === 'work_order' && p.ItemId === i.ParentWorkOrderId));
-  const count = parents.length + orphanLines.length;
+  // The count is of PIECES OF WORK — work orders, admin tasks, findings — not of job lines. A
+  // thirteen-line renovation is one thing the board decided to do, not thirteen. Same set the
+  // subtotal is made from, so the count and the money can never describe different things.
+  const orphanLines = counted.filter((i) => i.ItemType === 'job_line');
+  const count = counted.length;
 
   // Each parent, with its own lines nested beneath it in document order.
   const rendered = [];
@@ -607,14 +607,28 @@ function visibleItems(items) {
     && !(i.ItemType === 'job_line' && summaryWoIds.has(i.ParentWorkOrderId)));
 }
 
+// What the money is counted from — which is NOT the same as what is printed. A work order's row
+// carries the roll-up of its own lines, so adding both the row and the lines beneath it counts
+// the same money twice: an itemized job showing $800 on the row and $800 on the line it came
+// from put $1,600 in the total. Count the work order, print the detail.
+//
+// A job line whose work order is not on the report has nobody to roll it up, so it counts for
+// itself. Admin tasks and findings always count for themselves.
+function totalledItems(items) {
+  const visible = visibleItems(items);
+  const woIds = new Set(visible.filter((i) => i.ItemType === 'work_order').map((i) => i.ItemId));
+  return visible.filter((i) => i.ItemType !== 'job_line' || !woIds.has(i.ParentWorkOrderId));
+}
+
 export function renderBoardReportItemsHtml({ report, items, aggregates, reportPhotos = [] }) {
   const sections = ['done', 'coming_up', 'overdue', 'admin_work'];
   // Off unless this report says otherwise. Hours stay recorded on the work either way — this
   // only decides whether the board sees them.
   const showHours = report.ShowHours === true;
   const visible = visibleItems(items);
-  const grandHours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
-  const grandCost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const counted = totalledItems(items);
+  const grandHours = counted.reduce((t, i) => t + (i.SnapHours || 0), 0);
+  const grandCost = counted.reduce((t, i) => t + (i.SnapCost || 0), 0);
   return htmlShell(
     `Board Report — ${report.Title}`,
     `${report.PeriodStart} to ${report.PeriodEnd} · looking ahead to ${report.ForwardEnd}${report.Status === 'draft' ? ' · DRAFT' : ''}`,
@@ -656,15 +670,15 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
   }
   if (report.SummaryNotes) lines.push('', summaryHtmlToText(report.SummaryNotes));
   const visible = visibleItems(items);
+  const countedAll = totalledItems(items);
   for (const sec of ['done', 'coming_up', 'overdue', 'admin_work']) {
     const rows = visible.filter((i) => i.Section === sec);
     if (!rows.length) continue;
-    const secHours = rows.reduce((t, i) => t + (i.SnapHours || 0), 0);
-    // Same count as the HTML: pieces of work, not job lines.
-    const parents = rows.filter((i) => i.ItemType !== 'job_line');
-    const orphans = rows.filter((i) => i.ItemType === 'job_line'
-      && !parents.some((p) => p.ItemType === 'work_order' && p.ItemId === i.ParentWorkOrderId));
-    lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${parents.length + orphans.length})`
+    // Same set the HTML counts and totals from: pieces of work, not job lines.
+    const secCounted = countedAll.filter((i) => i.Section === sec);
+    const secHours = secCounted.reduce((t, i) => t + (i.SnapHours || 0), 0);
+    const orphans = secCounted.filter((i) => i.ItemType === 'job_line');
+    lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${secCounted.length})`
       + `${showHours && secHours ? ` · ${fmtHours(secHours)}` : ''}:`);
 
     const lineBits = (it) => [itemDatesText(it),
@@ -692,8 +706,8 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
       if (it.ReportNote) lines.push(`      ${it.ReportNote}`);
     }
   }
-  const grandCost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
-  const grandHours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
+  const grandCost = countedAll.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const grandHours = countedAll.reduce((t, i) => t + (i.SnapHours || 0), 0);
   // Same two rules as the HTML footer: no item count, and hours only when asked for.
   const totalParts = [
     showHours && grandHours ? fmtHours(grandHours) : null,
