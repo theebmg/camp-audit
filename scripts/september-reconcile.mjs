@@ -33,7 +33,7 @@ console.log(`  PRINTED           ${visible.length}`);
 console.log(`  COUNTED           ${counted.length}   <- work orders and admin tasks, not their lines`);
 const m = html.match(/Total\s*\u2014\s*([^<]*)/);
 console.log(`  footer reads      ${m ? m[1].trim() : '(no total line)'}`);
-const fm = m && /\$([\d,]+(?:\.\d\d)?)/.exec(m[1]);
+const fm = m && /\$([\d,]+(?:\.\d+)?)/.exec(m[1]);
 const footerNum = fm ? Number(fm[1].replace(/,/g, '')) : 0;
 console.log(`  RECONCILES        ${Math.abs(footerNum - cost) < 0.005 ? 'YES' : `NO (footer ${footerNum} vs computed ${cost})`}\n`);
 

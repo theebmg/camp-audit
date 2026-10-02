@@ -401,6 +401,21 @@ console.log('\n## a second pass must not wipe what the first worked out');
   }
 }
 
+console.log('\n## money never prints a lone decimal');
+{
+  const { renderBoardReportItemsHtml } = await import('/app/src/reportRender.js');
+  const mk = (cost) => renderBoardReportItemsHtml({
+    report: { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft' },
+    items: [{ Id: 990, ItemType: 'job_line', ItemId: 41, Section: 'done', Included: true,
+      SnapTitle: `${TAG} money`, SnapDate: '2026-09-02', SnapCost: cost }],
+    aggregates: [],
+  }).replace(/\s+/g, ' ');
+  ok(/\$1,399\.40/.test(mk(1399.4)), '1399.4 prints as $1,399.40, not $1,399.4');
+  ok(/\$1,200(?!\.)/.test(mk(1200)), 'a whole amount stays $1,200 with no decimals');
+  ok(/\$86\.18/.test(mk(86.18)), 'and real cents are untouched');
+  ok(!/\$[\d,]+\.\d(?!\d)/.test(mk(299.4)), 'no amount anywhere ends in a single decimal');
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(
