@@ -2136,7 +2136,7 @@ router.get('/board-reports/:id(\\d+)', async (req, res, next) => {
 // covers the notes field because it's a textarea inside the report form.
 router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
   try {
-    const { title, periodStart, periodEnd, forwardStart, forwardEnd, showHours } = req.body || {};
+    const { title, periodStart, periodEnd, forwardStart, forwardEnd, showHours, showFunding } = req.body || {};
     // Sanitised on the way IN, not on the way out, so what is stored is already safe and no
     // later reader has to remember to clean it (Part 2D).
     const summaryNotes = req.body && 'summaryNotes' in req.body
@@ -2158,6 +2158,9 @@ router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
         return res.status(400).json({ ok: false, error: `${label} isn't a valid date. Use the date picker.` });
       }
     }
+    if (showFunding !== undefined && !['off', 'non_camp', 'all'].includes(String(showFunding))) {
+      return res.status(400).json({ ok: false, error: 'Show funding must be off, non_camp or all.' });
+    }
     if (merged.periodStart && merged.periodEnd && merged.periodEnd < merged.periodStart) {
       return res.status(400).json({
         ok: false,
@@ -2174,6 +2177,7 @@ router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
     const report = await updateBoardReport(req.params.id, {
       title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes,
       showHours: showHours === undefined ? undefined : !!showHours,
+      showFunding: showFunding === undefined ? undefined : String(showFunding),
     });
     if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
     res.json({ ok: true, report });

@@ -5530,6 +5530,19 @@ async function renderBoardReport() {
           </p>
           <p class="field-error" id="brShowHours-err"></p>
         </div>
+        <div class="field-row">
+          <label for="brShowFunding">Show funding</label>
+          <select id="brShowFunding" ${published ? 'disabled' : ''}>
+            <option value="off" ${report.ShowFunding === 'off' ? 'selected' : ''}>Off — no funding anywhere</option>
+            <option value="non_camp" ${report.ShowFunding === 'non_camp' ? 'selected' : ''}>Non-camp only — tag what camp didn't pay for</option>
+            <option value="all" ${report.ShowFunding === 'all' ? 'selected' : ''}>All sources — tag every cost</option>
+          </select>
+          <p class="muted" style="margin:2px 0 0;font-size:0.8rem">
+            Funding comes from the receipts split onto the work, so a cost typed straight onto a
+            job line has none. A new report starts with whatever the last one used.
+          </p>
+          <p class="field-error" id="brShowFunding-err"></p>
+        </div>
         ${published ? '' : `<div class="btn-row">
           <button type="button" class="btn btn-secondary" id="brRefresh" ${busy ? 'disabled' : ''}>${busy ? 'Working…' : 'Refresh suggestions'}</button>
           <button type="button" class="btn btn-secondary" id="brAddItem">＋ Add item</button>
@@ -5780,6 +5793,12 @@ async function renderBoardReport() {
         e.target.checked = !e.target.checked;
         showFieldError('brShowHours', saveErrorMessage(err));
       }
+    });
+    document.getElementById('brShowFunding')?.addEventListener('change', async (e) => {
+      const was = report.ShowFunding;
+      clearFieldError('brShowFunding');
+      try { await patchReport({ showFunding: e.target.value }); draw(); }
+      catch (err) { e.target.value = was; showFieldError('brShowFunding', saveErrorMessage(err)); }
     });
     mountSummaryEditor(report, async (html) => {
       // "Saved as you type" was true only when it worked; a failure said nothing at all.

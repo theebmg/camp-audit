@@ -5117,6 +5117,7 @@ export async function listFundingSources({ includeInactive = false } = {}) {
     Id: r.id, Name: r.name, CountsAsCampSpend: r.counts_as_camp_spend,
     IsContribution: r.is_contribution, IsInKind: r.is_in_kind,
     SortOrder: r.sort_order, Active: r.active,
+    ShortLabel: r.short_label || r.name,
   }));
 }
 export async function createFundingSource({ name, countsAsCampSpend = false, isContribution = false, isInKind = false, sortOrder = 100 }) {
@@ -5482,7 +5483,10 @@ export async function computeBoardReportAggregates(reportId) {
   const CAMP = `(fs.id IS NULL OR fs.counts_as_camp_spend)`;
   const spendSql = (where) => `
     SELECT COALESCE(SUM(e.amount) FILTER (WHERE ${CAMP}), 0)                      AS camp,
-           COALESCE(SUM(e.amount) FILTER (WHERE fs.is_contribution), 0)           AS contributed,
+           -- Everything that is NOT camp money, however it happens to be classified. Keying
+           -- this off is_contribution alone would quietly drop a non-camp source nobody
+           -- remembered to tick, and the board would read it as camp spend by omission.
+           COALESCE(SUM(e.amount) FILTER (WHERE fs.id IS NOT NULL AND NOT fs.counts_as_camp_spend), 0) AS contributed,
            COALESCE(SUM(e.amount) FILTER (WHERE fs.is_in_kind), 0)                AS in_kind
     FROM expenses e
     LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
@@ -5791,6 +5795,8 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
     [periodStart, periodEnd]
   );
   const woSeen = new Set();
+  // One query for every line in the batch rather than one per line.
+  const lineFunding = await jobLineFundingForReport(rows.map((r) => r.id));
   for (const [i, r] of rows.entries()) {
     // Already on a published report — it reached the board, so it is not proposed again.
     if (reported.has(reportedKey('job_line', r.id))) continue;
@@ -5828,6 +5834,7 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
       snapAssetName: r.asset_name,
       snapStatus: r.status_name, snapDate: r.completed_date,
       snapHours: r.actual_hours, snapCost: r.cost, snapEstCost: r.est_cost,
+      snapFunding: lineFunding.get(r.id) || null,
     });
   }
   return rows.length;
@@ -5970,6 +5977,35 @@ async function suggestCalendarAndProjections(reportId, passId, reported, { forwa
 // The funding split comes from the receipts, because that is where funding source lives. A
 // line with no receipts allocated contributes nothing to the split, which is why the split is
 // empty until expenses are divided onto work.
+// Who paid for one job line, from the receipts split onto it. The same shape as the work
+// order's roll-up so the renderer has one thing to deal with. A line whose cost was typed
+// straight in as actual_cost has no receipt behind it and so has no funding — which is the
+// honest answer, not a gap to paper over.
+async function jobLineFundingForReport(jobLineIds) {
+  if (!jobLineIds.length) return new Map();
+  const { rows } = await pool.query(
+    `SELECT ea.dest_id AS job_line_id,
+            COALESCE(fs.short_label, fs.name, 'Unassigned') AS source,
+            COALESCE(fs.counts_as_camp_spend, true) AS is_camp,
+            SUM(ea.amount) AS amount
+     FROM expense_allocations ea
+     JOIN expenses e ON e.id = ea.expense_id
+     LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND ea.dest_type = 'job_line' AND ea.dest_id = ANY($1)
+     GROUP BY 1, 2, 3 ORDER BY 4 DESC`,
+    [jobLineIds]
+  );
+  const byLine = new Map();
+  for (const r of rows) {
+    if (!byLine.has(r.job_line_id)) byLine.set(r.job_line_id, []);
+    byLine.get(r.job_line_id).push({
+      Source: r.source, IsCamp: r.is_camp === true, Amount: Number(r.amount),
+    });
+  }
+  return byLine;
+}
+
 async function workOrderRollupForReport(workOrderId) {
   const { rows } = await pool.query(
     `SELECT
@@ -5992,8 +6028,9 @@ async function workOrderRollupForReport(workOrderId) {
 
   // Funding split: receipts allocated to this work order's lines, grouped by who paid.
   const { rows: funding } = await pool.query(
-    `SELECT COALESCE(fs.name, 'Unassigned') AS source,
+    `SELECT COALESCE(fs.short_label, fs.name, 'Unassigned') AS source,
             COALESCE(fs.is_contribution, false) AS is_contribution,
+            COALESCE(fs.counts_as_camp_spend, true) AS is_camp,
             SUM(ea.amount) AS amount
      FROM expense_allocations ea
      JOIN expenses e ON e.id = ea.expense_id
@@ -6001,7 +6038,7 @@ async function workOrderRollupForReport(workOrderId) {
      WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
        AND ((ea.dest_type = 'job_line' AND ea.dest_id IN (SELECT id FROM job_lines WHERE work_order_id = $1))
          OR (ea.dest_type = 'work_order' AND ea.dest_id = $1))
-     GROUP BY 1, 2 ORDER BY 3 DESC`,
+     GROUP BY 1, 2, 3 ORDER BY 4 DESC`,
     [workOrderId]
   );
 
@@ -6051,7 +6088,9 @@ async function workOrderRollupForReport(workOrderId) {
     linesDone: Number(r.lines_done) || 0,
     firstDate: r.first_date || null,
     lastCompleted: r.last_completed || null,
-    funding: funding.map((f) => ({ Source: f.source, IsContribution: f.is_contribution, Amount: Number(f.amount) })),
+    funding: funding.map((f) => ({
+      Source: f.source, IsContribution: f.is_contribution, IsCamp: f.is_camp === true, Amount: Number(f.amount),
+    })),
     progress,
   };
 }
@@ -6371,6 +6410,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
          WHERE jl.work_order_id = $1 AND s.counts_as_work_performed
          ORDER BY jl.sort_order, jl.id`, [r.id]
       );
+      const kidFunding = await jobLineFundingForReport(kids.map((c) => c.id));
       for (const [k, c] of kids.entries()) {
         if (reported.has(reportedKey('job_line', c.id))) continue;
         await upsertBoardReportItem(reportId, { passId,
@@ -6379,6 +6419,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
           snapSubtitle: c.date_inferred ? `${r.title} · date not recorded` : r.title,
           snapAssetName: r.place, snapStatus: c.status_name, snapDate: c.completed_date,
           snapHours: c.actual_hours, snapCost: c.cost, snapEstCost: c.est_cost,
+          snapFunding: kidFunding.get(c.id) || null,
         });
         n += 1;
       }
@@ -6545,6 +6586,7 @@ function boardReportRowShape(r) {
     ForwardEnd: r.forward_end_text || r.forward_end,
     SummaryNotes: r.summary_notes,
     ShowHours: r.show_hours === true,
+    ShowFunding: r.show_funding || 'non_camp',
     CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
   };
 }
@@ -6590,10 +6632,12 @@ export async function getOrCreateDraftBoardReport() {
     // show_hours carries over from the most recent report rather than resetting: whoever turned
     // hours on last month almost certainly wants them on again, and the alternative is
     // rediscovering the toggle every month. Falls back to false when this is the first report.
-    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end, show_hours)
+    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end, show_hours, show_funding)
      VALUES ($1,'draft',$2,$3,$4,$5,
              COALESCE((SELECT show_hours FROM board_reports
-                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), false))
+                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), false),
+             COALESCE((SELECT show_funding FROM board_reports
+                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), 'non_camp'))
      RETURNING id`,
     [title, p.periodStart, p.periodEnd, p.forwardStart, p.forwardEnd]
   );
@@ -6615,7 +6659,7 @@ export async function listBoardReports() {
 const BOARD_REPORT_UPDATE_COLUMNS = {
   title: 'title', periodStart: 'period_start', periodEnd: 'period_end',
   forwardStart: 'forward_start', forwardEnd: 'forward_end', summaryNotes: 'summary_notes',
-  showHours: 'show_hours',
+  showHours: 'show_hours', showFunding: 'show_funding',
 };
 // Published reports are read-only: a report the board has already seen must not change
 // underneath them, which is the entire point of publishing.

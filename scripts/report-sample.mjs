@@ -8,6 +8,7 @@ import { renderBoardReportItemsHtml, renderBoardReportItemsText } from '/app/src
 const report = {
   Title: 'SAMPLE — September 2026', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30',
   ForwardEnd: '2026-10-15', Status: 'draft', ShowHours: false,
+  ShowFunding: process.argv.includes('all') ? 'all' : (process.argv.includes('nofunding') ? 'off' : 'non_camp'),
   SummaryNotes: 'A sample of the new layout. Figures are illustrative.',
 };
 
@@ -19,17 +20,19 @@ const items = [
     SnapCost: 559, SnapProgress: 'Completed: Replace Sump Pump, Install Dehumidifier' },
   { Id: 2, ItemType: 'job_line', ItemId: 82, ParentWorkOrderId: 60, Section: 'done', Included: true,
     SnapTitle: 'Replace Sump Pump', SnapAssetName: "Caretaker's Residence", SnapStatus: 'Done',
-    SnapDate: '2026-09-23', SnapCost: 379 },
+    SnapDate: '2026-09-23', SnapCost: 379,
+    SnapFunding: [{ Source: 'Camp', IsCamp: true, Amount: 379 }] },
   { Id: 3, ItemType: 'job_line', ItemId: 83, ParentWorkOrderId: 60, Section: 'done', Included: true,
     SnapTitle: 'Install Dehumidifier', SnapAssetName: "Caretaker's Residence", SnapStatus: 'Done',
-    SnapDate: '2026-09-23', SnapCost: 180 },
+    SnapDate: '2026-09-23', SnapCost: 180,
+    SnapFunding: [{ Source: 'Camp', IsCamp: true, Amount: 120 }, { Source: 'Donor', IsCamp: false, Amount: 60 }] },
 
   // Open work order, itemized: a $0 line, an estimate-only line, and Still to do.
   { Id: 4, ItemType: 'work_order', ItemId: 54, Section: 'done', Included: true, DisplayMode: 'itemized',
     SnapTitle: "Caretaker's Renovations", SnapAssetName: "Caretaker's Residence",
     SnapStatus: 'Reported', SnapStartDate: '2026-09-22', SnapDate: null,
     SnapCost: 800, SnapEstCost: 1540,
-    SnapFunding: [{ Source: 'Camp funds', Amount: 1000 }, { Source: 'Personal (Ben)', Amount: 240 }],
+    SnapFunding: [{ Source: 'Ben', IsCamp: false, Amount: 800 }],
     SnapProgress: '52% of ~$1,540 est. complete (4 of 12 lines)',
     SnapOpenLines: ['Paint bedrooms upstairs', 'Clean upstairs', 'Replace lights upstairs'] },
   { Id: 5, ItemType: 'job_line', ItemId: 68, ParentWorkOrderId: 54, Section: 'done', Included: true,

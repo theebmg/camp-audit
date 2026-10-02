@@ -296,7 +296,7 @@ export function renderPlainEmailHtml(subject, text) {
 // exactly what it said in March.
 
 const SECTION_TITLES = {
-  done: 'Work Completed',
+  done: 'Work This Period',
   coming_up: 'Coming Up',
   overdue: 'Overdue',
   admin_work: 'Administrative Work',
@@ -500,13 +500,34 @@ function itemDatesText(it) {
 // status on every line is noise the board has to read past. Title, date, cost — nothing else.
 // A $0 line is a line with no money against it, so the figure is left off rather than printed
 // as a meaningless zero.
-function nestedLineHtml(it, showHours = false) {
+// "Funded by Ben", or "Ben $800 · Camp $440" when more than one source paid.
+//
+// showFunding: 'off' prints nothing; 'non_camp' prints only money that did NOT come from camp
+// funds, because the board's question is what a job cost CAMP and camp money needs no tag;
+// 'all' labels everything.
+//
+// Returns null rather than an empty string when there is nothing to say, so callers can drop
+// the separator too.
+function fundingTagText(it, showFunding) {
+  if (showFunding === 'off') return null;
+  const all = Array.isArray(it.SnapFunding) ? it.SnapFunding.filter((f) => f && f.Amount) : [];
+  if (!all.length) return null;
+  const shown = showFunding === 'all' ? all : all.filter((f) => f.IsCamp === false);
+  if (!shown.length) return null;
+  // One source paying for the whole thing reads as a sentence; a split reads as figures.
+  if (shown.length === 1 && shown.length === all.length) return `Funded by ${shown[0].Source}`;
+  return shown.map((f) => `${f.Source} ${fmtMoney(f.Amount)}`).join(' · ');
+}
+
+function nestedLineHtml(it, showHours = false, showFunding = 'non_camp') {
+  // No date: every line under a work order happened inside the reporting period, and the work
+  // order above already carries the span. Repeating it on each line was the noisiest thing left.
   const bits = [
-    itemDatesText(it),
     showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
     it.SnapCost ? fmtMoney(it.SnapCost) : null,
     // "est. on open items only" — the same rule the work order row above it uses.
     !it.SnapCost && !it.SnapDate && it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null,
+    fundingTagText(it, showFunding),
   ].filter(Boolean);
   return `
     <div style="padding:4px 0;font-size:0.92rem;color:#474d66;">
@@ -540,23 +561,24 @@ function stillToDoHtml(it) {
     </div>`;
 }
 
-function itemLineHtml(it, showHours = false, opts = {}) {
+function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_camp') {
   // Dates read as a span rather than a single stamp (decisions §7): when something started
   // and whether it has finished is more use to a board than one undated figure.
   const dates = itemDatesText(it);
   // Money: actual only, and only when there is one. An estimate is labelled "est." and shown
   // on open work alongside it — never instead of it and never summed (decisions §2, §3).
+  // Spend against estimate reads as one fact, not two: "$800 spent of ~$1,540 est." says where
+  // a job has got to in a way that "$800 · ~$1,540 est." does not. Either half alone still
+  // prints on its own.
   const money = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
   const est = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
+  const spend = money && est ? `${money} spent of ${est}` : (money || est);
+  const funding = fundingTagText(it, showFunding);
   const bits = [
     it.SnapAssetName, it.SnapStatus, dates,
     showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
-    money, est,
+    spend, funding,
   ].filter(Boolean);
-  // "Camp $1,000 · Personal $240" — who actually paid, from the receipts allocated to the work.
-  const funding = Array.isArray(it.SnapFunding) && it.SnapFunding.length
-    ? it.SnapFunding.map((f) => `${f.Source} ${fmtMoney(f.Amount)}`).join(' · ')
-    : null;
   // The em-dash suffix is for things the detail line does not already say. Printing the
   // asset there as well gave "Front Gate Repair — Red Gate" above "Red Gate · Done · …",
   // and an admin task's category turned into "Fixed NVR Hard Drive — Other", which is noise
@@ -573,7 +595,6 @@ function itemLineHtml(it, showHours = false, opts = {}) {
     <div style="border-bottom:1px solid #c7d2dd;padding:9px 0;">
       <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${suffix ? ` <span style="color:#565c78;">— ${escapeHtml(suffix)}</span>` : ''}</div>
       ${bits.length ? `<div style="color:#565c78;font-size:0.85rem;">${escapeHtml(bits.join(' · '))}</div>` : ''}
-      ${funding ? `<div style="color:#565c78;font-size:0.85rem;">Funded by ${escapeHtml(funding)}</div>` : ''}
       ${it.SnapProgress && !opts.hideProgress ? `<div style="color:#565c78;font-size:0.85rem;">${escapeHtml(it.SnapProgress)}</div>` : ''}
       ${opts.nested || ''}
       ${stillToDoHtml(it)}
@@ -584,7 +605,7 @@ function itemLineHtml(it, showHours = false, opts = {}) {
 
 // A summary work order prints one line and swallows its job lines; an itemized one
 // prints its lines instead. Summary is the default for every WO (§6).
-function sectionHtml(section, items, showHours = false) {
+function sectionHtml(section, items, showHours = false, showFunding = 'non_camp') {
   if (!items.some((i) => i.Section === section && i.Included)) return '';
   // One rule, shared with the footer, so a section subtotal and the grand total can never
   // disagree about what counts again.
@@ -604,14 +625,14 @@ function sectionHtml(section, items, showHours = false) {
   // Each parent, with its own lines nested beneath it in document order.
   const rendered = [];
   for (const it of visible) {
-    if (it.ItemType === 'job_line' && orphanLines.includes(it)) { rendered.push(itemLineHtml(it, showHours)); continue; }
+    if (it.ItemType === 'job_line' && orphanLines.includes(it)) { rendered.push(itemLineHtml(it, showHours, {}, showFunding)); continue; }
     if (it.ItemType === 'job_line') continue;             // printed under its work order below
-    if (it.ItemType !== 'work_order') { rendered.push(itemLineHtml(it, showHours)); continue; }
+    if (it.ItemType !== 'work_order') { rendered.push(itemLineHtml(it, showHours, {}, showFunding)); continue; }
     const lines = visible.filter((l) => l.ItemType === 'job_line' && l.ParentWorkOrderId === it.ItemId);
-    const nested = nestedBlockHtml(lines.map((l) => nestedLineHtml(l, showHours)).join(''));
+    const nested = nestedBlockHtml(lines.map((l) => nestedLineHtml(l, showHours, showFunding)).join(''));
     // An itemized work order's lines say what was completed, so the roll-up sentence that says
     // the same thing in prose is redundant directly above them.
-    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0 }));
+    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0 }, showFunding));
   }
 
   return `
@@ -652,6 +673,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
   // Off unless this report says otherwise. Hours stay recorded on the work either way — this
   // only decides whether the board sees them.
   const showHours = report.ShowHours === true;
+  const showFunding = report.ShowFunding || 'non_camp';
   const visible = visibleItems(items);
   const counted = totalledItems(items);
   const grandHours = counted.reduce((t, i) => t + (i.SnapHours || 0), 0);
@@ -662,7 +684,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
     `
     ${moneyHeaderHtml(aggregates)}
     ${report.SummaryNotes ? `<div style="background:#fbf6ec;border:1px solid #e3d9c2;border-left:4px solid #13432f;border-radius:10px;padding:14px 16px;margin-bottom:10px;">${plainSummaryToHtml(report.SummaryNotes)}</div>` : ''}
-    ${sections.map((sec) => sectionHtml(sec, items, showHours)).join('')}
+    ${sections.map((sec) => sectionHtml(sec, items, showHours, showFunding)).join('')}
     ${Array.isArray(reportPhotos) && reportPhotos.length ? `
       <h2 style="margin:26px 0 6px;font-size:1.05rem;color:#13432f;border-top:2px solid #13432f;padding-top:12px;text-transform:uppercase;letter-spacing:0.04em;">Other photos this month</h2>
       ${itemPhotosHtml(reportPhotos)}` : ''}
@@ -690,6 +712,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
 
 export function renderBoardReportItemsText({ report, items, aggregates }) {
   const showHours = report.ShowHours === true;
+  const showFunding = report.ShowFunding || 'non_camp';
   const lines = [`CAMP SYCHAR — BOARD REPORT — ${report.Title}`,
     `${report.PeriodStart} to ${report.PeriodEnd} (ahead to ${report.ForwardEnd})${report.Status === 'draft' ? ' — DRAFT' : ''}`, ''];
   for (const a of aggregates.filter((x) => ['money', 'savings'].includes(x.GroupKey))) {
@@ -708,17 +731,21 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${secCounted.length})`
       + `${showHours && secHours ? ` · ${fmtHours(secHours)}` : ''}:`);
 
-    const lineBits = (it) => [itemDatesText(it),
+    // No date on a nested line, same as the HTML.
+    const lineBits = (it) => [
       showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
       it.SnapCost ? fmtMoney(it.SnapCost) : null,
-      !it.SnapCost && !it.SnapDate && it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null].filter(Boolean);
+      !it.SnapCost && !it.SnapDate && it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null,
+      fundingTagText(it, showFunding)].filter(Boolean);
 
     for (const it of rows) {
       if (it.ItemType === 'job_line' && !orphans.includes(it)) continue;   // nested below
+      const pMoney = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
+      const pEst = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
       const bits = [it.SnapAssetName, itemDatesText(it),
         showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
-        it.SnapCost ? fmtMoney(it.SnapCost) : null,
-        !it.SnapCost && !it.SnapDate && it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null].filter(Boolean);
+        pMoney && pEst ? `${pMoney} spent of ${pEst}` : (pMoney || pEst),
+        fundingTagText(it, showFunding)].filter(Boolean);
       lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
       if (it.ItemType === 'work_order') {
         // Indented with a dash, which is as much of a connecting rail as plain text allows.
