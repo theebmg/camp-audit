@@ -6577,7 +6577,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
             COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date,
             (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
             jl.scheduled_date::text AS scheduled_date, jl.board_focus_set_at,
-            jl.actual_hours, COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost,
+            jl.actual_hours, ${JOB_LINE_ACTUAL_COST_EXPR} AS cost, jl.estimated_cost AS est_cost,
             w.id AS work_order_id, w.title AS wo_title, COALESCE(a.name, l.name) AS place
      FROM job_lines jl
      JOIN job_line_statuses s ON s.id = jl.status_id
@@ -6587,6 +6587,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
      LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
      WHERE jl.board_focus ORDER BY jl.id DESC`
   );
+  const flaggedFunding = await jobLineFundingForReport(lines.map((l) => l.id));
   for (const [i, r] of lines.entries()) {
     if (reported.has(reportedKey('job_line', r.id))) continue;
     const done = r.counts_as_work_performed;
@@ -6599,9 +6600,9 @@ async function suggestFlaggedItems(reportId, passId, reported) {
       snapAssetName: r.place, snapStatus: r.status,
       snapDate: done ? r.completed_date : r.scheduled_date,
       snapHours: r.actual_hours,
-      // Open work: whatever is recorded is an estimate until the work is done and paid for.
-      snapCost: done ? r.cost : null,
-      snapEstCost: done ? null : r.cost,
+      snapCost: r.cost ?? null,
+      snapEstCost: r.est_cost ?? null,
+      snapFunding: flaggedFunding.get(r.id) || null,
     });
     n += 1;
   }
@@ -6881,17 +6882,21 @@ export async function upsertBoardReportItem(reportId, {
        snap_status  = COALESCE(EXCLUDED.snap_status, board_report_items.snap_status),
        snap_date    = COALESCE(EXCLUDED.snap_date, board_report_items.snap_date),
        snap_start_date = COALESCE(EXCLUDED.snap_start_date, board_report_items.snap_start_date),
-       -- Recomputed from the work every pass, so they REPLACE rather than coalesce. Coalescing
-       -- meant a figure could never go DOWN or go away: an estimate wrongly stored as cost, or
-       -- a work order's estimate that later changed, was frozen into the report with no way to
-       -- correct it short of deleting the row. (Found when a line's cost read $440 of estimate
-       -- long after the rule said estimates must never be printed as cost.)
-       snap_est_cost = EXCLUDED.snap_est_cost,
-       snap_funding  = EXCLUDED.snap_funding,
-       snap_open_lines = EXCLUDED.snap_open_lines,
+       -- Recomputed figures REPLACE when the caller computed them, and are KEPT when it did
+       -- not. Both halves matter and each was learned the hard way:
+       --   coalescing always  -> a figure could never go down or go away, so an estimate
+       --                         wrongly stored as cost was frozen into the report;
+       --   replacing always   -> a pass that writes a partial snapshot wipes what another pass
+       --                         just worked out. A board-flagged job line is written twice,
+       --                         and the second write (which knows nothing about funding) blew
+       --                         away the funding the first had resolved.
+       -- So "undefined" from the caller means keep, and an explicit null means clear.
+       snap_est_cost   = CASE WHEN $24::boolean THEN EXCLUDED.snap_est_cost   ELSE board_report_items.snap_est_cost END,
+       snap_funding    = CASE WHEN $25::boolean THEN EXCLUDED.snap_funding    ELSE board_report_items.snap_funding END,
+       snap_open_lines = CASE WHEN $26::boolean THEN EXCLUDED.snap_open_lines ELSE board_report_items.snap_open_lines END,
        snap_hours   = COALESCE(EXCLUDED.snap_hours, board_report_items.snap_hours),
-       snap_cost    = EXCLUDED.snap_cost,
-       snap_progress= EXCLUDED.snap_progress,
+       snap_cost     = CASE WHEN $27::boolean THEN EXCLUDED.snap_cost     ELSE board_report_items.snap_cost END,
+       snap_progress = CASE WHEN $28::boolean THEN EXCLUDED.snap_progress ELSE board_report_items.snap_progress END,
        parent_work_order_id = COALESCE(EXCLUDED.parent_work_order_id, board_report_items.parent_work_order_id),
        suggested_at = now(),
        -- Without this the row keeps its PREVIOUS pass token, and the prune at the end
@@ -6904,7 +6909,10 @@ export async function upsertBoardReportItem(reportId, {
       snapAssetName ?? null, snapStatus ?? null, snapDate ?? null, snapHours ?? null,
       snapCost ?? null, snapProgress ?? null, parentWorkOrderId, passId, snapStartDate ?? null,
       snapEstCost ?? null, snapFunding ? JSON.stringify(snapFunding) : null,
-      snapOpenLines && snapOpenLines.length ? JSON.stringify(snapOpenLines) : null]
+      snapOpenLines && snapOpenLines.length ? JSON.stringify(snapOpenLines) : null,
+      // Did the caller work this field out at all? Only then may it overwrite.
+      snapEstCost !== undefined, snapFunding !== undefined, snapOpenLines !== undefined,
+      snapCost !== undefined, snapProgress !== undefined]
   );
   return rows[0].id;
 }
