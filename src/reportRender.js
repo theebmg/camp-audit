@@ -552,9 +552,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
       Total — ${visible.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}
     </div>
     ${grandCost ? `<div style="margin-top:5px;color:#6b7086;font-size:0.8rem;line-height:1.4;">
-      Recorded cost is what the work cost, whoever paid for it — it is <strong>not</strong> camp
-      spend. Who funded what is set out above. Estimates on open items are shown for context and
-      are never added into this total.
+      Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.
     </div>` : ''}
     <div style="margin-top:8px;color:#9298b0;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
   `
@@ -586,8 +584,7 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     + `${grandHours ? ` · ${fmtHours(grandHours)}` : ''}`
     + `${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}`);
   if (grandCost) {
-    lines.push('Recorded cost is what the work cost, whoever paid for it — it is NOT camp spend.',
-      'Who funded what is set out above. Estimates on open items are never added into this total.');
+    lines.push('Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.');
   }
   lines.push('', OPS_LABEL);
   return lines.join('\n');

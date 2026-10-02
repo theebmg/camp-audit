@@ -73,13 +73,110 @@ the rows across deliberately — `pg_restore -t` straight into `camp` appends ra
 replaces, which is rarely what is wanted. **Note:** `camp_app` cannot `CREATE DATABASE`, so a
 scratch database needs a superuser role.
 
+## Failure alerts
+
+A failure emails `BACKUP_ALERT_EMAIL`, as well as writing `failed` to `system_health`. Three
+cases, each with its own message, because they are not equally bad:
+
+| What happened | Subject | How bad |
+|---|---|---|
+| `pg_dump`/gzip failed | **BACKUP FAILED** | No new backup tonight. Last night's still stands. |
+| Dropbox upload failed | backup made, but the off-box copy failed | Tonight's backup is safe locally; nothing is off-box. Usually an expired rclone token. |
+| No rclone remote configured | backup is local only — no off-box copy | Every backup is on one machine. |
+
+Mail goes through the app's own mailer inside the container, which already holds working Gmail
+credentials — **no new secret**, and nothing sensitive reaches the log. Set the address in the
+app's environment next to the mail credentials:
+
+```
+BACKUP_ALERT_EMAIL=you@example.com
+```
+
+With no address set, the script logs that and carries on. **Sending an alert can never fail the
+backup**: a mail server having a bad day must not turn a good backup into a bad one, or hide the
+real error underneath it.
+
+A successful backup sends nothing. Silence means it worked — which is only trustworthy because
+failure is now loud.
+
+---
+
+## Rehearsing a full restore
+
+**Do this once, before it is ever needed.** Reading one table out of a dump proves the dumps
+contain data; it does not prove the restore path works. Allow 30 minutes.
+
+The rehearsal must go to a **scratch database**, never over `camp`.
+
+### Before you start
+
+`camp_app` cannot `CREATE DATABASE`. Use the `postgres` superuser inside the `nocodb-db`
+container, or grant `camp_app` the `CREATEDB` attribute for the duration.
+
+### The rehearsal
+
+```bash
+ssh camp
+LATEST=$(ls -t /root/backups/sychar-*.dump.gz | head -1)
+gunzip -c "$LATEST" > /tmp/rehearse.dump
+docker cp /tmp/rehearse.dump nocodb-db:/tmp/rehearse.dump
+
+docker exec nocodb-db psql -U postgres -c "DROP DATABASE IF EXISTS camp_rehearse"
+docker exec nocodb-db psql -U postgres -c "CREATE DATABASE camp_rehearse OWNER camp_app"
+docker exec nocodb-db pg_restore -U postgres -d camp_rehearse --no-owner /tmp/rehearse.dump
+```
+
+### What to check — the whole point of the exercise
+
+Compare the scratch database against live. Numbers that match mean the dump is complete, not
+merely readable:
+
+```bash
+for t in assets work_orders job_lines expenses board_report_items attachments people visits; do
+  live=$(docker exec nocodb-db psql -U camp_app -d camp -tAc "select count(*) from $t")
+  rest=$(docker exec nocodb-db psql -U postgres -d camp_rehearse -tAc "select count(*) from $t")
+  printf '%-20s live %-8s restored %-8s %s\n' "$t" "$live" "$rest" \
+    "$([ "$live" = "$rest" ] && echo OK || echo DIFFERS)"
+done
+```
+
+A row or two of difference on a busy table is normal — the dump is from 02:45 and live has moved
+on. A **zero**, or a table missing entirely, is not.
+
+Then spot-check that content survived, not just row counts:
+
+```bash
+docker exec nocodb-db psql -U postgres -d camp_rehearse -c \
+  "select id, title, left(summary_notes, 60) from board_reports"
+```
+
+### Tear it down
+
+```bash
+docker exec nocodb-db psql -U postgres -c "DROP DATABASE camp_rehearse"
+rm -f /tmp/rehearse.dump
+docker exec nocodb-db rm -f /tmp/rehearse.dump
+```
+
+### Record it
+
+Note the date in this file. A rehearsal nobody remembers doing is a rehearsal that has to happen
+again.
+
+| Date | By | Result |
+|---|---|---|
+| _(not yet rehearsed)_ | | |
+
+---
+
 ## Gaps worth knowing about
 
-1. **Nothing watches the watcher.** A failed backup writes `failed` to `system_health` and the
-   dashboard shows it — but only if someone looks at the dashboard. Worth an email on failure.
-2. **Restores are untested end to end.** A single table has now been read out of a dump and
-   verified, which is real evidence the dumps are good, but a full restore into a scratch
-   database has never been rehearsed. That rehearsal is the only way to know the restore path
-   works before it is needed.
+1. ~~**Nothing watches the watcher.**~~ **Fixed** — failures now email, see above.
+2. **Restores are untested end to end.** One table has been read out of a dump and verified
+   field by field, which is real evidence the dumps are good. A full restore has not been
+   rehearsed; the procedure above is written and waiting.
 3. **The window is 24 hours.** An accident at 02:44 loses a day. Fine for this workload; worth
    revisiting if the camp ever does heavy data entry.
+4. **The alert path shares the app's fate.** Alerts send through the container's mailer, so a
+   dead container means a backup failure cannot email. The `system_health` row still records it,
+   and a dead container is usually noticed on its own.

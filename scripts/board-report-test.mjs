@@ -146,10 +146,11 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
   ok(/Total — 3 item\(s\)/.test(html2), 'and all three rows are counted');
 
   console.log('\n## the footer says what the money is, so it is not read as camp spend');
-  ok(/not<\/strong> camp\s+spend/.test(html.replace(/\s+/g, ' ')) || /not camp spend/i.test(html),
-    'the HTML footer says it is not camp spend');
+  const NOTE = 'Recorded cost of work shown, including work funded outside camp. '
+    + 'Not camp spend; estimates excluded.';
+  ok(html.replace(/\s+/g, ' ').includes(NOTE), 'the HTML footer carries the note Ben wrote, verbatim');
   const text = renderBoardReportItemsText({ report, items: [wo, lineA, lineB], aggregates: [] });
-  ok(/NOT camp spend/.test(text), 'and so does the plain-text copy');
+  ok(text.includes(NOTE), 'and so does the plain-text copy');
   ok(/TOTAL — 1 item/.test(text), 'the text footer agrees with the HTML one');
 }
 

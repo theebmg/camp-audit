@@ -51,6 +51,33 @@ START_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 # stdout now; the crontab redirect is the ONE place persistence happens.
 log() { echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') $1"; }
 
+# A failed backup used to write 'failed' to system_health and wait for somebody to notice it on
+# the dashboard. Nobody looks at a dashboard to find out a backup they assume is working isn't,
+# so a failure now sends mail as well.
+#
+# Sent through the app's own mailer inside the container: it already holds working Gmail
+# credentials, so no new secret is introduced here and none of this script's output carries one.
+# BACKUP_ALERT_EMAIL is set in the app's environment alongside the mail credentials; with no
+# address configured this logs and moves on rather than failing a backup over a missing alert.
+#
+# Never allowed to fail the script: the backup's own success or failure is the thing that
+# matters, and a mail server having a bad day must not turn a good backup into a bad one or
+# mask the real error below.
+alert() {
+  local subject="$1" body="$2"
+  docker exec camp-audit node -e '
+    const to = process.env.BACKUP_ALERT_EMAIL;
+    if (!to) { console.error("no BACKUP_ALERT_EMAIL set"); process.exit(3); }
+    const [subject, body] = [process.argv[1], process.argv[2]];
+    import("/app/src/mailer.js")
+      .then((m) => m.sendMail({ to, subject, text: body }))
+      .then(() => console.error("alert sent"))
+      .catch((e) => { console.error("alert failed:", e.message); process.exit(4); });
+  ' "$subject" "$body" >/dev/null 2>&1 \
+    && log "alert emailed: $subject" \
+    || log "WARNING could not email the failure alert (the backup result above still stands)"
+}
+
 # Records one row in `backup_runs` per run, AND updates this subsystem's
 # current-state row in `system_health` (Build Brief v4 Part 2, 2026-09-13) —
 # db.js's getSystemHealth reads the latter for the dashboard warning; the
@@ -90,6 +117,15 @@ else
   log "FAILED pg_dump/gzip for $FILE"
   rm -f "$FILE"
   record_backup_run failed "pg_dump/gzip failed for $(basename "$FILE")"
+  alert "Camp CMMS: BACKUP FAILED" \
+"The nightly database backup did not run.
+
+What failed: pg_dump or gzip, writing $(basename "$FILE")
+When: $START_TIME
+
+There is NO new backup from tonight. Last night's is still in /root/backups and on Dropbox.
+
+Check: ssh camp, then tail /root/backups/backup.log"
   exit 1
 fi
 
@@ -112,11 +148,28 @@ if command -v rclone >/dev/null 2>&1 && rclone listremotes 2>/dev/null | grep -q
   else
     log "FAILED Dropbox upload for $FILE — local copy is still safe, but the off-box copy is missing until this is fixed"
     record_backup_run failed "Dropbox upload failed for $(basename "$FILE") — local copy is safe"
-    exit 1
+    alert "Camp CMMS: backup made, but the off-box copy failed" \
+"Tonight's database backup WAS written locally and is safe:
+  /root/backups/$(basename "$FILE")
+
+What failed: the Dropbox upload. There is no off-box copy of tonight's backup, so a
+loss of the server right now would cost everything since the last successful upload.
+
+Most likely the rclone token has expired. Check: ssh camp, then rclone listremotes
+and rclone about dropbox:"
+  exit 1
   fi
   rclone delete --min-age "${RETENTION_DAYS}d" "$RCLONE_REMOTE/" 2>&1 || true
 else
   log "WARNING skipping off-box copy — rclone 'dropbox' remote not configured on this host"
+  alert "Camp CMMS: backup is local only — no off-box copy" \
+"Tonight's database backup was written locally and is safe:
+  /root/backups/$(basename "$FILE")
+
+But rclone has no 'dropbox' remote configured on this host, so nothing is being copied
+off the server. Losing the server would lose every backup with it.
+
+Fix: ssh camp, then rclone config"
   BACKUP_DETAIL="local only — Dropbox not configured ($(du -h "$FILE" | cut -f1))"
 fi
 
