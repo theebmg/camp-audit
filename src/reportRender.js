@@ -564,13 +564,17 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
         showHours && grandHours ? fmtHours(grandHours) : null,
         grandCost ? `${fmtMoney(grandCost)} recorded cost of work shown` : null,
       ].filter(Boolean);
-      return parts.length ? `<div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
+      // The note explains the total, so it goes wherever the total goes. With no total printed
+      // there is nothing for it to qualify, and it would read as a disclaimer about figures the
+      // reader cannot see.
+      if (!parts.length) return '<div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;"></div>';
+      return `<div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
       Total — ${parts.join(' · ')}
-    </div>` : '<div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;"></div>';
-    })()}
-    ${visible.length ? `<div style="margin-top:5px;color:#6b7086;font-size:0.8rem;line-height:1.4;">
+    </div>
+    <div style="margin-top:5px;color:#6b7086;font-size:0.8rem;line-height:1.4;">
       Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.
-    </div>` : ''}
+    </div>`;
+    })()}
     <div style="margin-top:8px;color:#9298b0;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
   `
   );
@@ -606,14 +610,14 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     showHours && grandHours ? fmtHours(grandHours) : null,
     grandCost ? `${fmtMoney(grandCost)} recorded cost of work shown` : null,
   ].filter(Boolean);
-  if (totalParts.length) lines.push('', `TOTAL — ${totalParts.join(' · ')}`);
-  else lines.push('');
-  // Shown whenever anything is printed, not only when there is money: a report whose recorded
-  // cost is $0 — September, with every receipt still unallocated — is precisely the one where a
-  // reader needs telling what the figure does and does not cover.
-  if (visible.length) {
-    lines.push('Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.');
+  // Same pairing as the HTML: the note qualifies the total, so neither appears without the other.
+  if (totalParts.length) {
+    lines.push('', `TOTAL — ${totalParts.join(' · ')}`,
+      'Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.');
+  } else {
+    lines.push('');
   }
+
   lines.push('', OPS_LABEL);
   return lines.join('\n');
 }
