@@ -5605,7 +5605,15 @@ async function renderBoardReport() {
     return r;
   }
 
-  async function refresh() {
+  // Changing two dates quickly used to start two refreshes; the server now serialises them,
+  // but queueing here too means the screen never draws from a half-finished pass.
+  let refreshChain = Promise.resolve();
+  function refresh() {
+    refreshChain = refreshChain.then(runRefresh, runRefresh);
+    return refreshChain;
+  }
+
+  async function runRefresh() {
     busy = true; draw();
     try {
       const before = items.length;

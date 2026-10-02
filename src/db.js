@@ -6428,7 +6428,26 @@ async function suggestFlaggedItems(reportId, passId, reported) {
 
 // One pass over every rule. Safe to re-run — that's what makes changing the period on
 // the screen cheap, and why upsert never clobbers a decision.
+// Two passes must never overlap on one report. Each pass stamps the rows it writes with its
+// own id and then deletes every row NOT carrying that id — so when two run at once, the first
+// one's prune deletes the rows the second has just written. Observed destroying 17 of 21 items
+// on the real September report, silently, after two date-change events fired in quick
+// succession. Serialised per report rather than per process, because two app containers would
+// race just as happily.
+const REFRESH_LOCK_NS = 0x62726566;   // 'bref'
+
 export async function refreshBoardReportSuggestions(reportId) {
+  const lock = await pool.connect();
+  try {
+    await lock.query('SELECT pg_advisory_lock($1, $2)', [REFRESH_LOCK_NS, Number(reportId)]);
+    return await runBoardReportSuggestions(reportId);
+  } finally {
+    await lock.query('SELECT pg_advisory_unlock($1, $2)', [REFRESH_LOCK_NS, Number(reportId)]);
+    lock.release();
+  }
+}
+
+async function runBoardReportSuggestions(reportId) {
   const report = await getBoardReport(reportId);
   if (!report) return null;
   if (report.Status === 'published') {
