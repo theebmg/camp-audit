@@ -182,7 +182,7 @@ import {
   listGroups, getGroup, createGroup, updateGroup, deleteGroup,
   findDuplicateGroups, mergeGroups, listGroupTypes, createGroupType, updateGroupType,
 } from '../db.js';
-import { sendMail, mailIsConfigured } from '../mailer.js';
+import { sendMail, mailIsConfigured, resolveFromHeaders } from '../mailer.js';
 import {
   // Aliased: gcal.js exports its own buildAuthUrl, and the two grant different scopes to
   // different products. Sharing a name here would be one typo away from asking Google for
@@ -3562,13 +3562,19 @@ router.get('/gmail/oauth/start', async (req, res, next) => {
 router.get('/gmail/status', async (req, res, next) => {
   try {
     const settings = await getMailSettings();
+    const headers = await resolveFromHeaders();
     res.json({
       ...settings,
       OAuthClientConfigured: gmailOAuthIsConfigured(),
       ClientId: OAUTH_CLIENT_ID_FOR_DISPLAY,
       RedirectUri: GMAIL_REDIRECT_URI,
-      FromAddress: process.env.MAIL_FROM_ADDRESS || null,
+      // Exactly what will appear on a sent message, resolved the same way sendMail resolves it
+      // — not a re-reading of the env vars that could drift from the real behaviour.
+      FromHeader: headers.from,
+      FromAddress: headers.fromAddress,
       FromName: process.env.MAIL_FROM_NAME || null,
+      ReplyTo: headers.replyTo,
+      AuthAccount: headers.authAccount,
     });
   } catch (e) { next(e); }
 });

@@ -8084,12 +8084,18 @@ async function renderAdminEmail(container = app) {
         accounts, so this uses OAuth: you grant permission once in the browser and the app keeps a
         refresh token. It asks for one scope — <strong>send mail</strong> — and never reads a mailbox.
       </p>
+      <p class="muted" style="font-size:0.85rem">
+        The account that signs in and the address mail comes <em>from</em> can differ. Gmail allows
+        that only when the From address is a verified <em>send mail as</em> alias on the signed-in
+        account — otherwise Google quietly rewrites the sender to the signed-in address.
+      </p>
     </div>
 
     <div class="card">
-      ${row('Connected', st.Connected ? `yes — ${st.OauthUser || 'account unknown'}` : 'no', st.Connected)}
+      ${row('Signed in as', st.AuthAccount || (st.Connected ? 'account unknown' : 'not connected'), st.Connected)}
       ${st.ConnectedAt ? row('Connected on', new Date(st.ConnectedAt).toLocaleString(), true) : ''}
-      ${row('Sends as', st.FromAddress || '(not set — falls back to the signed-in account)', Boolean(st.FromAddress))}
+      ${row('Sends as (From)', st.FromHeader || '(not set)', Boolean(st.FromAddress))}
+      ${row('Replies go to', st.ReplyTo || '(not set)', Boolean(st.ReplyTo))}
       ${row('OAuth client', st.OAuthClientConfigured ? (st.ClientId || 'configured') : 'NOT configured', st.OAuthClientConfigured)}
       ${st.LastError ? row('Last error', st.LastError, false) : ''}
     </div>
