@@ -147,7 +147,12 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
   console.log('\n## itemized prints the lines instead');
   const html2 = renderBoardReportItemsHtml({ report, items: [{ ...wo, DisplayMode: 'itemized' }, lineA, lineB], aggregates: [] });
   ok(html2.includes(`${TAG} strip`) && html2.includes(`${TAG} reshingle`), 'both lines print');
-  ok(rowCount(html2) === 3, `and all three rows render (${rowCount(html2)})`);
+  // Itemized is now ONE parent block with its lines nested inside it, not three sibling rows.
+  const nestedCount = (h) => (h.match(/padding:4px 0;font-size:0\.92rem/g) || []).length;
+  ok(rowCount(html2) === 1, `one parent block (${rowCount(html2)})`);
+  ok(nestedCount(html2) === 2, `with both lines nested inside it (${nestedCount(html2)})`);
+  ok(/border-left:3px solid/.test(html2), 'behind the connecting rail');
+  ok(nestedCount(html) === 0, 'a summary work order nests nothing');
 
   console.log('\n## the footer says what the money is, so it is not read as camp spend');
   const NOTE = 'Recorded cost of work shown, including work funded outside camp. '
