@@ -125,14 +125,18 @@ console.log('\n## a report refresh never touches a real savings record');
   ok(beforeSavings === afterSavings,
     `${JSON.parse(beforeSavings).length} real savings entr(y/ies) unchanged by a refresh`);
 
-  // And the report reads whatever he set, rather than carrying its own copy of the figure.
-  const entries = JSON.parse(afterSavings);
-  if (entries.length) {
-    const annual = entries.reduce((t, e) => t + (e.period === 'monthly' ? Number(e.amount) * 12 : Number(e.amount)), 0);
-    const agg = (await db.listBoardReportAggregates(1)).find((a) => /Recurring savings secured this period/.test(a.Label));
-    ok(agg && Math.abs(Number(agg.ValueNumeric) - annual) < 0.005,
-      `the header states $${agg?.ValueNumeric}/yr, which is what his entries add up to`);
-  }
+  // And the report reads the entries rather than carrying its own copy of the figure. Mirrors
+  // the aggregate's own rule exactly — recurring, inside the period — including this test's own
+  // scratch admin task, which legitimately contributes a saving while it exists.
+  const period = (await db.pool.query('SELECT period_start::text ps, period_end::text pe FROM board_reports WHERE id = 1')).rows[0];
+  const expected = Number((await db.pool.query(
+    `SELECT COALESCE(SUM(CASE WHEN period = 'monthly' THEN amount * 12 ELSE amount END), 0) AS annualized
+     FROM savings_entries WHERE kind = 'recurring' AND occurred_on BETWEEN $1 AND $2`,
+    [period.ps, period.pe]
+  )).rows[0].annualized);
+  const agg = (await db.listBoardReportAggregates(1)).find((a) => /Recurring savings secured this period/.test(a.Label));
+  ok(agg && Math.abs(Number(agg.ValueNumeric) - expected) < 0.005,
+    `the header states $${agg?.ValueNumeric}/yr, matching the entries in the period ($${expected})`);
 }
 
 console.log('\n## no existing expense was reassigned');
