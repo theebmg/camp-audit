@@ -97,7 +97,7 @@ import {
   setBoardReportItemIncluded,
   setBoardReportItemFields,
   listBoardReportAggregates,
-  publishBoardReport,
+  publishBoardReport, unpublishBoardReport,
   recordBoardReportOutput,
   listBoardReportOutputs,
   getBoardReportOutput,
@@ -2225,6 +2225,19 @@ router.post('/board-reports/:id(\\d+)/refresh', async (req, res, next) => {
     const result = await refreshBoardReportSuggestions(req.params.id);
     if (!result) return res.status(404).json({ ok: false, error: 'Not found' });
     res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
+// Undo a publish. Admin only: it returns a report the board has already been given to an
+// editable state, which is not a thing to leave to a mis-tap.
+router.post('/board-reports/:id(\\d+)/unpublish', async (req, res, next) => {
+  try {
+    if (currentRole() !== 'admin') {
+      return res.status(403).json({ ok: false, error: 'Only an admin can unpublish a report.' });
+    }
+    const result = await unpublishBoardReport(req.params.id);
+    if (!result.ok) return res.status(result.error === 'Not found' ? 404 : 409).json(result);
+    res.json(result);
   } catch (e) { next(e); }
 });
 
