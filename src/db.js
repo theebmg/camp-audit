@@ -6526,6 +6526,7 @@ function boardReportRowShape(r) {
     ForwardStart: r.forward_start_text || r.forward_start,
     ForwardEnd: r.forward_end_text || r.forward_end,
     SummaryNotes: r.summary_notes,
+    ShowHours: r.show_hours === true,
     CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
   };
 }
@@ -6568,8 +6569,14 @@ export async function getOrCreateDraftBoardReport() {
   const p = await defaultBoardReportPeriods();
   const title = new Date(p.periodEnd).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   const { rows } = await pool.query(
-    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end)
-     VALUES ($1,'draft',$2,$3,$4,$5) RETURNING id`,
+    // show_hours carries over from the most recent report rather than resetting: whoever turned
+    // hours on last month almost certainly wants them on again, and the alternative is
+    // rediscovering the toggle every month. Falls back to false when this is the first report.
+    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end, show_hours)
+     VALUES ($1,'draft',$2,$3,$4,$5,
+             COALESCE((SELECT show_hours FROM board_reports
+                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), false))
+     RETURNING id`,
     [title, p.periodStart, p.periodEnd, p.forwardStart, p.forwardEnd]
   );
   return getBoardReport(rows[0].id);
@@ -6590,6 +6597,7 @@ export async function listBoardReports() {
 const BOARD_REPORT_UPDATE_COLUMNS = {
   title: 'title', periodStart: 'period_start', periodEnd: 'period_end',
   forwardStart: 'forward_start', forwardEnd: 'forward_end', summaryNotes: 'summary_notes',
+  showHours: 'show_hours',
 };
 // Published reports are read-only: a report the board has already seen must not change
 // underneath them, which is the entire point of publishing.

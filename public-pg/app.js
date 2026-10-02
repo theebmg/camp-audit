@@ -5519,6 +5519,17 @@ async function renderBoardReport() {
           <p class="field-error" id="brFwdTo-err"></p>
           <p class="muted" style="margin-top:2px;font-size:0.8rem">Defaults to the same length as the period covered.</p>
         </div>
+        <div class="field-row">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
+            <input type="checkbox" id="brShowHours" ${report.ShowHours ? 'checked' : ''} ${published ? 'disabled' : ''} />
+            Show hours on this report
+          </label>
+          <p class="muted" style="margin:2px 0 0;font-size:0.8rem">
+            Off by default. Hours are always recorded on the work either way — this only decides
+            whether the board sees them. A new report starts with whatever the last one used.
+          </p>
+          <p class="field-error" id="brShowHours-err"></p>
+        </div>
         ${published ? '' : `<div class="btn-row">
           <button type="button" class="btn btn-secondary" id="brRefresh" ${busy ? 'disabled' : ''}>${busy ? 'Working…' : 'Refresh suggestions'}</button>
           <button type="button" class="btn btn-secondary" id="brAddItem">＋ Add item</button>
@@ -5759,6 +5770,17 @@ async function renderBoardReport() {
         });
       }
     }
+    document.getElementById('brShowHours')?.addEventListener('change', async (e) => {
+      clearFieldError('brShowHours');
+      try {
+        await patchReport({ showHours: e.target.checked });
+        draw();
+      } catch (err) {
+        // Put the tick back: nothing was typed, so showing the real state is honest.
+        e.target.checked = !e.target.checked;
+        showFieldError('brShowHours', saveErrorMessage(err));
+      }
+    });
     mountSummaryEditor(report, async (html) => {
       // "Saved as you type" was true only when it worked; a failure said nothing at all.
       try { await patchReport({ summaryNotes: html }); clearFieldError('brSummary'); }

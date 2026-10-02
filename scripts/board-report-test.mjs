@@ -171,6 +171,50 @@ console.log('\n## the footer note appears even when the recorded cost is zero');
   ok(!/\$379/.test(html.split('Total')[1] || ''), 'and the estimate is still not in the total');
 }
 
+console.log('\n## Show hours: off by default, and off means off everywhere');
+{
+  const { renderBoardReportItemsHtml, renderBoardReportItemsText } = await import('/app/src/reportRender.js');
+  const items = [
+    { Id: 960, ItemType: 'work_order', ItemId: 88, Section: 'done', Included: true, DisplayMode: 'summary',
+      SnapTitle: `${TAG} Roof`, SnapCost: 1200, SnapHours: 4, SnapStartDate: '2026-09-05', SnapDate: '2026-09-23' },
+    { Id: 961, ItemType: 'admin_task', ItemId: 12, Section: 'admin_work', Included: true,
+      SnapTitle: `${TAG} Phones`, SnapHours: 2.5 },
+  ];
+  const base = { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft' };
+
+  const offHtml = renderBoardReportItemsHtml({ report: { ...base }, items, aggregates: [] });
+  const offText = renderBoardReportItemsText({ report: { ...base }, items, aggregates: [] });
+  ok(!/\b4h\b|\b2\.5h\b|6\.5h/.test(offHtml), 'no hours anywhere in the HTML when the toggle is off');
+  ok(!/\b4h\b|\b2\.5h\b|6\.5h/.test(offText), 'none in the plain-text copy either');
+  ok(offHtml.includes('$1,200'), 'money is untouched by the hours toggle');
+
+  const onHtml = renderBoardReportItemsHtml({ report: { ...base, ShowHours: true }, items, aggregates: [] });
+  const onText = renderBoardReportItemsText({ report: { ...base, ShowHours: true }, items, aggregates: [] });
+  ok(/4h/.test(onHtml) && /2\.5h/.test(onHtml), 'turning it on brings the item hours back in HTML');
+  ok(/6\.5h/.test(onHtml), 'and the footer total');
+  ok(/4h/.test(onText) && /6\.5h/.test(onText), 'and in the plain-text copy');
+
+  console.log('\n## the item count is gone from the footer');
+  ok(!/Total\s*\u2014\s*\d+\s*item/.test(onHtml) && !/item\(s\)/.test(onHtml.split('Total')[1] || ''),
+    'the HTML footer no longer tallies rows');
+  ok(!/TOTAL\s*\u2014\s*\d+\s*item/.test(onText), 'nor does the plain-text one');
+  ok(/Total\s*\u2014\s*6\.5h/.test(onHtml.replace(/\s+/g, ' ')), 'the footer leads with what is left');
+
+  console.log('\n## one-day work says Completed once, not a span of nothing');
+  const sameDay = [{ Id: 962, ItemType: 'job_line', ItemId: 3, Section: 'done', Included: true,
+    SnapTitle: `${TAG} same day`, SnapStartDate: '2026-09-23', SnapDate: '2026-09-23' }];
+  const sdHtml = renderBoardReportItemsHtml({ report: { ...base }, items: sameDay, aggregates: [] });
+  const sdText = renderBoardReportItemsText({ report: { ...base }, items: sameDay, aggregates: [] });
+  ok(!/Started/.test(sdHtml), 'no "Started" when it began and finished the same day');
+  ok(/Completed/.test(sdHtml), 'just "Completed"');
+  ok(!/Started/.test(sdText) && /Completed/.test(sdText), 'same in the plain-text copy');
+  const spanHtml = renderBoardReportItemsHtml({ report: { ...base }, items, aggregates: [] });
+  ok(/Started/.test(spanHtml) && /Completed/.test(spanHtml), 'a real span still shows both ends');
+  const openHtml = renderBoardReportItemsHtml({ report: { ...base },
+    items: [{ ...sameDay[0], SnapDate: null }], aggregates: [] });
+  ok(/Started/.test(openHtml) && /In progress/.test(openHtml), 'and open work still reads In progress');
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(

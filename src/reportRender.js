@@ -460,19 +460,26 @@ function itemPhotosHtml(photos) {
     </table>`;
 }
 
-function itemLineHtml(it) {
+// "Started 9/5 · Completed 9/23", or "Completed 9/23" when it began and finished the same day —
+// a span of one day is not a span, and printing both halves of it reads as a mistake.
+function itemDatesText(it) {
+  if (!it.SnapStartDate) return it.SnapDate ? fmtDate(it.SnapDate) : null;
+  if (!it.SnapDate) return `Started ${fmtDate(it.SnapStartDate)} · In progress`;
+  if (String(it.SnapStartDate) === String(it.SnapDate)) return `Completed ${fmtDate(it.SnapDate)}`;
+  return `Started ${fmtDate(it.SnapStartDate)} · Completed ${fmtDate(it.SnapDate)}`;
+}
+
+function itemLineHtml(it, showHours = false) {
   // Dates read as a span rather than a single stamp (decisions §7): when something started
   // and whether it has finished is more use to a board than one undated figure.
-  const dates = it.SnapStartDate
-    ? `Started ${fmtDate(it.SnapStartDate)} · ${it.SnapDate ? `Completed ${fmtDate(it.SnapDate)}` : 'In progress'}`
-    : (it.SnapDate ? fmtDate(it.SnapDate) : null);
+  const dates = itemDatesText(it);
   // Money: actual only, and only when there is one. An estimate is labelled "est." and shown
   // on open work alongside it — never instead of it and never summed (decisions §2, §3).
   const money = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
   const est = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
   const bits = [
     it.SnapAssetName, it.SnapStatus, dates,
-    it.SnapHours != null ? fmtHours(it.SnapHours) : null,
+    showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
     money, est,
   ].filter(Boolean);
   // "Camp $1,000 · Personal $240" — who actually paid, from the receipts allocated to the work.
@@ -504,7 +511,7 @@ function itemLineHtml(it) {
 
 // A summary work order prints one line and swallows its job lines; an itemized one
 // prints its lines instead. Summary is the default for every WO (§6).
-function sectionHtml(section, items) {
+function sectionHtml(section, items, showHours = false) {
   if (!items.some((i) => i.Section === section && i.Included)) return '';
   // One rule, shared with the footer, so a section subtotal and the grand total can never
   // disagree about what counts again.
@@ -512,13 +519,13 @@ function sectionHtml(section, items) {
   if (!visible.length) return '';
   const hours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
   const cost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
-  const sub = [hours ? fmtHours(hours) : null, cost ? fmtMoney(cost) : null].filter(Boolean).join(' · ');
+  const sub = [showHours && hours ? fmtHours(hours) : null, cost ? fmtMoney(cost) : null].filter(Boolean).join(' · ');
   return `
     <h2 style="margin:26px 0 4px;font-size:1.1rem;border-top:2px solid #eef0f6;padding-top:14px;">
       ${escapeHtml(SECTION_TITLES[section] || section)}
       <span style="color:#6b7086;font-weight:400;font-size:0.85rem;"> — ${visible.length} item(s)${sub ? ` · ${sub}` : ''}</span>
     </h2>
-    ${visible.map(itemLineHtml).join('')}`;
+    ${visible.map((it) => itemLineHtml(it, showHours)).join('')}`;
 }
 
 // What the reader can actually see: included, minus the job lines their work order is
@@ -535,6 +542,9 @@ function visibleItems(items) {
 
 export function renderBoardReportItemsHtml({ report, items, aggregates, reportPhotos = [] }) {
   const sections = ['done', 'coming_up', 'overdue', 'admin_work'];
+  // Off unless this report says otherwise. Hours stay recorded on the work either way — this
+  // only decides whether the board sees them.
+  const showHours = report.ShowHours === true;
   const visible = visibleItems(items);
   const grandHours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
   const grandCost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
@@ -544,13 +554,20 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
     `
     ${moneyHeaderHtml(aggregates)}
     ${report.SummaryNotes ? `<div style="background:#fbfbfe;border:1px solid #eef0f6;border-radius:10px;padding:14px;margin-bottom:6px;">${plainSummaryToHtml(report.SummaryNotes)}</div>` : ''}
-    ${sections.map((sec) => sectionHtml(sec, items)).join('')}
+    ${sections.map((sec) => sectionHtml(sec, items, showHours)).join('')}
     ${Array.isArray(reportPhotos) && reportPhotos.length ? `
       <h2 style="margin:26px 0 4px;font-size:1.1rem;border-top:2px solid #eef0f6;padding-top:14px;">Other photos this month</h2>
       ${itemPhotosHtml(reportPhotos)}` : ''}
-    <div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
-      Total — ${visible.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}
-    </div>
+    ${(() => {
+      // The item count is gone from the footer: a board reads the work, not a tally of rows.
+      const parts = [
+        showHours && grandHours ? fmtHours(grandHours) : null,
+        grandCost ? `${fmtMoney(grandCost)} recorded cost of work shown` : null,
+      ].filter(Boolean);
+      return parts.length ? `<div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
+      Total — ${parts.join(' · ')}
+    </div>` : '<div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;"></div>';
+    })()}
     ${visible.length ? `<div style="margin-top:5px;color:#6b7086;font-size:0.8rem;line-height:1.4;">
       Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.
     </div>` : ''}
@@ -560,6 +577,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
 }
 
 export function renderBoardReportItemsText({ report, items, aggregates }) {
+  const showHours = report.ShowHours === true;
   const lines = [`CAMP SYCHAR — BOARD REPORT — ${report.Title}`,
     `${report.PeriodStart} to ${report.PeriodEnd} (ahead to ${report.ForwardEnd})${report.Status === 'draft' ? ' — DRAFT' : ''}`, ''];
   for (const a of aggregates.filter((x) => ['money', 'savings'].includes(x.GroupKey))) {
@@ -570,9 +588,12 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
   for (const sec of ['done', 'coming_up', 'overdue', 'admin_work']) {
     const rows = visible.filter((i) => i.Section === sec);
     if (!rows.length) continue;
-    lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${rows.length}):`);
+    const secHours = rows.reduce((t, i) => t + (i.SnapHours || 0), 0);
+    lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${rows.length})`
+      + `${showHours && secHours ? ` · ${fmtHours(secHours)}` : ''}:`);
     for (const it of rows) {
-      const bits = [it.SnapAssetName, it.SnapDate ? fmtDate(it.SnapDate) : null,
+      const bits = [it.SnapAssetName, itemDatesText(it),
+        showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
         it.SnapCost != null ? fmtMoney(it.SnapCost) : null].filter(Boolean);
       lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
       if (it.ReportNote) lines.push(`      ${it.ReportNote}`);
@@ -580,9 +601,13 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
   }
   const grandCost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
   const grandHours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
-  lines.push('', `TOTAL — ${visible.length} item(s)`
-    + `${grandHours ? ` · ${fmtHours(grandHours)}` : ''}`
-    + `${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}`);
+  // Same two rules as the HTML footer: no item count, and hours only when asked for.
+  const totalParts = [
+    showHours && grandHours ? fmtHours(grandHours) : null,
+    grandCost ? `${fmtMoney(grandCost)} recorded cost of work shown` : null,
+  ].filter(Boolean);
+  if (totalParts.length) lines.push('', `TOTAL — ${totalParts.join(' · ')}`);
+  else lines.push('');
   // Shown whenever anything is printed, not only when there is money: a report whose recorded
   // cost is $0 — September, with every receipt still unallocated — is precisely the one where a
   // reader needs telling what the figure does and does not cover.
