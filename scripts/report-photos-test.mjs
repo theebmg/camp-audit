@@ -19,7 +19,13 @@ const REPORT = Number(process.argv[2]) || (await db.getOrCreateDraftBoardReport(
 const beforeRows = (await db.pool.query('SELECT * FROM board_report_photos WHERE report_id=$1', [REPORT])).rows;
 const cand0 = await db.listBoardReportPhotoCandidates(REPORT);
 const photos = cand0.flatMap((g) => g.Photos.map((p) => ({ ...p, ItemId: g.ItemId, ItemTitle: g.Title })));
-if (photos.length < 2) { console.log('not enough photos on report 1 to test'); process.exit(0); }
+if (photos.length < 2) {
+  // Not a pass. Everything already published is not proposed onto a new draft, so a fresh
+  // report can have no photos at all — say so rather than exiting green.
+  console.log(`SKIPPED — report ${REPORT} has ${photos.length} photo(s); needs 2.`);
+  console.log('Run against a report that has them:  node scripts/report-photos-test.mjs <reportId>');
+  process.exit(0);
+}
 const [pA, pB] = photos;
 const origRoles = (await db.pool.query(
   'SELECT id, role_id, include_in_report FROM attachment_links WHERE id = ANY($1) ORDER BY id',
