@@ -41,7 +41,11 @@ const after = roles.find((r) => /after/i.test(r.Name));
 const woItem = (await db.pool.query(
   `SELECT id, item_id, snap_title FROM board_report_items
    WHERE report_id=$1 AND item_type='work_order' AND included ORDER BY id LIMIT 1`, [REPORT])).rows[0];
-if (!woItem) { console.log('no work-order item on report 1 — nothing to test'); process.exit(0); }
+if (!woItem) {
+  console.log(`SKIPPED — report ${REPORT} has no work-order item.`);
+  console.log('Run against a report that has one:  node scripts/report-photos-levels-test.mjs <reportId>');
+  process.exit(0);
+}
 console.log(`using item "${woItem.snap_title}" (work order ${woItem.item_id})`);
 
 try {
