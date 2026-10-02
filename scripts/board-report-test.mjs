@@ -135,7 +135,9 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
   ok(!html.includes(`${TAG} strip`) && !html.includes(`${TAG} reshingle`),
     'and its lines do NOT print separately');
   // Counting rendered rows directly, now that the footer no longer tallies them.
-  const rowCount = (h) => (h.match(/border-bottom:1px solid #eef0f6;padding:9px 0;/g) || []).length;
+  // Counts item blocks by their padding signature rather than their colour, so a palette change
+  // does not read as a layout regression.
+  const rowCount = (h) => (h.match(/padding:9px 0;/g) || []).length;
   ok(rowCount(html) === 1, `one row reaches the reader, not three (${rowCount(html)})`);
   ok(html.includes('$1,200'), 'the total is the rolled-up actual');
   ok(!html.includes('$2,400'), 'the lines are not double counted on top of the row');

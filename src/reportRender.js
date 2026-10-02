@@ -505,7 +505,8 @@ function nestedLineHtml(it, showHours = false) {
     itemDatesText(it),
     showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
     it.SnapCost ? fmtMoney(it.SnapCost) : null,
-    it.SnapCost ? null : (it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null),
+    // "est. on open items only" — the same rule the work order row above it uses.
+    !it.SnapCost && !it.SnapDate && it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null,
   ].filter(Boolean);
   return `
     <div style="padding:4px 0;font-size:0.92rem;color:#474d66;">
@@ -710,14 +711,14 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     const lineBits = (it) => [itemDatesText(it),
       showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
       it.SnapCost ? fmtMoney(it.SnapCost) : null,
-      it.SnapCost ? null : (it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null)].filter(Boolean);
+      !it.SnapCost && !it.SnapDate && it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null].filter(Boolean);
 
     for (const it of rows) {
       if (it.ItemType === 'job_line' && !orphans.includes(it)) continue;   // nested below
       const bits = [it.SnapAssetName, itemDatesText(it),
         showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
         it.SnapCost ? fmtMoney(it.SnapCost) : null,
-        it.SnapCost ? null : (it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null)].filter(Boolean);
+        !it.SnapCost && !it.SnapDate && it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null].filter(Boolean);
       lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
       if (it.ItemType === 'work_order') {
         // Indented with a dash, which is as much of a connecting rail as plain text allows.

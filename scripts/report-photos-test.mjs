@@ -66,8 +66,15 @@ try {
   }
   const labels = sel.map((p) => buildPhotoLabel({ rolePrefix: p.RolePrefix, description: p.Description }));
   ok(labels.every((l) => l.length > 0), 'none is empty');
-  ok(new Set(labels).size === labels.length || labels.length < 2,
-    'the before and the after read differently, so the board can tell them apart');
+  // Only the two photos THIS test roled are under test. Real photos already on the report may
+  // legitimately share a caption — ten shots of one job all roled Before all read the same, and
+  // that is a data-entry matter for Ben, not a failure of the renderer.
+  const labelOf = (id) => {
+    const p = sel.find((x) => x.AttachmentId === id);
+    return p ? buildPhotoLabel({ rolePrefix: p.RolePrefix, description: p.Description }) : null;
+  };
+  ok(labelOf(pA.AttachmentId) !== labelOf(pB.AttachmentId),
+    `the before and the after read differently: "${labelOf(pA.AttachmentId)}" vs "${labelOf(pB.AttachmentId)}"`);
 
   console.log('\n## an email copy is built, captioned, and smaller');
   const one = sel[0];
