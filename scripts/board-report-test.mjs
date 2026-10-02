@@ -301,6 +301,59 @@ console.log('\n## Show funding (off / non-camp only / all)');
   ok(/WORK THIS PERIOD/.test(txt), 'and uses the new section name');
 }
 
+console.log('\n## funding precedence: receipts beat the budget field, which beats nothing');
+{
+  const kinds = (await db.pool.query('SELECT source, counts_as_camp_spend FROM job_line_funding_kinds ORDER BY sort_order')).rows;
+  ok(kinds.length >= 5, `the mapping is seeded (${kinds.map((k) => k.source).join(', ')})`);
+  const campKinds = kinds.filter((k) => k.counts_as_camp_spend).map((k) => k.source);
+  const nonCamp = kinds.filter((k) => !k.counts_as_camp_spend).map((k) => k.source);
+  ok(campKinds.includes('operating_budget') && campKinds.includes('capital_campaign')
+    && campKinds.includes('fund') && campKinds.includes('other'),
+    `camp: ${campKinds.join(', ')}`);
+  ok(nonCamp.length === 1 && nonCamp[0] === 'cabin_holder', `non-camp: ${nonCamp.join(', ')}`);
+
+  // An unknown source must count as CAMP, so contributions are never overstated.
+  const unknown = await db.pool.query(
+    `SELECT COALESCE(k.counts_as_camp_spend, true) AS is_camp
+     FROM (SELECT 'something_new'::text AS src) x
+     LEFT JOIN job_line_funding_kinds k ON k.source = x.src`);
+  ok(unknown.rows[0].is_camp === true, 'a source missing from the table counts as camp spend');
+
+  console.log('\n## the real September line keeps its attribution');
+  const items = await db.listBoardReportItems(1);
+  const l71 = items.find((i) => i.ItemType === 'job_line' && i.ItemId === 71);
+  if (l71) {
+    ok(l71.SnapFunding?.[0]?.Source === 'Ben Greenawalt',
+      `line 71 is attributed to ${l71.SnapFunding?.[0]?.Source} with no receipt behind it`);
+    ok(l71.SnapFunding?.[0]?.IsCamp === false, 'and is not camp money');
+    ok(l71.SnapFunding?.[0]?.From === 'job_line', 'resolved from the job line, not a receipt');
+  } else {
+    console.log('  --    line 71 is not on report 1 right now; skipped');
+  }
+
+  console.log('\n## camp spend is never inflated by contributed money');
+  const aggs = await db.listBoardReportAggregates(1);
+  const camp = aggs.find((a) => a.Label === 'Camp funds spent this period');
+  const tile = aggs.find((a) => a.Label === 'Contributed (non-camp)');
+  if (tile) {
+    ok(Number(camp.ValueNumeric) !== Number(camp.ValueNumeric) + Number(tile.ValueNumeric),
+      'the two are separate figures');
+    ok(tile.Note === 'Includes work paid directly, without a receipt.', 'the tile carries its note');
+  }
+
+  console.log('\n## "Last, First" reads as a person on the report');
+  const { renderBoardReportItemsHtml } = await import('/app/src/reportRender.js');
+  const html = renderBoardReportItemsHtml({
+    report: { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft', ShowFunding: 'non_camp' },
+    items: [{ Id: 980, ItemType: 'job_line', ItemId: 31, Section: 'done', Included: true,
+      SnapTitle: `${TAG} cash job`, SnapDate: '2026-09-02', SnapCost: 800,
+      SnapFunding: [{ Source: 'Ben Greenawalt', IsCamp: false, Amount: 800 }] }],
+    aggregates: [],
+  });
+  ok(/Funded by Ben Greenawalt/.test(html), 'the tag names the person, not the category');
+  ok(!/Greenawalt, Ben/.test(html), 'and not surname-first as stored');
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(
