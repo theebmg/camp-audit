@@ -552,13 +552,8 @@ console.log('\n## a fund-charged receipt linked to work keeps its fund');
     ok(stamped.funding_source === 'fund' && stamped.funding_ref_id === fund.id,
       `the allocation is stamped with the fund, not the line's category (${stamped.funding_source})`);
 
-    const roll = await db.workOrderRollupForReportForTest
-      ? null
-      : null;   // the rollup is private; check through the resolver's own output instead
-    const rep = await db.listBoardReportItems(1);   // not used; keeps the shape obvious
-    void roll; void rep;
-
-    // What the report would say about that line.
+    // What the report resolves for that line. The rollup itself is module-private, so this
+    // asserts the same precedence the report applies.
     const { rows: resolved } = await db.pool.query(
       `SELECT COALESCE(f.name, 'none') AS source
        FROM expense_allocations ea
