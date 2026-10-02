@@ -107,10 +107,33 @@ const t2 = await db.getAdminTask(task.Id);
 ok(t2.TaskDate === p.periodStart && t2.CompletedDate === p.periodEnd,
   `started ${t2.TaskDate}, completed ${t2.CompletedDate}`);
 
-console.log('\n## the existing September savings record is untouched');
-const real = (await db.pool.query('select amount, old_cost, new_cost from savings_entries where id = 2')).rows[0];
-ok(real && Number(real.amount) === 270, `still $${real?.amount}/month, as Ben left it`);
-ok(real && real.old_cost === null && real.new_cost === null, 'and was not back-filled');
+console.log('\n## a report refresh never touches a real savings record');
+// This used to pin savings_entries id 2 to $270 — which broke the moment Ben corrected the
+// figure himself, exactly as he said he would. The guarantee is not "the number is 270", it is
+// "we do not write to his savings". So: snapshot every real entry, run the thing most likely to
+// rewrite them, and compare.
+{
+  const realSavings = () => db.pool.query(
+    `SELECT s.id, s.amount, s.period, s.old_cost, s.new_cost, s.occurred_on::text, s.kind
+     FROM savings_entries s
+     WHERE s.source_type IS DISTINCT FROM 'admin_task'
+        OR s.source_id NOT IN (SELECT id FROM admin_tasks WHERE title LIKE $1)
+     ORDER BY s.id`, [`${TAG}%`]);
+  const beforeSavings = JSON.stringify((await realSavings()).rows);
+  await db.refreshBoardReportSuggestions(1);
+  const afterSavings = JSON.stringify((await realSavings()).rows);
+  ok(beforeSavings === afterSavings,
+    `${JSON.parse(beforeSavings).length} real savings entr(y/ies) unchanged by a refresh`);
+
+  // And the report reads whatever he set, rather than carrying its own copy of the figure.
+  const entries = JSON.parse(afterSavings);
+  if (entries.length) {
+    const annual = entries.reduce((t, e) => t + (e.period === 'monthly' ? Number(e.amount) * 12 : Number(e.amount)), 0);
+    const agg = (await db.listBoardReportAggregates(1)).find((a) => /Recurring savings secured this period/.test(a.Label));
+    ok(agg && Math.abs(Number(agg.ValueNumeric) - annual) < 0.005,
+      `the header states $${agg?.ValueNumeric}/yr, which is what his entries add up to`);
+  }
+}
 
 console.log('\n## no existing expense was reassigned');
 const unassigned = (await db.pool.query(
