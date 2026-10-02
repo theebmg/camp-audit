@@ -4677,6 +4677,14 @@ async function renderExpenseDetail({ id } = {}) {
       assetId: selectedAsset?.Id || null,
       notes: fd.get('notes') || null,
     };
+    // Before saving: is this charge already on the books? Checked at the moment a destination
+    // and an amount both exist, because that is when a duplicate becomes possible — a job line's
+    // cost is its typed figure PLUS its receipts, added, so linking a receipt to a line that
+    // already carries the same number counts one charge twice.
+    if (payload.amount && (payload.jobLineId || payload.workOrderId)) {
+      const proceed = await checkForDuplicateCharge(payload, id);
+      if (!proceed) return;
+    }
     try {
       if (id) {
         await api(`/api/pg/expenses/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
@@ -9193,6 +9201,72 @@ async function loadReportFunds(reportId) {
       showFieldError('brFunds', saveErrorMessage(err));
     }
   }));
+}
+
+// Warn before one charge is recorded twice.
+//
+// Returns true to carry on saving, false to stop. When Ben says two records are the same
+// charge, the receipt is linked and the typed figure is cleared together, so the money is
+// counted once and now has evidence behind it.
+async function checkForDuplicateCharge(payload, expenseId) {
+  let found;
+  try {
+    const qs = new URLSearchParams({ amount: String(payload.amount) });
+    if (expenseId) qs.set('expenseId', String(expenseId));
+    if (payload.jobLineId) qs.set('jobLineId', String(payload.jobLineId));
+    if (payload.workOrderId) qs.set('workOrderId', String(payload.workOrderId));
+    if (payload.purchaseDate) qs.set('purchaseDate', payload.purchaseDate);
+    found = await api(`/api/pg/expenses/duplicate-check?${qs}`);
+  } catch {
+    return true;   // the check is a courtesy; never block a save because it failed
+  }
+
+  const money = (n) => `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+  // A job line already carrying this exact figure, typed in by hand.
+  const typed = (found.typedCosts || [])[0];
+  if (typed) {
+    const answer = await confirmDialog(
+      `${typed.Title} already has ${money(typed.Amount)} recorded as its cost, typed in directly.\n\n`
+      + 'Is this receipt that same charge?\n\n'
+      + 'If it is, the receipt will be attached to that line and the typed figure removed, so the '
+      + 'cost is counted once with the receipt as its evidence. If it is a separate charge, the '
+      + 'two will be added together.',
+      { confirmLabel: 'Yes — same charge', cancelLabel: 'No — separate charge', danger: false }
+    );
+    if (answer) {
+      try {
+        // The expense has to exist before it can be linked.
+        let realId = expenseId;
+        if (!realId) {
+          const { expense } = await api('/api/pg/expenses', { method: 'POST', body: JSON.stringify({ ...payload, jobLineId: null, workOrderId: null }) });
+          realId = expense.Id;
+        } else {
+          await api(`/api/pg/expenses/${realId}`, { method: 'PATCH', body: JSON.stringify({ ...payload, jobLineId: null, workOrderId: null }) });
+        }
+        await api(`/api/pg/expenses/${realId}/same-charge`, {
+          method: 'POST', body: JSON.stringify({ jobLineId: typed.JobLineId }),
+        });
+        toast(`Linked to ${typed.Title}. The typed ${money(typed.Amount)} was replaced by this receipt.`, 9000);
+        go('expenseDetail', { id: realId }, { replace: true });
+      } catch (err) { toast(saveErrorMessage(err), 9000); }
+      return false;   // handled here
+    }
+  }
+
+  // Another receipt for the same amount at about the same time.
+  const dupe = (found.receipts || [])[0];
+  if (dupe) {
+    const go2 = await confirmDialog(
+      `There is already a receipt for ${money(dupe.Amount)} on ${dupe.PurchaseDate}`
+      + `${dupe.Vendor ? ` from ${dupe.Vendor}` : ''}`
+      + `${dupe.Allocations ? ', already linked to work' : ', not yet linked to anything'}.\n\n`
+      + 'Save this one as well?',
+      { confirmLabel: 'Yes, it is a different charge', cancelLabel: 'Cancel', danger: false }
+    );
+    if (!go2) return false;
+  }
+  return true;
 }
 
 // ---------- Board report photos (Part 2A / 2B) ----------

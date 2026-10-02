@@ -70,6 +70,25 @@ const unalloc = (await db.pool.query(
      AND e.purchase_date BETWEEN $1 AND $2
      AND NOT EXISTS (SELECT 1 FROM expense_allocations ea WHERE ea.expense_id = e.id)`,
   [report.PeriodStart, report.PeriodEnd])).rows[0];
+// A charge recorded twice reads as two charges. Worth saying before anyone signs the figure off.
+const dupes = (await db.pool.query(`
+  SELECT jl.id, left(jl.title, 38) AS title, jl.actual_cost,
+         e.id AS expense_id, e.vendor, e.purchase_date::text AS purchase_date,
+         (SELECT count(*)::int FROM expense_allocations ea WHERE ea.expense_id = e.id) AS allocated
+  FROM job_lines jl
+  JOIN expenses e ON ROUND(e.amount, 2) = ROUND(jl.actual_cost, 2)
+  WHERE jl.actual_cost IS NOT NULL AND e.deleted_at IS NULL AND e.triage_status <> 'void'
+  ORDER BY jl.id`)).rows;
+if (dupes.length) {
+  console.log('\nPOSSIBLE DOUBLE COUNTS — one charge recorded in two places');
+  for (const d of dupes) {
+    console.log(`  ${d.title}  typed ${money(d.actual_cost)}`);
+    console.log(`      also receipt #${d.expense_id} ${d.vendor || ''} ${d.purchase_date}`
+      + ` (${d.allocated ? 'linked to work' : 'not linked to anything'})`);
+  }
+  console.log('  If either pair is one charge, say so on the expense and the typed figure is replaced.');
+}
+
 console.log(`\nWHY THE RECORDED COST IS WHAT IT IS`);
 console.log(`  ${unalloc.n} receipt(s) totalling ${money(unalloc.total)} in this period are not split onto any job line,`);
 console.log(`  so no work can claim them as actual cost. Splitting them is what turns the`);
