@@ -497,6 +497,50 @@ console.log('\n## approved funds print under the header, not in it');
   ok(!/Approved Funds/i.test(none), 'and a report with no fund activity shows nothing');
 }
 
+console.log('\n## the footer breaks the cost down by funder');
+{
+  const { renderBoardReportItemsHtml, renderBoardReportItemsText } = await import('/app/src/reportRender.js');
+  const base = { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft', ShowFunding: 'non_general' };
+  const items = [
+    { Id: 981, ItemType: 'work_order', ItemId: 95, Section: 'done', Included: true, DisplayMode: 'summary',
+      SnapTitle: `${TAG} job`, SnapDate: '2026-09-20', SnapCost: 1399.4,
+      SnapFunding: [
+        { Source: 'Ben Greenawalt', IsCamp: false, IsGeneral: false, Amount: 1100 },
+        { Source: 'Discretionary Audit Fund', IsCamp: true, IsGeneral: false, Amount: 299.4 },
+      ] },
+  ];
+  const html = renderBoardReportItemsHtml({ report: base, items, aggregates: [] }).replace(/\s+/g, ' ');
+  const txt = renderBoardReportItemsText({ report: base, items, aggregates: [] });
+
+  ok(/Cost of work shown: \$1,399\.40/.test(html), 'the footer states the cost under its own label');
+  ok(/Ben Greenawalt \$1,100/.test(html) && /Discretionary Audit Fund \$299\.40/.test(html),
+    'and breaks it down by funder');
+  ok(!/Not camp spend/.test(html) && !/estimates excluded/.test(html), 'the old disclaimer is gone');
+  ok(/not the camp.s official books/i.test(html), 'but the official-books line stays');
+  ok(/COST OF WORK SHOWN: \$1,399\.40/.test(txt) && /Ben Greenawalt \$1,100/.test(txt),
+    'the plain-text copy carries both');
+
+  console.log('\n## the parts always add up to the whole');
+  const gap = [{ ...items[0], SnapCost: 1599.4 }];   // $200 with no funding recorded against it
+  const gapHtml = renderBoardReportItemsHtml({ report: base, items: gap, aggregates: [] }).replace(/\s+/g, ' ');
+  ok(/Unattributed \$200/.test(gapHtml),
+    'a cost with no funder is shown as Unattributed rather than quietly dropped');
+
+  console.log('\n## $0 categories are hidden');
+  const zero = [{ ...items[0], SnapFunding: [...items[0].SnapFunding, { Source: 'Donor', IsCamp: false, IsGeneral: false, Amount: 0 }] }];
+  ok(!/Donor/.test(renderBoardReportItemsHtml({ report: base, items: zero, aggregates: [] })),
+    'a funder with nothing against it does not appear');
+
+  console.log('\n## the general pot is named for the reader');
+  const gen = [{ ...items[0], SnapFunding: [{ Source: 'Operating Budget', IsCamp: true, IsGeneral: true, Amount: 1399.4 }] }];
+  const genHtml = renderBoardReportItemsHtml({ report: base, items: gen, aggregates: [] }).replace(/\s+/g, ' ');
+  ok(/Camp general \$1,399\.40/.test(genHtml), 'it reads "Camp general", not its internal label');
+  ok(!/Operating Budget/.test(genHtml), 'the internal label does not reach the board');
+
+  console.log('\n## section headings carry no money');
+  ok(!/item\(s\)[^<]*\$/.test(html), 'no subtotal beside the item count');
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(
