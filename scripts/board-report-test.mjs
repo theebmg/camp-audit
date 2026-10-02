@@ -182,53 +182,40 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
   ok(nestedCount(html) === 0, 'a summary work order nests nothing');
 
   console.log('\n## the footer says what the money is, so it is not read as camp spend');
-  const NOTE = 'Recorded cost of work shown, including work funded outside camp. '
-    + 'Not camp spend; estimates excluded.';
-  ok(html.replace(/\s+/g, ' ').includes(NOTE), 'the HTML footer carries the note Ben wrote, verbatim');
+  ok(/Cost of work shown: \$1,200/.test(html.replace(/\s+/g, ' ')),
+    'the footer states the rolled-up cost under its own label');
   const text = renderBoardReportItemsText({ report, items: [wo, lineA, lineB], aggregates: [] });
-  ok(text.includes(NOTE), 'and so does the plain-text copy');
-  ok(/TOTAL .* \$1,200 recorded cost of work shown/.test(text),
-    'the text footer states the same rolled-up total as the HTML one');
+  ok(/COST OF WORK SHOWN: \$1,200/.test(text),
+    'the plain-text footer states the same figure');
 }
 
-console.log('\n## the note appears only alongside a recorded cost');
+console.log('\n## nothing to total means no total line');
 {
   const { renderBoardReportItemsHtml, renderBoardReportItemsText } = await import('/app/src/reportRender.js');
-  const NOTE = 'Recorded cost of work shown, including work funded outside camp. '
-    + 'Not camp spend; estimates excluded.';
   const report = { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft' };
 
-  // September's shape: estimates only, nothing allocated, hours off — so no total is printed.
+  // September's shape before any actuals: estimates only, hours off.
   const bare = [{ Id: 950, ItemType: 'job_line', ItemId: 9, Section: 'done', Included: true,
     SnapTitle: `${TAG} estimate only`, SnapCost: null, SnapEstCost: 379, SnapHours: 1.5 }];
   const bareHtml = renderBoardReportItemsHtml({ report, items: bare, aggregates: [] });
   const bareText = renderBoardReportItemsText({ report, items: bare, aggregates: [] });
-  ok(!/Total\s*\u2014/.test(bareHtml), 'no total line when there is nothing to total');
-  ok(!bareHtml.replace(/\s+/g, ' ').includes(NOTE), 'and NO note either — it has nothing to qualify');
-  ok(!/TOTAL\s*\u2014/.test(bareText) && !bareText.includes(NOTE), 'same in the plain-text copy');
+  ok(!/Cost of work shown/.test(bareHtml), 'no cost line when there is no cost');
+  ok(!/COST OF WORK SHOWN/.test(bareText), 'same in the plain-text copy');
   ok(bareHtml.includes(`${TAG} estimate only`), 'the item itself still prints');
   ok(/379/.test(bareHtml), 'and its estimate still shows on the row');
 
-  // Money present: both come back, together.
-  const paid = [{ ...bare[0], SnapCost: 379 }];
-  const paidHtml = renderBoardReportItemsHtml({ report, items: paid, aggregates: [] });
-  const paidText = renderBoardReportItemsText({ report, items: paid, aggregates: [] });
-  ok(/Total\s*\u2014/.test(paidHtml), 'a total appears once there is real money');
-  ok(paidHtml.replace(/\s+/g, ' ').includes(NOTE), 'and the note comes with it');
-  ok(/TOTAL\s*\u2014/.test(paidText) && paidText.includes(NOTE), 'both in the plain-text copy too');
+  // Hours alone still produce a line — but no cost, so no breakdown.
+  const hoursOnly = renderBoardReportItemsHtml({ report: { ...report, ShowHours: true }, items: bare, aggregates: [] })
+    .replace(/\s+/g, ' ');
+  ok(/1\.5h/.test(hoursOnly), 'hours alone print');
+  ok(!/Cost of work shown/.test(hoursOnly), 'with no cost figure beside them');
 
-  // Hours alone produce a total, but NOT the note: there is no cost figure for it to qualify.
-  const hoursOnly = renderBoardReportItemsHtml({ report: { ...report, ShowHours: true }, items: bare, aggregates: [] });
-  const hoursOnlyText = renderBoardReportItemsText({ report: { ...report, ShowHours: true }, items: bare, aggregates: [] });
-  ok(/Total\s*\u2014\s*1\.5h/.test(hoursOnly.replace(/\s+/g, ' ')), 'hours alone print a total');
-  ok(!hoursOnly.replace(/\s+/g, ' ').includes(NOTE), 'and NO note — the total carries no cost to qualify');
-  ok(!hoursOnlyText.includes(NOTE), 'nor in the plain-text copy');
-
-  // Hours AND money: the total carries both, and the note returns with the money.
-  const bothHtml = renderBoardReportItemsHtml({ report: { ...report, ShowHours: true }, items: paid, aggregates: [] });
-  const bothFlat = bothHtml.replace(/\s+/g, ' ');
-  ok(/Total\s*\u2014\s*1\.5h\s*·\s*\$379/.test(bothFlat), 'hours and money share one total line');
-  ok(bothFlat.includes(NOTE), 'and the note is back, because there is now a cost');
+  // Money present: the cost and its breakdown both appear.
+  const paid = [{ ...bare[0], SnapCost: 379,
+    SnapFunding: [{ Source: 'Camp', IsCamp: true, IsGeneral: true, Amount: 379 }] }];
+  const paidHtml = renderBoardReportItemsHtml({ report, items: paid, aggregates: [] }).replace(/\s+/g, ' ');
+  ok(/Cost of work shown: \$379/.test(paidHtml), 'a cost line appears once there is real money');
+  ok(/Camp general \$379/.test(paidHtml), 'and the breakdown comes with it');
 }
 
 console.log('\n## Show hours: off by default, and off means off everywhere');
@@ -255,10 +242,9 @@ console.log('\n## Show hours: off by default, and off means off everywhere');
   ok(/4h/.test(onText) && /6\.5h/.test(onText), 'and in the plain-text copy');
 
   console.log('\n## the item count is gone from the footer');
-  ok(!/Total\s*\u2014\s*\d+\s*item/.test(onHtml) && !/item\(s\)/.test(onHtml.split('Total')[1] || ''),
-    'the HTML footer no longer tallies rows');
-  ok(!/TOTAL\s*\u2014\s*\d+\s*item/.test(onText), 'nor does the plain-text one');
-  ok(/Total\s*\u2014\s*6\.5h/.test(onHtml.replace(/\s+/g, ' ')), 'the footer leads with what is left');
+  ok(!/item\(s\)/.test(onHtml.split('Cost of work shown')[1] || ''), 'the HTML footer does not tally rows');
+  ok(!/COST OF WORK SHOWN:[^\n]*item/.test(onText), 'nor does the plain-text one');
+  ok(/6\.5h/.test(onHtml.replace(/\s+/g, ' ')), 'and the hours total still prints');
 
   console.log('\n## one-day work says Completed once, not a span of nothing');
   const sameDay = [{ Id: 962, ItemType: 'job_line', ItemId: 3, Section: 'done', Included: true,
@@ -516,7 +502,7 @@ console.log('\n## the footer breaks the cost down by funder');
   ok(/Ben Greenawalt \$1,100/.test(html) && /Discretionary Audit Fund \$299\.40/.test(html),
     'and breaks it down by funder');
   ok(!/Not camp spend/.test(html) && !/estimates excluded/.test(html), 'the old disclaimer is gone');
-  ok(/not the camp.s official books/i.test(html), 'but the official-books line stays');
+  ok(/official books/i.test(html), 'but the official-books line stays');
   ok(/COST OF WORK SHOWN: \$1,399\.40/.test(txt) && /Ben Greenawalt \$1,100/.test(txt),
     'the plain-text copy carries both');
 
