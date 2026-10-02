@@ -5536,12 +5536,13 @@ async function renderBoardReport() {
           <label for="brShowFunding">Show funding</label>
           <select id="brShowFunding" ${published ? 'disabled' : ''}>
             <option value="off" ${report.ShowFunding === 'off' ? 'selected' : ''}>Off — no funding anywhere</option>
-            <option value="non_camp" ${report.ShowFunding === 'non_camp' ? 'selected' : ''}>Non-camp only — tag what camp didn't pay for</option>
+            <option value="non_general" ${report.ShowFunding === 'non_general' ? 'selected' : ''}>Non-general only — tag everything but the general budget</option>
             <option value="all" ${report.ShowFunding === 'all' ? 'selected' : ''}>All sources — tag every cost</option>
           </select>
           <p class="muted" style="margin:2px 0 0;font-size:0.8rem">
-            Funding comes from the receipts split onto the work, so a cost typed straight onto a
-            job line has none. A new report starts with whatever the last one used.
+            Non-general tags earmarked funds, cabin holders, donors and in-kind — everything
+            except the general operating budget, which needs no label. Earmarked funds are still
+            camp spend. A new report starts with whatever the last one used.
           </p>
           <p class="field-error" id="brShowFunding-err"></p>
         </div>

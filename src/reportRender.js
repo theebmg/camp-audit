@@ -500,6 +500,44 @@ function itemPhotosHtml(photos) {
 
 // "Started 9/5 · Completed 9/23", or "Completed 9/23" when it began and finished the same day —
 // a span of one day is not a span, and printing both halves of it reads as a mistake.
+// Approved funds — camp money the board earmarked for something in particular.
+//
+// It sits BELOW the money header, not in it, because it is not a separate pot of money: every
+// pound of it is already inside "Camp funds spent". The board approved a figure and is entitled
+// to see how much of it has gone, and against what.
+//
+// Over-spend is stated plainly, in the same amber used for outstanding work. A board finding
+// out late is worse than a board finding out bluntly.
+function approvedFundsHtml(aggregates, showFunding) {
+  if (showFunding === 'off') return '';
+  const funds = (aggregates || []).filter((a) => a.GroupKey === 'funds');
+  if (!funds.length) return '';
+  const rows = funds.map((f) => {
+    const over = /over$|over\b/.test(String(f.ValueText || ''));
+    return `
+      <tr>
+        <td style="padding:7px 0;border-bottom:1px solid #c7d2dd;vertical-align:top;">
+          <div style="font-weight:600;color:#2c3047;">${escapeHtml(f.Label)}</div>
+          ${f.Note ? `<div style="color:#565c78;font-size:0.78rem;">${escapeHtml(f.Note)}</div>` : ''}
+        </td>
+        <td style="padding:7px 0;border-bottom:1px solid #c7d2dd;text-align:right;white-space:nowrap;
+                   color:${over ? '#7a4a10' : '#565c78'};font-size:0.9rem;vertical-align:top;">
+          ${escapeHtml(f.ValueText || '')}
+        </td>
+      </tr>`;
+  }).join('');
+  return `
+    <h2 style="margin:22px 0 4px;font-size:1.05rem;color:#13432f;border-top:2px solid #13432f;padding-top:12px;text-transform:uppercase;letter-spacing:0.04em;">
+      Approved Funds
+    </h2>
+    <p style="margin:0 0 6px;color:#565c78;font-size:0.8rem;">
+      Camp money set aside for a stated purpose. Already counted inside camp funds spent, not on top of it.
+    </p>
+    <table role="presentation" width="100%" style="width:100%;border-collapse:collapse;margin-bottom:4px;">
+      ${rows}
+    </table>`;
+}
+
 function itemDatesText(it) {
   if (!it.SnapStartDate) return it.SnapDate ? fmtDate(it.SnapDate) : null;
   if (!it.SnapDate) return `Started ${fmtDate(it.SnapStartDate)} · In progress`;
@@ -514,9 +552,13 @@ function itemDatesText(it) {
 // as a meaningless zero.
 // "Funded by Ben", or "Ben $800 · Camp $440" when more than one source paid.
 //
-// showFunding: 'off' prints nothing; 'non_camp' prints only money that did NOT come from camp
-// funds, because the board's question is what a job cost CAMP and camp money needs no tag;
-// 'all' labels everything.
+// showFunding:
+//   'off'          nothing;
+//   'non_general'  everything EXCEPT the general operating budget — so an earmarked camp fund
+//                  is tagged even though it is camp money. The earlier rule keyed off
+//                  camp/non-camp, which printed a Discretionary Fund line exactly like a
+//                  general-budget one and left the board unable to tell them apart;
+//   'all'          every source, general included.
 //
 // Returns null rather than an empty string when there is nothing to say, so callers can drop
 // the separator too.
@@ -524,14 +566,14 @@ function fundingTagText(it, showFunding) {
   if (showFunding === 'off') return null;
   const all = Array.isArray(it.SnapFunding) ? it.SnapFunding.filter((f) => f && f.Amount) : [];
   if (!all.length) return null;
-  const shown = showFunding === 'all' ? all : all.filter((f) => f.IsCamp === false);
+  const shown = showFunding === 'all' ? all : all.filter((f) => f.IsGeneral !== true);
   if (!shown.length) return null;
   // One source paying for the whole thing reads as a sentence; a split reads as figures.
   if (shown.length === 1 && shown.length === all.length) return `Funded by ${shown[0].Source}`;
   return shown.map((f) => `${f.Source} ${fmtMoney(f.Amount)}`).join(' · ');
 }
 
-function nestedLineHtml(it, showHours = false, showFunding = 'non_camp') {
+function nestedLineHtml(it, showHours = false, showFunding = 'non_general') {
   // No date: every line under a work order happened inside the reporting period, and the work
   // order above already carries the span. Repeating it on each line was the noisiest thing left.
   const bits = [
@@ -573,19 +615,25 @@ function stillToDoHtml(it) {
     </div>`;
 }
 
-function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_camp') {
+function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_general') {
   // Dates read as a span rather than a single stamp (decisions §7): when something started
   // and whether it has finished is more use to a board than one undated figure.
   const dates = itemDatesText(it);
   // Money: actual only, and only when there is one. An estimate is labelled "est." and shown
   // on open work alongside it — never instead of it and never summed (decisions §2, §3).
+  // An OPEN work order carries no money on its own row. A part-finished job's roll-up invites
+  // the reader to treat it as what the job cost, when it is neither a final figure nor a
+  // reliable fraction of one — the lines below say what has actually been spent and by whom.
+  // A closed work order keeps its roll-up: that figure is finished and means something.
+  const openWorkOrder = it.ItemType === 'work_order' && !it.SnapDate;
+
   // Spend against estimate reads as one fact, not two: "$800 spent of ~$1,540 est." says where
   // a job has got to in a way that "$800 · ~$1,540 est." does not. Either half alone still
   // prints on its own.
   const money = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
   const est = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
-  const spend = money && est ? `${money} spent of ${est}` : (money || est);
-  const funding = fundingTagText(it, showFunding);
+  const spend = openWorkOrder ? null : (money && est ? `${money} spent of ${est}` : (money || est));
+  const funding = openWorkOrder ? null : fundingTagText(it, showFunding);
   const bits = [
     it.SnapAssetName, it.SnapStatus, dates,
     showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
@@ -603,11 +651,17 @@ function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_camp'
     && it.SnapSubtitle !== it.SnapAssetName
     && it.ItemType !== 'admin_task'
     ? it.SnapSubtitle : null;
+
+  // "45% of ~$4,000 est. complete" is a dollar figure too, so it goes with the rest on an open
+  // work order. The no-money form — "Completed: wall removal, beam install" — is kept, because
+  // it says what happened without putting a number on it.
+  const progressHasMoney = /[$]/.test(String(it.SnapProgress || ''));
+  const showProgress = it.SnapProgress && !opts.hideProgress && !(openWorkOrder && progressHasMoney);
   return `
     <div style="border-bottom:1px solid #c7d2dd;padding:9px 0;">
       <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${suffix ? ` <span style="color:#565c78;">— ${escapeHtml(suffix)}</span>` : ''}</div>
       ${bits.length ? `<div style="color:#565c78;font-size:0.85rem;">${escapeHtml(bits.join(' · '))}</div>` : ''}
-      ${it.SnapProgress && !opts.hideProgress ? `<div style="color:#565c78;font-size:0.85rem;">${escapeHtml(it.SnapProgress)}</div>` : ''}
+      ${showProgress ? `<div style="color:#565c78;font-size:0.85rem;">${escapeHtml(it.SnapProgress)}</div>` : ''}
       ${opts.nested || ''}
       ${stillToDoHtml(it)}
       ${itemPhotosHtml(it.Photos)}
@@ -617,7 +671,7 @@ function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_camp'
 
 // A summary work order prints one line and swallows its job lines; an itemized one
 // prints its lines instead. Summary is the default for every WO (§6).
-function sectionHtml(section, items, showHours = false, showFunding = 'non_camp') {
+function sectionHtml(section, items, showHours = false, showFunding = 'non_general') {
   if (!items.some((i) => i.Section === section && i.Included)) return '';
   // One rule, shared with the footer, so a section subtotal and the grand total can never
   // disagree about what counts again.
@@ -685,7 +739,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
   // Off unless this report says otherwise. Hours stay recorded on the work either way — this
   // only decides whether the board sees them.
   const showHours = report.ShowHours === true;
-  const showFunding = report.ShowFunding || 'non_camp';
+  const showFunding = report.ShowFunding || 'non_general';
   const visible = visibleItems(items);
   const counted = totalledItems(items);
   const grandHours = counted.reduce((t, i) => t + (i.SnapHours || 0), 0);
@@ -695,6 +749,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
     `${report.PeriodStart} to ${report.PeriodEnd} · looking ahead to ${report.ForwardEnd}${report.Status === 'draft' ? ' · DRAFT' : ''}`,
     `
     ${moneyHeaderHtml(aggregates)}
+    ${approvedFundsHtml(aggregates, showFunding)}
     ${report.SummaryNotes ? `<div style="background:#fbf6ec;border:1px solid #e3d9c2;border-left:4px solid #13432f;border-radius:10px;padding:14px 16px;margin-bottom:10px;">${plainSummaryToHtml(report.SummaryNotes)}</div>` : ''}
     ${sections.map((sec) => sectionHtml(sec, items, showHours, showFunding)).join('')}
     ${Array.isArray(reportPhotos) && reportPhotos.length ? `
@@ -724,12 +779,20 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
 
 export function renderBoardReportItemsText({ report, items, aggregates }) {
   const showHours = report.ShowHours === true;
-  const showFunding = report.ShowFunding || 'non_camp';
+  const showFunding = report.ShowFunding || 'non_general';
   const lines = [`CAMP SYCHAR — BOARD REPORT — ${report.Title}`,
     `${report.PeriodStart} to ${report.PeriodEnd} (ahead to ${report.ForwardEnd})${report.Status === 'draft' ? ' — DRAFT' : ''}`, ''];
   for (const a of aggregates.filter((x) => ['money', 'savings'].includes(x.GroupKey))) {
     lines.push(`${a.Label}: ${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : (a.ValueText || '—')}`);
     if (a.Note) lines.push(`  ${a.Note}`);
+  }
+  const fundRows = aggregates.filter((x) => x.GroupKey === 'funds');
+  if (fundRows.length && showFunding !== 'off') {
+    lines.push('', 'APPROVED FUNDS (already counted inside camp funds spent):');
+    for (const f of fundRows) {
+      lines.push(`  ${f.Label}: ${f.ValueText || ''}`);
+      if (f.Note) lines.push(`      ${f.Note}`);
+    }
   }
   if (report.SummaryNotes) lines.push('', summaryHtmlToText(report.SummaryNotes));
   const visible = visibleItems(items);
@@ -753,12 +816,13 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
 
     for (const it of rows) {
       if (it.ItemType === 'job_line' && !orphans.includes(it)) continue;   // nested below
+      const openWo = it.ItemType === 'work_order' && !it.SnapDate;
       const pMoney = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
       const pEst = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
       const bits = [it.SnapAssetName, itemDatesText(it),
         showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
-        pMoney && pEst ? `${pMoney} spent of ${pEst}` : (pMoney || pEst),
-        fundingTagText(it, showFunding)].filter(Boolean);
+        openWo ? null : (pMoney && pEst ? `${pMoney} spent of ${pEst}` : (pMoney || pEst)),
+        openWo ? null : fundingTagText(it, showFunding)].filter(Boolean);
       lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
       if (it.ItemType === 'work_order') {
         // Indented with a dash, which is as much of a connecting rail as plain text allows.

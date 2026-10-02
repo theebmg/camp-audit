@@ -5554,6 +5554,37 @@ export async function computeBoardReportAggregates(reportId) {
     out.push({ groupKey: 'money', label: 'In-kind this period', valueNumeric: Number(p.in_kind) });
   }
 
+  // Approved funds: camp money the board earmarked for something in particular. It IS camp
+  // spend — it sits inside "Camp funds spent", not beside it — but the board approved a figure
+  // and is entitled to see how much of it has gone. Reuses getFundBalances, which already
+  // counts both halves: shares allocated to the fund, plus the unsplit remainder of any receipt
+  // charged to it.
+  //
+  // Only funds with something to report. A fund nobody has drawn on is not news.
+  for (const f of await getFundBalances()) {
+    const spentFromLines = Number((await pool.query(
+      `SELECT COALESCE(SUM(jl.actual_cost), 0) AS total FROM job_lines jl
+       WHERE jl.funding_source = 'fund' AND jl.funding_ref_id = $1 AND jl.actual_cost IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM expense_allocations ea
+                          WHERE ea.dest_type = 'job_line' AND ea.dest_id = jl.id)`,
+      [f.Id]
+    )).rows[0].total);
+    const spent = Number(f.Spent) + spentFromLines;
+    if (!f.Active || spent <= 0) continue;
+    const remaining = Number(f.Amount) - spent;
+    const bits = [
+      `${fmtMoneyPlain(spent)} of ${fmtMoneyPlain(Number(f.Amount))} used`,
+      remaining >= 0 ? `${fmtMoneyPlain(remaining)} left` : `${fmtMoneyPlain(-remaining)} over`,
+    ];
+    // Days left only while there are any — a closed window says so instead of counting down
+    // past zero.
+    if (f.DaysLeft != null) bits.push(f.DaysLeft >= 0 ? `${f.DaysLeft} days left` : 'window closed');
+    out.push({
+      groupKey: 'funds', label: f.Name, valueText: bits.join(' · '),
+      note: f.AuthorizedBy ? `authorized by ${f.AuthorizedBy}` : null,
+    });
+  }
+
   // Recurring is reported as an annual rate — that's how a monthly saving is worth
   // understanding — while storage keeps the monthly figure that was negotiated.
   const rec = await pool.query(
@@ -6054,13 +6085,16 @@ async function jobLineFundingForReport(jobLineIds) {
     `SELECT ea.dest_id AS job_line_id,
             COALESCE(fs.short_label, fs.name, 'Unassigned') AS source,
             COALESCE(fs.counts_as_camp_spend, true) AS is_camp,
+            -- An unset funding source is treated as general, so it needs no tag. That matches
+            -- how it is already counted: as ordinary camp spend.
+            COALESCE(fs.is_general, true) AS is_general,
             SUM(ea.amount) AS amount
      FROM expense_allocations ea
      JOIN expenses e ON e.id = ea.expense_id
      LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
      WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
        AND ea.dest_type = 'job_line' AND ea.dest_id = ANY($1)
-     GROUP BY 1, 2, 3 ORDER BY 4 DESC`,
+     GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC`,
     [jobLineIds]
   );
 
@@ -6071,6 +6105,7 @@ async function jobLineFundingForReport(jobLineIds) {
     `SELECT jl.id AS job_line_id, jl.funding_source, jl.funding_ref_id,
             COALESCE(jl.actual_cost, 0) AS amount,
             COALESCE(k.counts_as_camp_spend, true) AS is_camp,
+            COALESCE(k.is_general, false) AS is_general,
             COALESCE(k.label, jl.funding_source) AS kind_label,
             ch.name AS cabin_holder_name, f.name AS fund_name,
             cc.name AS campaign_name, ob.name AS other_name
@@ -6088,7 +6123,8 @@ async function jobLineFundingForReport(jobLineIds) {
   for (const r of allocs) {
     if (!allocByLine.has(r.job_line_id)) allocByLine.set(r.job_line_id, []);
     allocByLine.get(r.job_line_id).push({
-      Source: r.source, IsCamp: r.is_camp === true, Amount: Number(r.amount), From: 'receipt',
+      Source: r.source, IsCamp: r.is_camp === true, IsGeneral: r.is_general === true,
+      Amount: Number(r.amount), From: 'receipt',
     });
   }
 
@@ -6111,7 +6147,8 @@ async function jobLineFundingForReport(jobLineIds) {
     }
     if (b && Number(b.amount) > 0) {
       byLine.set(id, [{
-        Source: budgetLabel, IsCamp: b.is_camp === true, Amount: Number(b.amount), From: 'job_line',
+        Source: budgetLabel, IsCamp: b.is_camp === true, IsGeneral: b.is_general === true,
+        Amount: Number(b.amount), From: 'job_line',
       }]);
     }
   }
@@ -6146,7 +6183,8 @@ async function workOrderRollupForReport(workOrderId) {
   const fundingTotals = new Map();
   for (const entries of perLine.values()) {
     for (const e of entries) {
-      const cur = fundingTotals.get(e.Source) || { source: e.Source, is_camp: e.IsCamp, amount: 0 };
+      const cur = fundingTotals.get(e.Source)
+        || { source: e.Source, is_camp: e.IsCamp, is_general: e.IsGeneral === true, amount: 0 };
       cur.amount += e.Amount;
       fundingTotals.set(e.Source, cur);
     }
@@ -6155,17 +6193,19 @@ async function workOrderRollupForReport(workOrderId) {
   const { rows: woLevel } = await pool.query(
     `SELECT COALESCE(fs.short_label, fs.name, 'Unassigned') AS source,
             COALESCE(fs.counts_as_camp_spend, true) AS is_camp,
+            COALESCE(fs.is_general, true) AS is_general,
             SUM(ea.amount) AS amount
      FROM expense_allocations ea
      JOIN expenses e ON e.id = ea.expense_id
      LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
      WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
        AND ea.dest_type = 'work_order' AND ea.dest_id = $1
-     GROUP BY 1, 2`,
+     GROUP BY 1, 2, 3`,
     [workOrderId]
   );
   for (const r of woLevel) {
-    const cur = fundingTotals.get(r.source) || { source: r.source, is_camp: r.is_camp === true, amount: 0 };
+    const cur = fundingTotals.get(r.source)
+      || { source: r.source, is_camp: r.is_camp === true, is_general: r.is_general === true, amount: 0 };
     cur.amount += Number(r.amount);
     fundingTotals.set(r.source, cur);
   }
@@ -6218,7 +6258,8 @@ async function workOrderRollupForReport(workOrderId) {
     firstDate: r.first_date || null,
     lastCompleted: r.last_completed || null,
     funding: funding.map((f) => ({
-      Source: f.source, IsCamp: f.is_camp === true, Amount: Number(f.amount),
+      Source: f.source, IsCamp: f.is_camp === true, IsGeneral: f.is_general === true,
+      Amount: Number(f.amount),
     })),
     progress,
   };
@@ -6733,7 +6774,7 @@ function boardReportRowShape(r) {
     ForwardEnd: r.forward_end_text || r.forward_end,
     SummaryNotes: r.summary_notes,
     ShowHours: r.show_hours === true,
-    ShowFunding: r.show_funding || 'non_camp',
+    ShowFunding: r.show_funding || 'non_general',
     CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
   };
 }
@@ -6784,7 +6825,7 @@ export async function getOrCreateDraftBoardReport() {
              COALESCE((SELECT show_hours FROM board_reports
                         ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), false),
              COALESCE((SELECT show_funding FROM board_reports
-                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), 'non_camp'))
+                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), 'non_general'))
      RETURNING id`,
     [title, p.periodStart, p.periodEnd, p.forwardStart, p.forwardEnd]
   );
