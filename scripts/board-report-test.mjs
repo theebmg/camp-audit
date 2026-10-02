@@ -571,6 +571,59 @@ console.log('\n## a fund-charged receipt linked to work keeps its fund');
   }
 }
 
+console.log('\n## one charge is never counted twice');
+{
+  const asset = (await db.pool.query('select id from assets limit 1')).rows[0];
+  const { workOrderId: woId } = await db.createWorkOrder({
+    title: `${TAG} dupe`, assetId: asset.id, priority: 'Medium',
+  });
+  const line = await db.createJobLine(woId, { title: `${TAG} drywall`, estimatedCost: 300 });
+  // A cost typed straight onto the line, the way it is entered before a receipt turns up.
+  await db.pool.query('UPDATE job_lines SET actual_cost = 299.40 WHERE id = $1', [line.Id]);
+  const exp = await db.createExpense({ vendor: `${TAG} Lowes`, amount: 299.40, purchaseDate: p.periodStart });
+
+  console.log('\n   the checker finds it');
+  const found = await db.findPossibleDuplicateCharges({
+    amount: 299.40, expenseId: exp.Id, jobLineId: line.Id, purchaseDate: p.periodStart,
+  });
+  ok(found.typedCosts.length === 1 && found.typedCosts[0].JobLineId === line.Id,
+    'the line already carrying that figure is reported');
+  ok(found.typedCosts[0].Amount === 299.4, `as ${found.typedCosts[0].Amount}`);
+
+  console.log('\n   and an unrelated amount is left alone');
+  const none = await db.findPossibleDuplicateCharges({ amount: 12.34, jobLineId: line.Id });
+  ok(none.typedCosts.length === 0, 'a different figure raises nothing');
+
+  console.log('\n   saying "same charge" counts it once, with the receipt as evidence');
+  const res = await db.mergeTypedCostIntoReceipt(exp.Id, line.Id, { by: 'test' });
+  ok(res && Number(res.ClearedTypedCost) === 299.4, `the typed ${res?.ClearedTypedCost} was cleared`);
+  const after = (await db.pool.query(
+    `SELECT jl.actual_cost,
+            (SELECT COALESCE(SUM(ea.amount),0) FROM expense_allocations ea
+              WHERE ea.dest_type='job_line' AND ea.dest_id=jl.id) alloc
+     FROM job_lines jl WHERE jl.id = $1`, [line.Id])).rows[0];
+  ok(after.actual_cost === null, 'the typed figure is gone');
+  ok(Number(after.alloc) === 299.4, 'and the receipt is allocated in its place');
+
+  const total = Number((await db.pool.query(
+    `SELECT COALESCE(jl.actual_cost,0) + COALESCE((SELECT SUM(ea.amount) FROM expense_allocations ea
+       WHERE ea.dest_type='job_line' AND ea.dest_id=jl.id),0) AS total
+     FROM job_lines jl WHERE jl.id = $1`, [line.Id])).rows[0].total);
+  ok(Math.abs(total - 299.4) < 0.005, `the line costs ${total}, not 598.80`);
+
+  console.log('\n   and it is written down where someone will find it later');
+  const logged = (await db.pool.query(
+    `SELECT action FROM activity_log WHERE entity_type='job_line' AND entity_id=$1
+     ORDER BY id DESC LIMIT 1`, [line.Id])).rows[0];
+  ok(/same charge as receipt/.test(logged?.action || ''), 'the merge is in the activity log');
+
+  await db.pool.query('DELETE FROM expense_allocations WHERE expense_id = $1', [exp.Id]);
+  await db.pool.query('DELETE FROM expenses WHERE id = $1', [exp.Id]);
+  await db.pool.query('DELETE FROM activity_log WHERE entity_type=$1 AND entity_id=$2', ['job_line', line.Id]);
+  await db.pool.query('DELETE FROM job_lines WHERE id = $1', [line.Id]);
+  await db.pool.query('DELETE FROM work_orders WHERE id = $1', [woId]);
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(
