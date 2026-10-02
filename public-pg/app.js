@@ -5118,7 +5118,7 @@ function wireReportsTabs(container = app) {
 
 async function renderReports(params = {}) {
   const mode = REPORT_TABS.some((t) => t.key === params.mode) ? params.mode : 'explorer';
-  if (mode === 'board') return renderBoardReport();
+  if (mode === 'board') return renderBoardReport(params);
   if (mode === 'workPerformed') return renderWorkPerformedReport();
   if (mode === 'deferredBacklog') return renderDeferredBacklogReport();
   if (mode === 'visitorActivity') return renderVisitorActivityReport();
@@ -5471,17 +5471,24 @@ function wireReportPreviewArea(report, { sendPath, sendBody }) {
 // Board Report draft editor (Build Brief §6/§7). Replaces the old ad-hoc range picker:
 // there is one report now, it is an entity, and everything on it is a decision you can
 // see and change. Suggestions arrive pre-checked; nothing is ever force-included.
-async function renderBoardReport() {
+// Opens the current draft by default, or a specific report when given an id — which is how a
+// published report is reached. Publishing used to be a one-way door: the report was frozen,
+// correctly, and then became unreachable because this screen only ever asked for the draft.
+async function renderBoardReport(params = {}) {
   setChrome({ title: 'Reports', showBack: false, showLogout: true });
-  let report = null; let items = []; let aggregates = []; let outputs = [];
+  const viewingId = params.id ? Number(params.id) : null;
+  let report = null; let items = []; let aggregates = []; let outputs = []; let pastReports = [];
   let busy = false;
   const expanded = new Set();   // which work orders are showing their lines
 
   async function load() {
-    const d = await api('/api/pg/board-reports/draft');
+    const d = await api(viewingId ? `/api/pg/board-reports/${viewingId}` : '/api/pg/board-reports/draft');
     report = d.report; items = d.items || []; aggregates = d.aggregates || [];
     const hist = await api('/api/pg/board-reports');
     outputs = hist.outputs || [];
+    // Every report that is not the one on screen — published ones especially, which have
+    // nowhere else to be found.
+    pastReports = (hist.reports || []).filter((r) => r.Id !== report.Id);
   }
 
   const linesOf = (woId) => items.filter((i) => i.ItemType === 'job_line' && i.ParentWorkOrderId === woId);
@@ -5575,6 +5582,13 @@ async function renderBoardReport() {
     const published = report.Status === 'published';
     setApp(`
       ${reportsTabsHtml('board')}
+      ${published ? `<div class="card" style="background:#eef5f0;border-left:4px solid #13432f">
+        <strong style="color:#13432f">Published ${escapeHtml(report.PublishedAt ? String(report.PublishedAt).slice(0, 10) : '')} — read-only</strong>
+        <p class="muted" style="margin:4px 0 0;font-size:0.86rem">
+          This is the copy the board was given, frozen as it went out. Nothing here can change.
+          <a href="#" id="brBackToDraft">Open the current draft</a> to carry on working.
+        </p>
+      </div>` : ''}
       <div class="card">
         <h3>Board Report — ${escapeHtml(report.Title)} ${published ? '<span class="muted">(published)</span>' : '<span class="muted">(draft)</span>'}</h3>
         <div class="field-row"><label>Period covered</label>
@@ -5694,9 +5708,29 @@ async function renderBoardReport() {
         <p class="muted" style="margin:8px 0 0;font-size:0.82rem">Every copy that leaves the app is saved below, exactly as it went out.</p>
       </div>
 
+      ${pastReports.length ? `<div class="card">
+        <h3>Past Reports</h3>
+        <p class="muted" style="margin:-4px 0 8px;font-size:0.85rem">
+          Published reports are frozen as the board received them. Open one to read it back.
+        </p>
+        ${pastReports.map((r) => `<div class="list-item" style="display:flex;justify-content:space-between;gap:10px;align-items:baseline">
+          <div>
+            <strong>${escapeHtml(r.Title)}</strong>
+            <span class="muted" style="font-size:0.85rem"> — ${escapeHtml(r.PeriodStart)} to ${escapeHtml(r.PeriodEnd)}</span>
+          </div>
+          <span style="white-space:nowrap">
+            <span class="pill">${r.Status === 'published' ? `published ${escapeHtml(String(r.PublishedAt || '').slice(0, 10))}` : 'draft'}</span>
+            <a href="#" class="br-open-report" data-id="${r.Id}" style="margin-left:8px">open</a>
+          </span>
+        </div>`).join('')}
+      </div>` : ''}
+
       ${outputs.length ? `<div class="card">
-        <h3>History</h3>
-        ${outputs.map((o) => `<div class="list-item" style="display:flex;justify-content:space-between;gap:10px">
+        <h3>Sends &amp; Downloads</h3>
+        <p class="muted" style="margin:-4px 0 8px;font-size:0.85rem">
+          Every time this report was emailed, downloaded or previewed${outputs.length > 12 ? `. Showing the 12 most recent of ${outputs.length}` : ''}.
+        </p>
+        ${outputs.slice(0, 12).map((o) => `<div class="list-item" style="display:flex;justify-content:space-between;gap:10px">
           <div><strong>${escapeHtml(o.ReportTitle)}</strong> <span class="muted">— ${escapeHtml(o.Kind)}${o.WasDraft ? ' (draft)' : ''}${o.Recipients ? ` → ${escapeHtml(o.Recipients)}` : ''}</span></div>
           <a href="#" class="br-open-output" data-id="${o.Id}">view</a>
         </div>`).join('')}
@@ -5810,6 +5844,14 @@ async function renderBoardReport() {
       await api(`/api/pg/board-reports/${report.Id}/publish`, { method: 'POST' });
       toast('Published'); await load(); draw();
     });
+    document.getElementById('brBackToDraft')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      go('reports', { mode: 'board' }, { replace: true });
+    });
+    app.querySelectorAll('.br-open-report').forEach((el) => el.addEventListener('click', (e) => {
+      e.preventDefault();
+      go('reports', { mode: 'board', id: el.dataset.id });
+    }));
     app.querySelectorAll('.br-open-output').forEach((el) => el.addEventListener('click', async (e) => {
       e.preventDefault();
       const d = await api(`/api/pg/board-report-outputs/${el.dataset.id}`);
