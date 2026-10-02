@@ -1,0 +1,1 @@
+before searching, building, or deploying anything, run git fetch and confirm the local branch matches origin/main (or the intended branch). If it's behind, pull first. Before any deploy, confirm the local build matches what you're about to replace and that no newer commits exist upstream. Never conclude something doesn't exist from a checkout you haven't confirmed is current.
