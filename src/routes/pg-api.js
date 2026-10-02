@@ -164,6 +164,7 @@ import {
   getGcalConnection, getGcalRefreshToken, saveGcalCalendar, clearGcalConnection,
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
   listFundingSources, createFundingSource, updateFundingSource,
+  findPossibleDuplicateCharges, mergeTypedCostIntoReceipt,
   listBoardReportFunds, setBoardReportFund,
   listBoardReportPhotoCandidates,
   seedDefaultReportPhotos, setBoardReportPhoto, removeBoardReportPhoto,
@@ -3487,6 +3488,32 @@ router.post('/board-reports/summary-preview', async (req, res, next) => {
   try { res.json({ html: plainSummaryToHtml(String((req.body || {}).text || '')) }); } catch (e) { next(e); }
 });
 
+
+// ---- Is this charge already recorded? ----
+// Read-only. Answers "have I entered this twice", and never decides for anyone.
+router.get('/expenses/duplicate-check', async (req, res, next) => {
+  try {
+    const q = req.query || {};
+    res.json(await findPossibleDuplicateCharges({
+      amount: q.amount,
+      expenseId: q.expenseId ? Number(q.expenseId) : null,
+      jobLineId: q.jobLineId ? Number(q.jobLineId) : null,
+      workOrderId: q.workOrderId ? Number(q.workOrderId) : null,
+      purchaseDate: q.purchaseDate || null,
+    }));
+  } catch (e) { next(e); }
+});
+
+// "Yes, these are one charge." Links the receipt and clears the typed figure together.
+router.post('/expenses/:id(\\d+)/same-charge', async (req, res, next) => {
+  try {
+    const { jobLineId } = req.body || {};
+    if (!jobLineId) return res.status(400).json({ ok: false, error: 'jobLineId is required' });
+    const result = await mergeTypedCostIntoReceipt(req.params.id, Number(jobLineId), { by: currentUsername() });
+    if (!result) return res.status(404).json({ ok: false, error: 'Expense or job line not found' });
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
 
 // ---- Approved funds shown on a report ----
 router.get('/board-reports/:id(\\d+)/funds', async (req, res, next) => {

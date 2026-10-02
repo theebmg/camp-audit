@@ -5384,6 +5384,107 @@ export async function resolveAllocationFunding({ destType, destId, fallbackFundI
 // The unsplit case: at most one job_line/work_order allocation, carrying the whole
 // amount. Leaves any leftover/admin_task rows and any line-item splits alone — those
 // are managed by the split editor, not by picking a destination on the main form.
+// Is this charge already recorded somewhere?
+//
+// A job line's cost is its TYPED actual plus any receipts allocated to it, ADDED together. That
+// is right when the typed figure is labour and the receipt is materials, and wrong when they
+// are the same transaction — which is how one $299.40 charge came to sit on a job line and on
+// an unlinked receipt at the same time, counted twice on the report.
+//
+// Nothing here changes anything. It reports what it found and lets the person say whether two
+// records are one charge, because only they know.
+export async function findPossibleDuplicateCharges({
+  amount, expenseId = null, jobLineId = null, workOrderId = null, purchaseDate = null, windowDays = 21,
+}) {
+  const amt = Number(amount);
+  if (!amt) return { typedCosts: [], receipts: [] };
+
+  // 1. A job line already carrying this figure as a typed cost. Scoped to the work the receipt
+  //    is being attached to when one is named, because an unrelated $299.40 elsewhere on the
+  //    property is a coincidence, not a duplicate.
+  const scope = jobLineId
+    ? { sql: 'AND jl.id = $2', params: [jobLineId] }
+    : (workOrderId ? { sql: 'AND jl.work_order_id = $2', params: [workOrderId] } : { sql: '', params: [] });
+  const { rows: typedCosts } = scope.sql || jobLineId || workOrderId
+    ? await pool.query(
+      `SELECT jl.id, jl.title, jl.actual_cost, jl.work_order_id, w.title AS wo_title
+       FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
+       WHERE jl.actual_cost IS NOT NULL AND ROUND(jl.actual_cost, 2) = ROUND($1::numeric, 2) ${scope.sql}`,
+      [amt, ...scope.params]
+    )
+    : { rows: [] };
+
+  // 2. Another receipt for the same amount at about the same time — two photographs of one till
+  //    slip, or the same card charge entered twice.
+  const { rows: receipts } = await pool.query(
+    `SELECT e.id, e.vendor, e.amount, e.purchase_date::text AS purchase_date,
+            (SELECT count(*)::int FROM expense_allocations ea WHERE ea.expense_id = e.id) AS allocations
+     FROM expenses e
+     WHERE e.deleted_at IS NULL AND e.triage_status <> 'void'
+       AND ROUND(e.amount, 2) = ROUND($1::numeric, 2)
+       AND ($2::int IS NULL OR e.id <> $2)
+       AND ($3::date IS NULL OR e.purchase_date BETWEEN $3::date - ($4 || ' days')::interval
+                                                   AND $3::date + ($4 || ' days')::interval)
+     ORDER BY e.purchase_date DESC LIMIT 5`,
+    [amt, expenseId, purchaseDate, String(windowDays)]
+  );
+
+  return {
+    typedCosts: typedCosts.map((r) => ({
+      JobLineId: r.id, Title: r.title, Amount: Number(r.actual_cost),
+      WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title,
+    })),
+    receipts: receipts.map((r) => ({
+      Id: r.id, Vendor: r.vendor, Amount: Number(r.amount),
+      PurchaseDate: r.purchase_date, Allocations: r.allocations,
+    })),
+  };
+}
+
+// "These two records are one charge." Links the receipt to the line and clears the typed figure
+// in ONE transaction, so the cost is never briefly doubled and never briefly lost. The receipt
+// becomes the evidence for a cost that was previously just a number somebody typed.
+export async function mergeTypedCostIntoReceipt(expenseId, jobLineId, { by = null } = {}) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: lineRows } = await client.query(
+      'SELECT id, title, actual_cost FROM job_lines WHERE id = $1 FOR UPDATE', [jobLineId]
+    );
+    const line = lineRows[0];
+    if (!line) { await client.query('ROLLBACK'); return null; }
+    const { rows: expRows } = await client.query(
+      'SELECT id, amount, fund_id FROM expenses WHERE id = $1 AND deleted_at IS NULL', [expenseId]
+    );
+    const exp = expRows[0];
+    if (!exp) { await client.query('ROLLBACK'); return null; }
+
+    const typed = line.actual_cost == null ? null : Number(line.actual_cost);
+    await client.query('UPDATE job_lines SET actual_cost = NULL WHERE id = $1', [jobLineId]);
+
+    const funding = await resolveAllocationFunding({
+      destType: 'job_line', destId: jobLineId, fallbackFundId: exp.fund_id ?? null,
+    });
+    await client.query(
+      `INSERT INTO expense_allocations (expense_id, dest_type, dest_id, amount, funding_source, funding_ref_id)
+       VALUES ($1,'job_line',$2,$3,$4,$5)`,
+      [expenseId, jobLineId, Number(exp.amount) || 0, funding.fundingSource, funding.fundingRefId]
+    );
+    await client.query('COMMIT');
+    // Logged where it will be found later: a cost that silently stopped being typed and started
+    // being a receipt is exactly the kind of change someone queries a month afterwards.
+    await logActivity({
+      action: `recorded as the same charge as receipt #${expenseId} (typed cost of ${typed} replaced by the receipt)`,
+      entityType: 'job_line', entityId: Number(jobLineId), entityLabel: line.title,
+      details: by ? `confirmed by ${by}` : null,
+    });
+    await distributeSavings(expenseId);
+    return { JobLineId: Number(jobLineId), ExpenseId: Number(expenseId), ClearedTypedCost: typed };
+  } catch (e) {
+    await client.query('ROLLBACK'); throw e;
+  } finally { client.release(); }
+}
+
 export async function setExpenseDestination(expenseId, { jobLineId, workOrderId, amount }) {
   if (jobLineId === undefined && workOrderId === undefined) return;
   await pool.query(
