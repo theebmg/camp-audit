@@ -262,32 +262,57 @@ console.log('\n## Show funding (off / non-camp only / all)');
       SnapFunding: [{ Source: 'Ben', IsCamp: false, Amount: 800 }] },
     { Id: 972, ItemType: 'job_line', ItemId: 22, ParentWorkOrderId: 91, Section: 'done', Included: true,
       SnapTitle: `${TAG} pump`, SnapDate: '2026-09-02', SnapCost: 379,
-      SnapFunding: [{ Source: 'Camp', IsCamp: true, Amount: 379 }] },
+      SnapFunding: [{ Source: 'Camp', IsCamp: true, IsGeneral: true, Amount: 379 }] },
     { Id: 973, ItemType: 'job_line', ItemId: 23, ParentWorkOrderId: 91, Section: 'done', Included: true,
       SnapTitle: `${TAG} mixed`, SnapDate: '2026-09-02', SnapCost: 180,
-      SnapFunding: [{ Source: 'Camp', IsCamp: true, Amount: 120 }, { Source: 'Donor', IsCamp: false, Amount: 60 }] },
+      SnapFunding: [{ Source: 'Camp', IsCamp: true, IsGeneral: true, Amount: 120 },
+        { Source: 'Donor', IsCamp: false, IsGeneral: false, Amount: 60 }] },
+    // Camp money, but earmarked — the case the old camp/non-camp rule rendered identically to
+    // the general budget, leaving the board unable to tell them apart.
+    { Id: 974, ItemType: 'job_line', ItemId: 24, ParentWorkOrderId: 91, Section: 'done', Included: true,
+      SnapTitle: `${TAG} drywall`, SnapDate: '2026-09-02', SnapCost: 299.4,
+      SnapFunding: [{ Source: 'Discretionary Fund', IsCamp: true, IsGeneral: false, Amount: 299.4 }] },
   ];
   const render = (mode) => renderBoardReportItemsHtml({ report: { ...base, ShowFunding: mode }, items, aggregates: [] })
     .replace(/\s+/g, ' ');
 
   const off = render('off');
-  ok(!/Funded by/.test(off) && !/Donor/.test(off), 'off: no funding anywhere');
+  ok(!/Funded by/.test(off) && !/Donor/.test(off) && !/Discretionary/.test(off),
+    'off: no funding anywhere');
   ok(/\$800/.test(off), 'but the money is still there');
 
-  const nc = render('non_camp');
-  ok(/Funded by Ben/.test(nc), 'non-camp: a wholly non-camp line is tagged');
-  ok(!/Funded by Camp/.test(nc), 'and a camp-funded line gets NO tag');
+  const nc = render('non_general');
+  ok(/Funded by Ben/.test(nc), 'non-general: a non-camp line is tagged');
+  ok(!/Funded by Camp/.test(nc), 'the GENERAL budget gets no tag');
+  ok(/Funded by Discretionary Fund/.test(nc),
+    'but an EARMARKED camp fund IS tagged — camp money the board set aside is not the general pot');
   ok(/Donor \$60/.test(nc) && !/Camp \$120/.test(nc),
-    'a mixed line shows only the non-camp share');
+    'a mixed line shows only the non-general share');
 
   const all = render('all');
-  ok(/Funded by Camp/.test(all), 'all: camp-funded lines are tagged too');
+  ok(/Funded by Camp/.test(all), 'all: the general budget is tagged too');
   ok(/Camp \$120/.test(all) && /Donor \$60/.test(all), 'and a mixed line shows both shares');
 
-  console.log('\n## the tag sits after the cost, and the roll-up reads as spend against estimate');
+  console.log('\n## the tag sits after the cost on a LINE');
   ok(/\$800 · Funded by Ben/.test(nc), 'on a line: cost then funding');
-  ok(/\$800 spent of ~\$1,540 est\. · Funded by Ben/.test(nc),
-    'on the work order: "$800 spent of ~$1,540 est. · Funded by Ben"');
+
+  console.log('\n## an open work order carries no money on its own row');
+  const woRow = nc.split(`${TAG} Reno`)[1]?.split('border-left:3px solid')[0] || '';
+  ok(!/\$/.test(woRow), 'no figure of any kind on the open work order row');
+  ok(!/spent of/.test(woRow), 'no "spent of ~est."');
+  ok(!/Funded by/.test(woRow), 'and no funding split');
+  ok(/In progress/.test(woRow), 'it still says In progress');
+  ok(/\$800 · Funded by Ben/.test(nc), 'while its lines keep their costs and tags');
+
+  console.log('\n## a CLOSED work order keeps its roll-up');
+  const closed = renderBoardReportItemsHtml({
+    report: { ...base, ShowFunding: 'non_general' },
+    items: [{ ...items[0], SnapDate: '2026-09-30', SnapEstCost: null }],
+    aggregates: [],
+  }).replace(/\s+/g, ' ');
+  const closedRow = closed.split(`${TAG} Reno`)[1] || '';
+  ok(/\$800/.test(closedRow), 'a finished job still shows what it cost');
+  ok(/Funded by Ben/.test(closedRow), 'and who paid for it');
 
   console.log('\n## nested lines carry no date, and the section is renamed');
   ok(!/padding:4px 0;font-size:0\.92rem[^<]*<\/div>\s*<div[^>]*>[^<]*2026-09-02/.test(nc), 'no date on a nested line');
@@ -296,7 +321,7 @@ console.log('\n## Show funding (off / non-camp only / all)');
   ok(/WORK THIS PERIOD|Work This Period/i.test(nc), 'the section is called Work This Period');
   ok(!/Work Completed/.test(nc), 'and no longer Work Completed');
 
-  const txt = renderBoardReportItemsText({ report: { ...base, ShowFunding: 'non_camp' }, items, aggregates: [] });
+  const txt = renderBoardReportItemsText({ report: { ...base, ShowFunding: 'non_general' }, items, aggregates: [] });
   ok(/Funded by Ben/.test(txt), 'the plain-text copy tags funding too');
   ok(/WORK THIS PERIOD/.test(txt), 'and uses the new section name');
 }
@@ -344,7 +369,7 @@ console.log('\n## funding precedence: receipts beat the budget field, which beat
   console.log('\n## "Last, First" reads as a person on the report');
   const { renderBoardReportItemsHtml } = await import('/app/src/reportRender.js');
   const html = renderBoardReportItemsHtml({
-    report: { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft', ShowFunding: 'non_camp' },
+    report: { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft', ShowFunding: 'non_general' },
     items: [{ Id: 980, ItemType: 'job_line', ItemId: 31, Section: 'done', Included: true,
       SnapTitle: `${TAG} cash job`, SnapDate: '2026-09-02', SnapCost: 800,
       SnapFunding: [{ Source: 'Ben Greenawalt', IsCamp: false, Amount: 800 }] }],
@@ -414,6 +439,35 @@ console.log('\n## money never prints a lone decimal');
   ok(/\$1,200(?!\.)/.test(mk(1200)), 'a whole amount stays $1,200 with no decimals');
   ok(/\$86\.18/.test(mk(86.18)), 'and real cents are untouched');
   ok(!/\$[\d,]+\.\d(?!\d)/.test(mk(299.4)), 'no amount anywhere ends in a single decimal');
+}
+
+console.log('\n## approved funds print under the header, not in it');
+{
+  const { renderBoardReportItemsHtml, renderBoardReportItemsText } = await import('/app/src/reportRender.js');
+  const base = { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft' };
+  const aggs = [
+    { GroupKey: 'money', Label: 'Camp funds spent this period', ValueNumeric: 978.07 },
+    { GroupKey: 'funds', Label: 'Discretionary Audit Fund',
+      ValueText: '$886 of $5,000 used · $4,114 left · 90 days left', Note: 'authorized by Camp Sychar board' },
+  ];
+  const html = renderBoardReportItemsHtml({ report: { ...base, ShowFunding: 'non_general' }, items: [], aggregates: aggs }).replace(/\s+/g, ' ');
+  ok(/Approved Funds/i.test(html), 'the block has a heading');
+  ok(/Discretionary Audit Fund/.test(html), 'the fund is named');
+  ok(/\$886 of \$5,000 used/.test(html), 'usage against the approved figure');
+  ok(/\$4,114 left/.test(html) && /90 days left/.test(html), 'remaining and days left');
+  ok(/authorized by Camp Sychar board/.test(html), 'and who approved it');
+  ok(/already counted inside camp funds spent/i.test(html),
+    'it says plainly that this is not money on TOP of camp spend');
+
+  const txt = renderBoardReportItemsText({ report: { ...base, ShowFunding: 'non_general' }, items: [], aggregates: aggs });
+  ok(/APPROVED FUNDS/.test(txt) && /\$886 of \$5,000/.test(txt), 'the plain-text copy carries it too');
+
+  const off = renderBoardReportItemsHtml({ report: { ...base, ShowFunding: 'off' }, items: [], aggregates: aggs });
+  ok(!/Approved Funds/i.test(off), 'turning funding off hides the block');
+
+  const none = renderBoardReportItemsHtml({ report: { ...base, ShowFunding: 'non_general' }, items: [],
+    aggregates: aggs.filter((a) => a.GroupKey !== 'funds') });
+  ok(!/Approved Funds/i.test(none), 'and a report with no fund activity shows nothing');
 }
 
 console.log('\n## cleanup');
