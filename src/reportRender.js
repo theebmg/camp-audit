@@ -430,6 +430,7 @@ function moneyHeaderHtml(aggregates) {
     <td style="padding:12px 14px;border-left:4px solid #13432f;border-right:1px solid #c7d2dd;">
       <div style="color:#565c78;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em;line-height:1.35;">${escapeHtml(a.Label)}</div>
       <div style="font-size:1.15rem;font-weight:700;color:#13432f;margin-top:2px;">${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : escapeHtml(a.ValueText || '—')}</div>
+      ${a.Note ? `<div style="color:#565c78;font-size:0.68rem;line-height:1.3;margin-top:3px;">${escapeHtml(a.Note)}</div>` : ''}
     </td>`;
   // Both rows must have the same number of cells or Outlook renders a ragged table — it does
   // not reflow a short row the way a browser does. The shorter row gets an empty filler cell.
@@ -717,6 +718,7 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     `${report.PeriodStart} to ${report.PeriodEnd} (ahead to ${report.ForwardEnd})${report.Status === 'draft' ? ' — DRAFT' : ''}`, ''];
   for (const a of aggregates.filter((x) => ['money', 'savings'].includes(x.GroupKey))) {
     lines.push(`${a.Label}: ${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : (a.ValueText || '—')}`);
+    if (a.Note) lines.push(`  ${a.Note}`);
   }
   if (report.SummaryNotes) lines.push('', summaryHtmlToText(report.SummaryNotes));
   const visible = visibleItems(items);

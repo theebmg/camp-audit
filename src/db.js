@@ -5496,12 +5496,37 @@ export async function computeBoardReportAggregates(reportId) {
   const ytd = await pool.query(spendSql('e.purchase_date BETWEEN $1 AND $2'), [yearStart, report.PeriodEnd]);
   const p = spend.rows[0]; const y = ytd.rows[0];
 
+  // Work paid for directly, with no receipt: a cabin holder settling with a contractor in cash
+  // is real contributed money, and counting only receipts made it invisible. Measured from the
+  // job line's own actual cost, dated by when the line was completed.
+  const directSql = (from, to) => pool.query(
+    `SELECT COALESCE(SUM(jl.actual_cost), 0) AS total
+     FROM job_lines jl
+     LEFT JOIN job_line_funding_kinds k ON k.source = jl.funding_source
+     WHERE jl.funding_source IS NOT NULL AND NOT COALESCE(k.counts_as_camp_spend, true)
+       AND jl.actual_cost IS NOT NULL
+       AND COALESCE(jl.completed_date, jl.completed_at::date) BETWEEN $1 AND $2
+       -- Only where no receipt has been split onto the line: receipts win, and counting both
+       -- would report the same money twice.
+       AND NOT EXISTS (SELECT 1 FROM expense_allocations ea
+                        WHERE ea.dest_type = 'job_line' AND ea.dest_id = jl.id)`,
+    [from, to]
+  );
+  const directP = Number((await directSql(report.PeriodStart, report.PeriodEnd)).rows[0].total);
+  const directY = Number((await directSql(yearStart, report.PeriodEnd)).rows[0].total);
+
+  const nonCampP = Number(p.contributed) + directP;
+  const nonCampY = Number(y.contributed) + directY;
+
   out.push({ groupKey: 'money', label: 'Camp funds spent this period', valueNumeric: Number(p.camp) });
   out.push({ groupKey: 'money', label: 'Camp funds spent year to date', valueNumeric: Number(y.camp) });
-  // Only shown once there is something to show, so the header does not carry two permanent
-  // zeroes while Ben has not yet marked anything as contributed.
-  if (Number(p.contributed) > 0 || Number(y.contributed) > 0) {
-    out.push({ groupKey: 'money', label: 'Contributed this period', valueNumeric: Number(p.contributed) });
+  // Only shown once there is something to show, so the header does not carry a permanent zero
+  // while Ben has not yet marked anything as non-camp.
+  if (nonCampP > 0 || nonCampY > 0) {
+    out.push({
+      groupKey: 'money', label: 'Contributed (non-camp)', valueNumeric: nonCampP,
+      note: 'Includes work paid directly, without a receipt.',
+    });
   }
   if (Number(p.in_kind) > 0 || Number(y.in_kind) > 0) {
     out.push({ groupKey: 'money', label: 'In-kind this period', valueNumeric: Number(p.in_kind) });
@@ -5981,9 +6006,29 @@ async function suggestCalendarAndProjections(reportId, passId, reported, { forwa
 // order's roll-up so the renderer has one thing to deal with. A line whose cost was typed
 // straight in as actual_cost has no receipt behind it and so has no funding — which is the
 // honest answer, not a gap to paper over.
+// "Greenawalt, Ben" reads as a filing entry; "Ben Greenawalt" reads as a person who paid for
+// something. Cabin holders are stored surname-first, so the tag flips them — and leaves alone
+// anything that does not look like "Last, First".
+function personNameForTag(name) {
+  const s = String(name || '').trim();
+  const m = /^([^,]+),\s*(.+)$/.exec(s);
+  return m ? `${m[2].trim()} ${m[1].trim()}` : s;
+}
+
+// Who paid for a job line.
+//
+// PRECEDENCE, and the reason for it: receipts win, because a receipt is evidence that money
+// actually moved. The job line's own Funding Source records intent, and is the fallback for the
+// case that has no paperwork at all — a cash payment, or a cabin holder paying a contractor
+// directly. Without the fallback that money is invisible to the report, which is exactly what
+// happened to the $800 wall removal.
+//
+// A line carrying BOTH is reported as a conflict rather than silently resolved: someone has
+// been paid twice over, or one of the two records is wrong, and neither is ours to guess.
 async function jobLineFundingForReport(jobLineIds) {
   if (!jobLineIds.length) return new Map();
-  const { rows } = await pool.query(
+
+  const { rows: allocs } = await pool.query(
     `SELECT ea.dest_id AS job_line_id,
             COALESCE(fs.short_label, fs.name, 'Unassigned') AS source,
             COALESCE(fs.counts_as_camp_spend, true) AS is_camp,
@@ -5996,12 +6041,57 @@ async function jobLineFundingForReport(jobLineIds) {
      GROUP BY 1, 2, 3 ORDER BY 4 DESC`,
     [jobLineIds]
   );
-  const byLine = new Map();
-  for (const r of rows) {
-    if (!byLine.has(r.job_line_id)) byLine.set(r.job_line_id, []);
-    byLine.get(r.job_line_id).push({
-      Source: r.source, IsCamp: r.is_camp === true, Amount: Number(r.amount),
+
+  // The budget field, for lines no receipt has been split onto. The label comes from whatever
+  // the funding_ref_id points at — a cabin holder's name, a fund's name — falling back to the
+  // kind's own label when there is no reference.
+  const { rows: budget } = await pool.query(
+    `SELECT jl.id AS job_line_id, jl.funding_source, jl.funding_ref_id,
+            COALESCE(jl.actual_cost, 0) AS amount,
+            COALESCE(k.counts_as_camp_spend, true) AS is_camp,
+            COALESCE(k.label, jl.funding_source) AS kind_label,
+            ch.name AS cabin_holder_name, f.name AS fund_name,
+            cc.name AS campaign_name, ob.name AS other_name
+     FROM job_lines jl
+     LEFT JOIN job_line_funding_kinds k ON k.source = jl.funding_source
+     LEFT JOIN cabin_holders ch ON jl.funding_source = 'cabin_holder' AND ch.id = jl.funding_ref_id
+     LEFT JOIN funds f ON jl.funding_source = 'fund' AND f.id = jl.funding_ref_id
+     LEFT JOIN capital_campaign_projects cc ON jl.funding_source = 'capital_campaign' AND cc.id = jl.funding_ref_id
+     LEFT JOIN other_budget_categories ob ON jl.funding_source = 'other' AND ob.id = jl.funding_ref_id
+     WHERE jl.id = ANY($1) AND jl.funding_source IS NOT NULL`,
+    [jobLineIds]
+  );
+
+  const allocByLine = new Map();
+  for (const r of allocs) {
+    if (!allocByLine.has(r.job_line_id)) allocByLine.set(r.job_line_id, []);
+    allocByLine.get(r.job_line_id).push({
+      Source: r.source, IsCamp: r.is_camp === true, Amount: Number(r.amount), From: 'receipt',
     });
+  }
+
+  const byLine = new Map();
+  for (const id of jobLineIds) {
+    const fromReceipts = allocByLine.get(id);
+    const b = budget.find((x) => x.job_line_id === id);
+    const budgetLabel = b
+      ? personNameForTag(b.cabin_holder_name || b.fund_name || b.campaign_name || b.other_name || '') || b.kind_label
+      : null;
+
+    if (fromReceipts && fromReceipts.length) {
+      // Flagged, not resolved. Shown on the report screen and in the reconcile script; never in
+      // the board's copy, which does not need our bookkeeping arguments.
+      const conflict = b && Number(b.amount) > 0
+        && fromReceipts.some((f) => f.IsCamp !== (b.is_camp === true));
+      if (conflict) fromReceipts.conflict = { receipts: fromReceipts.map((f) => f.Source).join(', '), line: budgetLabel };
+      byLine.set(id, fromReceipts);
+      continue;
+    }
+    if (b && Number(b.amount) > 0) {
+      byLine.set(id, [{
+        Source: budgetLabel, IsCamp: b.is_camp === true, Amount: Number(b.amount), From: 'job_line',
+      }]);
+    }
   }
   return byLine;
 }
@@ -6026,21 +6116,38 @@ async function workOrderRollupForReport(workOrderId) {
   );
   const r = rows[0] || {};
 
-  // Funding split: receipts allocated to this work order's lines, grouped by who paid.
-  const { rows: funding } = await pool.query(
+  // Funding split for the whole job: the SAME per-line rule rolled up, so the work order's row
+  // and the lines beneath it can never disagree about who paid. Doing this with its own
+  // allocations-only query is what made a work order show no funding while its line showed some.
+  const { rows: lineIdRows } = await pool.query('SELECT id FROM job_lines WHERE work_order_id = $1', [workOrderId]);
+  const perLine = await jobLineFundingForReport(lineIdRows.map((r) => r.id));
+  const fundingTotals = new Map();
+  for (const entries of perLine.values()) {
+    for (const e of entries) {
+      const cur = fundingTotals.get(e.Source) || { source: e.Source, is_camp: e.IsCamp, amount: 0 };
+      cur.amount += e.Amount;
+      fundingTotals.set(e.Source, cur);
+    }
+  }
+  // Receipts booked against the work order itself rather than one of its lines.
+  const { rows: woLevel } = await pool.query(
     `SELECT COALESCE(fs.short_label, fs.name, 'Unassigned') AS source,
-            COALESCE(fs.is_contribution, false) AS is_contribution,
             COALESCE(fs.counts_as_camp_spend, true) AS is_camp,
             SUM(ea.amount) AS amount
      FROM expense_allocations ea
      JOIN expenses e ON e.id = ea.expense_id
      LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
      WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
-       AND ((ea.dest_type = 'job_line' AND ea.dest_id IN (SELECT id FROM job_lines WHERE work_order_id = $1))
-         OR (ea.dest_type = 'work_order' AND ea.dest_id = $1))
-     GROUP BY 1, 2, 3 ORDER BY 4 DESC`,
+       AND ea.dest_type = 'work_order' AND ea.dest_id = $1
+     GROUP BY 1, 2`,
     [workOrderId]
   );
+  for (const r of woLevel) {
+    const cur = fundingTotals.get(r.source) || { source: r.source, is_camp: r.is_camp === true, amount: 0 };
+    cur.amount += Number(r.amount);
+    fundingTotals.set(r.source, cur);
+  }
+  const funding = [...fundingTotals.values()].sort((a, b) => b.amount - a.amount);
 
   // Progress, weighted by estimated cost rather than by counting lines — eight of thirteen is
   // misleading when the lines are not the same size (§2c). Falls back to naming what finished
@@ -6089,7 +6196,7 @@ async function workOrderRollupForReport(workOrderId) {
     firstDate: r.first_date || null,
     lastCompleted: r.last_completed || null,
     funding: funding.map((f) => ({
-      Source: f.source, IsContribution: f.is_contribution, IsCamp: f.is_camp === true, Amount: Number(f.amount),
+      Source: f.source, IsCamp: f.is_camp === true, Amount: Number(f.amount),
     })),
     progress,
   };
@@ -6816,9 +6923,9 @@ export async function replaceBoardReportAggregates(reportId, aggregates) {
     await client.query('DELETE FROM board_report_aggregates WHERE report_id = $1', [reportId]);
     for (const [idx, a] of aggregates.entries()) {
       await client.query(
-        `INSERT INTO board_report_aggregates (report_id, group_key, label, value_numeric, value_text, sort_index)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [reportId, a.groupKey, a.label, a.valueNumeric ?? null, a.valueText ?? null, a.sortIndex ?? idx]
+        `INSERT INTO board_report_aggregates (report_id, group_key, label, value_numeric, value_text, sort_index, note)
+         VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [reportId, a.groupKey, a.label, a.valueNumeric ?? null, a.valueText ?? null, a.sortIndex ?? idx, a.note ?? null]
       );
     }
     await client.query('COMMIT');
@@ -6833,7 +6940,7 @@ export async function listBoardReportAggregates(reportId) {
   return rows.map((r) => ({
     Id: r.id, GroupKey: r.group_key, Label: r.label,
     ValueNumeric: r.value_numeric != null ? Number(r.value_numeric) : null,
-    ValueText: r.value_text, SortIndex: r.sort_index,
+    ValueText: r.value_text, SortIndex: r.sort_index, Note: r.note,
   }));
 }
 
