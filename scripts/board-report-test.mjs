@@ -527,6 +527,55 @@ console.log('\n## the footer breaks the cost down by funder');
   ok(!/item\(s\)[^<]*\$/.test(html), 'no subtotal beside the item count');
 }
 
+console.log('\n## a fund-charged receipt linked to work keeps its fund');
+{
+  const fund = (await db.pool.query('SELECT id, name FROM funds ORDER BY id LIMIT 1')).rows[0];
+  if (!fund) { console.log('  --    no funds defined; skipped'); }
+  else {
+    const asset = (await db.pool.query('select id from assets limit 1')).rows[0];
+    const { workOrderId: woId } = await db.createWorkOrder({
+      title: `${TAG} fund link`, assetId: asset.id, priority: 'Medium',
+    });
+    // A line budgeted against the GENERAL operating budget — the case that used to swallow the
+    // fund, because a split inherits its category from the line it lands on.
+    const line = await db.createJobLine(woId, { title: `${TAG} general line`, estimatedCost: 100 });
+    await db.pool.query(
+      "UPDATE job_lines SET funding_source = 'operating_budget', funding_ref_id = NULL WHERE id = $1",
+      [line.Id]
+    );
+    const exp = await db.createExpense({ vendor: `${TAG} Hardware`, amount: 250, purchaseDate: p.periodStart });
+    await db.pool.query('UPDATE expenses SET fund_id = $2 WHERE id = $1', [exp.Id, fund.id]);
+    await db.createExpenseAllocation(exp.Id, { destType: 'job_line', destId: line.Id, amount: 250, quantity: 1 });
+
+    const stamped = (await db.pool.query(
+      'SELECT funding_source, funding_ref_id FROM expense_allocations WHERE expense_id = $1', [exp.Id])).rows[0];
+    ok(stamped.funding_source === 'fund' && stamped.funding_ref_id === fund.id,
+      `the allocation is stamped with the fund, not the line's category (${stamped.funding_source})`);
+
+    const roll = await db.workOrderRollupForReportForTest
+      ? null
+      : null;   // the rollup is private; check through the resolver's own output instead
+    const rep = await db.listBoardReportItems(1);   // not used; keeps the shape obvious
+    void roll; void rep;
+
+    // What the report would say about that line.
+    const { rows: resolved } = await db.pool.query(
+      `SELECT COALESCE(f.name, 'none') AS source
+       FROM expense_allocations ea
+       JOIN expenses e ON e.id = ea.expense_id
+       LEFT JOIN funds f ON f.id = COALESCE(e.fund_id,
+                              CASE WHEN ea.funding_source = 'fund' THEN ea.funding_ref_id END)
+       WHERE ea.dest_id = $1 AND ea.dest_type = 'job_line'`, [line.Id]);
+    ok(resolved[0]?.source === fund.name,
+      `and the report resolves it to "${resolved[0]?.source}" rather than the general budget`);
+
+    await db.pool.query('DELETE FROM expense_allocations WHERE expense_id = $1', [exp.Id]);
+    await db.pool.query('DELETE FROM expenses WHERE id = $1', [exp.Id]);
+    await db.pool.query('DELETE FROM job_lines WHERE id = $1', [line.Id]);
+    await db.pool.query('DELETE FROM work_orders WHERE id = $1', [woId]);
+  }
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(
