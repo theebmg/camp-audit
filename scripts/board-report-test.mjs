@@ -134,7 +134,9 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
   ok(html.includes(`${TAG} Roof`), 'the work order row prints');
   ok(!html.includes(`${TAG} strip`) && !html.includes(`${TAG} reshingle`),
     'and its lines do NOT print separately');
-  ok(/Total — 1 item\(s\)/.test(html), 'the footer counts the one row the reader can see, not three');
+  // Counting rendered rows directly, now that the footer no longer tallies them.
+  const rowCount = (h) => (h.match(/border-bottom:1px solid #eef0f6;padding:9px 0;/g) || []).length;
+  ok(rowCount(html) === 1, `one row reaches the reader, not three (${rowCount(html)})`);
   ok(html.includes('$1,200'), 'the total is the rolled-up actual');
   ok(!html.includes('$2,400'), 'the lines are not double counted on top of the row');
   ok(!html.includes('$1,500') || html.includes('est.'),
@@ -143,7 +145,7 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
   console.log('\n## itemized prints the lines instead');
   const html2 = renderBoardReportItemsHtml({ report, items: [{ ...wo, DisplayMode: 'itemized' }, lineA, lineB], aggregates: [] });
   ok(html2.includes(`${TAG} strip`) && html2.includes(`${TAG} reshingle`), 'both lines print');
-  ok(/Total — 3 item\(s\)/.test(html2), 'and all three rows are counted');
+  ok(rowCount(html2) === 3, `and all three rows render (${rowCount(html2)})`);
 
   console.log('\n## the footer says what the money is, so it is not read as camp spend');
   const NOTE = 'Recorded cost of work shown, including work funded outside camp. '
@@ -151,7 +153,8 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
   ok(html.replace(/\s+/g, ' ').includes(NOTE), 'the HTML footer carries the note Ben wrote, verbatim');
   const text = renderBoardReportItemsText({ report, items: [wo, lineA, lineB], aggregates: [] });
   ok(text.includes(NOTE), 'and so does the plain-text copy');
-  ok(/TOTAL — 1 item/.test(text), 'the text footer agrees with the HTML one');
+  ok(/TOTAL .* \$1,200\.00 recorded cost of work shown/.test(text),
+    'the text footer states the same rolled-up total as the HTML one');
 }
 
 console.log('\n## the footer note appears even when the recorded cost is zero');
@@ -167,8 +170,10 @@ console.log('\n## the footer note appears even when the recorded cost is zero');
   const text = renderBoardReportItemsText({ report, items, aggregates: [] });
   ok(html.replace(/\s+/g, ' ').includes(NOTE), 'the HTML note survives a $0 report');
   ok(text.includes(NOTE), 'and so does the plain-text one');
-  ok(/Total . 1 item\(s\)/.test(html), 'the footer still counts the row');
-  ok(!/\$379/.test(html.split('Total')[1] || ''), 'and the estimate is still not in the total');
+  ok(!/\$379/.test(html.split('Not camp spend')[0].split('recorded cost')[1] || ''),
+    'the estimate is still not in the total');
+  ok(!/recorded cost of work shown/.test(html.replace(NOTE, '')),
+    'and with no actual cost there is no total figure to mislead anyone');
 }
 
 console.log('\n## Show hours: off by default, and off means off everywhere');
