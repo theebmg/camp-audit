@@ -551,6 +551,11 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
     <div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
       Total — ${visible.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}
     </div>
+    ${grandCost ? `<div style="margin-top:5px;color:#6b7086;font-size:0.8rem;line-height:1.4;">
+      Recorded cost is what the work cost, whoever paid for it — it is <strong>not</strong> camp
+      spend. Who funded what is set out above. Estimates on open items are shown for context and
+      are never added into this total.
+    </div>` : ''}
     <div style="margin-top:8px;color:#9298b0;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
   `
   );
@@ -574,6 +579,15 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
       lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
       if (it.ReportNote) lines.push(`      ${it.ReportNote}`);
     }
+  }
+  const grandCost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const grandHours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
+  lines.push('', `TOTAL — ${visible.length} item(s)`
+    + `${grandHours ? ` · ${fmtHours(grandHours)}` : ''}`
+    + `${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}`);
+  if (grandCost) {
+    lines.push('Recorded cost is what the work cost, whoever paid for it — it is NOT camp spend.',
+      'Who funded what is set out above. Estimates on open items are never added into this total.');
   }
   lines.push('', OPS_LABEL);
   return lines.join('\n');

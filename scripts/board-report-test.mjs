@@ -119,6 +119,40 @@ const unassigned = (await db.pool.query(
 const total = (await db.pool.query(`select count(*)::int n from expenses where vendor not like $1`, [`${TAG}%`])).rows[0].n;
 ok(unassigned === total, `all ${total} real expenses are still unset, for Ben to mark himself`);
 
+console.log('\n## a summary work order rolls its lines up into its own row (decisions: rollup)');
+{
+  const { renderBoardReportItemsHtml, renderBoardReportItemsText } = await import('/app/src/reportRender.js');
+  const wo = { Id: 901, ItemType: 'work_order', ItemId: 77, Section: 'done', Included: true,
+    DisplayMode: 'summary', SnapTitle: `${TAG} Roof`, SnapCost: 1200, SnapEstCost: 1500, SnapHours: 4 };
+  const lineA = { Id: 902, ItemType: 'job_line', ItemId: 1, ParentWorkOrderId: 77, Section: 'done',
+    Included: true, SnapTitle: `${TAG} strip`, SnapCost: 700 };
+  const lineB = { Id: 903, ItemType: 'job_line', ItemId: 2, ParentWorkOrderId: 77, Section: 'done',
+    Included: true, SnapTitle: `${TAG} reshingle`, SnapCost: 500 };
+  const report = { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft' };
+  const html = renderBoardReportItemsHtml({ report, items: [wo, lineA, lineB], aggregates: [] });
+
+  ok(html.includes(`${TAG} Roof`), 'the work order row prints');
+  ok(!html.includes(`${TAG} strip`) && !html.includes(`${TAG} reshingle`),
+    'and its lines do NOT print separately');
+  ok(/Total — 1 item\(s\)/.test(html), 'the footer counts the one row the reader can see, not three');
+  ok(html.includes('$1,200'), 'the total is the rolled-up actual');
+  ok(!html.includes('$2,400'), 'the lines are not double counted on top of the row');
+  ok(!html.includes('$1,500') || html.includes('est.'),
+    'the estimate only ever appears labelled as an estimate, never in the total');
+
+  console.log('\n## itemized prints the lines instead');
+  const html2 = renderBoardReportItemsHtml({ report, items: [{ ...wo, DisplayMode: 'itemized' }, lineA, lineB], aggregates: [] });
+  ok(html2.includes(`${TAG} strip`) && html2.includes(`${TAG} reshingle`), 'both lines print');
+  ok(/Total — 3 item\(s\)/.test(html2), 'and all three rows are counted');
+
+  console.log('\n## the footer says what the money is, so it is not read as camp spend');
+  ok(/not<\/strong> camp\s+spend/.test(html.replace(/\s+/g, ' ')) || /not camp spend/i.test(html),
+    'the HTML footer says it is not camp spend');
+  const text = renderBoardReportItemsText({ report, items: [wo, lineA, lineB], aggregates: [] });
+  ok(/NOT camp spend/.test(text), 'and so does the plain-text copy');
+  ok(/TOTAL — 1 item/.test(text), 'the text footer agrees with the HTML one');
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(
