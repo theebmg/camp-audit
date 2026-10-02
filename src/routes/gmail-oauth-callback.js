@@ -11,7 +11,7 @@
 // so req.session is available both to verify the CSRF state that /oauth/start wrote and to
 // record who connected it.
 import express from 'express';
-import { exchangeCodeForTokens, fetchGrantedEmail } from '../gmailOAuth.js';
+import { exchangeCodeForTokens, fetchGrantedEmail, emailFromIdToken } from '../gmailOAuth.js';
 import { setMailOAuthToken } from '../db.js';
 
 const router = express.Router();
@@ -37,7 +37,18 @@ router.get('/', async (req, res) => {
         + 'Security → Third-party access, then connect again.'
       );
     }
-    const grantedEmail = await fetchGrantedEmail(tokens.access_token);
+    // The id_token first — it is in the response we already have. userinfo is a fallback for a
+    // grant made before 'email' was requested.
+    const grantedEmail = emailFromIdToken(tokens.id_token)
+      || await fetchGrantedEmail(tokens.access_token);
+    if (!grantedEmail) {
+      // Storing a connection with no address against it is what produced a "connected" screen
+      // that could not send a thing. Refuse it instead.
+      throw new Error(
+        'Google did not say which account granted access, so the connection cannot be used to '
+        + 'send. Reconnect and make sure the consent screen lists the email permission.'
+      );
+    }
     await setMailOAuthToken({
       refreshToken: tokens.refresh_token,
       user: grantedEmail,
