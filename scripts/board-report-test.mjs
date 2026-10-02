@@ -358,9 +358,11 @@ console.log('\n## a second pass must not wipe what the first worked out');
 {
   // The exact shape that lost the paint line's funding: a board-flagged job line is written by
   // the Done rule with funding, then again by the flagged rule which knows nothing about it.
+  // Created 'published', not 'draft': a partial unique index allows only one draft at a time,
+  // and the real September draft is it. The upsert does not care about status.
   const rep = (await db.pool.query(
     `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end)
-     VALUES ($1,'draft','2026-09-01','2026-09-30','2026-10-01','2026-10-15') RETURNING id`,
+     VALUES ($1,'published','2026-09-01','2026-09-30','2026-10-01','2026-10-15') RETURNING id`,
     [`${TAG} upsert`])).rows[0].id;
   try {
     await db.upsertBoardReportItem(rep, {
