@@ -5715,15 +5715,14 @@ async function renderBoardReport(params = {}) {
         <p class="muted" style="margin:-4px 0 8px;font-size:0.85rem">
           Published reports are frozen as the board received them. Open one to read it back.
         </p>
-        ${pastReports.map((r) => `<div class="list-item" style="display:flex;justify-content:space-between;gap:10px;align-items:baseline">
-          <div>
+        ${pastReports.map((r) => `<div class="list-item list-item-actionable">
+          <div class="lia-main">
             <strong>${escapeHtml(r.Title)}</strong>
             <span class="muted" style="font-size:0.85rem"> — ${escapeHtml(r.PeriodStart)} to ${escapeHtml(r.PeriodEnd)}</span>
           </div>
-          <span style="white-space:nowrap">
+          <span class="lia-actions">
             <span class="pill">${r.Status === 'published' ? `published ${escapeHtml(String(r.PublishedAt || '').slice(0, 10))}` : 'draft'}</span>
-            <button type="button" class="btn btn-secondary br-open-report" data-id="${r.Id}"
-                    style="margin-left:8px;padding:4px 12px;font-size:0.85rem">Open</button>
+            <button type="button" class="btn btn-secondary btn-inline br-open-report" data-id="${r.Id}">Open</button>
           </span>
         </div>`).join('')}
       </div>` : ''}
@@ -5733,9 +5732,11 @@ async function renderBoardReport(params = {}) {
         <p class="muted" style="margin:-4px 0 8px;font-size:0.85rem">
           Every time this report was emailed, downloaded or previewed${outputs.length > 12 ? `. Showing the 12 most recent of ${outputs.length}` : ''}.
         </p>
-        ${outputs.slice(0, 12).map((o) => `<div class="list-item" style="display:flex;justify-content:space-between;gap:10px">
-          <div><strong>${escapeHtml(o.ReportTitle)}</strong> <span class="muted">— ${escapeHtml(o.Kind)}${o.WasDraft ? ' (draft)' : ''}${o.Recipients ? ` → ${escapeHtml(o.Recipients)}` : ''}</span></div>
-          <a href="#" class="br-open-output" data-id="${o.Id}">view</a>
+        ${outputs.slice(0, 12).map((o) => `<div class="list-item list-item-actionable">
+          <div class="lia-main"><strong>${escapeHtml(o.ReportTitle)}</strong> <span class="muted">— ${escapeHtml(o.Kind)}${o.WasDraft ? ' (draft)' : ''}${o.Recipients ? ` → ${escapeHtml(o.Recipients)}` : ''}</span></div>
+          <span class="lia-actions">
+            <button type="button" class="btn btn-secondary btn-inline br-open-output" data-id="${o.Id}">View</button>
+          </span>
         </div>`).join('')}
       </div>` : ''}
     `);

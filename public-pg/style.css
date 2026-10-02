@@ -1090,3 +1090,34 @@ input.has-error, select.has-error, textarea.has-error {
   border-color: #b4232a;
   background: #fff8f8;
 }
+
+/* A button sitting INSIDE a row, rather than stacked under a form.
+   .btn is width:100% by design — the app is mobile-first and a form button should fill its
+   column — but that same rule puts a 226px "Open" into a flex row and pushes it past the right
+   edge of the screen, where it cannot be tapped at all. Reproduced at 1440px and at 393px. */
+.btn-inline {
+  width: auto;
+  margin-top: 0;
+  padding: 8px 16px;
+  font-size: 0.88rem;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+/* Rows carrying an inline action wrap instead of overflowing, and the text side is allowed to
+   shrink — without min-width:0 a long title refuses to narrow and pushes the action out. */
+.list-item-actionable {
+  flex-wrap: wrap;
+  align-items: baseline;
+}
+.list-item-actionable > .lia-main {
+  flex: 1 1 240px;
+  min-width: 0;
+}
+.list-item-actionable > .lia-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
