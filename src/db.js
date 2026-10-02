@@ -7000,6 +7000,7 @@ function boardReportRowShape(r) {
     ForwardStart: r.forward_start_text || r.forward_start,
     ForwardEnd: r.forward_end_text || r.forward_end,
     SummaryNotes: r.summary_notes,
+    PublishSnapshot: r.publish_snapshot || null,
     ShowHours: r.show_hours === true,
     ShowFunding: r.show_funding || 'non_general',
     CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
@@ -7262,6 +7263,79 @@ export async function listBoardReportAggregates(reportId) {
 // Publish: drop the items nobody checked, then freeze. Excluded rows are deleted rather
 // than kept as included=false, so a published report contains exactly what the board
 // saw — no shadow list of things that were considered and cut.
+// Undo a publish.
+//
+// Restores the "Include on board report" flags that publishing cleared, from the snapshot it
+// took, and returns the report to draft so it can be worked on again.
+//
+// What it CANNOT undo: items that were unchecked when the report went out were deleted, and are
+// not in the snapshot. A refresh proposes them again if they still qualify. The confirmation
+// says so rather than implying a clean reversal.
+//
+// Only one draft may exist at a time. An empty untouched draft standing in the way is removed —
+// it is the shell the screen made when the report was published, and nobody has put anything in
+// it. One with any content in it is never touched; the caller is told instead.
+export async function unpublishBoardReport(id) {
+  const cur = await getBoardReport(id);
+  if (!cur) return { ok: false, error: 'Not found' };
+  if (cur.Status !== 'published') return { ok: false, error: 'That report is not published.' };
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const { rows: others } = await client.query(
+      `SELECT r.id, r.title,
+              (SELECT count(*)::int FROM board_report_items i WHERE i.report_id = r.id) AS items,
+              length(COALESCE(r.summary_notes, '')) AS summary
+       FROM board_reports r WHERE r.status = 'draft' AND r.id <> $1`, [id]
+    );
+    for (const other of others) {
+      if (other.items === 0 && other.summary === 0) {
+        await client.query('DELETE FROM board_reports WHERE id = $1', [other.id]);
+      } else {
+        await client.query('ROLLBACK');
+        return {
+          ok: false,
+          error: `"${other.title}" is already open as a draft with ${other.items} item(s) in it. `
+            + 'Only one draft can exist at a time, so finish or clear that one first.',
+        };
+      }
+    }
+
+    const snap = cur.PublishSnapshot || {};
+    const cleared = snap.clearedFlags || {};
+    const restored = {};
+    for (const [type, table] of [['work_order', 'work_orders'], ['job_line', 'job_lines'],
+      ['condition_finding', 'condition_findings']]) {
+      const entries = Array.isArray(cleared[type]) ? cleared[type] : [];
+      restored[type] = 0;
+      for (const e of entries) {
+        const { rowCount } = await client.query(
+          `UPDATE ${table} SET board_focus = true, board_focus_set_at = $2 WHERE id = $1`,
+          [e.id, e.setAt || null]
+        );
+        restored[type] += rowCount;
+      }
+    }
+
+    await client.query(
+      `UPDATE board_reports SET status = 'draft', published_at = NULL, publish_snapshot = NULL
+       WHERE id = $1`, [id]
+    );
+    await client.query('COMMIT');
+
+    await logActivity({
+      action: 'unpublished', entityType: 'board_report', entityId: Number(id), entityLabel: cur.Title,
+      details: `flags restored: ${Object.entries(restored).map(([k, v]) => `${v} ${k}`).join(', ')}`
+        + (others.length ? `; removed the empty draft "${others[0].title}"` : ''),
+    });
+    return { ok: true, report: await getBoardReport(id), restored, removedEmptyDrafts: others.length };
+  } catch (e) {
+    await client.query('ROLLBACK'); throw e;
+  } finally { client.release(); }
+}
+
 export async function publishBoardReport(id) {
   const cur = await getBoardReport(id);
   if (!cur) return null;
@@ -7282,31 +7356,45 @@ export async function publishBoardReport(id) {
     const cleared = {};
     for (const [type, table] of [['work_order', 'work_orders'], ['job_line', 'job_lines'],
       ['condition_finding', 'condition_findings']]) {
+      // RETURNING hands back the row AFTER the update, so the old set_at has to be read first
+      // or the date it was flagged is lost and Unpublish can only restore a bare flag.
+      const { rows: before } = await client.query(
+        `SELECT id, board_focus_set_at FROM ${table}
+         WHERE board_focus AND id IN (
+           SELECT item_id FROM board_report_items WHERE report_id = $1 AND item_type = $2
+         )`, [id, type]
+      );
+      const setAtById = new Map(before.map((r) => [r.id, r.board_focus_set_at]));
       const { rows } = await client.query(
         `UPDATE ${table} SET board_focus = false, board_focus_set_at = NULL
          WHERE board_focus AND id IN (
            SELECT item_id FROM board_report_items WHERE report_id = $1 AND item_type = $2
-         ) RETURNING id`, [id, type]
+         ) RETURNING id, board_focus_set_at`, [id, type]
       );
-      cleared[type] = rows.map((r) => r.id);
+      cleared[type] = rows.map((r) => ({ id: r.id, setAt: setAtById.get(r.id) || null }));
     }
     // Recorded in the work order log where there is one, so a flag disappearing is
     // explained rather than just noticed.
-    for (const woId of cleared.work_order) {
+    for (const { id: woId } of cleared.work_order) {
       await client.query(
         `INSERT INTO work_order_log_entries (work_order_id, note, username) VALUES ($1,$2,$3)`,
         [woId, `Board report flag cleared — included on the published report "${cur.Title}"`, currentUsername()]
       );
     }
-    for (const lineId of cleared.job_line) {
+    for (const { id: lineId } of cleared.job_line) {
       await client.query(
         `INSERT INTO work_order_log_entries (work_order_id, note, username)
          SELECT jl.work_order_id, $2, $3 FROM job_lines jl WHERE jl.id = $1`,
         [lineId, `Board report flag cleared — included on the published report "${cur.Title}"`, currentUsername()]
       );
     }
+    const { rows: droppedRows } = await client.query(
+      `SELECT count(*)::int AS n FROM board_report_items WHERE report_id = $1`, [id]
+    );
     await client.query(
-      `UPDATE board_reports SET status = 'published', published_at = now() WHERE id = $1`, [id]
+      `UPDATE board_reports SET status = 'published', published_at = now(), publish_snapshot = $2
+       WHERE id = $1`,
+      [id, JSON.stringify({ clearedFlags: cleared, itemsKept: droppedRows[0].n, publishedBy: currentUsername() })]
     );
     await client.query('COMMIT');
   } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }

@@ -5703,7 +5703,9 @@ async function renderBoardReport(params = {}) {
           <button type="button" class="btn btn-secondary" id="brSave">Save a copy</button>
           <button type="button" class="btn btn-secondary" id="brDownload">Download</button>
           <button type="button" class="btn btn-secondary" id="brEmail">Email…</button>
-          ${published ? '' : '<button type="button" class="btn btn-primary" id="brPublish">Publish</button>'}
+          ${published
+            ? (state.options?.currentUser?.role === 'admin' ? '<button type="button" class="btn btn-secondary" id="brUnpublish">Unpublish</button>' : '')
+            : '<button type="button" class="btn btn-primary" id="brPublish">Publish</button>'}
         </div>
         <p class="muted" style="margin:8px 0 0;font-size:0.82rem">Every copy that leaves the app is saved below, exactly as it went out.</p>
       </div>
@@ -5720,7 +5722,8 @@ async function renderBoardReport(params = {}) {
           </div>
           <span style="white-space:nowrap">
             <span class="pill">${r.Status === 'published' ? `published ${escapeHtml(String(r.PublishedAt || '').slice(0, 10))}` : 'draft'}</span>
-            <a href="#" class="br-open-report" data-id="${r.Id}" style="margin-left:8px">open</a>
+            <button type="button" class="btn btn-secondary br-open-report" data-id="${r.Id}"
+                    style="margin-left:8px;padding:4px 12px;font-size:0.85rem">Open</button>
           </span>
         </div>`).join('')}
       </div>` : ''}
@@ -5839,10 +5842,43 @@ async function renderBoardReport(params = {}) {
     const pub = document.getElementById('brPublish');
     if (pub) pub.addEventListener('click', async () => {
       const on = items.filter((i) => i.Included).length;
-      if (!await confirmDialog(`Publish this report with ${on} item(s)? Unchecked items are dropped and the report becomes read-only.`,
-        { confirmLabel: 'Publish', cancelLabel: 'Keep editing', danger: false })) return;
-      await api(`/api/pg/board-reports/${report.Id}/publish`, { method: 'POST' });
-      toast('Published'); await load(); draw();
+      const off = items.length - on;
+      // Publishing is not sending. Saying so here, because pressing it expecting the board to
+      // receive something and getting an empty screen instead is exactly what happened.
+      const lines = [
+        `Publish "${report.Title}" with ${on} item(s)?`,
+        '',
+        'Publishing FREEZES this report as the copy of record. It does not email anyone —',
+        'use Email… for that, before or after publishing.',
+        '',
+        `· It becomes read-only and moves to Past Reports.`,
+        `· The screen then opens a NEW empty draft for the next report.`,
+        `· Items already published are not proposed onto that draft again.`,
+      ];
+      if (off > 0) lines.push(`· ${off} unchecked item(s) will be DELETED and cannot be brought back.`);
+      lines.push('', 'An admin can undo this afterwards.');
+      if (!await confirmDialog(lines.join('\n'),
+        { confirmLabel: 'Publish', cancelLabel: 'Keep editing', danger: off > 0 })) return;
+      try {
+        await api(`/api/pg/board-reports/${report.Id}/publish`, { method: 'POST' });
+        toast('Published — find it under Past Reports. Use Email… to send it.', 9000);
+        await load(); draw();
+      } catch (err) { toast(saveErrorMessage(err), 8000); }
+    });
+
+    document.getElementById('brUnpublish')?.addEventListener('click', async () => {
+      if (!await confirmDialog(
+        `Unpublish "${report.Title}"?\n\n`
+        + 'It returns to being an editable draft and the board-report flags it cleared are put back.\n\n'
+        + 'Items that were unchecked when it published were deleted at the time and do not come '
+        + 'back; refreshing proposes them again if they still qualify.',
+        { confirmLabel: 'Unpublish', cancelLabel: 'Leave it published', danger: false })) return;
+      try {
+        const r = await api(`/api/pg/board-reports/${report.Id}/unpublish`, { method: 'POST' });
+        const n = Object.values(r.restored || {}).reduce((t, v) => t + v, 0);
+        toast(`Unpublished — editable again${n ? `, ${n} flag(s) restored` : ''}.`, 8000);
+        go('reports', { mode: 'board' }, { replace: true });
+      } catch (err) { toast(saveErrorMessage(err), 10000); }
     });
     document.getElementById('brBackToDraft')?.addEventListener('click', (e) => {
       e.preventDefault();
