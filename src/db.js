@@ -5765,7 +5765,11 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
             COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date,
             (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
             jl.actual_hours,
-            COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost,
+            -- Actual and estimate are kept APART. They used to be COALESCEd into one "cost"
+            -- that the row printed and the footer summed, so a line with only an estimate
+            -- published that estimate as money spent — the exact thing the rules forbid.
+            ${JOB_LINE_ACTUAL_COST_EXPR} AS cost,
+            jl.estimated_cost AS est_cost,
             w.id AS work_order_id, w.title AS wo_title, a.name AS asset_name, s.name AS status_name,
             -- The work order's OWN status and dates, so the header row this pass writes
             -- carries the same detail the board-featured path has always written (decisions §7).
@@ -5813,6 +5817,7 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
         snapHours: roll.actualHours || null,
         snapFunding: roll.funding.length ? roll.funding : null,
         snapProgress: r.wo_completed ? null : roll.progress,
+        snapOpenLines: r.wo_is_terminal ? null : roll.openLines,
       });
     }
     await upsertBoardReportItem(reportId, { passId,
@@ -5822,7 +5827,7 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
       snapSubtitle: r.date_inferred ? `${r.wo_title} · date not recorded` : r.wo_title,
       snapAssetName: r.asset_name,
       snapStatus: r.status_name, snapDate: r.completed_date,
-      snapHours: r.actual_hours, snapCost: r.cost,
+      snapHours: r.actual_hours, snapCost: r.cost, snapEstCost: r.est_cost,
     });
   }
   return rows.length;
@@ -6027,7 +6032,16 @@ async function workOrderRollupForReport(workOrderId) {
     }
   }
 
+  // What the job still has left, for "Still to do" under an open work order.
+  const { rows: open } = await pool.query(
+    `SELECT jl.title FROM job_lines jl JOIN job_line_statuses jls ON jls.id = jl.status_id
+     WHERE jl.work_order_id = $1 AND NOT jls.is_terminal
+     ORDER BY jl.sort_order, jl.id LIMIT 12`,
+    [workOrderId]
+  );
+
   return {
+    openLines: open.map((x) => String(x.title).trim()).filter(Boolean),
     actualCost: Number(r.actual_cost) || 0,
     hasActual: Number(r.lines_with_actual) > 0,
     estCost: Number(r.est_cost) || 0,
@@ -6332,6 +6346,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
       snapHours: roll.actualHours || null,
       snapFunding: roll.funding.length ? roll.funding : null,
       snapProgress: r.is_terminal ? null : roll.progress,
+      snapOpenLines: r.is_terminal ? null : roll.openLines,
       // "Featured since March" stays on open items so a stale flag reads as stale;
       // on finished work the flag is about to clear itself, so it says nothing.
       // Any OPEN item keeps "featured since March", including one sitting in Done as
@@ -6349,7 +6364,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
         `SELECT jl.id, jl.title, s.name AS status_name,
                 COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date,
                 (jl.completed_date IS NULL AND jl.completed_at IS NOT NULL) AS date_inferred,
-                jl.actual_hours, COALESCE(${JOB_LINE_ACTUAL_COST_EXPR}, jl.estimated_cost) AS cost
+                jl.actual_hours, ${JOB_LINE_ACTUAL_COST_EXPR} AS cost, jl.estimated_cost AS est_cost
          FROM job_lines jl
          JOIN job_line_statuses s ON s.id = jl.status_id
          LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
@@ -6363,7 +6378,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
           parentWorkOrderId: r.id, snapTitle: c.title,
           snapSubtitle: c.date_inferred ? `${r.title} · date not recorded` : r.title,
           snapAssetName: r.place, snapStatus: c.status_name, snapDate: c.completed_date,
-          snapHours: c.actual_hours, snapCost: c.cost,
+          snapHours: c.actual_hours, snapCost: c.cost, snapEstCost: c.est_cost,
         });
         n += 1;
       }
@@ -6396,7 +6411,10 @@ async function suggestFlaggedItems(reportId, passId, reported) {
       snapSubtitle: `${r.wo_title}${done && r.date_inferred ? ' · date not recorded' : stale}`,
       snapAssetName: r.place, snapStatus: r.status,
       snapDate: done ? r.completed_date : r.scheduled_date,
-      snapHours: r.actual_hours, snapCost: r.cost,
+      snapHours: r.actual_hours,
+      // Open work: whatever is recorded is an estimate until the work is done and paid for.
+      snapCost: done ? r.cost : null,
+      snapEstCost: done ? null : r.cost,
     });
     n += 1;
   }
@@ -6631,6 +6649,7 @@ export async function listBoardReportItems(reportId) {
     SnapTitle: r.snap_title, SnapSubtitle: r.snap_subtitle, SnapAssetName: r.snap_asset_name,
     SnapStatus: r.snap_status, SnapDate: r.snap_date_text, SnapStartDate: r.snap_start_date_text,
     SnapEstCost: r.snap_est_cost != null ? Number(r.snap_est_cost) : null,
+    SnapOpenLines: Array.isArray(r.snap_open_lines) ? r.snap_open_lines : null,
     SnapFunding: r.snap_funding || null,
     SnapHours: r.snap_hours != null ? Number(r.snap_hours) : null,
     SnapCost: r.snap_cost != null ? Number(r.snap_cost) : null,
@@ -6647,16 +6666,17 @@ export async function listBoardReportItems(reportId) {
 export async function upsertBoardReportItem(reportId, {
   itemType, itemId, itemDate = null, section, included, displayMode, reportNote, sortIndex,
   snapTitle, snapSubtitle, snapAssetName, snapStatus, snapStartDate, snapDate, snapHours, snapCost, snapProgress,
-  snapEstCost, snapFunding,
+  snapEstCost, snapFunding, snapOpenLines,
   parentWorkOrderId = null, passId = null,
 }) {
   const { rows } = await pool.query(
     `INSERT INTO board_report_items
        (report_id, item_type, item_id, item_date, section, included, display_mode, report_note, sort_index,
         snap_title, snap_subtitle, snap_asset_name, snap_status, snap_date, snap_hours, snap_cost, snap_progress,
-        parent_work_order_id, suggested_at, last_pass_id, snap_start_date, snap_est_cost, snap_funding)
+        parent_work_order_id, suggested_at, last_pass_id, snap_start_date, snap_est_cost, snap_funding,
+        snap_open_lines)
      VALUES ($1,$2,$3,$4,$5,COALESCE($6,true),COALESCE($7,'summary'),$8,COALESCE($9,0),
-             $10,$11,$12,$13,$14,$15,$16,$17,$18,now(),$19,$20,$21,$22)
+             $10,$11,$12,$13,$14,$15,$16,$17,$18,now(),$19,$20,$21,$22,$23)
      -- Matches the expression index from 0092: item_date is nullable, and NULL is
      -- DISTINCT from NULL in a plain unique constraint, so a bare column list here
      -- could never find the existing row and every pass inserted a duplicate.
@@ -6671,11 +6691,17 @@ export async function upsertBoardReportItem(reportId, {
        snap_status  = COALESCE(EXCLUDED.snap_status, board_report_items.snap_status),
        snap_date    = COALESCE(EXCLUDED.snap_date, board_report_items.snap_date),
        snap_start_date = COALESCE(EXCLUDED.snap_start_date, board_report_items.snap_start_date),
-       snap_est_cost = COALESCE(EXCLUDED.snap_est_cost, board_report_items.snap_est_cost),
-       snap_funding  = COALESCE(EXCLUDED.snap_funding, board_report_items.snap_funding),
+       -- Recomputed from the work every pass, so they REPLACE rather than coalesce. Coalescing
+       -- meant a figure could never go DOWN or go away: an estimate wrongly stored as cost, or
+       -- a work order's estimate that later changed, was frozen into the report with no way to
+       -- correct it short of deleting the row. (Found when a line's cost read $440 of estimate
+       -- long after the rule said estimates must never be printed as cost.)
+       snap_est_cost = EXCLUDED.snap_est_cost,
+       snap_funding  = EXCLUDED.snap_funding,
+       snap_open_lines = EXCLUDED.snap_open_lines,
        snap_hours   = COALESCE(EXCLUDED.snap_hours, board_report_items.snap_hours),
-       snap_cost    = COALESCE(EXCLUDED.snap_cost, board_report_items.snap_cost),
-       snap_progress= COALESCE(EXCLUDED.snap_progress, board_report_items.snap_progress),
+       snap_cost    = EXCLUDED.snap_cost,
+       snap_progress= EXCLUDED.snap_progress,
        parent_work_order_id = COALESCE(EXCLUDED.parent_work_order_id, board_report_items.parent_work_order_id),
        suggested_at = now(),
        -- Without this the row keeps its PREVIOUS pass token, and the prune at the end
@@ -6687,7 +6713,8 @@ export async function upsertBoardReportItem(reportId, {
       reportNote ?? null, sortIndex ?? null, snapTitle ?? null, snapSubtitle ?? null,
       snapAssetName ?? null, snapStatus ?? null, snapDate ?? null, snapHours ?? null,
       snapCost ?? null, snapProgress ?? null, parentWorkOrderId, passId, snapStartDate ?? null,
-      snapEstCost ?? null, snapFunding ? JSON.stringify(snapFunding) : null]
+      snapEstCost ?? null, snapFunding ? JSON.stringify(snapFunding) : null,
+      snapOpenLines && snapOpenLines.length ? JSON.stringify(snapOpenLines) : null]
   );
   return rows[0].id;
 }

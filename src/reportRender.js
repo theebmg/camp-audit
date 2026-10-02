@@ -469,7 +469,51 @@ function itemDatesText(it) {
   return `Started ${fmtDate(it.SnapStartDate)} · Completed ${fmtDate(it.SnapDate)}`;
 }
 
-function itemLineHtml(it, showHours = false) {
+// A job line nested under its work order. Deliberately sparse: the parent already says where
+// the work was and that it is done, so repeating the work order's name, the location and the
+// status on every line is noise the board has to read past. Title, date, cost — nothing else.
+// A $0 line is a line with no money against it, so the figure is left off rather than printed
+// as a meaningless zero.
+function nestedLineHtml(it, showHours = false) {
+  const bits = [
+    itemDatesText(it),
+    showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
+    it.SnapCost ? fmtMoney(it.SnapCost) : null,
+    it.SnapCost ? null : (it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null),
+  ].filter(Boolean);
+  return `
+    <div style="padding:4px 0;font-size:0.92rem;color:#3c4056;">
+      ${escapeHtml(it.SnapTitle || '(untitled)')}${bits.length ? `<span style="color:#6b7086;"> · ${escapeHtml(bits.join(' · '))}</span>` : ''}
+    </div>`;
+}
+
+// The indent rail. A left border on a td is one of the few indent mechanisms Word's rendering
+// engine honours, so Outlook shows the same connecting line every other client does — a
+// margin-left div or a CSS border on a div would simply be dropped there.
+function nestedBlockHtml(innerHtml) {
+  if (!innerHtml) return '';
+  return `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+           style="width:100%;border-collapse:collapse;margin:2px 0 6px;">
+      <tr>
+        <td width="14" style="width:14px;"></td>
+        <td style="border-left:3px solid #e1e4f0;padding:2px 0 2px 12px;">${innerHtml}</td>
+      </tr>
+    </table>`;
+}
+
+// What a job has left, under an open work order only. Grey, and after the finished lines:
+// the board reads what happened first and what is outstanding second.
+function stillToDoHtml(it) {
+  const open = Array.isArray(it.SnapOpenLines) ? it.SnapOpenLines.filter(Boolean) : [];
+  if (!open.length) return '';
+  return `
+    <div style="padding:4px 0 2px;font-size:0.88rem;color:#9298b0;">
+      <span style="font-weight:600;">Still to do:</span> ${escapeHtml(open.join(' · '))}
+    </div>`;
+}
+
+function itemLineHtml(it, showHours = false, opts = {}) {
   // Dates read as a span rather than a single stamp (decisions §7): when something started
   // and whether it has finished is more use to a board than one undated figure.
   const dates = itemDatesText(it);
@@ -503,7 +547,9 @@ function itemLineHtml(it, showHours = false) {
       <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>${suffix ? ` <span style="color:#6b7086;">— ${escapeHtml(suffix)}</span>` : ''}</div>
       ${bits.length ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(bits.join(' · '))}</div>` : ''}
       ${funding ? `<div style="color:#6b7086;font-size:0.85rem;">Funded by ${escapeHtml(funding)}</div>` : ''}
-      ${it.SnapProgress ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(it.SnapProgress)}</div>` : ''}
+      ${it.SnapProgress && !opts.hideProgress ? `<div style="color:#6b7086;font-size:0.85rem;">${escapeHtml(it.SnapProgress)}</div>` : ''}
+      ${opts.nested || ''}
+      ${stillToDoHtml(it)}
       ${itemPhotosHtml(it.Photos)}
       ${it.ReportNote ? `<div style="margin-top:4px;font-size:0.9rem;">${escapeHtml(it.ReportNote)}</div>` : ''}
     </div>`;
@@ -520,12 +566,33 @@ function sectionHtml(section, items, showHours = false) {
   const hours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
   const cost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
   const sub = [showHours && hours ? fmtHours(hours) : null, cost ? fmtMoney(cost) : null].filter(Boolean).join(' · ');
+
+  // The count is of PIECES OF WORK — work orders, admin tasks, findings — not of job lines.
+  // A thirteen-line renovation is one thing the board decided to do, not thirteen.
+  const parents = visible.filter((i) => i.ItemType !== 'job_line');
+  const orphanLines = visible.filter((i) => i.ItemType === 'job_line'
+    && !parents.some((p) => p.ItemType === 'work_order' && p.ItemId === i.ParentWorkOrderId));
+  const count = parents.length + orphanLines.length;
+
+  // Each parent, with its own lines nested beneath it in document order.
+  const rendered = [];
+  for (const it of visible) {
+    if (it.ItemType === 'job_line' && orphanLines.includes(it)) { rendered.push(itemLineHtml(it, showHours)); continue; }
+    if (it.ItemType === 'job_line') continue;             // printed under its work order below
+    if (it.ItemType !== 'work_order') { rendered.push(itemLineHtml(it, showHours)); continue; }
+    const lines = visible.filter((l) => l.ItemType === 'job_line' && l.ParentWorkOrderId === it.ItemId);
+    const nested = nestedBlockHtml(lines.map((l) => nestedLineHtml(l, showHours)).join(''));
+    // An itemized work order's lines say what was completed, so the roll-up sentence that says
+    // the same thing in prose is redundant directly above them.
+    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0 }));
+  }
+
   return `
     <h2 style="margin:26px 0 4px;font-size:1.1rem;border-top:2px solid #eef0f6;padding-top:14px;">
       ${escapeHtml(SECTION_TITLES[section] || section)}
-      <span style="color:#6b7086;font-weight:400;font-size:0.85rem;"> — ${visible.length} item(s)${sub ? ` · ${sub}` : ''}</span>
+      <span style="color:#6b7086;font-weight:400;font-size:0.85rem;"> — ${count} item(s)${sub ? ` · ${sub}` : ''}</span>
     </h2>
-    ${visible.map((it) => itemLineHtml(it, showHours)).join('')}`;
+    ${rendered.join('')}`;
 }
 
 // What the reader can actually see: included, minus the job lines their work order is
@@ -593,13 +660,35 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     const rows = visible.filter((i) => i.Section === sec);
     if (!rows.length) continue;
     const secHours = rows.reduce((t, i) => t + (i.SnapHours || 0), 0);
-    lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${rows.length})`
+    // Same count as the HTML: pieces of work, not job lines.
+    const parents = rows.filter((i) => i.ItemType !== 'job_line');
+    const orphans = rows.filter((i) => i.ItemType === 'job_line'
+      && !parents.some((p) => p.ItemType === 'work_order' && p.ItemId === i.ParentWorkOrderId));
+    lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${parents.length + orphans.length})`
       + `${showHours && secHours ? ` · ${fmtHours(secHours)}` : ''}:`);
+
+    const lineBits = (it) => [itemDatesText(it),
+      showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
+      it.SnapCost ? fmtMoney(it.SnapCost) : null,
+      it.SnapCost ? null : (it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null)].filter(Boolean);
+
     for (const it of rows) {
+      if (it.ItemType === 'job_line' && !orphans.includes(it)) continue;   // nested below
       const bits = [it.SnapAssetName, itemDatesText(it),
         showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
-        it.SnapCost != null ? fmtMoney(it.SnapCost) : null].filter(Boolean);
+        it.SnapCost ? fmtMoney(it.SnapCost) : null,
+        it.SnapCost ? null : (it.SnapEstCost ? `~${fmtMoney(it.SnapEstCost)} est.` : null)].filter(Boolean);
       lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
+      if (it.ItemType === 'work_order') {
+        // Indented with a dash, which is as much of a connecting rail as plain text allows.
+        const kids = rows.filter((l) => l.ItemType === 'job_line' && l.ParentWorkOrderId === it.ItemId);
+        for (const k of kids) {
+          const kb = lineBits(k);
+          lines.push(`      - ${k.SnapTitle || '(untitled)'}${kb.length ? ` · ${kb.join(' · ')}` : ''}`);
+        }
+        const open = Array.isArray(it.SnapOpenLines) ? it.SnapOpenLines.filter(Boolean) : [];
+        if (open.length) lines.push(`      Still to do: ${open.join(' · ')}`);
+      }
       if (it.ReportNote) lines.push(`      ${it.ReportNote}`);
     }
   }
