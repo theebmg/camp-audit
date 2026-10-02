@@ -354,6 +354,51 @@ console.log('\n## funding precedence: receipts beat the budget field, which beat
   ok(!/Greenawalt, Ben/.test(html), 'and not surname-first as stored');
 }
 
+console.log('\n## a second pass must not wipe what the first worked out');
+{
+  // The exact shape that lost the paint line's funding: a board-flagged job line is written by
+  // the Done rule with funding, then again by the flagged rule which knows nothing about it.
+  const rep = (await db.pool.query(
+    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end)
+     VALUES ($1,'draft','2026-09-01','2026-09-30','2026-10-01','2026-10-15') RETURNING id`,
+    [`${TAG} upsert`])).rows[0].id;
+  try {
+    await db.upsertBoardReportItem(rep, {
+      passId: 'p1', itemType: 'job_line', itemId: 999001, section: 'done', sortIndex: 1,
+      snapTitle: `${TAG} flagged line`, snapCost: 300,
+      snapFunding: [{ Source: 'Ben Greenawalt', IsCamp: false, Amount: 300 }],
+      snapProgress: 'half done',
+    });
+    let row = (await db.pool.query(
+      'SELECT snap_cost, snap_funding, snap_progress FROM board_report_items WHERE report_id=$1', [rep])).rows[0];
+    ok(!!row.snap_funding, 'the first pass stores funding');
+
+    // Second pass: same row, no funding and no progress computed.
+    await db.upsertBoardReportItem(rep, {
+      passId: 'p2', itemType: 'job_line', itemId: 999001, section: 'done', sortIndex: 1,
+      snapTitle: `${TAG} flagged line`, snapCost: 300,
+    });
+    row = (await db.pool.query(
+      'SELECT snap_cost, snap_funding, snap_progress FROM board_report_items WHERE report_id=$1', [rep])).rows[0];
+    ok(!!row.snap_funding, 'a pass that did not compute funding LEAVES IT ALONE');
+    ok(row.snap_progress === 'half done', 'and leaves progress alone too');
+    ok(Number(row.snap_cost) === 300, 'while the cost it did compute still applies');
+
+    // An explicit null still clears — that is how a wrong figure gets corrected.
+    await db.upsertBoardReportItem(rep, {
+      passId: 'p3', itemType: 'job_line', itemId: 999001, section: 'done', sortIndex: 1,
+      snapTitle: `${TAG} flagged line`, snapCost: null, snapFunding: null,
+    });
+    row = (await db.pool.query(
+      'SELECT snap_cost, snap_funding FROM board_report_items WHERE report_id=$1', [rep])).rows[0];
+    ok(row.snap_funding === null, 'an explicit null DOES clear funding');
+    ok(row.snap_cost === null, 'and an explicit null clears the cost');
+  } finally {
+    await db.pool.query('DELETE FROM board_report_items WHERE report_id=$1', [rep]);
+    await db.pool.query('DELETE FROM board_reports WHERE id=$1', [rep]);
+  }
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(
