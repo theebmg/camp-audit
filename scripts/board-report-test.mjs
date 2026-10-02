@@ -624,6 +624,53 @@ console.log('\n## one charge is never counted twice');
   await db.pool.query('DELETE FROM work_orders WHERE id = $1', [woId]);
 }
 
+console.log('\n## a fund-charged receipt counts against its fund however its splits are labelled');
+{
+  const fund = (await db.pool.query('SELECT id, name, amount FROM funds ORDER BY id LIMIT 1')).rows[0];
+  if (!fund) { console.log('  --    no funds defined; skipped'); }
+  else {
+    const before = Number((await db.getFundBalances()).find((f) => f.Id === fund.id).Spent);
+
+    const asset = (await db.pool.query('select id from assets limit 1')).rows[0];
+    const { workOrderId: woId } = await db.createWorkOrder({
+      title: `${TAG} fundspend`, assetId: asset.id, priority: 'Medium',
+    });
+    const line = await db.createJobLine(woId, { title: `${TAG} general line`, estimatedCost: 10 });
+    await db.pool.query(
+      "UPDATE job_lines SET funding_source = 'operating_budget', funding_ref_id = NULL WHERE id = $1",
+      [line.Id]
+    );
+
+    // The shape that lost $485.97: charged to a fund, fully split onto a line budgeted against
+    // the general operating budget.
+    const exp = await db.createExpense({ vendor: `${TAG} Fundbuy`, amount: 400, purchaseDate: p.periodStart });
+    await db.pool.query('UPDATE expenses SET fund_id = $2 WHERE id = $1', [exp.Id, fund.id]);
+    await db.pool.query(
+      `INSERT INTO expense_allocations (expense_id, dest_type, dest_id, amount, funding_source, funding_ref_id)
+       VALUES ($1,'job_line',$2,400,'operating_budget',NULL)`,
+      [exp.Id, line.Id]
+    );
+
+    const after = Number((await db.getFundBalances()).find((f) => f.Id === fund.id).Spent);
+    ok(Math.abs((after - before) - 400) < 0.005,
+      `the fund's spend rose by $${(after - before).toFixed(2)}, not $0 — the split's label did not hide it`);
+
+    // And it is counted ONCE, not once per piece of the old two-part sum.
+    await db.pool.query('UPDATE expense_allocations SET amount = 150 WHERE expense_id = $1', [exp.Id]);
+    const partial = Number((await db.getFundBalances()).find((f) => f.Id === fund.id).Spent);
+    ok(Math.abs((partial - before) - 400) < 0.005,
+      `a partly-split receipt still counts once at $${(partial - before).toFixed(2)}, not its amount plus its remainder`);
+
+    await db.pool.query('DELETE FROM expense_allocations WHERE expense_id = $1', [exp.Id]);
+    await db.pool.query('DELETE FROM expenses WHERE id = $1', [exp.Id]);
+    await db.pool.query('DELETE FROM job_lines WHERE id = $1', [line.Id]);
+    await db.pool.query('DELETE FROM work_orders WHERE id = $1', [woId]);
+
+    const restored = Number((await db.getFundBalances()).find((f) => f.Id === fund.id).Spent);
+    ok(Math.abs(restored - before) < 0.005, `and the real fund is back to $${restored.toFixed(2)}`);
+  }
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(
