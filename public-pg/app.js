@@ -584,7 +584,36 @@ async function api(path, opts = {}) {
 // Uploads one file directly onto an existing entity — upload + link in one
 // request. Use uploadAttachmentUnlinked instead when the entity doesn't
 // exist yet (a form that creates its parent row on submit).
-async function uploadAttachment(file, entityType, entityId, { roleId, classification, caption, category, ownerId } = {}) {
+// fetch() cannot report upload progress — the spec has no hook for it — so uploads go through
+// XMLHttpRequest, which does. Everything else about the request is identical.
+//
+// onProgress receives 0..1, or null when the browser cannot tell us the total (a stream of
+// unknown length). A null means "still going, no idea how far", which the bar shows as
+// indeterminate rather than pretending to a number.
+function uploadWithProgress(url, formData, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.upload.addEventListener('progress', (e) => {
+      if (!onProgress) return;
+      onProgress(e.lengthComputable && e.total ? e.loaded / e.total : null);
+    });
+    // The upload finishing is not the job finishing: the server still has to resize and store
+    // the image. Hold at 100% of SENDING rather than claiming done.
+    xhr.upload.addEventListener('load', () => onProgress && onProgress(1));
+    xhr.addEventListener('load', () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText || '{}'); } catch { /* server said something odd */ }
+      if (xhr.status >= 200 && xhr.status < 300 && body.ok !== false) resolve(body);
+      else reject(new Error(body.error || `Upload failed (${xhr.status})`));
+    });
+    xhr.addEventListener('error', () => reject(new Error("Upload failed — check your connection and try again.")));
+    xhr.addEventListener('abort', () => reject(new Error('Upload cancelled')));
+    xhr.send(formData);
+  });
+}
+
+async function uploadAttachment(file, entityType, entityId, { roleId, classification, caption, category, ownerId, onProgress } = {}) {
   const fd = new FormData();
   fd.append('file', file);
   fd.append('entityType', entityType);
@@ -594,9 +623,7 @@ async function uploadAttachment(file, entityType, entityId, { roleId, classifica
   if (roleId) fd.append('roleId', String(roleId));
   if (classification) fd.append('classification', classification);
   if (caption) fd.append('caption', caption);
-  const res = await fetch('/api/pg/attachments', { method: 'POST', body: fd });
-  const body = await res.json();
-  if (!res.ok || body.ok === false) throw new Error(body.error || 'Upload failed');
+  const body = await uploadWithProgress('/api/pg/attachments', fd, onProgress);
   return body.attachment;
 }
 
@@ -605,14 +632,12 @@ async function uploadAttachment(file, entityType, entityId, { roleId, classifica
 // belong to (a finding, a component event, the request itself) is created.
 // Returns the attachment id to submit alongside the rest of the form; the
 // server links it once the parent row exists.
-async function uploadAttachmentUnlinked(file, category, ownerId) {
+async function uploadAttachmentUnlinked(file, category, ownerId, onProgress) {
   const fd = new FormData();
   fd.append('file', file);
   fd.append('category', category);
   fd.append('ownerId', String(ownerId));
-  const res = await fetch('/api/pg/attachments', { method: 'POST', body: fd });
-  const body = await res.json();
-  if (!res.ok || body.ok === false) throw new Error(body.error || 'Upload failed');
+  const body = await uploadWithProgress('/api/pg/attachments', fd, onProgress);
   return body.attachment.Id;
 }
 
@@ -685,18 +710,60 @@ async function renderAttachmentSection(entityType, entityId, container, opts = {
         <input type="file" accept="${accept}" multiple style="display:none" class="attach-input" />
       </label>
     </div>
+    <div class="attach-progress" hidden style="margin-top:8px">
+      <div style="height:8px;background:#e8edf3;border-radius:999px;overflow:hidden">
+        <div class="attach-progress-fill" style="height:100%;width:0;background:#1a5c40;
+             border-radius:999px;transition:width .15s linear"></div>
+      </div>
+      <div class="attach-progress-label muted" style="font-size:0.8rem;margin-top:3px"></div>
+    </div>
     <div class="attach-edit-panel" hidden></div>`;
 
   container.querySelector('.attach-input').addEventListener('change', async (e) => {
     const files = [...e.target.files];
     if (!files.length) return;
-    try {
-      for (const file of files) {
-        await uploadAttachment(file, entityType, entityId, { roleId: defaultRole?.Id, classification: inheritedClassification });
+    const bar = container.querySelector('.attach-progress');
+    const label = container.querySelector('.attach-progress-label');
+    const fill = container.querySelector('.attach-progress-fill');
+    bar.hidden = false;
+
+    // A phone on camp wifi sending a 4 MB photo takes long enough that silence reads as
+    // "nothing happened", and the second tap uploads it twice.
+    const show = (i, frac) => {
+      const many = files.length > 1 ? `Photo ${i + 1} of ${files.length} — ` : '';
+      if (frac == null) {
+        label.textContent = `${many}uploading…`;
+        fill.style.width = '100%';
+        fill.style.opacity = '0.45';
+        return;
       }
+      fill.style.opacity = '1';
+      // Each file occupies its own slice of the bar, so the whole batch moves left to right once.
+      const overall = ((i + frac) / files.length) * 100;
+      fill.style.width = `${overall.toFixed(1)}%`;
+      label.textContent = frac >= 1
+        ? `${many}processing on the server…`
+        : `${many}${Math.round(frac * 100)}%`;
+    };
+
+    try {
+      for (const [i, file] of files.entries()) {
+        show(i, 0);
+        await uploadAttachment(file, entityType, entityId, {
+          roleId: defaultRole?.Id, classification: inheritedClassification,
+          onProgress: (frac) => show(i, frac),
+        });
+      }
+      label.textContent = files.length > 1 ? `${files.length} photos added` : 'Added';
       renderAttachmentSection(entityType, entityId, container, opts);
       if (onChange) onChange();
-    } catch (err) { toast(err.message); }
+    } catch (err) {
+      bar.hidden = true;
+      toast(saveErrorMessage(err), 8000);
+    } finally {
+      // The input keeps its value otherwise, so choosing the same file twice does nothing.
+      e.target.value = '';
+    }
   });
 
   container.querySelectorAll('.attach-thumb').forEach((el) => el.addEventListener('click', () => {
@@ -15605,3 +15672,19 @@ function handleGcalOauthRedirect() {
     render('login');
   }
 })();
+
+// Scrolling a page should scroll the page. A focused <input type="number"> otherwise eats the
+// wheel and silently increments — so a cost reads $299.40 when you looked at it and $302.40
+// after you scrolled past, with nothing on screen to show it changed. There are 43 such fields,
+// so this is one delegated guard rather than 43 opt-outs.
+//
+// Blurring rather than preventDefault(): the value stays put AND the page keeps scrolling,
+// which is what the wheel was for. Any pending edit commits on blur exactly as it would have if
+// the field had been tabbed away from.
+//
+// Arrow keys also step the value, and are left alone: those are deliberate keystrokes aimed at
+// the field. Only the wheel fires when you were not aiming at it.
+document.addEventListener('wheel', (e) => {
+  const el = document.activeElement;
+  if (el && el.tagName === 'INPUT' && el.type === 'number' && el === e.target) el.blur();
+}, { passive: true });
