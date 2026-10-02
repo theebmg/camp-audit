@@ -12,7 +12,18 @@ function escapeHtml(s) {
 // string before slicing.
 const isoStr = (v) => (v instanceof Date ? v.toISOString() : String(v || ''));
 const fmtDate = (iso) => isoStr(iso).slice(0, 10);
-const fmtMoney = (n) => (n == null ? '—' : `$${Number(n).toLocaleString()}`);
+// Whole dollars print clean; anything with cents prints BOTH of them. toLocaleString's default
+// drops a trailing zero, which put "$1,399.4" on the footer of a board report — a number that
+// reads as unfinished rather than as a figure anyone checked.
+const fmtMoney = (n) => {
+  if (n == null) return '—';
+  const v = Number(n);
+  const cents = Math.round(Math.abs(v) * 100) % 100;
+  return `$${v.toLocaleString('en-US', {
+    minimumFractionDigits: cents ? 2 : 0,
+    maximumFractionDigits: cents ? 2 : 0,
+  })}`;
+};
 
 // ── Colour ───────────────────────────────────────────────────────────────
 // Measured against white, not chosen by eye: a board report is read on paper, on a phone in
