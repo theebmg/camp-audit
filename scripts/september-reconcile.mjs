@@ -14,9 +14,13 @@ const { report, items, aggregates } = data;
 
 const summaryWo = new Set(items.filter((i) => i.Included && i.ItemType === 'work_order' && i.DisplayMode === 'summary').map((i) => i.ItemId));
 const visible = items.filter((i) => i.Included && !(i.ItemType === 'job_line' && summaryWo.has(i.ParentWorkOrderId)));
-const cost = visible.reduce((t, i) => t + (i.SnapCost || 0), 0);
-const hours = visible.reduce((t, i) => t + (i.SnapHours || 0), 0);
-const est = visible.reduce((t, i) => t + (i.SnapEstCost || 0), 0);
+// What is PRINTED is not what is COUNTED: a work order's row carries the roll-up of its lines,
+// so adding both counts the same money twice. Same rule the renderer uses.
+const woIds = new Set(visible.filter((i) => i.ItemType === 'work_order').map((i) => i.ItemId));
+const counted = visible.filter((i) => i.ItemType !== 'job_line' || !woIds.has(i.ParentWorkOrderId));
+const cost = counted.reduce((t, i) => t + (i.SnapCost || 0), 0);
+const hours = counted.reduce((t, i) => t + (i.SnapHours || 0), 0);
+const est = counted.reduce((t, i) => t + (i.SnapEstCost || 0), 0);
 
 console.log(`BOARD REPORT ${REPORT} — ${report.Title}`);
 console.log(`${report.PeriodStart} to ${report.PeriodEnd}, looking ahead to ${report.ForwardEnd}\n`);
@@ -26,9 +30,12 @@ console.log(`  stored            ${items.length}`);
 console.log(`  included          ${items.filter((i) => i.Included).length}`);
 console.log(`  hidden under a summary work order  ${items.filter((i) => i.Included).length - visible.length}`);
 console.log(`  PRINTED           ${visible.length}`);
-const m = html.match(/Total\s*—\s*(\d+)\s*item/);
-console.log(`  footer states     ${m ? m[1] : '(not found)'}`);
-console.log(`  RECONCILES        ${m && Number(m[1]) === visible.length ? 'YES' : 'NO'}\n`);
+console.log(`  COUNTED           ${counted.length}   <- work orders and admin tasks, not their lines`);
+const m = html.match(/Total\s*\u2014\s*([^<]*)/);
+console.log(`  footer reads      ${m ? m[1].trim() : '(no total line)'}`);
+const fm = m && /\$([\d,]+(?:\.\d\d)?)/.exec(m[1]);
+const footerNum = fm ? Number(fm[1].replace(/,/g, '')) : 0;
+console.log(`  RECONCILES        ${Math.abs(footerNum - cost) < 0.005 ? 'YES' : `NO (footer ${footerNum} vs computed ${cost})`}\n`);
 
 console.log('MONEY');
 console.log(`  recorded cost of work shown   ${money(cost)}   <- actuals only, this is the footer figure`);
@@ -47,7 +54,7 @@ console.log('\nSECTIONS');
 for (const s of ['done', 'coming_up', 'overdue', 'admin_work']) {
   const rows = visible.filter((i) => i.Section === s);
   if (!rows.length) continue;
-  console.log(`  ${s} (${rows.length})`);
+  console.log(`  ${s} (${counted.filter((i) => i.Section === s).length} counted, ${rows.length} printed)`);
   for (const r of rows) {
     const bits = [r.SnapCost != null ? money(r.SnapCost) : null,
       r.SnapEstCost != null && !r.SnapDate ? `~${money(r.SnapEstCost)} est.` : null,
