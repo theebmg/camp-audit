@@ -1381,6 +1381,7 @@ async function render(view, params = {}, opts = {}) {
       adminJobLineStatuses: () => renderAdminJobLineStatuses(),
       adminAttachmentRoles: () => renderAdminAttachmentRoles(),
       adminFundingKinds: () => renderAdminFundingKinds(),
+      adminEmail: () => renderAdminEmail(),
       adminAssetTypeIcons: () => renderAdminAssetTypeIcons(),
       adminMapCalibration: () => renderAdminMapCalibration(),
       adminJobLineTemplates: () => renderAdminJobLineTemplates(),
@@ -1797,6 +1798,7 @@ const ADMIN_LEAF_RENDERERS = {
   adminJobLineStatuses: (params, container) => renderAdminJobLineStatuses(container),
   adminAttachmentRoles: (params, container) => renderAdminAttachmentRoles(container),
   adminFundingKinds: (params, container) => renderAdminFundingKinds(container),
+  adminEmail: (params, container) => renderAdminEmail(container),
   adminAssetTypeIcons: (params, container) => renderAdminAssetTypeIcons(container),
   adminMapCalibration: (params, container) => renderAdminMapCalibration(container),
   adminJobLineTemplates: (params, container) => renderAdminJobLineTemplates(container),
@@ -6634,6 +6636,7 @@ const ADMIN_CATEGORIES = {
       { view: 'adminJobLineStatuses', icon: '🚦', label: 'Job Line Statuses' },
       { view: 'adminAttachmentRoles', icon: '📎', label: 'Attachment Roles' },
       { view: 'adminFundingKinds', icon: '💷', label: 'Job Line Funding' },
+      { view: 'adminEmail', icon: '✉️', label: 'Email' },
       { view: 'adminAssetTypeIcons', icon: '🛖', label: 'Asset Type Icons' },
     ],
   },
@@ -8060,6 +8063,97 @@ async function renderAdminCauses(container = app) {
 // report" pre-ticks the report checkbox for that role (still overridable per
 // link) — tagging something "After / Repair" is already saying "this is the
 // proof."
+async function renderAdminEmail(container = app) {
+  if (container === app) setChrome({ title: 'Email', showBack: true, showLogout: true });
+  container.innerHTML = LOADING_HTML;
+  let st;
+  try { st = await api('/api/pg/gmail/status'); }
+  catch (err) { container.innerHTML = `<div class="card"><p class="muted">${escapeHtml(err.message)}</p></div>`; return; }
+
+  const row = (label, value, good) => `
+    <div class="list-item list-item-actionable">
+      <div class="lia-main">${escapeHtml(label)}</div>
+      <span class="lia-actions"><span class="pill" style="${good === false ? 'background:#fbeaea;color:#7a1f1f' : ''}">${escapeHtml(value)}</span></span>
+    </div>`;
+
+  container.innerHTML = `
+    <div class="card">
+      <h3>Email</h3>
+      <p class="muted">
+        Board reports are sent through Gmail. Google no longer allows app passwords for Workspace
+        accounts, so this uses OAuth: you grant permission once in the browser and the app keeps a
+        refresh token. It asks for one scope — <strong>send mail</strong> — and never reads a mailbox.
+      </p>
+    </div>
+
+    <div class="card">
+      ${row('Connected', st.Connected ? `yes — ${st.OauthUser || 'account unknown'}` : 'no', st.Connected)}
+      ${st.ConnectedAt ? row('Connected on', new Date(st.ConnectedAt).toLocaleString(), true) : ''}
+      ${row('Sends as', st.FromAddress || '(not set — falls back to the signed-in account)', Boolean(st.FromAddress))}
+      ${row('OAuth client', st.OAuthClientConfigured ? (st.ClientId || 'configured') : 'NOT configured', st.OAuthClientConfigured)}
+      ${st.LastError ? row('Last error', st.LastError, false) : ''}
+    </div>
+
+    ${st.OAuthClientConfigured ? '' : `<div class="card" style="background:#fff8e6;border-color:#f0e2b8">
+      <strong>No OAuth client</strong>
+      <p class="muted" style="margin:4px 0 0;font-size:0.88rem">
+        Set GMAIL_OAUTH_CLIENT_ID and GMAIL_OAUTH_CLIENT_SECRET in the server's .env — or let it
+        reuse the calendar ones — then restart the app.
+      </p>
+    </div>`}
+
+    <div class="card">
+      <h3>${st.Connected ? 'Reconnect or disconnect' : 'Connect'}</h3>
+      <p class="muted" style="font-size:0.86rem">
+        This redirect URI must be listed on the OAuth client in Google Cloud Console, exactly:<br />
+        <code style="word-break:break-all">${escapeHtml(st.RedirectUri || '')}</code>
+      </p>
+      <div class="btn-row">
+        <button type="button" class="btn btn-primary" id="mailConnect" ${st.OAuthClientConfigured ? '' : 'disabled'}>
+          ${st.Connected ? 'Reconnect' : 'Connect Gmail'}
+        </button>
+        ${st.Connected ? '<button type="button" class="btn btn-secondary" id="mailDisconnect">Disconnect</button>' : ''}
+      </div>
+    </div>
+
+    ${st.Connected ? `<div class="card">
+      <h3>Send a test</h3>
+      <div class="field-row"><label>To</label><input id="mailTestTo" type="email" placeholder="you@example.com" /></div>
+      <button type="button" class="btn btn-secondary" id="mailTest">Send test email</button>
+      <p class="field-error" id="mailTestTo-err"></p>
+    </div>` : ''}`;
+
+  document.getElementById('mailConnect')?.addEventListener('click', async () => {
+    try {
+      const r = await api('/api/pg/gmail/oauth/start');
+      // A top-level navigation, not a popup: Google refuses to render consent in a frame, and a
+      // popup is what gets blocked on a phone.
+      window.location.href = r.url;
+    } catch (err) { toast(saveErrorMessage(err), 9000); }
+  });
+
+  document.getElementById('mailDisconnect')?.addEventListener('click', async () => {
+    if (!await confirmDialog('Disconnect Gmail? Board reports cannot be emailed until it is reconnected.',
+      { confirmLabel: 'Disconnect', cancelLabel: 'Keep it', danger: true })) return;
+    try { await api('/api/pg/gmail/disconnect', { method: 'POST' }); renderAdminEmail(container); }
+    catch (err) { toast(saveErrorMessage(err), 8000); }
+  });
+
+  document.getElementById('mailTest')?.addEventListener('click', async () => {
+    const to = document.getElementById('mailTestTo').value.trim();
+    clearFieldError('mailTestTo');
+    if (!to) { showFieldError('mailTestTo', 'Put an address in first.'); return; }
+    const btn = document.getElementById('mailTest');
+    btn.disabled = true; btn.textContent = 'Sending…';
+    try {
+      await api('/api/pg/gmail/test', { method: 'POST', body: JSON.stringify({ to }) });
+      toast(`Sent to ${to} — check that inbox, and spam the first time.`, 9000);
+    } catch (err) {
+      showFieldError('mailTestTo', saveErrorMessage(err));
+    } finally { btn.disabled = false; btn.textContent = 'Send test email'; }
+  });
+}
+
 async function renderAdminFundingKinds(container = app) {
   if (container === app) setChrome({ title: 'Job Line Funding', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
@@ -15724,6 +15818,22 @@ renderThemePicker();
 // otherwise — go(view, params) never touches the browser URL — so this is
 // the one place a query string is read, and it's stripped immediately after
 // via replaceState so a page refresh never re-shows the toast.
+// The Gmail consent flow ends in a redirect to "/" carrying its outcome. Without this the
+// browser simply lands on the dashboard and nothing says whether the connection took.
+function handleGmailOauthRedirect() {
+  const params = new URLSearchParams(window.location.search);
+  const connected = params.get('mailConnected');
+  const failed = params.get('mailError');
+  if (!connected && !failed) return;
+  // Strip it from the URL so a refresh does not re-announce a month-old result.
+  const url = new URL(window.location.href);
+  url.searchParams.delete('mailConnected');
+  url.searchParams.delete('mailError');
+  window.history.replaceState({}, '', url.toString());
+  if (connected) toast(`Gmail connected as ${connected}. Send a test from Admin → Email.`, 10000);
+  else toast(`Gmail could not be connected: ${failed}`, 14000);
+}
+
 function handleGcalOauthRedirect() {
   const params = new URLSearchParams(window.location.search);
   const connected = params.get('gcalConnected');
@@ -15746,6 +15856,7 @@ function handleGcalOauthRedirect() {
     if (deepLink) await go(deepLink.view, deepLink.params, { reset: true });
     else await go('dashboard', {});
     handleGcalOauthRedirect();
+  handleGmailOauthRedirect();
   } catch {
     pendingDeepLink = deepLink;
     render('login');

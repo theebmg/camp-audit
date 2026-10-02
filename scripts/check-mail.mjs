@@ -23,7 +23,7 @@ show('MAIL_FROM_ADDRESS');
 show('MAIL_FROM_NAME');
 show('BACKUP_ALERT_EMAIL');
 
-const configured = mailIsConfigured();
+const configured = await mailIsConfigured();
 console.log(`\nmailIsConfigured(): ${configured}`);
 
 if (!configured) {

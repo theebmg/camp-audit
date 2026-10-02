@@ -13,6 +13,7 @@ import mailInboundRouter from './routes/mail-inbound.js';
 import receiptInboundRouter from './routes/receipt-inbound.js';
 import mailDispatchRouter from './routes/mail-dispatch.js';
 import gcalOauthCallbackRouter from './routes/gcal-oauth-callback.js';
+import gmailOauthCallbackRouter from './routes/gmail-oauth-callback.js';
 import quoInboundRouter from './routes/quo-inbound.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -133,6 +134,9 @@ app.use('/api/quo/inbound', quoInboundRouter);
 // three Mailgun routes above. See gcal-oauth-callback.js's header comment
 // for why this doesn't open up any other /gcal/* route.
 app.use('/api/pg/gcal/oauth/callback', gcalOauthCallbackRouter);
+// Same reasoning, for Gmail. Google requires OAuth for Workspace accounts now that app
+// passwords are gone, so this is the only way the app can send mail at all.
+app.use('/api/pg/gmail/oauth/callback', gmailOauthCallbackRouter);
 // Postgres-backed parallel API (migration in progress) — additive, does not
 // replace /api. See toClaudeCode/camp-cmms-postgres-migration-brief.md.
 app.use('/api/pg', requireAuth, pgApiRouter);

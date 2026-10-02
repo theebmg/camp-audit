@@ -165,6 +165,7 @@ import {
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
   listFundingSources, createFundingSource, updateFundingSource,
   findPossibleDuplicateCharges, mergeTypedCostIntoReceipt,
+  getMailSettings, clearMailOAuthToken, recordMailError,
   listBoardReportFunds, setBoardReportFund,
   listBoardReportPhotoCandidates,
   seedDefaultReportPhotos, setBoardReportPhoto, removeBoardReportPhoto,
@@ -182,6 +183,15 @@ import {
   findDuplicateGroups, mergeGroups, listGroupTypes, createGroupType, updateGroupType,
 } from '../db.js';
 import { sendMail, mailIsConfigured } from '../mailer.js';
+import {
+  // Aliased: gcal.js exports its own buildAuthUrl, and the two grant different scopes to
+  // different products. Sharing a name here would be one typo away from asking Google for
+  // calendar access when the admin pressed "Connect Gmail".
+  buildAuthUrl as buildGmailAuthUrl,
+  gmailOAuthIsConfigured,
+  REDIRECT_URI as GMAIL_REDIRECT_URI,
+  OAUTH_CLIENT_ID_FOR_DISPLAY,
+} from '../gmailOAuth.js';
 import crypto from 'crypto';
 import { buildAuthUrl, revokeToken, getAccessTokenOrThrow, listWritableCalendars, createCampWorkCalendar } from '../gcal.js';
 import { runGcalSyncDrain } from '../gcalSync.js';
@@ -3013,7 +3023,7 @@ function requestStatusEmail(request, status, reviewNote) {
 async function notifyRequester(request, status, reviewNote) {
   const content = requestStatusEmail(request, status, reviewNote);
   if (!content || !request.RequesterEmail) return;
-  if (!mailIsConfigured()) {
+  if (!await mailIsConfigured()) {
     await createRequestMessage(request.Id, { subject: content.subject, body: content.text, toEmail: request.RequesterEmail, sentBy: 'system', status: 'failed', error: 'Email not configured' });
     return;
   }
@@ -3526,6 +3536,68 @@ router.post('/expenses/:id(\\d+)/same-charge', async (req, res, next) => {
     if (!result) return res.status(404).json({ ok: false, error: 'Expense or job line not found' });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }
+});
+
+// ---- Gmail connection (admin) ----
+// Starting the flow is authenticated and admin-only; only the callback bypasses auth, because
+// Google navigates the browser to it directly.
+router.get('/gmail/oauth/start', async (req, res, next) => {
+  try {
+    if (currentRole() !== 'admin') return res.status(403).json({ ok: false, error: 'Admins only.' });
+    if (!gmailOAuthIsConfigured()) {
+      return res.status(500).json({
+        ok: false,
+        error: 'No Google OAuth client is configured. Set GMAIL_OAUTH_CLIENT_ID and '
+          + 'GMAIL_OAUTH_CLIENT_SECRET in .env, or reuse the calendar ones.',
+      });
+    }
+    // Per-attempt random token, stored in the session and checked on the way back: the standard
+    // CSRF defence for a flow that ends in a plain browser redirect.
+    const state = crypto.randomUUID();
+    req.session.gmailOauthState = state;
+    res.json({ ok: true, url: buildGmailAuthUrl(state, req.query.loginHint || null), redirectUri: GMAIL_REDIRECT_URI });
+  } catch (e) { next(e); }
+});
+
+router.get('/gmail/status', async (req, res, next) => {
+  try {
+    const settings = await getMailSettings();
+    res.json({
+      ...settings,
+      OAuthClientConfigured: gmailOAuthIsConfigured(),
+      ClientId: OAUTH_CLIENT_ID_FOR_DISPLAY,
+      RedirectUri: GMAIL_REDIRECT_URI,
+      FromAddress: process.env.MAIL_FROM_ADDRESS || null,
+      FromName: process.env.MAIL_FROM_NAME || null,
+    });
+  } catch (e) { next(e); }
+});
+
+router.post('/gmail/disconnect', async (req, res, next) => {
+  try {
+    if (currentRole() !== 'admin') return res.status(403).json({ ok: false, error: 'Admins only.' });
+    await clearMailOAuthToken({ by: currentUsername(), reason: 'disconnected from the admin screen' });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// Proves the whole path end to end, which is the only way to know it works.
+router.post('/gmail/test', async (req, res, next) => {
+  try {
+    if (currentRole() !== 'admin') return res.status(403).json({ ok: false, error: 'Admins only.' });
+    const to = (req.body || {}).to;
+    if (!to) return res.status(400).json({ ok: false, error: 'An address to send to is required.' });
+    await sendMail({
+      to,
+      subject: 'Sychar Operations — mail test',
+      text: 'If you are reading this, board reports can be emailed from the app.',
+      html: '<p>If you are reading this, board reports can be emailed from the app.</p>',
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    await recordMailError(e.message).catch(() => {});
+    res.status(502).json({ ok: false, error: e.message });
+  }
 });
 
 // ---- Approved funds shown on a report ----

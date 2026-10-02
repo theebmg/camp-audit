@@ -68,7 +68,7 @@ router.post('/submit', async (req, res, next) => {
     const { values, attachmentIds } = req.body || {};
     const request = await createMaintenanceRequest({ values: values || {}, attachmentIds: Array.isArray(attachmentIds) ? attachmentIds : [] });
 
-    if (mailIsConfigured() && request.RequesterEmail) {
+    if (await mailIsConfigured() && request.RequesterEmail) {
       const subject = `We received your maintenance request (Ref #${request.Id})`;
       const text = `Hi${request.RequesterName ? ' ' + request.RequesterName : ''},\n\n`
         + `Thanks — we received your maintenance request (Ref #${request.Id}) and will follow up by email once it's been reviewed.\n\n`

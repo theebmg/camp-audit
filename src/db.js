@@ -5074,6 +5074,65 @@ export async function deleteFund(id) {
 // Dashboard fund tile (§3.4) — "$X of $Y remaining · N days left". Spent =
 // sum of non-void expenses with that fund_id; over-spend is a positive
 // Overage number the frontend renders in a warning color, never blocked.
+// Gmail OAuth credentials. The refresh token NEVER leaves this module in a readable form
+// except to the mailer — getMailSettings returns only whether one exists.
+export async function getMailOAuthToken() {
+  const { rows } = await pool.query(
+    'SELECT oauth_user, oauth_refresh_token FROM mail_settings WHERE id = 1'
+  );
+  return rows[0]?.oauth_refresh_token
+    ? { user: rows[0].oauth_user, refreshToken: rows[0].oauth_refresh_token }
+    : null;
+}
+
+export async function getMailSettings() {
+  const { rows } = await pool.query(
+    `SELECT oauth_user, connected_at, connected_by, last_error,
+            oauth_refresh_token IS NOT NULL AS connected
+     FROM mail_settings WHERE id = 1`
+  );
+  const r = rows[0] || {};
+  return {
+    Connected: r.connected === true,
+    OauthUser: r.oauth_user || null,
+    ConnectedAt: r.connected_at || null,
+    ConnectedBy: r.connected_by || null,
+    LastError: r.last_error || null,
+  };
+}
+
+export async function setMailOAuthToken({ refreshToken, user, by = null }) {
+  await pool.query(
+    `UPDATE mail_settings
+        SET oauth_refresh_token = $1, oauth_user = $2, connected_at = now(),
+            connected_by = $3, last_error = NULL
+      WHERE id = 1`,
+    [refreshToken, user || null, by]
+  );
+  // The token itself is never logged — only that a connection happened, and as whom.
+  await logActivity({
+    action: 'connected Gmail for sending', entityType: 'mail_settings', entityId: 1,
+    entityLabel: user || 'unknown account',
+  });
+}
+
+export async function clearMailOAuthToken({ by = null, reason = null } = {}) {
+  await pool.query(
+    `UPDATE mail_settings
+        SET oauth_refresh_token = NULL, connected_at = NULL, last_error = $1 WHERE id = 1`,
+    [reason]
+  );
+  await logActivity({
+    action: 'disconnected Gmail for sending', entityType: 'mail_settings', entityId: 1,
+    entityLabel: reason || 'disconnected', details: by ? `by ${by}` : null,
+  });
+}
+
+// Recorded so a send that fails at 2am is explicable in the morning rather than just absent.
+export async function recordMailError(message) {
+  await pool.query('UPDATE mail_settings SET last_error = $1 WHERE id = 1', [String(message).slice(0, 500)]);
+}
+
 export async function getFundBalances() {
   const funds = await listFunds();
   // Two halves of the same money (0083): shares explicitly allocated to a fund, plus
