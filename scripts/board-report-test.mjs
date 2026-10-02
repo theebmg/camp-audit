@@ -248,6 +248,59 @@ console.log('\n## Show hours: off by default, and off means off everywhere');
   ok(/Started/.test(openHtml) && /In progress/.test(openHtml), 'and open work still reads In progress');
 }
 
+console.log('\n## Show funding (off / non-camp only / all)');
+{
+  const { renderBoardReportItemsHtml, renderBoardReportItemsText } = await import('/app/src/reportRender.js');
+  const base = { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft' };
+  const items = [
+    { Id: 970, ItemType: 'work_order', ItemId: 91, Section: 'done', Included: true, DisplayMode: 'itemized',
+      SnapTitle: `${TAG} Reno`, SnapStartDate: '2026-09-02', SnapDate: null,
+      SnapCost: 800, SnapEstCost: 1540,
+      SnapFunding: [{ Source: 'Ben', IsCamp: false, Amount: 800 }] },
+    { Id: 971, ItemType: 'job_line', ItemId: 21, ParentWorkOrderId: 91, Section: 'done', Included: true,
+      SnapTitle: `${TAG} beam`, SnapDate: '2026-09-02', SnapCost: 800,
+      SnapFunding: [{ Source: 'Ben', IsCamp: false, Amount: 800 }] },
+    { Id: 972, ItemType: 'job_line', ItemId: 22, ParentWorkOrderId: 91, Section: 'done', Included: true,
+      SnapTitle: `${TAG} pump`, SnapDate: '2026-09-02', SnapCost: 379,
+      SnapFunding: [{ Source: 'Camp', IsCamp: true, Amount: 379 }] },
+    { Id: 973, ItemType: 'job_line', ItemId: 23, ParentWorkOrderId: 91, Section: 'done', Included: true,
+      SnapTitle: `${TAG} mixed`, SnapDate: '2026-09-02', SnapCost: 180,
+      SnapFunding: [{ Source: 'Camp', IsCamp: true, Amount: 120 }, { Source: 'Donor', IsCamp: false, Amount: 60 }] },
+  ];
+  const render = (mode) => renderBoardReportItemsHtml({ report: { ...base, ShowFunding: mode }, items, aggregates: [] })
+    .replace(/\s+/g, ' ');
+
+  const off = render('off');
+  ok(!/Funded by/.test(off) && !/Donor/.test(off), 'off: no funding anywhere');
+  ok(/\$800/.test(off), 'but the money is still there');
+
+  const nc = render('non_camp');
+  ok(/Funded by Ben/.test(nc), 'non-camp: a wholly non-camp line is tagged');
+  ok(!/Funded by Camp/.test(nc), 'and a camp-funded line gets NO tag');
+  ok(/Donor \$60/.test(nc) && !/Camp \$120/.test(nc),
+    'a mixed line shows only the non-camp share');
+
+  const all = render('all');
+  ok(/Funded by Camp/.test(all), 'all: camp-funded lines are tagged too');
+  ok(/Camp \$120/.test(all) && /Donor \$60/.test(all), 'and a mixed line shows both shares');
+
+  console.log('\n## the tag sits after the cost, and the roll-up reads as spend against estimate');
+  ok(/\$800 · Funded by Ben/.test(nc), 'on a line: cost then funding');
+  ok(/\$800 spent of ~\$1,540 est\. · Funded by Ben/.test(nc),
+    'on the work order: "$800 spent of ~$1,540 est. · Funded by Ben"');
+
+  console.log('\n## nested lines carry no date, and the section is renamed');
+  ok(!/padding:4px 0;font-size:0\.92rem[^<]*<\/div>\s*<div[^>]*>[^<]*2026-09-02/.test(nc), 'no date on a nested line');
+  const nestedChunk = (nc.match(/border-left:3px solid[^]*?<\/td>/) || [''])[0];
+  ok(!/Completed|2026-09-02/.test(nestedChunk), `the nested block has no dates in it`);
+  ok(/WORK THIS PERIOD|Work This Period/i.test(nc), 'the section is called Work This Period');
+  ok(!/Work Completed/.test(nc), 'and no longer Work Completed');
+
+  const txt = renderBoardReportItemsText({ report: { ...base, ShowFunding: 'non_camp' }, items, aggregates: [] });
+  ok(/Funded by Ben/.test(txt), 'the plain-text copy tags funding too');
+  ok(/WORK THIS PERIOD/.test(txt), 'and uses the new section name');
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(
