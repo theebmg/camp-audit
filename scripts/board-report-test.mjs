@@ -154,6 +154,23 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
   ok(/TOTAL — 1 item/.test(text), 'the text footer agrees with the HTML one');
 }
 
+console.log('\n## the footer note appears even when the recorded cost is zero');
+{
+  const { renderBoardReportItemsHtml, renderBoardReportItemsText } = await import('/app/src/reportRender.js');
+  const NOTE = 'Recorded cost of work shown, including work funded outside camp. '
+    + 'Not camp spend; estimates excluded.';
+  const report = { Title: 'T', PeriodStart: '2026-09-01', PeriodEnd: '2026-09-30', ForwardEnd: '2026-10-15', Status: 'draft' };
+  // September's shape: estimates only, nothing allocated, so every actual is null.
+  const items = [{ Id: 950, ItemType: 'job_line', ItemId: 9, Section: 'done', Included: true,
+    SnapTitle: `${TAG} estimate only`, SnapCost: null, SnapEstCost: 379, SnapHours: 1.5 }];
+  const html = renderBoardReportItemsHtml({ report, items, aggregates: [] });
+  const text = renderBoardReportItemsText({ report, items, aggregates: [] });
+  ok(html.replace(/\s+/g, ' ').includes(NOTE), 'the HTML note survives a $0 report');
+  ok(text.includes(NOTE), 'and so does the plain-text one');
+  ok(/Total . 1 item\(s\)/.test(html), 'the footer still counts the row');
+  ok(!/\$379/.test(html.split('Total')[1] || ''), 'and the estimate is still not in the total');
+}
+
 console.log('\n## cleanup');
 await purge();
 const left = (await db.pool.query(

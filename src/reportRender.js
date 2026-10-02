@@ -551,7 +551,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
     <div style="margin-top:22px;padding-top:12px;border-top:2px solid #eef0f6;font-weight:700;">
       Total — ${visible.length} item(s)${grandHours ? ` · ${fmtHours(grandHours)}` : ''}${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}
     </div>
-    ${grandCost ? `<div style="margin-top:5px;color:#6b7086;font-size:0.8rem;line-height:1.4;">
+    ${visible.length ? `<div style="margin-top:5px;color:#6b7086;font-size:0.8rem;line-height:1.4;">
       Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.
     </div>` : ''}
     <div style="margin-top:8px;color:#9298b0;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
@@ -583,7 +583,10 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
   lines.push('', `TOTAL — ${visible.length} item(s)`
     + `${grandHours ? ` · ${fmtHours(grandHours)}` : ''}`
     + `${grandCost ? ` · ${fmtMoney(grandCost)} recorded cost of work shown` : ''}`);
-  if (grandCost) {
+  // Shown whenever anything is printed, not only when there is money: a report whose recorded
+  // cost is $0 — September, with every receipt still unallocated — is precisely the one where a
+  // reader needs telling what the figure does and does not cover.
+  if (visible.length) {
     lines.push('Recorded cost of work shown, including work funded outside camp. Not camp spend; estimates excluded.');
   }
   lines.push('', OPS_LABEL);
