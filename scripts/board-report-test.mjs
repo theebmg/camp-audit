@@ -153,7 +153,7 @@ console.log('\n## a summary work order rolls its lines up into its own row (deci
   ok(html.replace(/\s+/g, ' ').includes(NOTE), 'the HTML footer carries the note Ben wrote, verbatim');
   const text = renderBoardReportItemsText({ report, items: [wo, lineA, lineB], aggregates: [] });
   ok(text.includes(NOTE), 'and so does the plain-text copy');
-  ok(/TOTAL .* \$1,200\.00 recorded cost of work shown/.test(text),
+  ok(/TOTAL .* \$1,200 recorded cost of work shown/.test(text),
     'the text footer states the same rolled-up total as the HTML one');
 }
 
