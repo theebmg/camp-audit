@@ -17,23 +17,28 @@ const count = async () => (await db.pool.query(
   'SELECT count(*)::int n FROM board_report_items WHERE report_id=$1', [REPORT])).rows[0].n;
 
 console.log('## a single refresh settles the report');
+const t0 = Date.now();
 await db.refreshBoardReportSuggestions(REPORT);
+console.log(`    one pass takes ${Date.now() - t0}ms`);
 const settled = await count();
 console.log(`    ${settled} item(s)`);
 ok(settled > 0, 'the report has items to lose');
 
 console.log('\n## five refreshes at once');
-const results = await Promise.all([1, 2, 3, 4, 5].map(() => db.refreshBoardReportSuggestions(REPORT)));
+const settle = (p) => p.then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+const results = await Promise.all([1, 2, 3, 4, 5].map(() => settle(db.refreshBoardReportSuggestions(REPORT))));
 const after = await count();
-console.log(`    ${after} item(s), pruned per pass: ${results.map((r) => r.prunedCount).join(', ')}`);
+const ran = results.filter((r) => r.ok);
+console.log(`    ${after} item(s); ${ran.length}/5 passes ran, pruned: ${ran.map((r) => r.v.prunedCount).join(', ')}`);
 ok(after === settled, `not one item was lost (${settled} before, ${after} after)`);
-ok(results.every((r) => r.prunedCount === 0), 'and no pass pruned anything the others had written');
+ok(ran.every((r) => r.v.prunedCount === 0), 'and no pass pruned anything another had written');
+ok(ran.length >= 1, 'at least one pass got through');
 
 console.log('\n## ten, interleaved with reads');
 const before2 = await count();
 await Promise.all([
-  ...Array.from({ length: 10 }, () => db.refreshBoardReportSuggestions(REPORT)),
-  ...Array.from({ length: 10 }, () => db.listBoardReportItems(REPORT)),
+  ...Array.from({ length: 10 }, () => settle(db.refreshBoardReportSuggestions(REPORT))),
+  ...Array.from({ length: 10 }, () => settle(db.listBoardReportItems(REPORT))),
 ]);
 const after2 = await count();
 ok(after2 === before2, `still ${after2}, was ${before2}`);

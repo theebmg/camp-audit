@@ -6436,14 +6436,34 @@ async function suggestFlaggedItems(reportId, passId, reported) {
 // race just as happily.
 const REFRESH_LOCK_NS = 0x62726566;   // 'bref'
 
+// TRY the lock and give the connection straight back if someone else holds it, rather than
+// blocking on it. Blocking deadlocks the pool: every waiter holds a connection while waiting,
+// the pass itself needs connections to do its work, and past a handful of concurrent refreshes
+// there are none left for anyone to make progress with. Only the one pass that actually holds
+// the lock keeps a connection.
+const REFRESH_LOCK_WAIT_MS = 60000;
+
 export async function refreshBoardReportSuggestions(reportId) {
-  const lock = await pool.connect();
-  try {
-    await lock.query('SELECT pg_advisory_lock($1, $2)', [REFRESH_LOCK_NS, Number(reportId)]);
-    return await runBoardReportSuggestions(reportId);
-  } finally {
-    await lock.query('SELECT pg_advisory_unlock($1, $2)', [REFRESH_LOCK_NS, Number(reportId)]);
-    lock.release();
+  const id = Number(reportId);
+  const deadline = Date.now() + REFRESH_LOCK_WAIT_MS;
+  for (;;) {
+    const lock = await pool.connect();
+    let held = false;
+    try {
+      const { rows } = await lock.query('SELECT pg_try_advisory_lock($1, $2) AS ok', [REFRESH_LOCK_NS, id]);
+      held = rows[0].ok === true;
+      if (held) return await runBoardReportSuggestions(reportId);
+    } finally {
+      if (held) await lock.query('SELECT pg_advisory_unlock($1, $2)', [REFRESH_LOCK_NS, id]);
+      lock.release();
+    }
+    if (Date.now() > deadline) {
+      const e = new Error('Another refresh of this report is still running. Try again in a moment.');
+      e.status = 409;
+      throw e;
+    }
+    // Jittered, so several waiters do not all wake and retry together.
+    await new Promise((r) => setTimeout(r, 60 + Math.floor(Math.random() * 120)));
   }
 }
 
