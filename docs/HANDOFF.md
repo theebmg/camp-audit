@@ -175,13 +175,40 @@ work. Per-report show/hide. One fund exists: Discretionary Audit Fund, $5,000.
 4. A savings note reads "$277/month" while the record says $300, so the report states $3,600/yr.
    The record is authoritative.
 
-**Proposed, not built** (do not build without a decision):
-- `docs/people-consolidation-proposal.md` — one people list; funders, visitors, cabin holders and
-  volunteers as roles on a person. **Picker token matching and merge preview are small and
-  independent — could ship any time.** The backfill would CREATE records, which needs explicit
-  approval: no migration in this project has done that.
-- `docs/funding-unification-proposal.md` — one funding vocabulary for receipts and job lines.
-- `docs/hosted-photo-page-proposal.md` — recommendation was to hold.
+**People consolidation + funding unification — half built (2026-10-03, Ben said build both):**
+
+Done and live:
+- Every combobox matches each typed word in any order (`rankOptions` in `app.js`); People search
+  does the same server-side. "Ben Greenawalt" now finds "Greenawalt, Ben".
+- Merge dialog previews what moves (`previewPersonMerge`, counted from `PERSON_REFERENCES`); a
+  person's profile lists likely duplicates with Open / Merge….
+- **Migration 0116**: `funding_sources.kind / person_id / fund_id / ref_table / ref_id`;
+  `job_lines.funding_source_id` and `expense_allocations.funding_source_id` **alongside** the old
+  `(funding_source, funding_ref_id)` pair; `crew_sessions.person_id`; `users.person_id`.
+  A trigger (`sync_funding_source_id`) fills the new column from the pair on every write, and
+  `funding_source_id_for(source, ref, create)` is the one mapping. It created exactly one row
+  (the Discretionary Audit Fund as a funding source). "Personal (Ben)" now points at person 80.
+- `scripts/funding-reconcile.mjs` — old pair vs new column, every row. Clean as of deploy.
+- Person profile shows Funded, Hours and login. Merge carries funder records, crew sessions and
+  the login link.
+
+**The application still READS the old pair.** Nothing the report prints is computed differently;
+the September render was byte-identical before and after apart from its timestamp.
+
+Not done, in order:
+1. **Read cutover + one picker.** Job-line and expense forms get one funding control over
+   `funding_sources`, choosing a *person* rather than a holding; `jobLineFundingForReport`,
+   `getFundingRefLabel`, `resolveAllocationFunding`, `getFundBalances` and the WO rollup read
+   `funding_source_id`. ~60 read sites in `db.js`. `expenses.fund_id` folds into
+   `expenses.funding_source_id` at the same time. Do this **after the September email is out**,
+   and diff the report render before and after as was done for 0116.
+2. **Retire `volunteers`.** The proposal called it dead; it is not — the crew/attendance screens
+   read it (`crew_session_volunteers`, `job_line_volunteers`, ~30 references). Those pickers move
+   to people with the Volunteer role first. Its single row, "Chuck Smith", is test data
+   (`Testemail123@gmailtest.com`, "La La Lane") and should be deleted, not migrated — Ben to confirm.
+3. Drop the old pair and `job_line_funding_kinds` — only after 1 has run clean for a release.
+
+**Proposed, not built:** `docs/hosted-photo-page-proposal.md` — recommendation was to hold.
 
 **Known-harmless:** an empty second draft (#26) exists, the shell created when #1 published.
 Unpublishing #1 removes it.
@@ -202,12 +229,12 @@ Unpublishing #1 removes it.
 
 ---
 
-## 9. Migrations 0095–0114
+## 9. Migrations 0095–0116
 
 People/groups/visits (0095–0096), text intake (0097–0100), report fields (0101, 0103–0105),
 funding sources (0102), show_hours (0106), open lines (0107), show_funding (0108), job-line
 funding kinds (0109), aggregate note (0110), general funding (0111), per-report funds (0112),
-publish snapshot (0113), mail OAuth (0114).
+publish snapshot (0113), mail OAuth (0114), mail log (0115), one funding list (0116).
 
 **Always dry-run** inside `BEGIN … ROLLBACK` against the live schema, each negative probe behind
 its own `SAVEPOINT` — a failed statement otherwise poisons the transaction and hides every probe
