@@ -35,6 +35,25 @@ function captureDeepLinkParams() {
   return woId ? { view: 'workOrderDetail', params: { id: woId } } : { view: 'assetDetail', params: { id: assetId } };
 }
 
+// The outcome of the last email attempt per report, kept outside the screen's own state so it
+// survives the redraw that follows a send. A toast was the only signal before, and it was gone
+// before it could be read.
+const brSendStatus = {};
+function brSendStatusHtml(reportId) {
+  const st = brSendStatus[reportId];
+  if (!st) return '';
+  const look = {
+    sending: 'background:#eef2fb;color:#1f3a7a',
+    sent: 'background:#e8f5ea;color:#1c5a2a',
+    failed: 'background:#fbeaea;color:#7a1f1f',
+  }[st.state];
+  const admin = state.options?.currentUser?.role === 'admin';
+  return `<div role="status" style="${look};margin:10px 0 0;padding:10px 12px;border-radius:8px;font-size:0.92rem">
+    ${escapeHtml(st.text)}${st.state === 'failed' && admin
+      ? ' <a href="#" id="brOpenMailLog" style="color:inherit;text-decoration:underline">Email log</a>' : ''}
+  </div>`;
+}
+
 function toast(msg, ms = 2500) {
   toastEl.textContent = msg;
   toastEl.hidden = false;
@@ -5709,6 +5728,7 @@ async function renderBoardReport(params = {}) {
             ? (state.options?.currentUser?.role === 'admin' ? '<button type="button" class="btn btn-secondary" id="brUnpublish">Unpublish</button>' : '')
             : '<button type="button" class="btn btn-primary" id="brPublish">Publish</button>'}
         </div>
+        <div id="brSendStatus">${brSendStatusHtml(report.Id)}</div>
         <p class="muted" style="margin:8px 0 0;font-size:0.82rem">Every copy that leaves the app is saved below, exactly as it went out.</p>
       </div>
 
@@ -5803,6 +5823,7 @@ async function renderBoardReport(params = {}) {
         }
         return null;
       }
+      if (kind === 'email') return { ok: false, error: e.message };
       toast(e.message, 5000); return null;
     }
   }
@@ -5839,12 +5860,28 @@ async function renderBoardReport(params = {}) {
     document.getElementById('brEmail').addEventListener('click', async () => {
       const recipient = await promptDialog('Email the board report to:', { confirmLabel: 'Send', placeholder: 'name@example.org' });
       if (!recipient || !recipient.trim()) return;
-      const res = await output('email', { recipient });
-      if (res) { toast(`Sent to ${recipient}`); await load(); draw(); }
-      // output() already toasted the failure, but briefly. A send failure is worth more than a
-      // few seconds, so it is also written where it can be read back: Admin → Integrations →
-      // Email (Gmail) shows the last error.
-      else toast('Not sent. The reason is on Admin → Integrations → Email (Gmail).', 10000);
+      const to = recipient.trim();
+      const show = (st, text) => {
+        brSendStatus[report.Id] = st ? { state: st, text } : null;
+        const el = document.getElementById('brSendStatus');
+        if (el) el.innerHTML = brSendStatusHtml(report.Id);
+        document.getElementById('brOpenMailLog')?.addEventListener('click', (e) => {
+          e.preventDefault(); go('adminEmail');
+        });
+      };
+      const btn = document.getElementById('brEmail');
+      btn.disabled = true; btn.textContent = 'Sending…';
+      show('sending', `Sending to ${to}…`);
+      const res = await output('email', { recipient: to });
+      const at = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      if (res?.ok) {
+        brSendStatus[report.Id] = { state: 'sent', text: `Sent to ${to} at ${at}.` };
+        await load(); draw();
+      } else {
+        btn.disabled = false; btn.textContent = 'Email…';
+        // null = the draft confirmation was declined; nothing was attempted.
+        if (res) show('failed', `Unable to send: ${res.error}`); else show(null);
+      }
     });
     const pub = document.getElementById('brPublish');
     if (pub) pub.addEventListener('click', async () => {
@@ -8071,8 +8108,26 @@ async function renderAdminEmail(container = app) {
   if (container === app) setChrome({ title: 'Email', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
   let st;
-  try { st = await api('/api/pg/gmail/status'); }
+  let log = [];
+  try {
+    st = await api('/api/pg/gmail/status');
+    log = (await api('/api/pg/mail-log?limit=30')).log || [];
+  }
   catch (err) { container.innerHTML = `<div class="card"><p class="muted">${escapeHtml(err.message)}</p></div>`; return; }
+
+  const pillLook = { sent: 'background:#e8f5ea;color:#1c5a2a', failed: 'background:#fbeaea;color:#7a1f1f', sending: '' };
+  const pillText = { sent: 'Sent', failed: 'Unable to send', sending: 'Sending…' };
+  const logHtml = log.map((m) => `
+    <div class="list-item" style="cursor:default;display:block">
+      <div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline">
+        <strong style="word-break:break-word">${escapeHtml(m.Recipient || '')}</strong>
+        <span class="pill" style="${pillLook[m.Status] || ''};white-space:nowrap">${pillText[m.Status] || escapeHtml(m.Status)}</span>
+      </div>
+      <div class="muted" style="font-size:0.84rem">${escapeHtml(m.Subject || '')}</div>
+      <div class="muted" style="font-size:0.8rem">${escapeHtml(new Date(m.CreatedAt).toLocaleString())}${m.SentBy ? ` · ${escapeHtml(m.SentBy)}` : ''}${m.Context ? ` · ${escapeHtml(m.Context)}` : ''}</div>
+      ${m.Error ? `<div style="color:#7a1f1f;font-size:0.88rem;margin-top:4px">${escapeHtml(m.Error)}</div>` : ''}
+      ${m.Detail && m.Detail !== m.Error ? `<details class="muted" style="font-size:0.78rem;margin-top:2px"><summary>Technical detail</summary>${escapeHtml(m.Detail)}</details>` : ''}
+    </div>`).join('');
 
   const row = (label, value, good) => `
     <div class="list-item list-item-actionable">
@@ -8131,7 +8186,12 @@ async function renderAdminEmail(container = app) {
       <div class="field-row"><label>To</label><input id="mailTestTo" type="email" placeholder="you@example.com" /></div>
       <button type="button" class="btn btn-secondary" id="mailTest">Send test email</button>
       <p class="field-error" id="mailTestTo-err"></p>
-    </div>` : ''}`;
+    </div>` : ''}
+
+    <div class="card">
+      <h3>Email log</h3>
+      ${logHtml || '<p class="muted">Nothing has been sent yet.</p>'}
+    </div>`;
 
   document.getElementById('mailConnect')?.addEventListener('click', async () => {
     try {
@@ -8158,9 +8218,11 @@ async function renderAdminEmail(container = app) {
     try {
       await api('/api/pg/gmail/test', { method: 'POST', body: JSON.stringify({ to }) });
       toast(`Sent to ${to} — check that inbox, and spam the first time.`, 9000);
+      renderAdminEmail(container);
     } catch (err) {
-      showFieldError('mailTestTo', saveErrorMessage(err));
-    } finally { btn.disabled = false; btn.textContent = 'Send test email'; }
+      await renderAdminEmail(container);
+      showFieldError('mailTestTo', `Unable to send: ${err.message}`);
+    }
   });
 }
 

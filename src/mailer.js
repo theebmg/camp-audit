@@ -13,6 +13,8 @@
 // That's the whole trick: you never need admin rights over the alias's own
 // mailbox, only over the Gmail account you authenticate as.
 import nodemailer from 'nodemailer';
+import MailComposer from 'nodemailer/lib/mail-composer/index.js';
+import { refreshAccessToken } from './gmailOAuth.js';
 
 // A stored OAuth connection beats anything in the environment, because it is the one that can
 // be re-granted from the browser when Google revokes it. Read lazily and cached only for as long
@@ -110,14 +112,99 @@ export async function resolveFromHeaders() {
   };
 }
 
-export async function sendMail({ to, subject, html, text, replyTo, attachments }) {
-  const t = await getTransporter();
-  const h = await resolveFromHeaders();
-  return t.sendMail({
-    from: h.from, to, subject, html, text,
-    ...(attachments && attachments.length ? { attachments } : {}),
-    replyTo: replyTo || h.replyTo,
+// Sent through Gmail's HTTPS API, not SMTP. This host's provider blocks outbound 25/465/587, so
+// an SMTP send can only ever time out — and gmail.send, the one scope this app asks for, is the
+// API's scope in any case. The upload endpoint takes the raw message, so nodemailer still builds
+// the MIME (inline photos included) and only the transport differs.
+const GMAIL_SEND_URL = 'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=media';
+
+function buildRaw(message) {
+  return new Promise((resolve, reject) => {
+    new MailComposer(message).compile().build((err, buf) => (err ? reject(err) : resolve(buf)));
   });
+}
+
+async function sendViaGmailApi(refreshToken, message) {
+  const { access_token: accessToken } = await refreshAccessToken(refreshToken);
+  const raw = await buildRaw(message);
+  const res = await fetch(GMAIL_SEND_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'message/rfc822' },
+    body: raw,
+    signal: AbortSignal.timeout(90000),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(`Gmail API ${res.status}: ${json.error?.message || res.statusText}`);
+    err.httpStatus = res.status;
+    err.googleReason = json.error?.errors?.[0]?.reason || json.error?.status || null;
+    throw err;
+  }
+  return { messageId: json.id || null, bytes: raw.length };
+}
+
+// What Ben reads. The raw error is kept beside it in the log for whoever has to fix it.
+export function friendlyMailError(err, to) {
+  const raw = String(err?.message || err || '');
+  const reconnect = 'Reconnect at Admin → Integrations → Email (Gmail).';
+  if (/^Email cannot be sent/.test(raw)) return raw;
+  if (err?.googleError === 'invalid_grant' || /invalid_grant|expired or revoked/i.test(raw)) {
+    return `Google has withdrawn this app's permission to send. ${reconnect}`;
+  }
+  if (err?.httpStatus === 401) return `Google did not accept the app's sign-in. ${reconnect}`;
+  if (err?.httpStatus === 403 && /has not been used|is disabled|accessNotConfigured/i.test(raw)) {
+    return 'The Gmail API is not switched on for the Google project this app uses.';
+  }
+  if (err?.httpStatus === 403) return `The Gmail connection is not allowed to send mail. ${reconnect}`;
+  if (err?.httpStatus === 400 && /To header|recipient|address/i.test(raw)) {
+    return `"${to}" is not an address Gmail will accept. Check it for typos.`;
+  }
+  if (err?.httpStatus === 413 || /too large/i.test(raw)) {
+    return 'The message is too large for Gmail. Deselect some photos and try again.';
+  }
+  if (err?.httpStatus === 429 || /rate ?limit|quota/i.test(raw)) {
+    return "Gmail's sending limit has been reached for now. Try again later.";
+  }
+  if (err?.httpStatus >= 500) return 'Gmail had a problem on its side. Try again in a few minutes.';
+  if (/timeout|timed out|ETIMEDOUT|ECONN|ENOTFOUND|EAI_AGAIN|fetch failed|aborted/i.test(raw)) {
+    return 'The server could not reach Google. Try again in a minute.';
+  }
+  return `Gmail refused the message: ${raw}`;
+}
+
+// Every send is logged — Sending, then Sent or Failed — so "did it go?" has an answer that does
+// not depend on having caught a toast. A logging failure never blocks or fails a send.
+export async function sendMail({ to, subject, html, text, replyTo, attachments, context, by }) {
+  const db = await import('./db.js');
+  const logId = await db.startMailLog({ recipient: to, subject, context, by }).catch(() => null);
+  try {
+    const h = await resolveFromHeaders();
+    const message = {
+      from: h.from, to, subject, html, text,
+      ...(attachments && attachments.length ? { attachments } : {}),
+      replyTo: replyTo || h.replyTo,
+    };
+    const stored = await storedOAuth();
+    const refreshToken = stored?.refreshToken || process.env.GMAIL_OAUTH_REFRESH_TOKEN;
+    let result;
+    if (refreshToken) {
+      result = await sendViaGmailApi(refreshToken, message);
+    } else {
+      // App-password fallback. SMTP is blocked from this host, so this exists for a host where
+      // it is not.
+      const info = await (await getTransporter()).sendMail(message);
+      result = { messageId: info?.messageId || null, bytes: null };
+    }
+    await db.finishMailLog(logId, { status: 'sent', ...result }).catch(() => {});
+    return result;
+  } catch (err) {
+    const friendly = friendlyMailError(err, to);
+    await db.finishMailLog(logId, { status: 'failed', error: friendly, detail: err?.message }).catch(() => {});
+    const out = new Error(friendly);
+    out.status = 502;
+    out.detail = err?.message;
+    throw out;
+  }
 }
 
 export async function sendReportEmail({ to, subject, html, text }) {

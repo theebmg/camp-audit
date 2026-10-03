@@ -5133,6 +5133,54 @@ export async function recordMailError(message) {
   await pool.query('UPDATE mail_settings SET last_error = $1 WHERE id = 1', [String(message).slice(0, 500)]);
 }
 
+// ---- Mail log (0115) ----
+// One row per attempt. Started as 'sending' before anything leaves, so an attempt that dies with
+// the process is still on record rather than simply absent.
+export async function startMailLog({ recipient, subject, context = null, by = null }) {
+  const { rows } = await pool.query(
+    `INSERT INTO mail_log (status, recipient, subject, context, sent_by)
+     VALUES ('sending', $1, $2, $3, $4) RETURNING id`,
+    [String(recipient || '').slice(0, 500), String(subject || '').slice(0, 500), context, by]
+  );
+  return rows[0].id;
+}
+
+export async function finishMailLog(id, { status, error = null, detail = null, messageId = null, bytes = null }) {
+  if (id) {
+    await pool.query(
+      `UPDATE mail_log
+          SET status = $2, finished_at = now(), error_message = $3, error_detail = $4,
+              provider_message_id = $5, size_bytes = $6
+        WHERE id = $1`,
+      [id, status, error, detail ? String(detail).slice(0, 2000) : null, messageId, bytes]
+    );
+  }
+  // The Email screen's "Last error" follows the most recent attempt: cleared by a success.
+  await pool.query('UPDATE mail_settings SET last_error = $1 WHERE id = 1',
+    [status === 'failed' ? String(error || detail || 'failed').slice(0, 500) : null]);
+}
+
+export async function listMailLog(limit = 50) {
+  // A row still 'sending' after five minutes was cut off by a restart; say so rather than
+  // showing "Sending…" forever.
+  const { rows } = await pool.query(
+    `SELECT id, created_at, finished_at, recipient, subject, context, sent_by, size_bytes,
+            CASE WHEN status = 'sending' AND created_at < now() - interval '5 minutes'
+                 THEN 'failed' ELSE status END AS status,
+            CASE WHEN status = 'sending' AND created_at < now() - interval '5 minutes'
+                 THEN 'Interrupted — the app restarted before this finished. Send it again.'
+                 ELSE error_message END AS error_message,
+            error_detail
+       FROM mail_log ORDER BY id DESC LIMIT $1`,
+    [Math.min(Math.max(Number(limit) || 50, 1), 200)]
+  );
+  return rows.map((r) => ({
+    Id: r.id, CreatedAt: r.created_at, FinishedAt: r.finished_at, Recipient: r.recipient,
+    Subject: r.subject, Context: r.context, SentBy: r.sent_by, SizeBytes: r.size_bytes,
+    Status: r.status, Error: r.error_message, Detail: r.error_detail,
+  }));
+}
+
 export async function getFundBalances() {
   const funds = await listFunds();
   // Two halves of the same money (0083): shares explicitly allocated to a fund, plus

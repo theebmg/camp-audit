@@ -165,7 +165,7 @@ import {
   getGcalEventColors, setGcalEventColor, requeueAllGcalSyncs,
   listFundingSources, createFundingSource, updateFundingSource,
   findPossibleDuplicateCharges, mergeTypedCostIntoReceipt,
-  getMailSettings, clearMailOAuthToken, recordMailError,
+  getMailSettings, clearMailOAuthToken, listMailLog,
   listBoardReportFunds, setBoardReportFund,
   listBoardReportPhotoCandidates,
   seedDefaultReportPhotos, setBoardReportPhoto, removeBoardReportPhoto,
@@ -2309,16 +2309,12 @@ router.post('/board-reports/:id(\\d+)/output', async (req, res, next) => {
           bytes, budgetMb,
         });
       }
-      try {
-        await sendMail({ to: recipient, subject: finalSubject, html, text, attachments: inlineAttachments });
-      } catch (sendErr) {
-        // A toast that disappears after a few seconds is not a record of anything. Ben watched
-        // this fail twice and had no way to tell me what it said. Keep it where the Email screen
-        // shows it, and name the recipient so a failure is traceable to an attempt.
-        await recordMailError(`Sending "${finalSubject}" to ${recipient} failed: ${sendErr.message}`)
-          .catch(() => {});
-        throw sendErr;
-      }
+      // sendMail logs the attempt and its outcome itself; a failure arrives here already worded
+      // for Ben and is passed straight on.
+      await sendMail({
+        to: recipient, subject: finalSubject, html, text, attachments: inlineAttachments,
+        context: 'Board report', by: req.user?.username || null,
+      });
     }
 
     const output = await recordBoardReportOutput(report.Id, {
@@ -3607,12 +3603,19 @@ router.post('/gmail/test', async (req, res, next) => {
       subject: 'Sychar Operations — mail test',
       text: 'If you are reading this, board reports can be emailed from the app.',
       html: '<p>If you are reading this, board reports can be emailed from the app.</p>',
+      context: 'Test', by: currentUsername(),
     });
     res.json({ ok: true });
   } catch (e) {
-    await recordMailError(e.message).catch(() => {});
     res.status(502).json({ ok: false, error: e.message });
   }
+});
+
+router.get('/mail-log', async (req, res, next) => {
+  try {
+    if (currentRole() !== 'admin') return res.status(403).json({ ok: false, error: 'Admins only.' });
+    res.json({ log: await listMailLog(req.query.limit) });
+  } catch (e) { next(e); }
 });
 
 // ---- Approved funds shown on a report ----
