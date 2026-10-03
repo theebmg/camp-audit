@@ -2808,43 +2808,50 @@ export async function listVolunteers({ includeInactive = false } = {}) {
   );
   return rows.map(volunteerRowShape);
 }
-export async function createVolunteer({ name, phone, email, address, skill = [] }) {
-  const { rows } = await pool.query(
-    `INSERT INTO volunteers (name, phone, email, address, skill) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-    [name, phone || null, email || null, address || null, skill]
-  );
-  await logActivity({ action: 'created', entityType: 'volunteer', entityId: rows[0].id, entityLabel: rows[0].name });
-  return volunteerRowShape(rows[0]);
+// Volunteers are people with the Volunteer role (0118); `volunteers` is a view over them. These
+// three keep the old screens' contract while writing to the one person list.
+async function volunteerRoleId() {
+  const { rows } = await pool.query(`SELECT id FROM person_roles WHERE name = 'Volunteer'`);
+  if (!rows[0]) { const e = new Error('The Volunteer role is missing — add it under Admin → Person roles'); e.status = 500; throw e; }
+  return rows[0].id;
 }
-export async function updateVolunteer(id, { name, phone, email, address, skill }) {
-  const { rows } = await pool.query(
-    `UPDATE volunteers SET name = COALESCE($2,name), phone = COALESCE($3,phone), email = COALESCE($4,email),
-       address = COALESCE($5,address), skill = COALESCE($6, skill)
-     WHERE id = $1 RETURNING *`,
-    [id, name ?? null, phone ?? null, email ?? null, address ?? null, skill ?? null]
-  );
-  if (rows[0]) await logActivity({ action: 'updated', entityType: 'volunteer', entityId: rows[0].id, entityLabel: rows[0].name });
+async function volunteerById(id) {
+  const { rows } = await pool.query('SELECT * FROM volunteers WHERE id = $1', [id]);
   return rows[0] ? volunteerRowShape(rows[0]) : null;
 }
-// Hard-deletes only if never assigned to a Work Order (mirrors
-// adminDeleteBuildingType's block-if-in-use pattern); otherwise deactivates
-// so WO assignment history isn't silently lost.
+export async function createVolunteer({ name, phone, email, address, skill = [] }) {
+  const person = await createPerson({
+    name, phone, email, roleIds: [await volunteerRoleId()], volunteerSkills: skill,
+    // People have no address field; nothing typed is thrown away.
+    volunteerNotes: address ? `Address: ${address}` : null,
+  });
+  return volunteerById(person.Id);
+}
+export async function updateVolunteer(id, { name, phone, email, address, skill }) {
+  await updatePerson(id, {
+    name: name ?? undefined, phone: phone ?? undefined, email: email ?? undefined,
+    volunteerSkills: skill ?? undefined,
+    volunteerNotes: address ? `Address: ${address}` : undefined,
+  });
+  return volunteerById(id);
+}
+// Stops someone being offered as a volunteer. The person stays — they may hold a cabin, visit,
+// or fund work — and any crew history keeps their name.
 export async function removeVolunteer(id) {
-  const nameRes = await pool.query('SELECT name FROM volunteers WHERE id = $1', [id]);
-  const name = nameRes.rows[0]?.name;
   const used = await pool.query(
     `SELECT (SELECT count(*) FROM job_line_volunteers WHERE volunteer_id = $1)
            + (SELECT count(*) FROM crew_session_volunteers WHERE volunteer_id = $1) AS count`,
     [id]
   );
-  if (Number(used.rows[0].count) > 0) {
-    await pool.query('UPDATE volunteers SET active = false WHERE id = $1', [id]);
-    await logActivity({ action: 'deactivated', entityType: 'volunteer', entityId: Number(id), entityLabel: name });
-    return { deactivated: true };
+  const { rows } = await pool.query(
+    `DELETE FROM person_role_assignments WHERE person_id = $1 AND role_id = $2 RETURNING person_id`,
+    [id, await volunteerRoleId()]
+  );
+  if (rows[0]) {
+    const p = await pool.query('SELECT name FROM people WHERE id = $1', [id]);
+    await logActivity({ action: 'removed Volunteer role', entityType: 'person', entityId: Number(id), entityLabel: p.rows[0]?.name });
   }
-  await pool.query('DELETE FROM volunteers WHERE id = $1', [id]);
-  await logActivity({ action: 'deleted', entityType: 'volunteer', entityId: Number(id), entityLabel: name });
-  return { deleted: true };
+  return Number(used.rows[0].count) > 0 ? { deactivated: true } : { deleted: true };
 }
 
 export async function listVendors({ includeInactive = false } = {}) {
@@ -3685,6 +3692,9 @@ const PERSON_REFERENCES = [
   ['funding_sources',         'person_id',         'repoint', 'funder record'],
   ['crew_sessions',           'person_id',         'repoint', 'crew session'],
   ['users',                   'person_id',         'repoint', 'login account'],
+  // 0118: volunteer_id IS people.id. Composite keys, so union.
+  ['crew_session_volunteers', 'volunteer_id',      'union', 'crew attendance'],
+  ['job_line_volunteers',     'volunteer_id',      'union', 'job assignment'],
 ];
 
 const GROUP_REFERENCES = [

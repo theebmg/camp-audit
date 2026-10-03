@@ -8183,14 +8183,16 @@ async function renderAdminEmail(container = app) {
       <p class="muted" style="font-size:0.85rem">
         The account that signs in and the address mail comes <em>from</em> can differ. Gmail allows
         that only when the From address is a verified <em>send mail as</em> alias on the signed-in
-        account — otherwise Google quietly rewrites the sender to the signed-in address.
+        account — otherwise Google quietly rewrites the sender to the signed-in address. As of
+        October 2026 that is what happens here: mail arrives From the signed-in account, with
+        replies still going to the address below.
       </p>
     </div>
 
     <div class="card">
       ${row('Signed in as', st.AuthAccount || (st.Connected ? 'account unknown' : 'not connected'), st.Connected)}
       ${st.ConnectedAt ? row('Connected on', new Date(st.ConnectedAt).toLocaleString(), true) : ''}
-      ${row('Sends as (From)', st.FromHeader || '(not set)', Boolean(st.FromAddress))}
+      ${row('Asks to send as', st.FromHeader || '(not set)', Boolean(st.FromAddress))}
       ${row('Replies go to', st.ReplyTo || '(not set)', Boolean(st.ReplyTo))}
       ${row('OAuth client', st.OAuthClientConfigured ? (st.ClientId || 'configured') : 'NOT configured', st.OAuthClientConfigured)}
       ${st.LastError ? row('Last error', st.LastError, false) : ''}
@@ -15966,6 +15968,11 @@ async function renderCrew() {
       ${skillFilter ? `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="clearSkillFilter">✕ Filtered by skill: ${escapeHtml(skillFilter)}</button></div>` : ''}
 
       <div class="card"><h3>Volunteers</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:0.85rem">
+          Volunteers are people with the Volunteer role — one list, shared with visitors, cabin
+          holders and funders. Someone already under People becomes a volunteer by ticking the
+          role on their page; adding one here creates the person.
+        </p>
         ${mode === 'table' ? personGridHtml(visibleVols, 'vol', emptyMsg) : (visibleVols.map((v) => personCard(v, 'vol')).join('') || `<p class="muted">${emptyMsg}</p>`)}
       </div>
       ${editing === 'new-vol' ? editFormHtml('vol', null) : `<div class="btn-row" style="margin:-6px 0 16px"><button class="btn btn-secondary" id="addVolBtn">+ Add Volunteer</button></div>`}
