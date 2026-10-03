@@ -1308,10 +1308,18 @@ export async function getBudgetOverview() {
     });
   }
 
-  const [campaignProjects, otherCategories, cabinHolders] = await Promise.all([
+  const [campaignProjects, otherCategories, cabinHolders, funders] = await Promise.all([
     listCapitalCampaignProjects().then((ents) => itemizedGroups('capital_campaign', ents)),
     listOtherBudgetCategories().then((ents) => itemizedGroups('other', ents)),
     listCabinHolders().then((ents) => itemizedGroups('cabin_holder', ents)),
+    // People, donors and in-kind named directly on a line (0117) — only those actually used,
+    // so this is a ledger of who has paid for work rather than a second people list.
+    pool.query(
+      `SELECT fs.id, COALESCE(p.name, fs.name) AS name, NULL AS description
+       FROM funding_sources fs LEFT JOIN people p ON p.id = fs.person_id
+       WHERE EXISTS (SELECT 1 FROM job_lines jl WHERE jl.funding_source = 'funder' AND jl.funding_ref_id = fs.id)
+       ORDER BY 2`
+    ).then(({ rows }) => itemizedGroups('funder', rows.map(fundingEntityRowShape))),
   ]);
 
   return {
@@ -1327,6 +1335,8 @@ export async function getBudgetOverview() {
     OtherTotal: otherCategories.reduce((s, p) => s + p.Total, 0),
     CabinHolders: cabinHolders,
     CabinHolderTotal: cabinHolders.reduce((s, p) => s + p.Total, 0),
+    Funders: funders,
+    FunderTotal: funders.reduce((s, p) => s + p.Total, 0),
   };
 }
 
@@ -1576,6 +1586,14 @@ export async function workOrderCloseGate(woId) {
 // the same soft, app-validated way as the other three.
 async function getFundingRefLabel(fundingSource, fundingRefId) {
   if (!fundingRefId) return null;
+  // 'funder' (0117) points at the one funding list; a person-funder is named for the person.
+  if (fundingSource === 'funder') {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(p.name, fs.name) AS name FROM funding_sources fs LEFT JOIN people p ON p.id = fs.person_id WHERE fs.id = $1`,
+      [fundingRefId]
+    );
+    return rows[0]?.name || null;
+  }
   const table = { capital_campaign: 'capital_campaign_projects', cabin_holder: 'cabin_holders', other: 'other_budget_categories', fund: 'funds' }[fundingSource];
   if (!table) return null;
   const { rows } = await pool.query(`SELECT name FROM ${table} WHERE id = $1`, [fundingRefId]);
@@ -5321,16 +5339,75 @@ export async function updateJobLineFundingKind(source, { label, countsAsCampSpen
 }
 
 export async function listFundingSources({ includeInactive = false } = {}) {
+  // Every active fund has a row in the one list, made the first time anyone looks — so a fund
+  // added yesterday is choosable on a receipt today without ever having funded a job line.
+  // Inactive funds too: a receipt charged to a fund that has since closed must still open
+  // showing it, or saving the form would quietly clear it.
+  await pool.query(`SELECT funding_source_id_for('fund', id) FROM funds`);
   const { rows } = await pool.query(
-    `SELECT * FROM funding_sources ${includeInactive ? '' : 'WHERE active'} ORDER BY sort_order, name`
+    `SELECT fs.*, COALESCE(p.name, fs.name) AS display_name
+     FROM funding_sources fs LEFT JOIN people p ON p.id = fs.person_id
+     ${includeInactive ? '' : 'WHERE fs.active'} ORDER BY fs.sort_order, fs.name`
   );
   return rows.map((r) => ({
-    Id: r.id, Name: r.name, CountsAsCampSpend: r.counts_as_camp_spend,
+    Id: r.id, Name: r.name, DisplayName: r.display_name, CountsAsCampSpend: r.counts_as_camp_spend,
     IsContribution: r.is_contribution, IsInKind: r.is_in_kind,
     SortOrder: r.sort_order, Active: r.active,
     ShortLabel: r.short_label || r.name,
     Kind: r.kind || null, PersonId: r.person_id || null, FundId: r.fund_id || null,
   }));
+}
+
+export async function funderForPerson(personId) {
+  const { rows } = await pool.query('SELECT funder_for_person($1) AS id', [personId]);
+  return (await listFundingSources({ includeInactive: true })).find((f) => f.Id === rows[0].id);
+}
+
+// The one list a job line's funding is chosen from. Each option's value is the pair the line
+// stores, "source::refId" — so every existing write path takes it as it always has.
+//
+// A person is offered once, as themselves: ('person', people.id), which the database turns into
+// their funder row on save. Holdings that name exactly one person are not offered separately;
+// `aliases` maps the values already stored for them onto that person's option, so an existing
+// line opens showing the person rather than a blank.
+export async function listFundingOptions() {
+  await pool.query(`SELECT funding_source_id_for('fund', id) FROM funds WHERE active`);
+  const [campaigns, others, funds, sources, people, holdings] = await Promise.all([
+    pool.query('SELECT id, name FROM capital_campaign_projects ORDER BY name'),
+    pool.query('SELECT id, name FROM other_budget_categories ORDER BY name'),
+    pool.query('SELECT id, name FROM funds WHERE active ORDER BY name'),
+    pool.query(`SELECT id, name, kind, person_id, short_label FROM funding_sources WHERE active ORDER BY sort_order, name`),
+    pool.query(
+      `SELECT p.id, p.name, (SELECT string_agg(DISTINCT a.name, ', ')
+                               FROM cabin_holder_people chp JOIN assets a ON a.cabin_holder_id = chp.cabin_holder_id
+                              WHERE chp.person_id = p.id) AS cabins
+       FROM people p WHERE p.active ORDER BY lower(p.name)`),
+    pool.query(
+      `SELECT ch.id, ch.name, count(chp.person_id)::int AS people, min(chp.person_id) AS person_id
+       FROM cabin_holders ch LEFT JOIN cabin_holder_people chp ON chp.cabin_holder_id = ch.id
+       GROUP BY ch.id, ch.name ORDER BY ch.name`),
+  ]);
+  const v = (source, ref) => `${source}::${ref ?? ''}`;
+  const options = [{ value: v('operating_budget', null), label: 'Operating Budget', sublabel: 'Camp' }];
+  for (const f of funds.rows) options.push({ value: v('fund', f.id), label: f.name, sublabel: 'Camp fund' });
+  for (const c of campaigns.rows) options.push({ value: v('capital_campaign', c.id), label: c.name, sublabel: 'Capital campaign' });
+  for (const o of others.rows) options.push({ value: v('other', o.id), label: o.name, sublabel: 'Other category' });
+  for (const s of sources.rows.filter((r) => ['donor_org', 'in_kind'].includes(r.kind))) {
+    options.push({ value: v('funder', s.id), label: s.name, sublabel: s.kind === 'in_kind' ? 'Contribution, no receipt' : 'Contribution' });
+  }
+  for (const p of people.rows) {
+    options.push({ value: v('person', p.id), label: p.name, sublabel: ['Person', p.cabins].filter(Boolean).join(' · ') });
+  }
+  const aliases = {};
+  for (const h of holdings.rows) {
+    if (h.people === 1) aliases[v('cabin_holder', h.id)] = v('person', h.person_id);
+    else options.push({ value: v('cabin_holder', h.id), label: h.name, sublabel: 'Cabin holding (no person linked)' });
+  }
+  for (const s of sources.rows) {
+    if (s.kind === 'person' && s.person_id) aliases[v('funder', s.id)] = v('person', s.person_id);
+    if (s.kind === 'camp_general') aliases[v('funder', s.id)] = v('operating_budget', null);
+  }
+  return { options, aliases };
 }
 
 // Does the new funding_source_id agree with the old (funding_source, funding_ref_id) pair on
@@ -6479,15 +6556,16 @@ async function jobLineFundingForReport(jobLineIds) {
   // the money as ordinary general spend — the fund Ben had chosen on the receipt vanished.
   const { rows: allocs } = await pool.query(
     `SELECT ea.dest_id AS job_line_id,
-            COALESCE(f.name, ch.name, fs.short_label, fs.name, k.label, 'Unassigned') AS source,
+            COALESCE(f.name, ch.name, afp.name, afs.short_label, afs.name, fs.short_label, fs.name, k.label, 'Unassigned') AS source,
             CASE WHEN f.id IS NOT NULL THEN true
                  WHEN ch.id IS NOT NULL THEN false
+                 WHEN afs.id IS NOT NULL THEN afs.counts_as_camp_spend
                  WHEN fs.id IS NOT NULL THEN fs.counts_as_camp_spend
                  WHEN k.source IS NOT NULL THEN k.counts_as_camp_spend
                  ELSE true END AS is_camp,
             -- Only the general pot is general. A fund or a named person never is, which is what
             -- earns them a tag.
-            CASE WHEN f.id IS NOT NULL OR ch.id IS NOT NULL THEN false
+            CASE WHEN f.id IS NOT NULL OR ch.id IS NOT NULL OR afs.id IS NOT NULL THEN false
                  WHEN fs.id IS NOT NULL THEN fs.is_general
                  WHEN k.source IS NOT NULL THEN k.is_general
                  ELSE true END AS is_general,
@@ -6498,6 +6576,9 @@ async function jobLineFundingForReport(jobLineIds) {
        ON f.id = COALESCE(e.fund_id, CASE WHEN ea.funding_source = 'fund' THEN ea.funding_ref_id END)
      LEFT JOIN cabin_holders ch
        ON ea.funding_source = 'cabin_holder' AND ch.id = ea.funding_ref_id AND e.fund_id IS NULL
+     LEFT JOIN funding_sources afs
+       ON ea.funding_source = 'funder' AND afs.id = ea.funding_ref_id AND e.fund_id IS NULL
+     LEFT JOIN people afp ON afp.id = afs.person_id
      LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
      LEFT JOIN job_line_funding_kinds k ON k.source = ea.funding_source
      WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
@@ -6512,15 +6593,18 @@ async function jobLineFundingForReport(jobLineIds) {
   const { rows: budget } = await pool.query(
     `SELECT jl.id AS job_line_id, jl.funding_source, jl.funding_ref_id,
             COALESCE(jl.actual_cost, 0) AS amount,
-            COALESCE(k.counts_as_camp_spend, true) AS is_camp,
+            COALESCE(bfs.counts_as_camp_spend, k.counts_as_camp_spend, true) AS is_camp,
             COALESCE(k.is_general, false) AS is_general,
             COALESCE(k.label, jl.funding_source) AS kind_label,
+            COALESCE(bp.name, bfs.short_label, bfs.name) AS funder_name,
             ch.name AS cabin_holder_name, f.name AS fund_name,
             cc.name AS campaign_name, ob.name AS other_name
      FROM job_lines jl
      LEFT JOIN job_line_funding_kinds k ON k.source = jl.funding_source
      LEFT JOIN cabin_holders ch ON jl.funding_source = 'cabin_holder' AND ch.id = jl.funding_ref_id
      LEFT JOIN funds f ON jl.funding_source = 'fund' AND f.id = jl.funding_ref_id
+     LEFT JOIN funding_sources bfs ON jl.funding_source = 'funder' AND bfs.id = jl.funding_ref_id
+     LEFT JOIN people bp ON bp.id = bfs.person_id
      LEFT JOIN capital_campaign_projects cc ON jl.funding_source = 'capital_campaign' AND cc.id = jl.funding_ref_id
      LEFT JOIN other_budget_categories ob ON jl.funding_source = 'other' AND ob.id = jl.funding_ref_id
      WHERE jl.id = ANY($1) AND jl.funding_source IS NOT NULL`,
@@ -6541,7 +6625,7 @@ async function jobLineFundingForReport(jobLineIds) {
     const fromReceipts = allocByLine.get(id);
     const b = budget.find((x) => x.job_line_id === id);
     const budgetLabel = b
-      ? personNameForTag(b.cabin_holder_name || b.fund_name || b.campaign_name || b.other_name || '') || b.kind_label
+      ? personNameForTag(b.cabin_holder_name || b.funder_name || b.fund_name || b.campaign_name || b.other_name || '') || b.kind_label
       : null;
 
     if (fromReceipts && fromReceipts.length) {
@@ -6599,13 +6683,14 @@ async function workOrderRollupForReport(workOrderId) {
   }
   // Receipts booked against the work order itself rather than one of its lines.
   const { rows: woLevel } = await pool.query(
-    `SELECT COALESCE(f.name, ch.name, fs.short_label, fs.name, k.label, 'Unassigned') AS source,
+    `SELECT COALESCE(f.name, ch.name, afp.name, afs.short_label, afs.name, fs.short_label, fs.name, k.label, 'Unassigned') AS source,
             CASE WHEN f.id IS NOT NULL THEN true
                  WHEN ch.id IS NOT NULL THEN false
+                 WHEN afs.id IS NOT NULL THEN afs.counts_as_camp_spend
                  WHEN fs.id IS NOT NULL THEN fs.counts_as_camp_spend
                  WHEN k.source IS NOT NULL THEN k.counts_as_camp_spend
                  ELSE true END AS is_camp,
-            CASE WHEN f.id IS NOT NULL OR ch.id IS NOT NULL THEN false
+            CASE WHEN f.id IS NOT NULL OR ch.id IS NOT NULL OR afs.id IS NOT NULL THEN false
                  WHEN fs.id IS NOT NULL THEN fs.is_general
                  WHEN k.source IS NOT NULL THEN k.is_general
                  ELSE true END AS is_general,
@@ -6616,6 +6701,9 @@ async function workOrderRollupForReport(workOrderId) {
        ON f.id = COALESCE(e.fund_id, CASE WHEN ea.funding_source = 'fund' THEN ea.funding_ref_id END)
      LEFT JOIN cabin_holders ch
        ON ea.funding_source = 'cabin_holder' AND ch.id = ea.funding_ref_id AND e.fund_id IS NULL
+     LEFT JOIN funding_sources afs
+       ON ea.funding_source = 'funder' AND afs.id = ea.funding_ref_id AND e.fund_id IS NULL
+     LEFT JOIN people afp ON afp.id = afs.person_id
      LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
      LEFT JOIN job_line_funding_kinds k ON k.source = ea.funding_source
      WHERE e.triage_status != 'void' AND e.deleted_at IS NULL

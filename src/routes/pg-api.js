@@ -62,7 +62,7 @@ import {
   getChecklistInstanceForExport,
   listUsers, countActiveUsers, countActiveAdmins, createUser, updateUser, deleteUser,
   listActivityLog,
-  getBudgetSettings, updateBudgetSettings, getBudgetOverview,
+  getBudgetSettings, updateBudgetSettings, getBudgetOverview, listFundingOptions, funderForPerson,
   listCapitalCampaignProjects, createCapitalCampaignProject, updateCapitalCampaignProject, deleteCapitalCampaignProject,
   listOtherBudgetCategories, createOtherBudgetCategory, updateOtherBudgetCategory, deleteOtherBudgetCategory,
   listCabinHolders, createCabinHolder, updateCabinHolder, deleteCabinHolder,
@@ -1257,6 +1257,19 @@ router.get('/capital-plan', async (req, res, next) => {
 
 // ---- Budget separation: operating budget vs. capital campaigns vs.
 //      cabin-holder-funded work vs. user-defined "other" categories ----
+
+// The funder row for a person, made the first time they pay for something.
+router.post('/funding-sources/for-person', async (req, res, next) => {
+  try {
+    const personId = Number((req.body || {}).personId);
+    if (!personId) return res.status(400).json({ ok: false, error: 'personId is required' });
+    res.json({ source: await funderForPerson(personId) });
+  } catch (e) { next(e); }
+});
+
+router.get('/funding-options', async (req, res, next) => {
+  try { res.json(await listFundingOptions()); } catch (e) { next(e); }
+});
 
 router.get('/budget/overview', async (req, res, next) => {
   try { res.json(await getBudgetOverview()); } catch (e) { next(e); }

@@ -18,6 +18,7 @@ export const WO_PRIORITY_OPTIONS = ['Low', 'Medium', 'High', 'Urgent'];
 // for why job_lines.funding_source needed a fifth value.
 export const FUNDING_SOURCE_LABELS = {
   operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other', fund: 'Fund',
+  funder: 'Person / Donor',
 };
 
 export function buildAssetReportRows({ assets, propertyFields, eavByAsset, componentRowsByAsset, flagsByAsset }, componentTypeOptions) {

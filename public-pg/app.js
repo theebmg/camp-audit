@@ -3736,6 +3736,8 @@ const FUNDING_GROUP_META = {
   campaign: { title: 'Capital Campaign Projects', icon: '🏗️', endpoint: 'budget/capital-campaign-projects', singular: 'Project' },
   other: { title: 'Other', icon: '🗂️', endpoint: 'budget/other-categories', singular: 'Category' },
   cabin: { title: 'Cabin-Holder Ledger', icon: '🏘️', endpoint: 'budget/cabin-holders', singular: 'Cabin-Holder' },
+  // Read-only here: a funder is a person or a row in Admin → Funding sources, not made on this page.
+  funder: { title: 'People & Donors', icon: '🤝', readOnly: true },
 };
 
 async function renderCapitalPlan() {
@@ -3780,7 +3782,7 @@ async function renderCapitalPlan() {
           <span>${escapeHtml(it.Title)}</span>
           <span class="pill">${escapeHtml(it.Status)} · ${moneyFmt(it.Cost)}</span>
         </div>`).join('') : '<p class="muted">No work orders tagged to this yet.</p>'}
-        <div class="btn-row"><button class="btn btn-secondary delete-fund-entity" data-kind="${kind}" data-id="${g.Id}" data-name="${escapeHtml(g.Name)}">Delete</button></div>
+        ${FUNDING_GROUP_META[kind].readOnly ? '' : `<div class="btn-row"><button class="btn btn-secondary delete-fund-entity" data-kind="${kind}" data-id="${g.Id}" data-name="${escapeHtml(g.Name)}">Delete</button></div>`}
       </div>
     </details>`;
   }
@@ -3800,7 +3802,7 @@ async function renderCapitalPlan() {
             <div style="margin-top:6px">${zeroCost.map((g) => fundingEntityRowHtml(kind, g)).join('')}</div>
           </details>` : ''}
       </div>
-      ${addingKind === kind ? `
+      ${meta.readOnly ? '' : addingKind === kind ? `
         <div class="field-row"><label>${meta.singular} Name</label><input id="newFundEntityName" required /></div>
         <div class="field-row"><label>Description (optional)</label><textarea id="newFundEntityDesc"></textarea></div>
         <div class="btn-row">
@@ -3834,6 +3836,7 @@ async function renderCapitalPlan() {
         ${budgetSectionHtml()}
         ${fundingGroupHtml('campaign', budgetOverview.CapitalCampaignProjects)}
         ${fundingGroupHtml('cabin', budgetOverview.CabinHolders)}
+        ${(budgetOverview.Funders || []).length ? fundingGroupHtml('funder', budgetOverview.Funders) : ''}
         ${fundingGroupHtml('other', budgetOverview.OtherCategories)}
       </div>
 
@@ -4656,6 +4659,10 @@ async function renderExpenseDetail({ id } = {}) {
   // Who paid (§2b). Fetched rather than read from state.options so a source added in Admin
   // appears without a reload.
   const fundingSources = (await api('/api/pg/funding-sources').catch(() => ({ sources: [] }))).sources || [];
+  // A fund and "who paid" used to be two fields that could disagree. A receipt charged to a fund
+  // shows as that fund, which is also what the report has always given precedence to.
+  const paidFromId = (expense?.FundId && fundingSources.find((f) => f.FundId === expense.FundId)?.Id)
+    || expense?.FundingSourceId || null;
 
   app.innerHTML = `
     <div class="card">
@@ -4672,27 +4679,31 @@ async function renderExpenseDetail({ id } = {}) {
           Tax charged in error (camp is tax-exempt — flags this for the quarterly recovery list)
         </label>
         <div class="field-row"><label>Category</label><select name="categoryId">${categoryPickerOptionsHtml(expenseCategories, expense?.CategoryId)}</select></div>
-        <div class="field-row"><label>Who paid</label>
+        <div class="field-row"><label>Paid from</label>
           <select name="fundingSourceId" id="expFundingSource">
-            <option value="">— not set —</option>
-            ${fundingSources.map((f) => `<option value="${f.Id}" ${expense?.FundingSourceId === f.Id ? 'selected' : ''}>${escapeHtml(f.Name)}</option>`).join('')}
+            <option value="">— not set (counts as camp spend) —</option>
+            ${[['Camp', ['camp_general', 'camp_fund']], ['People', ['person']], ['Contributions', ['donor_org', 'in_kind']],
+              ['Other', ['campaign', 'other_category', 'cabin_holding', null]]].map(([group, kinds]) => {
+              const inGroup = fundingSources.filter((f) => kinds.includes(f.Kind));
+              return inGroup.length ? `<optgroup label="${group}">${inGroup.map((f) => `<option value="${f.Id}" ${paidFromId === f.Id ? 'selected' : ''}>${escapeHtml(f.DisplayName || f.Name)}</option>`).join('')}</optgroup>` : '';
+            }).join('')}
           </select>
           <p class="muted" style="margin-top:2px;font-size:0.8rem">
-            Camp money is reported as camp spend; personal, donated and in-kind are reported
-            separately, so a contribution is never counted as the camp spending.
+            One list: camp money (general, or a named fund — a reference line, not a cap), a
+            person, a donor, or in-kind. Camp money is reported as camp spend; everything else is
+            reported separately as a contribution.
+            <a href="#" id="expOtherPerson">Someone not listed…</a>
           </p>
+          <div id="expOtherPersonPick" hidden></div>
         </div>
         <div class="field-row" id="inKindRow" ${expense?.InKindNote ? '' : 'hidden'}>
           <label>What was contributed</label>
           <input name="inKindNote" value="${escapeHtml(expense?.InKindNote || '')}" placeholder="e.g. 6 hours of volunteer labour, donated lumber" />
           <p class="muted" style="margin-top:2px;font-size:0.8rem">In-kind has no receipt, so the amount above is its estimated value.</p>
         </div>
-        <div class="field-row"><label>Fund</label><select name="fundId">${fundPickerOptionsHtml(funds, expense?.FundId)}</select>
-          <p class="muted" style="margin-top:2px;font-size:0.8rem">A reference line, not a cap — going over always saves, it just shows as a warning on the Expenses page.</p>
-        </div>
         <div class="field-row"><label>Work Order (optional)</label><select id="expenseWoPicker"><option value="">— none —</option></select></div>
         <div class="field-row" id="expenseLineRow" hidden><label>Job Line (optional)</label><select id="expenseLinePicker"><option value="">— none —</option></select>
-          <p class="muted" style="margin-top:2px;font-size:0.8rem">Picking a line funded by a fund defaults Fund above, if you haven't already chosen one yourself.</p>
+
         </div>
         <div class="field-row"><label>Asset (optional)</label><div class="asset-picker" id="expenseAssetPicker"></div></div>
         <div class="field-row"><label>Notes</label><textarea name="notes">${escapeHtml(expense?.Notes || '')}</textarea></div>
@@ -4727,6 +4738,29 @@ async function renderExpenseDetail({ id } = {}) {
     };
     fsSel?.addEventListener('change', syncInKind);
     syncInKind();
+    // Anyone on the people list can be the one who paid; their funder row is made on first use.
+    document.getElementById('expOtherPerson')?.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const mount = document.getElementById('expOtherPersonPick');
+      mount.hidden = false;
+      const { people } = await api('/api/pg/people');
+      mountPersonPicker(mount, {
+        people,
+        onSelect: async (person) => {
+          if (!person) return;
+          try {
+            const { source } = await api('/api/pg/funding-sources/for-person', { method: 'POST', body: JSON.stringify({ personId: person.Id }) });
+            if (!fundingSources.some((f) => f.Id === source.Id)) {
+              fundingSources.push(source);
+              fsSel.insertAdjacentHTML('beforeend', `<option value="${source.Id}">${escapeHtml(source.DisplayName || source.Name)}</option>`);
+            }
+            fsSel.value = String(source.Id);
+            mount.hidden = true; syncInKind();
+          } catch (err) { toast(err.message, 6000); }
+        },
+      });
+      mount.querySelector('input')?.focus();
+    });
   }
 
   const woPicker = document.getElementById('expenseWoPicker');
@@ -4761,7 +4795,8 @@ async function renderExpenseDetail({ id } = {}) {
       fundingSourceId: fd.get('fundingSourceId') ? Number(fd.get('fundingSourceId')) : null,
       inKindNote: fd.get('inKindNote') || null,
       categoryId: fd.get('categoryId') || null,
-      fundId: fd.get('fundId') || null,
+      // Choosing a fund in "Paid from" is what charges the receipt to it.
+      fundId: fundingSources.find((f) => String(f.Id) === String(fd.get('fundingSourceId')))?.FundId || null,
       jobLineId: linePicker.value || null,
       workOrderId: woPicker.value || null,
       assetId: selectedAsset?.Id || null,
@@ -13582,21 +13617,23 @@ function mountCombobox(container, {
 // funding_source + funding_ref_id are two columns in Postgres but one
 // decision to a person ("who's paying for this line?"), so the grid treats
 // them as one cell with a composite "source::refId" value.
-function fundingOptionValue(source, refId) { return `${source || 'operating_budget'}::${refId ?? ''}`; }
+// One funding list (0117). The server sends the options and a map of values that mean the same
+// funder under an older name — a holding that names one person, or that person's funder row —
+// so a line saved either way opens showing the person.
+let fundingAliases = {};
+function fundingOptionValue(source, refId) {
+  const raw = `${source || 'operating_budget'}::${refId ?? ''}`;
+  return fundingAliases[raw] || raw;
+}
+async function loadFundingOptions() {
+  const r = await api('/api/pg/funding-options');
+  fundingAliases = r.aliases || {};
+  return r.options || [];
+}
 function parseFundingOptionValue(value) {
   const [source, ref] = String(value ?? '').split('::');
   return { source: source || 'operating_budget', refId: ref ? Number(ref) : null };
 }
-function buildFundingOptions(fundingEntities) {
-  const out = [{ value: fundingOptionValue('operating_budget', null), label: FUNDING_SOURCE_LABELS.operating_budget }];
-  for (const source of ['capital_campaign', 'cabin_holder', 'other', 'fund']) {
-    for (const e of fundingEntities[source] || []) {
-      out.push({ value: fundingOptionValue(source, e.Id), label: `${FUNDING_SOURCE_LABELS[source]} › ${e.Name}`, sublabel: null });
-    }
-  }
-  return out;
-}
-
 // ---------- Job Line Grid (entry/edit surface for a WO's lines) ----------
 //
 // The grid replaces the stacked per-line form on New Work Order and on the
@@ -14523,14 +14560,15 @@ function jlgRowsFromJobLines(jobLines) {
 // sources, flattened into the one searchable list the Funding Source column
 // uses (§9).
 async function loadGridContext() {
-  const [campaignRes, cabinRes, otherRes, fundsRes, settings] = await Promise.all([
+  const [campaignRes, cabinRes, otherRes, fundsRes, settings, fundingOptions] = await Promise.all([
     api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'),
     api('/api/pg/budget/other-categories'), api('/api/pg/funds'), api('/api/pg/display-settings'),
+    loadFundingOptions(),
   ]);
   const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items, fund: fundsRes.funds };
   return {
     fundingEntities,
-    fundingOptions: buildFundingOptions(fundingEntities),
+    fundingOptions,
     jobLineStatuses: state.options.jobLineStatuses,
     globalCascadeDefaults: settings.CascadeDefaults || JLG_CASCADE_DEFAULTS,
   };
@@ -14900,6 +14938,7 @@ async function renderEditWorkOrderLines({ id }) {
 // 'fund' added Build Brief v3 Part 1 (see migration 0053's header comment).
 const FUNDING_SOURCE_LABELS = {
   operating_budget: 'Operating Budget', capital_campaign: 'Capital Campaign', cabin_holder: 'Cabin-Holder', other: 'Other', fund: 'Fund',
+  funder: 'Person / Donor', person: 'Person',
 };
 // Funding lives per-line. Source and ref are two columns in Postgres but one
 // decision to a person, so both the grid's Funding Source column and the job
@@ -15007,9 +15046,9 @@ async function renderWorkOrderDetail({ id }, container = app) {
     api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
     api('/api/pg/causes'), api('/api/pg/funds'),
   ]);
+  const fundingOptions = await loadFundingOptions();
   const allSkills = skillsRes.skills.map((s) => s.Name);
   const checklistTemplates = tplRes.templates;
-  const fundingOptions = buildFundingOptions({ capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items, fund: fundsRes.funds });
   const causesCatalog = causesRes.causes;
   const { workOrder: wo, rollup, crewRoster, closeGate, assetUpdates, jobLines, checklist, logEntries, crewSessions } = detail;
   const propertyFieldTitles = state.options.propertyFields.map((f) => f.title);
