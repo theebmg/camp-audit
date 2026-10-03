@@ -11,15 +11,23 @@ Written 2026-10-03 for a session with no memory of the work. **Read this first.*
 | | |
 |---|---|
 | Report | #1 "September 2026", **published**, 20 items, 26 photos (4.22 MB as email), 1,802-char summary |
-| Gmail | **Connected** 2026-10-03 16:25 as `ben@fracturedrv.com`, no errors |
+| Gmail | **Connected** 2026-10-03 as `ben@fracturedrv.com` |
 | Sends as | `"Camp Sychar Operations" <cmms@fracturedrv.com>`, Reply-To `cmms@fracturedrv.com` |
-| Emails actually sent | **0** |
+| Board report emails sent | **0** — a test to `ben@fracturedrv.com` went out 2026-10-03 |
 
-**Everything is configured and verified. Nobody has pressed Send yet.**
-Reports → Board Report → **Email…** A send over the 15 MB cap is refused, not attempted.
+**Mail goes over Gmail's HTTPS API, not SMTP.** DigitalOcean blocks outbound 25/465/587 from
+this box, so the original nodemailer SMTP transport could only ever time out — which is what
+Ben's first two sends did. `src/mailer.js` now builds the MIME with nodemailer's MailComposer and
+posts it to `gmail.googleapis.com` (the `gmail.send` scope is the API's scope anyway).
 
-If Ben reports a failure, the reason is recorded at **Admin → Integrations → Email (Gmail)**
-under "Last error", and in `mail_settings.last_error` — a toast is no longer the only copy.
+**Every attempt is logged** in `mail_log` (0115): `sending` → `sent` / `failed`, with a
+plain-language reason (`friendlyMailError`) beside the raw one. Shown at **Admin → Integrations →
+Email (Gmail) → Email log**, and the report screen shows Sending / Sent / Unable to send in place.
+
+**Not yet confirmed:** that mail arrives *from* `cmms@`. Gmail silently rewrites From to the
+signed-in account if `cmms@` is not a verified send-as alias on it. Ben to check the test email.
+
+Remaining: Ben presses Reports → Board Report → **Email…**
 
 ---
 
@@ -31,16 +39,15 @@ under "Last error", and in `mail_settings.last_error` — a toast is no longer t
 | Stack | Node/Express + PostgreSQL + vanilla-JS SPA (`public-pg/app.js`, no bundler, one `<script>`) |
 | Host | One DigitalOcean box, Docker Compose, behind Caddy. SSH alias `camp` |
 | Containers | `camp-audit`; DB `nocodb-db`, database `camp` |
-| Repo | `github.com/theebmg/camp-audit`. **Local branch is `text-intake`; it is pushed to `main`** |
+| Repo | `github.com/theebmg/camp-audit`. This host IS production; its checkout is on `main` and pushes to `origin/main` |
 | Env | `/root/camp-audit/.env`, mode 600, gitignored |
 
 **Deploy** (every change, no exceptions):
 ```bash
-git push origin text-intake:main
-ssh camp 'cd ~/camp-audit && git pull --no-rebase origin main && cd /root/nocodb \
-  && docker compose build -q camp-audit && docker compose up -d camp-audit && sleep 8'
+git push origin main
+cd /root/nocodb && docker compose build -q camp-audit && docker compose up -d camp-audit && sleep 8
 # schema changes:
-ssh camp 'docker exec camp-audit npm run migrate'
+docker exec camp-audit npm run migrate
 ```
 
 `git pull origin main` on the host needs `--no-rebase`: the host has a merge commit of its own
@@ -160,7 +167,7 @@ work. Per-report show/hide. One fund exists: Discretionary Audit Fund, $5,000.
 ## 7. Outstanding
 
 **Needs Ben:**
-1. **Press Send.** Nothing else blocks it.
+1. **Press Send**, after confirming the test email shows `cmms@` as the sender.
 2. **Rotate the OAuth client secret** — it was pasted into a chat transcript on 2026-10-02.
    Client `618947223294-dm17fa14…`. Add a new secret in Cloud Console, put it in `.env` as
    `GMAIL_OAUTH_CLIENT_SECRET`, delete the old.
