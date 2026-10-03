@@ -2925,8 +2925,11 @@ export async function createCrewSession({ workOrderId, jobLineId, activity, sess
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO crew_sessions (work_order_id, job_line_id, activity, session_date, hours, note, username)
-       VALUES ($1,$2,$3,COALESCE($4,CURRENT_DATE),$5,$6,$7) RETURNING id`,
+      // username is who entered it; person_id is whose hours they are (0116). Today those are the
+      // same person, found through the login's own link.
+      `INSERT INTO crew_sessions (work_order_id, job_line_id, activity, session_date, hours, note, username, person_id)
+       VALUES ($1,$2,$3,COALESCE($4,CURRENT_DATE),$5,$6,$7,
+               (SELECT person_id FROM users WHERE username = $7)) RETURNING id`,
       [workOrderId || null, jobLineId || null, activity || null, sessionDate || null, hours ?? null, note || null, currentUsername()]
     );
     sessionId = rows[0].id;
@@ -3302,6 +3305,43 @@ export async function getPerson(id) {
     `SELECT g.id, g.name FROM groups g WHERE g.contact_person_id = $1 ORDER BY lower(g.name)`, [id]
   );
   person.ContactForGroups = groups.map((g) => ({ Id: g.id, Name: g.name }));
+
+  // What this person is named as the funder of (0116). Job lines and receipts are listed apart
+  // and NOT added together: a receipt split onto a line this person also funds is the same
+  // money seen twice, and the board report is where that is reconciled.
+  const { rows: fundedLines } = await pool.query(
+    `SELECT jl.id, jl.title, jl.actual_cost, jl.estimated_cost, wo.id AS wo_id, wo.title AS wo_title
+     FROM job_lines jl
+     JOIN funding_sources fs ON fs.id = jl.funding_source_id
+     LEFT JOIN work_orders wo ON wo.id = jl.work_order_id
+     WHERE fs.person_id = $1 ORDER BY jl.id DESC`,
+    [id]
+  );
+  person.FundedLines = fundedLines.map((r) => ({
+    Id: r.id, Title: r.title, WorkOrderId: r.wo_id, WorkOrderTitle: r.wo_title,
+    ActualCost: r.actual_cost == null ? null : Number(r.actual_cost),
+    EstimatedCost: r.estimated_cost == null ? null : Number(r.estimated_cost),
+  }));
+  const { rows: fundedReceipts } = await pool.query(
+    `SELECT e.id, e.vendor, e.amount, e.purchase_date::text AS purchase_date
+     FROM expenses e JOIN funding_sources fs ON fs.id = e.funding_source_id
+     WHERE fs.person_id = $1 AND e.deleted_at IS NULL AND e.triage_status != 'void'
+     ORDER BY e.purchase_date DESC NULLS LAST, e.id DESC`,
+    [id]
+  );
+  person.FundedReceipts = fundedReceipts.map((r) => ({
+    Id: r.id, Vendor: r.vendor, Amount: r.amount == null ? null : Number(r.amount), PurchaseDate: r.purchase_date,
+  }));
+  const { rows: hours } = await pool.query(
+    `SELECT count(*)::int AS sessions, COALESCE(sum(hours), 0) AS hours, max(session_date)::text AS last
+     FROM crew_sessions WHERE person_id = $1`,
+    [id]
+  );
+  person.CrewSessions = hours[0].sessions;
+  person.CrewHours = Number(hours[0].hours);
+  person.LastCrewSession = hours[0].last;
+  const { rows: logins } = await pool.query('SELECT username FROM users WHERE person_id = $1 ORDER BY username', [id]);
+  person.Logins = logins.map((u) => u.username);
   return person;
 }
 
@@ -3622,6 +3662,11 @@ const PERSON_REFERENCES = [
   // already exist and drop the rest.
   ['person_role_assignments', 'person_id',         'union', 'role'],
   ['cabin_holder_people',     'person_id',         'union', 'cabin holding'],
+  // 0116. If both people already fund work, the kept person ends up with two funder rows;
+  // funding_source_id_for() takes the oldest, and nothing funded is lost or relabelled.
+  ['funding_sources',         'person_id',         'repoint', 'funder record'],
+  ['crew_sessions',           'person_id',         'repoint', 'crew session'],
+  ['users',                   'person_id',         'repoint', 'login account'],
 ];
 
 const GROUP_REFERENCES = [
@@ -5284,7 +5329,27 @@ export async function listFundingSources({ includeInactive = false } = {}) {
     IsContribution: r.is_contribution, IsInKind: r.is_in_kind,
     SortOrder: r.sort_order, Active: r.active,
     ShortLabel: r.short_label || r.name,
+    Kind: r.kind || null, PersonId: r.person_id || null, FundId: r.fund_id || null,
   }));
+}
+
+// Does the new funding_source_id agree with the old (funding_source, funding_ref_id) pair on
+// every row? Read-only: the lookup is asked not to create anything. Both representations are
+// written for now, and this is the proof they have not drifted.
+export async function reconcileFunding() {
+  const out = {};
+  for (const table of ['job_lines', 'expense_allocations']) {
+    const { rows } = await pool.query(
+      `SELECT t.id, t.funding_source, t.funding_ref_id, t.funding_source_id,
+              funding_source_id_for(t.funding_source, t.funding_ref_id, false) AS expected
+       FROM ${table} t
+       WHERE t.funding_source_id IS DISTINCT FROM funding_source_id_for(t.funding_source, t.funding_ref_id, false)
+       ORDER BY t.id`
+    );
+    const { rows: n } = await pool.query(`SELECT count(*)::int AS n FROM ${table}`);
+    out[table] = { rows: n[0].n, disagreements: rows };
+  }
+  return out;
 }
 export async function createFundingSource({ name, countsAsCampSpend = false, isContribution = false, isInKind = false, sortOrder = 100 }) {
   const { rows } = await pool.query(

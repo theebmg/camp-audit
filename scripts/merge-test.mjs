@@ -50,6 +50,16 @@ const ev = await db.pool.query(
 );
 const grp = await db.createGroup({ name: `${TAG} Group`, typeId: 1, contactPersonId: drop.Id });
 
+// 0116: a funder record and a crew session on drop, which must follow the person too.
+const fsrc = await db.pool.query(
+  `insert into funding_sources (name, kind, person_id, is_contribution, sort_order, active)
+   values ($1, 'person', $2, true, 999, false) returning id`, [`${TAG} funder`, drop.Id]
+);
+const crew = await db.pool.query(
+  `insert into crew_sessions (activity, hours, username, person_id) values ($1, 1.5, 'mergetest', $2) returning id`,
+  [`${TAG} session`, drop.Id]
+);
+
 const before = {
   keepVisits: (await db.pool.query('select count(*)::int n from visits where person_id=$1', [keep.Id])).rows[0].n,
   dropVisits: (await db.pool.query('select count(*)::int n from visits where person_id=$1', [drop.Id])).rows[0].n,
@@ -87,11 +97,18 @@ ok((await db.pool.query('select person_id from calendar_events where id=$1', [ev
   'calendar visit event repointed');
 ok((await db.getGroup(grp.Id)).ContactPersonId === keep.Id, 'group contact repointed');
 
+ok((await db.pool.query('select person_id from funding_sources where id=$1', [fsrc.rows[0].id])).rows[0].person_id === keep.Id,
+  'funder record repointed');
+ok((await db.pool.query('select person_id from crew_sessions where id=$1', [crew.rows[0].id])).rows[0].person_id === keep.Id,
+  'crew session repointed');
+ok(after.CrewHours === 1.5, `hours show on the kept person's record (got ${after.CrewHours})`);
+
 // Zero references anywhere to the removed id — the requirement, checked independently of the
 // merge's own internal check.
 const refs = [
   ['visits', 'person_id'], ['calendar_events', 'person_id'], ['groups', 'contact_person_id'],
   ['person_role_assignments', 'person_id'], ['cabin_holder_people', 'person_id'],
+  ['funding_sources', 'person_id'], ['crew_sessions', 'person_id'], ['users', 'person_id'],
 ];
 let leftover = 0;
 for (const [t, c] of refs) {
@@ -130,10 +147,15 @@ console.log('\n## cleanup');
 await db.pool.query('delete from visits where reason = $1', [`${TAG} visit`]);
 await db.pool.query('delete from calendar_events where title = $1', [`${TAG} event`]);
 await db.pool.query('delete from groups where name = $1', [`${TAG} Group`]);
+await db.pool.query('delete from crew_sessions where activity = $1', [`${TAG} session`]);
+await db.pool.query('delete from funding_sources where name = $1', [`${TAG} funder`]);
 await db.pool.query('delete from record_merges where removed_name like $1', [`${TAG}%`]);
 await db.pool.query('delete from people where name like $1', [`${TAG}%`]);
 await db.pool.query('delete from activity_log where entity_label like $1', [`${TAG}%`]);
 const left = (await db.pool.query('select count(*)::int n from people where name like $1', [`${TAG}%`])).rows[0].n;
-ok(left === 0, 'scratch records deleted');
+const leftOther = (await db.pool.query(
+  `select (select count(*) from crew_sessions where activity = $1)::int + (select count(*) from funding_sources where name = $2)::int as n`,
+  [`${TAG} session`, `${TAG} funder`])).rows[0].n;
+ok(left === 0 && leftOther === 0, 'scratch records deleted');
 console.log(`\n${fail.length ? `${fail.length} FAILURE(S): ` + fail.join(' | ') : 'all assertions passed'}`);
 process.exit(fail.length ? 1 : 0);

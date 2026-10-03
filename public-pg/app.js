@@ -3650,6 +3650,8 @@ function initMapEditor({ pins, features, layers }) {
   sizeStage();
 }
 
+// Cents kept: a person's contribution is a figure they may check against their own records.
+function money2(n) { return '$' + Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
 function moneyFmt(n) { return '$' + Number(n || 0).toLocaleString(undefined, { maximumFractionDigits: 0 }); }
 
 // Shared hover/focus tooltip for any [data-tooltip] element inside root — one
@@ -10831,6 +10833,7 @@ async function renderPersonProfile({ id }) {
         </div>
         ${person.Phone || person.Email ? `<p style="margin:8px 0 0">${escapeHtml([person.Phone, person.Email].filter(Boolean).join(' · '))}</p>` : ''}
         ${person.Notes ? `<p class="muted" style="margin:6px 0 0">${escapeHtml(person.Notes)}</p>` : ''}
+        ${(person.Logins || []).length ? `<p class="muted" style="margin:6px 0 0;font-size:0.85rem">Signs in as ${escapeHtml(person.Logins.join(', '))}</p>` : ''}
       </div>
 
       ${dupes.length ? `<div class="card" style="background:#fffdf5;border-color:#f0e6c8">
@@ -10864,6 +10867,31 @@ async function renderPersonProfile({ id }) {
           : '<p class="muted">No cabin holdings linked.</p>'}
         <div class="btn-row" style="margin-top:8px"><button type="button" class="btn btn-secondary" id="linkHoldingBtn">Link a holding</button></div>
       </div>
+
+      ${(person.FundedLines || []).length || (person.FundedReceipts || []).length ? `<div class="card">
+        <h3 style="font-size:0.95rem;margin:0 0 4px">Funded</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:0.85rem">
+          Work and receipts this person is named as paying for. The two lists are not added
+          together — a receipt can be for one of the jobs above it.
+        </p>
+        ${(person.FundedLines || []).map((l) => `<div class="list-item" ${l.WorkOrderId ? `data-wo="${l.WorkOrderId}" style="cursor:pointer"` : ''}>
+          <div style="display:flex;justify-content:space-between;gap:10px">
+            <div><strong>${escapeHtml(l.Title || 'Job line')}</strong>${l.WorkOrderTitle ? `<div class="muted" style="font-size:0.82rem">${escapeHtml(l.WorkOrderTitle)}</div>` : ''}</div>
+            <div style="white-space:nowrap">${l.ActualCost != null ? money2(l.ActualCost) : (l.EstimatedCost != null ? `<span class="muted">~${money2(l.EstimatedCost)} est.</span>` : '<span class="muted">no cost yet</span>')}</div>
+          </div>
+        </div>`).join('')}
+        ${(person.FundedReceipts || []).map((r) => `<div class="list-item">
+          <div style="display:flex;justify-content:space-between;gap:10px">
+            <div>Receipt — ${escapeHtml(r.Vendor || 'unknown vendor')}${r.PurchaseDate ? ` <span class="muted">${escapeHtml(r.PurchaseDate)}</span>` : ''}</div>
+            <div style="white-space:nowrap">${r.Amount != null ? money2(r.Amount) : ''}</div>
+          </div>
+        </div>`).join('')}
+      </div>` : ''}
+
+      ${person.CrewSessions ? `<div class="card">
+        <h3 style="font-size:0.95rem;margin:0 0 4px">Hours</h3>
+        <p style="margin:0">${person.CrewHours} hour(s) across ${person.CrewSessions} session(s)${person.LastCrewSession ? `, last on ${escapeHtml(person.LastCrewSession)}` : ''}.</p>
+      </div>` : ''}
 
       ${hasRole('Volunteer') ? `<div class="card">
         <h3 style="font-size:0.95rem;margin:0 0 6px">Volunteer</h3>
@@ -10912,6 +10940,7 @@ async function renderPersonProfile({ id }) {
       catch (e) { toast(e.message, 5000); }
     }));
     app.querySelectorAll('[data-group]').forEach((el) => el.addEventListener('click', () => go('groupProfile', { id: el.dataset.group })));
+    app.querySelectorAll('[data-wo]').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.wo })));
   }
 
   function openPersonEditor() {
