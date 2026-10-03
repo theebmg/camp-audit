@@ -3258,7 +3258,12 @@ export async function listPeople({ q = null, roleId = null, cabinHolder = null, 
   const where = [];
   const vals = [];
   if (!includeInactive) where.push('p.active');
-  if (q) { vals.push(`%${q}%`); where.push(`(p.name ILIKE $${vals.length} OR p.phone ILIKE $${vals.length} OR p.email ILIKE $${vals.length})`); }
+  // Every word must match somewhere, in any order: names are stored "Greenawalt, Ben", so a
+  // single substring match made "Ben Greenawalt" find nobody.
+  for (const tok of String(q || '').split(/[\s,]+/).filter(Boolean)) {
+    vals.push(`%${tok}%`);
+    where.push(`(p.name ILIKE $${vals.length} OR p.phone ILIKE $${vals.length} OR p.email ILIKE $${vals.length})`);
+  }
   if (roleId) { vals.push(roleId); where.push(`EXISTS (SELECT 1 FROM person_role_assignments x WHERE x.person_id = p.id AND x.role_id = $${vals.length})`); }
   if (cabinHolder === true) where.push('COALESCE(h.holding_count, 0) > 0');
   if (cabinHolder === false) where.push('COALESCE(h.holding_count, 0) = 0');
@@ -3608,14 +3613,15 @@ export async function updateGroupType(id, { name, sortOrder, active }) {
 // here, and the zero-references check below fails until it does.
 const PERSON_REFERENCES = [
   // [table, column, mode]
-  ['visits',                  'person_id',         'repoint'],
-  ['calendar_events',         'person_id',         'repoint'],
-  ['groups',                  'contact_person_id', 'repoint'],
+  // The fourth entry is how the merge preview names it to the person about to press Merge.
+  ['visits',                  'person_id',         'repoint', 'visit'],
+  ['calendar_events',         'person_id',         'repoint', 'calendar entry'],
+  ['groups',                  'contact_person_id', 'repoint', 'group contact'],
   // Composite PK (person_id, role_id) / (cabin_holder_id, person_id): a plain UPDATE would
   // violate the key when both people share a role or a holding, so these move what does not
   // already exist and drop the rest.
-  ['person_role_assignments', 'person_id',         'union'],
-  ['cabin_holder_people',     'person_id',         'union'],
+  ['person_role_assignments', 'person_id',         'union', 'role'],
+  ['cabin_holder_people',     'person_id',         'union', 'cabin holding'],
 ];
 
 const GROUP_REFERENCES = [
@@ -3696,6 +3702,21 @@ async function mergeRecords({ kind, keptId, removedId, refs, table, by }) {
     details: `absorbed "${removedName}" (#${removedId}) — ${Object.entries(repointed).filter(([, n]) => n).map(([k, n]) => `${k}: ${n}`).join(', ') || 'nothing to repoint'}`,
   });
   return { KeptId: Number(keptId), KeptName: keptName, RemovedId: Number(removedId), RemovedName: removedName, Repointed: repointed };
+}
+
+// What a merge would move, counted from the same list the merge itself walks — so the preview
+// cannot promise something the merge then does not do. Read-only.
+export async function previewPersonMerge({ keptId, removedId }) {
+  const { rows: both } = await pool.query('SELECT id, name FROM people WHERE id = ANY($1::int[])', [[keptId, removedId]]);
+  const kept = both.find((r) => Number(r.id) === Number(keptId));
+  const removed = both.find((r) => Number(r.id) === Number(removedId));
+  if (!kept || !removed) { const e = new Error('One of those records no longer exists'); e.status = 404; throw e; }
+  const moves = [];
+  for (const [refTable, refCol, , label] of PERSON_REFERENCES) {
+    const { rows } = await pool.query(`SELECT count(*)::int n FROM ${refTable} WHERE ${refCol} = $1`, [removedId]);
+    if (rows[0].n) moves.push({ Ref: `${refTable}.${refCol}`, Label: label || refTable, Count: rows[0].n });
+  }
+  return { KeptId: kept.id, KeptName: kept.name, RemovedId: removed.id, RemovedName: removed.name, Moves: moves };
 }
 
 export async function mergePeople({ keptId, removedId, by = null }) {

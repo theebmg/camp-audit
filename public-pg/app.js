@@ -10798,7 +10798,7 @@ async function renderPeople(params = {}) {
 // ---------- Person profile ----------
 async function renderPersonProfile({ id }) {
   setChrome({ title: 'Person', showBack: true, showLogout: true });
-  let person = null; let roles = []; let vendors = []; let skills = [];
+  let person = null; let roles = []; let vendors = []; let skills = []; let dupes = [];
 
   async function load() {
     const [p, r, v, s] = await Promise.all([
@@ -10808,6 +10808,9 @@ async function renderPersonProfile({ id }) {
       api('/api/pg/skills').catch(() => ({ skills: [] })),
     ]);
     person = p.person; roles = r.roles || []; vendors = v.vendors || []; skills = s.skills || [];
+    // Likely duplicates are offered up front rather than only when someone thinks to look.
+    dupes = (await api(`/api/pg/people/duplicate-check?name=${encodeURIComponent(person.Name)}&excludeId=${person.Id}`)
+      .catch(() => ({ matches: [] }))).matches || [];
   }
 
   function draw() {
@@ -10829,6 +10832,22 @@ async function renderPersonProfile({ id }) {
         ${person.Phone || person.Email ? `<p style="margin:8px 0 0">${escapeHtml([person.Phone, person.Email].filter(Boolean).join(' · '))}</p>` : ''}
         ${person.Notes ? `<p class="muted" style="margin:6px 0 0">${escapeHtml(person.Notes)}</p>` : ''}
       </div>
+
+      ${dupes.length ? `<div class="card" style="background:#fffdf5;border-color:#f0e6c8">
+        <h3 style="font-size:0.95rem;margin:0 0 4px">Possible duplicate${dupes.length === 1 ? '' : 's'}</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:0.85rem">
+          Other people whose name looks like this one. Merge only if it is the same person.
+        </p>
+        ${dupes.map((m) => `<div class="list-item list-item-actionable">
+          <div class="lia-main"><strong>${escapeHtml(m.Name)}</strong>
+            <div class="muted" style="font-size:0.82rem">${escapeHtml([(m.Cabins || []).map((c) => c.Name).join(', '), m.Phone, m.Email].filter(Boolean).join(' · ') || m.MatchReason)}</div>
+          </div>
+          <span class="lia-actions">
+            <button type="button" class="btn btn-secondary btn-inline dup-open" data-id="${m.Id}">Open</button>
+            <button type="button" class="btn btn-secondary btn-inline dup-merge" data-id="${m.Id}">Merge…</button>
+          </span>
+        </div>`).join('')}
+      </div>` : ''}
 
       <div class="card">
         <h3 style="font-size:0.95rem;margin:0 0 4px">Cabins</h3>
@@ -10884,6 +10903,8 @@ async function renderPersonProfile({ id }) {
 
     document.getElementById('editBtn').addEventListener('click', () => openPersonEditor());
     document.getElementById('mergeBtn').addEventListener('click', () => openMergeDialog('person', person));
+    app.querySelectorAll('.dup-open').forEach((b) => b.addEventListener('click', () => go('personProfile', { id: b.dataset.id })));
+    app.querySelectorAll('.dup-merge').forEach((b) => b.addEventListener('click', () => openMergeDialog('person', person, Number(b.dataset.id))));
     document.getElementById('linkHoldingBtn').addEventListener('click', () => openHoldingLinker());
     app.querySelectorAll('.unlink-holding').forEach((b) => b.addEventListener('click', async () => {
       if (!await confirmDialog(`Unlink "${b.previousElementSibling?.textContent?.trim() || 'this holding'}" from ${person.Name}?`, { danger: false })) return;
@@ -10999,7 +11020,7 @@ async function renderPersonProfile({ id }) {
 // ---------- Merge (§1) ----------
 // Keep one, absorb the other. The server does the repointing and refuses to finish if
 // anything would be left pointing at the removed record.
-async function openMergeDialog(kind, record) {
+async function openMergeDialog(kind, record, preselectId = null) {
   const path = kind === 'group' ? 'groups' : 'people';
   const d = await api(`/api/pg/${path}`);
   const others = (kind === 'group' ? d.groups : d.people).filter((r) => r.Id !== record.Id);
@@ -11023,7 +11044,32 @@ async function openMergeDialog(kind, record) {
   document.body.appendChild(overlay);
   overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
   let chosen = null;
-  mountCombobox(overlay.querySelector('#mergePick'), {
+  // The preview is counted by the server from the same reference list the merge walks, so it
+  // cannot promise something the merge does not then do.
+  const showPreview = async () => {
+    const el = overlay.querySelector('#mergePreview');
+    overlay.querySelector('#mergeGo').disabled = !chosen;
+    if (!chosen) { el.textContent = ''; return; }
+    if (kind !== 'person') {
+      el.textContent = `"${chosen.Name}" will be deleted and its visits and calendar entries move to "${record.Name}".`;
+      return;
+    }
+    el.textContent = 'Checking what would move…';
+    try {
+      const pv = await api(`/api/pg/people/merge-preview?keptId=${record.Id}&removedId=${chosen.Id}`);
+      const plural = (n, w) => `${n} ${w === 'calendar entry' ? (n === 1 ? w : 'calendar entries') : (n === 1 ? w : `${w}s`)}`;
+      el.innerHTML = `
+        <div style="background:#fbeaea;color:#7a1f1f;padding:8px 10px;border-radius:8px">
+          <strong>"${escapeHtml(pv.RemovedName)}" will be deleted. This cannot be undone.</strong>
+        </div>
+        <div style="margin-top:8px">Moves to "${escapeHtml(pv.KeptName)}":</div>
+        ${pv.Moves.length
+          ? `<ul style="margin:4px 0 0 18px;padding:0">${pv.Moves.map((m) => `<li>${escapeHtml(m.Detail || plural(m.Count, m.Label))}</li>`).join('')}</ul>`
+          : '<div>Nothing — this record has no visits, cabins, roles or anything else attached.</div>'}
+        ${[chosen.Phone, chosen.Email].some(Boolean) ? `<div style="margin-top:6px">Its contact details (${escapeHtml([chosen.Phone, chosen.Email].filter(Boolean).join(' · '))}) are <strong>not</strong> copied — add them to "${escapeHtml(pv.KeptName)}" first if you need them.</div>` : ''}`;
+    } catch (e) { el.textContent = e.message; overlay.querySelector('#mergeGo').disabled = true; }
+  };
+  const cbxMerge = mountCombobox(overlay.querySelector('#mergePick'), {
     options: others.map((r) => ({
       value: r.Id, label: r.Name,
       sublabel: [(r.Cabins || []).map((c) => c.Name).join(', '), `${r.VisitCount || 0} visit(s)`].filter(Boolean).join(' · '),
@@ -11031,13 +11077,14 @@ async function openMergeDialog(kind, record) {
     placeholder: `Type the duplicate ${kind}'s name…`,
     onSelect: (opt) => {
       chosen = opt ? others.find((r) => String(r.Id) === String(opt.value)) : null;
-      overlay.querySelector('#mergeGo').disabled = !chosen;
-      overlay.querySelector('#mergePreview').textContent = chosen
-        ? `"${chosen.Name}" will be deleted. ${chosen.VisitCount || 0} visit(s)${(chosen.Cabins || []).length ? ` and ${(chosen.Cabins || []).length} cabin(s)` : ''} move to "${record.Name}".`
-        : '';
+      showPreview();
     },
-    onClear: () => { chosen = null; overlay.querySelector('#mergeGo').disabled = true; overlay.querySelector('#mergePreview').textContent = ''; },
+    onClear: () => { chosen = null; showPreview(); },
   });
+  if (preselectId) {
+    chosen = others.find((r) => String(r.Id) === String(preselectId)) || null;
+    if (chosen) { cbxMerge.setValue(chosen.Id); showPreview(); }
+  }
   overlay.querySelector('#mergeGo').addEventListener('click', async () => {
     if (!chosen) return;
     if (!await confirmDialog(`Merge "${chosen.Name}" into "${record.Name}"? The duplicate is deleted and this cannot be undone.`)) return;
@@ -13335,6 +13382,35 @@ async function openProfilePhotoPicker(assetId, attachments = [], { onDone } = {}
   overlay.querySelector('#pfClear')?.addEventListener('click', () => set(null));
 }
 
+// Type-to-filter for every combobox. The query is split into words and every word must match,
+// in any order — names are stored "Greenawalt, Ben", and a whole-string substring match meant
+// typing "Ben Greenawalt" found nobody. A word that starts a word in the label ranks above one
+// that only appears mid-word, so "Ben" offers "Greenawalt, Ben" before "Bennett" loses to
+// "Lambeni". Case, accents and punctuation are ignored.
+function searchNorm(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ').trim();
+}
+function rankOptions(options, query) {
+  const qTokens = searchNorm(query).split(' ').filter(Boolean);
+  if (!qTokens.length) return options;
+  const scored = [];
+  options.forEach((o, i) => {
+    const label = searchNorm(o.label);
+    const words = label.split(' ');
+    let score = 0;
+    for (const t of qTokens) {
+      if (words.includes(t)) score += 3;
+      else if (words.some((w) => w.startsWith(t))) score += 2;
+      else if (label.includes(t)) score += 1;
+      else return;
+    }
+    scored.push({ o, score, i });
+  });
+  // Ties keep the list's own order, which callers have already sorted.
+  return scored.sort((a, b) => b.score - a.score || a.i - b.i).map((x) => x.o);
+}
+
 function mountCombobox(container, {
   options = [], value = null, placeholder = 'Type to search…',
   emptyText = 'No matches', inputClass = '', extraRowHtml = null, onExtraRow = null,
@@ -13405,8 +13481,7 @@ function mountCombobox(container, {
   }
 
   function open(query = '') {
-    const q = query.trim().toLowerCase();
-    filtered = (q ? opts.filter((o) => o.label.toLowerCase().includes(q)) : opts).slice(0, 200);
+    filtered = rankOptions(opts, query).slice(0, 200);
     highlight = filtered.length ? 0 : -1;
     draw();
   }

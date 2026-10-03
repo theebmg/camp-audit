@@ -171,7 +171,7 @@ import {
   seedDefaultReportPhotos, setBoardReportPhoto, removeBoardReportPhoto,
   listSelectedReportPhotos, addReportLevelPhoto, getReportEmailBudgetMb,
   listPeople, getPerson, createPerson, updatePerson, deletePerson,
-  findDuplicatePeople, mergePeople, listRecordMerges,
+  findDuplicatePeople, mergePeople, previewPersonMerge, listRecordMerges,
   listPersonRoles, createPersonRole, updatePersonRole, deletePersonRole,
   listHoldings, listUnlinkedHoldings, linkHoldingToPerson, unlinkHoldingFromPerson,
   listIncomingItems, getIncomingItem, dismissIncomingItem, reopenIncomingItem,
@@ -3171,6 +3171,14 @@ router.patch('/people/:id(\\d+)', async (req, res, next) => {
 
 router.delete('/people/:id(\\d+)', async (req, res, next) => {
   try { res.json(await deletePerson(req.params.id) || { ok: true }); } catch (e) { next(e); }
+});
+
+router.get('/people/merge-preview', async (req, res, next) => {
+  try {
+    const { keptId, removedId } = req.query;
+    if (!keptId || !removedId) return res.status(400).json({ ok: false, error: 'keptId and removedId are both required' });
+    res.json(await previewPersonMerge({ keptId: Number(keptId), removedId: Number(removedId) }));
+  } catch (e) { next(e); }
 });
 
 router.post('/people/merge', async (req, res, next) => {
