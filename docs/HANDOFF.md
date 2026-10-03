@@ -222,15 +222,21 @@ were byte-identical across 0116 and 0117.
   `chromium_headless_shell-1234` via `executablePath`. Do not `await go(...)` inside
   `page.evaluate` — it can hang; fire it and wait.
 
-Not done, in order:
-1. **Retire `volunteers`.** Now empty (the one test row was deleted with Ben's OK). The crew and
-   attendance screens still read it (`crew_session_volunteers`, `job_line_volunteers`, ~35
-   references in `app.js`, ~64 in `db.js`). Move those pickers to people with the Volunteer role.
-2. **The Email admin screen says "Sends as cmms@"** but Gmail delivers From `ben@fracturedrv.com`
-   with Reply-To `cmms@` (cmms@ is not a verified send-as alias). Ben is content; fix the label.
-3. Drop the old pair and `job_line_funding_kinds` — only after a release of clean
-   `funding-reconcile` runs, and only with Ben's say-so. Rewriting stored `cabin_holder/<id>`
-   rows to `funder` is a bulk edit and needs asking first.
+- **Migration 0118 — volunteers are people.** `volunteers` is now a VIEW over people holding the
+  Volunteer role (plus anyone with crew history, flagged inactive). The old table is
+  `volunteers_retired`, empty. `crew_session_volunteers.volunteer_id` and
+  `job_line_volunteers.volunteer_id` are FKs to `people(id)` and are in `PERSON_REFERENCES`.
+  `createVolunteer` / `updateVolunteer` / `removeVolunteer` write to people; the ~60 reads were
+  not touched. Nobody holds the Volunteer role yet, so crew pickers are empty until Ben tags people.
+- The Email screen no longer claims mail is sent as `cmms@` (Gmail delivers From `ben@`,
+  Reply-To `cmms@`; Ben is content with that).
+
+Not done — each needs Ben's say-so, none is urgent:
+1. Drop `volunteers_retired`, the old `(funding_source, funding_ref_id)` pair and
+   `job_line_funding_kinds`. Only after a release of clean `funding-reconcile` runs.
+2. Rewriting stored `cabin_holder/<holding>` rows to `funder/<row>` — a bulk edit of existing
+   records. Not needed for anything to work.
+3. `expenses.fund_id` still exists beside `expenses.funding_source_id`; the form writes both.
 
 **Proposed, not built:** `docs/hosted-photo-page-proposal.md` — recommendation was to hold.
 
@@ -253,12 +259,12 @@ Unpublishing #1 removes it.
 
 ---
 
-## 9. Migrations 0095–0117
+## 9. Migrations 0095–0118
 
 People/groups/visits (0095–0096), text intake (0097–0100), report fields (0101, 0103–0105),
 funding sources (0102), show_hours (0106), open lines (0107), show_funding (0108), job-line
 funding kinds (0109), aggregate note (0110), general funding (0111), per-report funds (0112),
-publish snapshot (0113), mail OAuth (0114), mail log (0115), one funding list (0116), funders on job lines (0117).
+publish snapshot (0113), mail OAuth (0114), mail log (0115), one funding list (0116), funders on job lines (0117), volunteers as people (0118).
 
 **Always dry-run** inside `BEGIN … ROLLBACK` against the live schema, each negative probe behind
 its own `SAVEPOINT` — a failed statement otherwise poisons the transaction and hides every probe
