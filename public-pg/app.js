@@ -14539,6 +14539,20 @@ function jlgClearDraft(key) { try { localStorage.removeItem(key); } catch { /* i
 // The grid seeds a row per saved job line, restoring pin/follow rendering
 // from pinned_fields — the only thing that column is for (§3).
 function jlgRowsFromJobLines(jobLines) {
+  const rows = jlgRowsRaw(jobLines);
+  // A saved line that differs from row 1 owns that value, whatever pinned_fields says. Lines
+  // edited on the card view are not pinned, so the grid showed them as FOLLOWING row 1 — and
+  // because the grid saves what it displays, pressing Save would have overwritten their funding
+  // (or status, or date) with row 1's. Nothing that is already stored may be lost by opening
+  // the grid.
+  for (const row of rows.slice(1)) {
+    for (const col of Object.keys(row.values)) {
+      if (row.values[col] !== rows[0].values[col] && !row.pinned.includes(col)) row.pinned = [...row.pinned, col];
+    }
+  }
+  return rows;
+}
+function jlgRowsRaw(jobLines) {
   return jobLines.map((jl) => ({
     id: jl.Id,
     title: jl.Title || '',
