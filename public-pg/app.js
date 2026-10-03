@@ -5841,6 +5841,10 @@ async function renderBoardReport(params = {}) {
       if (!recipient || !recipient.trim()) return;
       const res = await output('email', { recipient });
       if (res) { toast(`Sent to ${recipient}`); await load(); draw(); }
+      // output() already toasted the failure, but briefly. A send failure is worth more than a
+      // few seconds, so it is also written where it can be read back: Admin → Integrations →
+      // Email (Gmail) shows the last error.
+      else toast('Not sent. The reason is on Admin → Integrations → Email (Gmail).', 10000);
     });
     const pub = document.getElementById('brPublish');
     if (pub) pub.addEventListener('click', async () => {
