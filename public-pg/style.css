@@ -704,7 +704,10 @@ label {
 .jlg-toolbar-hint { flex: 1; min-width: 200px; font-size: 0.78rem; }
 .jlg-scroll { overflow-x: auto; }
 
-.jlg-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; table-layout: fixed; min-width: 900px; }
+/* min-width covers every fixed column plus a usable Funding Source: at 900px the fixed columns
+   and the 28% title took the whole table and Funding Source — the one column with no width of
+   its own — collapsed to nothing on a laptop-width window. Narrower than this, the grid scrolls. */
+.jlg-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; table-layout: fixed; min-width: 1240px; }
 .jlg-table th {
   text-align: left; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;
   color: var(--muted); font-weight: 700; padding: 7px 8px; border-bottom: 1px solid var(--border);
@@ -722,6 +725,7 @@ label {
 .jlg-th-title { width: 28%; }
 .jlg-th-estHours, .jlg-th-estCost { width: 90px; }
 .jlg-th-responsibility_class { width: 130px; }
+.jlg-th-funding_source { width: 210px; }
 .jlg-th-status_id { width: 140px; }
 .jlg-th-scheduled_date { width: 150px; }
 .jlg-c-menu { width: 40px; text-align: center; }
