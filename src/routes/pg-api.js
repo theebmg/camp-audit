@@ -2309,7 +2309,16 @@ router.post('/board-reports/:id(\\d+)/output', async (req, res, next) => {
           bytes, budgetMb,
         });
       }
-      await sendMail({ to: recipient, subject: finalSubject, html, text, attachments: inlineAttachments });
+      try {
+        await sendMail({ to: recipient, subject: finalSubject, html, text, attachments: inlineAttachments });
+      } catch (sendErr) {
+        // A toast that disappears after a few seconds is not a record of anything. Ben watched
+        // this fail twice and had no way to tell me what it said. Keep it where the Email screen
+        // shows it, and name the recipient so a failure is traceable to an attempt.
+        await recordMailError(`Sending "${finalSubject}" to ${recipient} failed: ${sendErr.message}`)
+          .catch(() => {});
+        throw sendErr;
+      }
     }
 
     const output = await recordBoardReportOutput(report.Id, {
