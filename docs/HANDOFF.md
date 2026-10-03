@@ -13,7 +13,7 @@ Written 2026-10-03 for a session with no memory of the work. **Read this first.*
 | Report | #1 "September 2026", **published**, 20 items, 26 photos (4.22 MB as email), 1,802-char summary |
 | Gmail | **Connected** 2026-10-03 as `ben@fracturedrv.com` |
 | Sends as | `"Camp Sychar Operations" <cmms@fracturedrv.com>`, Reply-To `cmms@fracturedrv.com` |
-| Board report emails sent | **0** — a test to `ben@fracturedrv.com` went out 2026-10-03 |
+| Board report emails sent | **Sent** to the board 2026-10-03 (see Admin → Integrations → Email → Email log) |
 
 **Mail goes over Gmail's HTTPS API, not SMTP.** DigitalOcean blocks outbound 25/465/587 from
 this box, so the original nodemailer SMTP transport could only ever time out — which is what
@@ -27,7 +27,6 @@ Email (Gmail) → Email log**, and the report screen shows Sending / Sent / Unab
 **Not yet confirmed:** that mail arrives *from* `cmms@`. Gmail silently rewrites From to the
 signed-in account if `cmms@` is not a verified send-as alias on it. Ben to check the test email.
 
-Remaining: Ben presses Reports → Board Report → **Email…**
 
 ---
 
@@ -167,7 +166,7 @@ work. Per-report show/hide. One fund exists: Discretionary Audit Fund, $5,000.
 ## 7. Outstanding
 
 **Needs Ben:**
-1. **Press Send**, after confirming the test email shows `cmms@` as the sender.
+1. ~~Press Send~~ **done 2026-10-03.** Mail arrives From `ben@fracturedrv.com`, Reply-To `cmms@`; Ben is fine with that.
 2. **Rotate the OAuth client secret** — it was pasted into a chat transcript on 2026-10-02.
    Client `618947223294-dm17fa14…`. Add a new secret in Cloud Console, put it in `.env` as
    `GMAIL_OAUTH_CLIENT_SECRET`, delete the old.
@@ -192,21 +191,46 @@ Done and live:
 - Person profile shows Funded, Hours and login. Merge carries funder records, crew sessions and
   the login link.
 
-**The application still READS the old pair.** Nothing the report prints is computed differently;
-the September render was byte-identical before and after apart from its timestamp.
+- **Migration 0117 + one picker (2026-10-03, after the September email went out).** The pair
+  gained a sixth source: `('funder', funding_sources.id)`. A form may write `('person', people.id)`
+  and the trigger turns it into that person's funder row (made on first use) — `'person'` is
+  never stored. Because the funder rides in the pair, duplicate / split / cascade / templates
+  carry it with no code changes.
+  - Job-line picker options come from `GET /api/pg/funding-options` (`listFundingOptions`):
+    camp, funds, campaigns, categories, donor, in-kind, every person, and holdings with no single
+    person. `aliases` maps `cabin_holder::<holding>` and `funder::<row>` onto `person::<id>`;
+    `fundingOptionValue()` applies it so existing lines open showing the person.
+  - Expense form: **Fund** and **Who paid** are one **Paid from** select. Choosing a fund row
+    sends both `fundingSourceId` and `fundId`. "Someone not listed…" makes a person a funder.
+  - `getFundingRefLabel`, `jobLineFundingForReport` (both receipt queries and the budget query)
+    and `getBudgetOverview` (new **People & Donors** ledger) understand `funder`.
+  - `scripts/funding-test.mjs` — 22 assertions, scratch records deleted.
+
+**Existing rows were not rewritten.** Lines stored as `cabin_holder/<holding>` stay that way
+until someone re-saves them; they resolve to the same `funding_source_id`. Before/after diffs of
+the September render, `september-reconcile`, budget overview, fund balances and every WO rollup
+were byte-identical across 0116 and 0117.
+
+**Gotchas found on the way:**
+- The grid saves what it DISPLAYS, and a line not in `pinned_fields` displays row 1's value.
+  Lines edited on the card view were never pinned, so opening Edit lines and pressing Save would
+  have reset their funding/status/date to row 1's. `jlgRowsFromJobLines` now pins any saved
+  value that differs from row 1.
+- `.jlg-table` had no width for Funding Source; at ~1280px it collapsed to 0. Now 210px, table
+  `min-width: 1240px`, scrolls sideways.
+- Headless check: `~/.npm/_npx/*/node_modules/playwright` with the cached
+  `chromium_headless_shell-1234` via `executablePath`. Do not `await go(...)` inside
+  `page.evaluate` — it can hang; fire it and wait.
 
 Not done, in order:
-1. **Read cutover + one picker.** Job-line and expense forms get one funding control over
-   `funding_sources`, choosing a *person* rather than a holding; `jobLineFundingForReport`,
-   `getFundingRefLabel`, `resolveAllocationFunding`, `getFundBalances` and the WO rollup read
-   `funding_source_id`. ~60 read sites in `db.js`. `expenses.fund_id` folds into
-   `expenses.funding_source_id` at the same time. Do this **after the September email is out**,
-   and diff the report render before and after as was done for 0116.
-2. **Retire `volunteers`.** The proposal called it dead; it is not — the crew/attendance screens
-   read it (`crew_session_volunteers`, `job_line_volunteers`, ~30 references). Those pickers move
-   to people with the Volunteer role first. Its single row, "Chuck Smith", is test data
-   (`Testemail123@gmailtest.com`, "La La Lane") and should be deleted, not migrated — Ben to confirm.
-3. Drop the old pair and `job_line_funding_kinds` — only after 1 has run clean for a release.
+1. **Retire `volunteers`.** Now empty (the one test row was deleted with Ben's OK). The crew and
+   attendance screens still read it (`crew_session_volunteers`, `job_line_volunteers`, ~35
+   references in `app.js`, ~64 in `db.js`). Move those pickers to people with the Volunteer role.
+2. **The Email admin screen says "Sends as cmms@"** but Gmail delivers From `ben@fracturedrv.com`
+   with Reply-To `cmms@` (cmms@ is not a verified send-as alias). Ben is content; fix the label.
+3. Drop the old pair and `job_line_funding_kinds` — only after a release of clean
+   `funding-reconcile` runs, and only with Ben's say-so. Rewriting stored `cabin_holder/<id>`
+   rows to `funder` is a bulk edit and needs asking first.
 
 **Proposed, not built:** `docs/hosted-photo-page-proposal.md` — recommendation was to hold.
 
@@ -229,12 +253,12 @@ Unpublishing #1 removes it.
 
 ---
 
-## 9. Migrations 0095–0116
+## 9. Migrations 0095–0117
 
 People/groups/visits (0095–0096), text intake (0097–0100), report fields (0101, 0103–0105),
 funding sources (0102), show_hours (0106), open lines (0107), show_funding (0108), job-line
 funding kinds (0109), aggregate note (0110), general funding (0111), per-report funds (0112),
-publish snapshot (0113), mail OAuth (0114), mail log (0115), one funding list (0116).
+publish snapshot (0113), mail OAuth (0114), mail log (0115), one funding list (0116), funders on job lines (0117).
 
 **Always dry-run** inside `BEGIN … ROLLBACK` against the live schema, each negative probe behind
 its own `SAVEPOINT` — a failed statement otherwise poisons the transaction and hides every probe

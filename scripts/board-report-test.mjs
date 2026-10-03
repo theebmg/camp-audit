@@ -355,7 +355,8 @@ console.log('\n## funding precedence: receipts beat the budget field, which beat
   ok(campKinds.includes('operating_budget') && campKinds.includes('capital_campaign')
     && campKinds.includes('fund') && campKinds.includes('other'),
     `camp: ${campKinds.join(', ')}`);
-  ok(nonCamp.length === 1 && nonCamp[0] === 'cabin_holder', `non-camp: ${nonCamp.join(', ')}`);
+  // 'funder' (0117): a person, donor or in-kind gift named directly on a line.
+  ok(nonCamp.length === 2 && nonCamp.includes('cabin_holder') && nonCamp.includes('funder'), `non-camp: ${nonCamp.join(', ')}`);
 
   // An unknown source must count as CAMP, so contributions are never overstated.
   const unknown = await db.pool.query(
