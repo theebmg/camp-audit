@@ -987,7 +987,6 @@ const NAV_ITEMS = [
   { icon: '📅', label: 'Calendar', view: 'calendar' },
   { icon: '📥', label: 'Inbox', view: 'inbox' },
   { icon: '🗂️', label: 'Admin Tasks', view: 'adminTasks' },
-  { icon: '↪️', label: 'Follow-ups', view: 'followUps' },
   { icon: '📝', label: 'Start Audit', view: 'auditPicker' },
   { icon: '📋', label: 'Audit Rounds', view: 'auditRounds' },
   { icon: '🗺️', label: 'Map', view: 'map' },
@@ -1028,7 +1027,7 @@ async function refreshNavBadges() {
 // the sidebar's reorder mode, and the result is saved to display_settings
 // (nav_layout). The trailing null-header section renders without a label.
 const DEFAULT_NAV_LAYOUT = [
-  { header: 'Daily', items: ['dashboard', 'workOrders', 'followUps', 'incoming', 'calendar', 'inbox', 'adminTasks'] },
+  { header: 'Daily', items: ['dashboard', 'workOrders', 'incoming', 'calendar', 'inbox', 'adminTasks'] },
   { header: 'Field', items: ['auditPicker', 'auditRounds', 'map', 'locations', 'notes', 'visits'] },
   { header: 'Money', items: ['expenses', 'materials', 'capitalPlan'] },
   { header: 'Records', items: ['people', 'groups', 'requests', 'crew', 'crewHours', 'maintenanceLog'] },
@@ -1123,6 +1122,8 @@ function placeNavItem(view, si, beforeView) {
 }
 
 function renderSidebar(activeView) {
+  // Follow-ups is a tab of Work Orders, so Work Orders stays lit while it is open.
+  if (activeView === 'followUps') activeView = 'workOrders';
   const layout = currentNavLayout();
   const flat = layout.flatMap((sec) => sec.items);
   const first = flat[0], last = flat[flat.length - 1];
@@ -5685,6 +5686,18 @@ async function renderBoardReport(params = {}) {
           <p class="field-error" id="brShowHours-err"></p>
         </div>
         <div class="field-row">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
+            <input type="checkbox" id="brShowScheduled" ${report.ShowScheduled !== false ? 'checked' : ''} ${published ? 'disabled' : ''} />
+            Pick up scheduled work (Coming Up and Overdue)
+          </label>
+          <p class="muted" style="margin:2px 0 0;font-size:0.8rem">
+            On: lines scheduled in the look-ahead window, and overdue ones, are added automatically.
+            Off: only flagged items and anything you check or add yourself. Finished work always
+            goes by the date it was completed.
+          </p>
+          <p class="field-error" id="brShowScheduled-err"></p>
+        </div>
+        <div class="field-row">
           <label for="brShowFunding">Show funding</label>
           <select id="brShowFunding" ${published ? 'disabled' : ''}>
             <option value="off" ${report.ShowFunding === 'off' ? 'selected' : ''}>Off — no funding anywhere</option>
@@ -6043,6 +6056,16 @@ async function renderBoardReport(params = {}) {
         // Put the tick back: nothing was typed, so showing the real state is honest.
         e.target.checked = !e.target.checked;
         showFieldError('brShowHours', saveErrorMessage(err));
+      }
+    });
+    document.getElementById('brShowScheduled')?.addEventListener('change', async (e) => {
+      clearFieldError('brShowScheduled');
+      try {
+        await patchReport({ showScheduled: e.target.checked });
+        refresh();
+      } catch (err) {
+        e.target.checked = !e.target.checked;
+        showFieldError('brShowScheduled', saveErrorMessage(err));
       }
     });
     loadReportFunds(report.Id);
@@ -6652,8 +6675,20 @@ function resolutionCardHtml(wo) {
     </div>`;
 }
 
+// Work Orders and Follow-ups are one screen with two tabs (Ben, Nov 2026): follow-ups are work
+// orders, so they live under Work Orders rather than as another menu entry.
+function workOrderTabsHtml(active) {
+  const tab = (key, label) => `<button type="button" class="btn btn-inline ${active === key ? 'btn-primary' : 'btn-secondary'} wo-tab" data-tab="${key}" style="margin:0">${label}</button>`;
+  return `<div class="wo-tabs" role="tablist" style="display:flex;gap:6px;margin-bottom:12px">${tab('list', '🛠️ Work orders')}${tab('followUps', '↪️ Follow-ups')}</div>`;
+}
+function wireWorkOrderTabs(root) {
+  root.querySelectorAll('.wo-tab').forEach((b) => b.addEventListener('click', () => {
+    go(b.dataset.tab === 'followUps' ? 'followUps' : 'workOrders', {});
+  }));
+}
+
 async function renderFollowUps(params = {}) {
-  setChrome({ title: 'Follow-ups', showBack: false, showLogout: true });
+  setChrome({ title: 'Work Orders', showBack: false, showLogout: true });
   app.innerHTML = LOADING_HTML;
   let bucket = params.bucket || '';
   let showClosed = false;
@@ -6677,6 +6712,7 @@ async function renderFollowUps(params = {}) {
     const chips = [['', `All (${list.length})`], ...Object.entries(FOLLOW_UP_BUCKETS).map(([k, l]) => [k, `${l} (${counts[k] || 0})`]),
       ['undecided', `Needs a decision (${counts.undecided || 0})`]];
     setApp(`
+      ${workOrderTabsHtml('followUps')}
       <div class="card">
         <h3 style="margin-top:0">Follow-up work</h3>
         <p class="muted">Work still owed after a temporary or partial fix, plus deferred work orders. Grouped by target date.</p>
@@ -6695,6 +6731,7 @@ async function renderFollowUps(params = {}) {
           </div>
         </div>`).join('') || '<p class="muted">Nothing here.</p>'}
       </div>`);
+    wireWorkOrderTabs(app);
     app.querySelectorAll('.fu-chip').forEach((c) => c.addEventListener('click', () => { bucket = c.dataset.b; draw(); }));
     app.querySelector('#fuClosed').addEventListener('change', async (e) => { showClosed = e.target.checked; await load(); draw(); });
     app.querySelectorAll('.fu-link').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.wo })));
@@ -11935,6 +11972,7 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
     const filterLabel = statusFilter || (scheduleFilter ? WO_SCHEDULE_FILTER_LABELS[scheduleFilter] : null);
 
     setApp(`
+      ${workOrderTabsHtml('list')}
       <div class="btn-row" style="margin-bottom:12px;justify-content:space-between">
         <button class="btn btn-primary" id="newWoBtnTop">+ New Work Order</button>
         <button class="btn btn-secondary" id="newWoFromTplBtn">+ From Template</button>
@@ -11960,6 +11998,7 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
     `, container);
 
     container.querySelector('#newWoBtnTop').addEventListener('click', () => go('newWorkOrder', {}));
+    wireWorkOrderTabs(container);
     // §8: templates are picked on the New Work Order screen, which is where
     // the grid lives — this is a shortcut into that picker, not a second flow.
     container.querySelector('#newWoFromTplBtn').addEventListener('click', async () => {
@@ -13936,6 +13975,9 @@ const JLG_COLUMNS = [
   { key: 'funding_source', label: 'Funding Source', kind: 'combobox', cascade: true },
   { key: 'status_id', label: 'Status', kind: 'select', cascade: true },
   { key: 'scheduled_date', label: 'Scheduled Date', kind: 'date', cascade: true },
+  // Not a cascade column: each line was finished on its own day. Blank on a line marked done
+  // means today (1b).
+  { key: 'completed_date', label: 'Completed', kind: 'date' },
 ];
 const JLG_CASCADE_COLUMNS = JLG_COLUMNS.filter((c) => c.cascade);
 const JLG_CASCADE_DEFAULTS = { responsibility_class: true, funding_source: true, status_id: true, scheduled_date: true };
@@ -14015,6 +14057,7 @@ function mountJobLineGrid(container, {
   const rowEls = new Map();      // row uid -> <tr>
 
   const cascadeOn = (col) => {
+    if (!JLG_CASCADE_COLUMNS.some((c) => c.key === col)) return false;
     const cfg = perWoCascade || globalCascadeDefaults || JLG_CASCADE_DEFAULTS;
     return cfg[col] !== false;
   };
@@ -14024,6 +14067,7 @@ function mountJobLineGrid(container, {
     funding_source: fundingOptionValue('operating_budget', null),
     status_id: firstOpenStatus ? String(firstOpenStatus.Id) : '',
     scheduled_date: '',
+    completed_date: '',
   });
 
   function blankRow(seed = {}) {
@@ -14089,6 +14133,7 @@ function mountJobLineGrid(container, {
       <td class="jlg-c-fund">${cellControlHtml(JLG_COLUMNS[4], idx, row)}</td>
       <td class="jlg-c-status">${cellControlHtml(JLG_COLUMNS[5], idx, row)}</td>
       <td class="jlg-c-date">${cellControlHtml(JLG_COLUMNS[6], idx, row)}</td>
+      <td class="jlg-c-date">${cellControlHtml(JLG_COLUMNS[7], idx, row)}</td>
       <td class="jlg-c-menu"><button type="button" class="jlg-remove" title="Remove this line" aria-label="Remove line ${idx + 1}">✕</button></td>
     </tr>`;
   }
@@ -14691,6 +14736,7 @@ function mountJobLineGrid(container, {
           estimatedHours: row.estHours === '' ? null : Number(row.estHours),
           estimatedCost: row.estCost === '' ? null : Number(row.estCost),
           scheduledDate: displayed(idx, 'scheduled_date') || null,
+          completedDate: displayed(idx, 'completed_date') || null,
           statusId: displayed(idx, 'status_id') ? Number(displayed(idx, 'status_id')) : null,
           statusNote: row.statusNote || undefined,
           pinnedFields: [...row.pinned],
@@ -14846,6 +14892,7 @@ function jlgRowsRaw(jobLines) {
       funding_source: fundingOptionValue(jl.FundingSource, jl.FundingRefId),
       status_id: String(jl.StatusId ?? ''),
       scheduled_date: (jl.ScheduledDate || '').slice(0, 10),
+      completed_date: (jl.CompletedDate || '').slice(0, 10),
     },
     pinned: jl.PinnedFields || [],
     originalStatusId: jl.StatusId ?? null,
@@ -15293,6 +15340,8 @@ function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
         ${jl.LinkedExpenseCount ? `<p class="muted" style="margin-top:2px;font-size:0.8rem">+ $${jl.LinkedExpenseTotal.toLocaleString()} from ${jl.LinkedExpenseCount} linked expense${jl.LinkedExpenseCount === 1 ? '' : 's'} — this field is the manual/no-receipt amount only; totals elsewhere include both.</p>` : '<p class="muted" style="margin-top:2px;font-size:0.8rem">For costs with no receipt (invoice paid directly, donated materials). Link an expense instead when there is one.</p>'}
       </div>
       <div class="field-row"><label>Scheduled Date</label><input class="jl-e-scheduled-date" type="date" value="${(jl.ScheduledDate || '').slice(0, 10)}" /></div>
+      <div class="field-row jl-e-completed-row"><label>Completed Date</label><input class="jl-e-completed-date" type="date" value="${(jl.CompletedDate || '').slice(0, 10)}" />
+        <p class="muted" style="font-size:0.8rem;margin-top:4px">The day the work was actually done — this decides which month's board report it goes on. Fill in the real date when entering work after the fact.</p></div>
       <div class="field-row">
         <label>Start Time (optional)</label>
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
@@ -15724,6 +15773,16 @@ async function renderWorkOrderDetail({ id }, container = app) {
     }
     statusSelect.addEventListener('change', syncStatusNoteVisibility);
     syncStatusNoteVisibility();
+    // Completed Date only means something on finished work. Marking a line done fills in
+    // today as a starting point — change it when the work happened on another day.
+    const completedInput = card.querySelector('.jl-e-completed-date');
+    const statusIsDone = () => !!jobLineStatuses.find((st) => String(st.Id) === statusSelect.value)?.CountsAsWorkPerformed;
+    function syncCompletedDate() {
+      card.querySelector('.jl-e-completed-row').hidden = !statusIsDone();
+      if (statusIsDone() && !completedInput.value) completedInput.value = isoDaysFromToday(0);
+    }
+    statusSelect.addEventListener('change', syncCompletedDate);
+    syncCompletedDate();
 
     // §9: one searchable list across all five funding sources, same component
     // and same option set the grid's Funding Source column uses — the two
@@ -15773,6 +15832,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
           estimatedCost: card.querySelector('.jl-e-est-cost').value,
           actualCost: card.querySelector('.jl-e-act-cost').value,
           scheduledDate: card.querySelector('.jl-e-scheduled-date').value,
+          completedDate: statusIsDone() ? (completedInput.value || undefined) : undefined,
           scheduledStartTime: card.querySelector('.jl-e-start-time').value,
           scheduledDurationHours: card.querySelector('.jl-e-duration-hours').value,
           complaint: card.querySelector('.jl-e-complaint').value,

@@ -4457,12 +4457,13 @@ export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds 
           `INSERT INTO job_lines (work_order_id, title, sort_order, responsibility_class, funding_source, funding_ref_id,
              estimated_hours, estimated_cost, scheduled_date, status_id, pinned_fields, completed_date, completed_at)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-             CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN CURRENT_DATE ELSE NULL END,
+             -- The completion date typed in the grid wins; today only when none was given (1b).
+             CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN COALESCE($12::date, CURRENT_DATE) ELSE NULL END,
              CASE WHEN (SELECT counts_as_work_performed FROM job_line_statuses WHERE id = $10) THEN now() ELSE NULL END)
            RETURNING id, scheduled_date`,
           [woId, title, sortOrder++, line.responsibilityClass || 'self', line.fundingSource || 'operating_budget',
             numOrNull(line.fundingRefId), numOrNull(line.estimatedHours), numOrNull(line.estimatedCost),
-            line.scheduledDate || null, statusId, pinned]
+            line.scheduledDate || null, statusId, pinned, line.completedDate || null]
         );
         await logActivity({ action: 'created', entityType: 'job_line', entityId: rows[0].id, entityLabel: title, details: `On Work Order #${woId}` });
         if (rows[0].scheduled_date) gcalSyncs.push(rows[0].id);
@@ -4472,11 +4473,14 @@ export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds 
       const prev = existing.get(id);
       await client.query(
         `UPDATE job_lines SET title = $2, responsibility_class = $3, funding_source = $4, funding_ref_id = $5,
-           estimated_hours = $6, estimated_cost = $7, scheduled_date = $8, sort_order = $9, pinned_fields = $10
+           estimated_hours = $6, estimated_cost = $7, scheduled_date = $8, sort_order = $9, pinned_fields = $10,
+           -- Written BEFORE the status change below, so a typed completion date is what a line
+           -- marked Done here keeps, rather than today's date. Blank keeps what was there.
+           completed_date = COALESCE($11::date, completed_date)
          WHERE id = $1`,
         [id, title, line.responsibilityClass || 'self', line.fundingSource || 'operating_budget',
           numOrNull(line.fundingRefId), numOrNull(line.estimatedHours), numOrNull(line.estimatedCost),
-          line.scheduledDate || null, sortOrder++, pinned]
+          line.scheduledDate || null, sortOrder++, pinned, line.completedDate || null]
       );
       // A saved line's status change IS a lifecycle transition, so it goes
       // through changeJobLineStatus — requires_note is enforced and the work
@@ -6342,8 +6346,11 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
        -- EITHER date landing in the period qualifies, rather than COALESCE picking one
        -- and discarding the other: a line whose recorded date is outside the window but
        -- which was marked done inside it is exactly the arrears case this serves.
-       AND (jl.completed_date BETWEEN $1 AND $2
-            OR jl.completed_at::date BETWEEN $1 AND $2)
+       -- The day the work was DONE decides the report, never the day the line was marked
+       -- done (1b, Nov 2026). The old "either date" rule put work entered in arrears on the
+       -- report for the month it was typed in. completed_at stands in only when no date was
+       -- ever recorded.
+       AND COALESCE(jl.completed_date, jl.completed_at::date) BETWEEN $1 AND $2
      ORDER BY COALESCE(jl.completed_date, jl.completed_at::date) DESC, jl.id`,
     [periodStart, periodEnd]
   );
@@ -6356,8 +6363,15 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
     // The WO rides along as the grouping header the screen expands. It is skipped when
     // the header itself was already reported, but NOT merely because some of its lines
     // were — a work order with new lines this period still needs its header.
-    if (!woSeen.has(r.work_order_id) && !reported.has(reportedKey('work_order', r.work_order_id))) {
+    // The WO rides along as the grouping header the screen expands — on EVERY month it has
+    // work in, not only the first (1b). A work order that spans months shows up each month
+    // with that month's lines under it.
+    if (!woSeen.has(r.work_order_id)) {
       woSeen.add(r.work_order_id);
+      // A header that already went out on an earlier report is a CONTINUATION: it carries no
+      // money of its own, the same rule open work orders follow, because its roll-up would
+      // re-print what the board was already shown. The lines beneath carry this month's costs.
+      const continued = reported.has(reportedKey('work_order', r.work_order_id));
       const roll = await workOrderRollupForReport(r.work_order_id, reportId);
       await upsertBoardReportItem(reportId, { passId,
         itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
@@ -6370,11 +6384,12 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
         // Only a finished work order gets a finish date. Falling back to the newest completed
         // LINE made an open WO read "Completed" because some of its lines were done.
         snapDate: r.wo_completed || (r.wo_is_terminal ? roll.lastCompleted : null),
+        snapSubtitle: continued ? 'continued from an earlier report' : null,
         // Real money only. The estimate rides alongside and is never summed in (§2, §3).
-        snapCost: roll.hasActual ? roll.actualCost : null,
-        snapEstCost: roll.hasEst ? roll.estCost : null,
-        snapHours: roll.actualHours || null,
-        snapFunding: roll.funding.length ? roll.funding : null,
+        snapCost: !continued && roll.hasActual ? roll.actualCost : null,
+        snapEstCost: !continued && roll.hasEst ? roll.estCost : null,
+        snapHours: continued ? null : (roll.actualHours || null),
+        snapFunding: !continued && roll.funding.length ? roll.funding : null,
         snapProgress: r.wo_completed ? null : roll.progress,
         snapOpenLines: r.wo_is_terminal ? null : roll.openLines,
       });
@@ -6427,7 +6442,7 @@ async function suggestAdminTasks(reportId, passId, reported, { periodStart, peri
 
 // Coming Up: scheduled inside the forward window, plus anything flagged regardless of
 // date, plus overdue. Overdue is computed, never a stored status, so it clears itself.
-async function suggestComingUp(reportId, passId, reported, { forwardStart, forwardEnd }) {
+async function suggestComingUp(reportId, passId, reported, { forwardStart, forwardEnd, showScheduled = true }) {
   const todayStr = today();
   const { rows } = await pool.query(
     `SELECT jl.id, jl.title, jl.scheduled_date::text AS scheduled_date, jl.estimated_cost,
@@ -6440,10 +6455,11 @@ async function suggestComingUp(reportId, passId, reported, { forwardStart, forwa
      JOIN work_order_statuses ws ON ws.id = w.status_id
      LEFT JOIN assets a ON a.id = w.asset_id
      WHERE NOT s.is_terminal AND NOT ws.is_terminal
-       AND (jl.scheduled_date BETWEEN $1 AND $2 OR jl.board_focus OR w.board_focus
-            OR jl.scheduled_date < $3)
+       -- $4 off = the report's "pick up scheduled work" switch is off: only flagged lines.
+       AND (($4 AND (jl.scheduled_date BETWEEN $1 AND $2 OR jl.scheduled_date < $3))
+            OR jl.board_focus OR w.board_focus)
      ORDER BY jl.scheduled_date NULLS LAST, jl.id`,
-    [forwardStart, forwardEnd, todayStr]
+    [forwardStart, forwardEnd, todayStr, showScheduled !== false]
   );
   for (const [i, r] of rows.entries()) {
     if (reported.has(reportedKey('job_line', r.id))) continue;
@@ -7059,7 +7075,7 @@ export async function getReportEmailBudgetMb() {
   return Number(rows[0]?.report_email_budget_mb) || 15;
 }
 
-async function suggestFlaggedItems(reportId, passId, reported) {
+async function suggestFlaggedItems(reportId, passId, reported, { periodEnd } = {}) {
   const monthOf = (d) => new Date(d).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   let n = 0;
 
@@ -7076,6 +7092,9 @@ async function suggestFlaggedItems(reportId, passId, reported) {
   );
   for (const [i, r] of wos.entries()) {
     if (reported.has(reportedKey('work_order', r.id))) continue;
+    // Finished after this report's period: it belongs to a later report. The flag survives
+    // until a report carrying it is published, so it is not lost by waiting (1b).
+    if (r.is_terminal && periodEnd && r.completed_date && r.completed_date > periodEnd) continue;
     // A work order row is also the grouping HEADER its job lines render under, and a
     // header has to sit in the same section as the lines it heads. The Done rule puts a
     // WO in Done only when it actually has lines completed in this period, so if this
@@ -7126,7 +7145,8 @@ async function suggestFlaggedItems(reportId, passId, reported) {
          JOIN job_line_statuses s ON s.id = jl.status_id
          LEFT JOIN (${JOB_LINE_EXPENSE_COST_SQL}) ec ON ec.job_line_id = jl.id
          WHERE jl.work_order_id = $1 AND s.counts_as_work_performed
-         ORDER BY jl.sort_order, jl.id`, [r.id]
+           AND ($2::date IS NULL OR COALESCE(jl.completed_date, jl.completed_at::date) <= $2::date)
+         ORDER BY jl.sort_order, jl.id`, [r.id, periodEnd || null]
       );
       const kidFunding = await jobLineFundingForReport(kids.map((c) => c.id));
       for (const [k, c] of kids.entries()) {
@@ -7163,6 +7183,8 @@ async function suggestFlaggedItems(reportId, passId, reported) {
   for (const [i, r] of lines.entries()) {
     if (reported.has(reportedKey('job_line', r.id))) continue;
     const done = r.counts_as_work_performed;
+    // Same rule for a single flagged line: done after the period, it waits for its own month.
+    if (done && periodEnd && r.completed_date && r.completed_date > periodEnd) continue;
     const stale = !done && r.board_focus_set_at ? ` · featured since ${monthOf(r.board_focus_set_at)}` : '';
     await upsertBoardReportItem(reportId, { passId,
       itemType: 'job_line', itemId: r.id,
@@ -7254,6 +7276,7 @@ async function runBoardReportSuggestions(reportId) {
   const periods = {
     periodStart: report.PeriodStart, periodEnd: report.PeriodEnd,
     forwardStart: report.ForwardStart, forwardEnd: report.ForwardEnd,
+    showScheduled: report.ShowScheduled,
   };
   // A token, not a timestamp: "did THIS pass write this row" is an exact question, and
   // comparing a JS clock to the database's was what made the prune delete rows the pass
@@ -7268,7 +7291,7 @@ async function runBoardReportSuggestions(reportId) {
     calendar: await suggestCalendarAndProjections(reportId, passId, reported, periods),
     // Last: a flag is the most deliberate statement there is about an item, so its
     // section overrides whatever a date rule put the same row in.
-    flagged: await suggestFlaggedItems(reportId, passId, reported),
+    flagged: await suggestFlaggedItems(reportId, passId, reported, periods),
   };
   // Drop what the current period no longer suggests — but only where the user never
   // decided anything about it. An unchecked row, a board note, or an itemized work
@@ -7306,6 +7329,7 @@ function boardReportRowShape(r) {
     SummaryNotes: r.summary_notes,
     PublishSnapshot: r.publish_snapshot || null,
     ShowHours: r.show_hours === true,
+    ShowScheduled: r.show_scheduled !== false,
     ShowFunding: r.show_funding || 'non_general',
     CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
   };
@@ -7347,17 +7371,19 @@ export async function getOrCreateDraftBoardReport() {
   const existing = await pool.query(`${BOARD_REPORT_SELECT} WHERE r.status = 'draft' LIMIT 1`);
   if (existing.rows[0]) return boardReportRowShape(existing.rows[0]);
   const p = await defaultBoardReportPeriods();
-  const title = new Date(p.periodEnd).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const title = boardReportAutoTitle(p.periodEnd);
   const { rows } = await pool.query(
     // show_hours carries over from the most recent report rather than resetting: whoever turned
     // hours on last month almost certainly wants them on again, and the alternative is
     // rediscovering the toggle every month. Falls back to false when this is the first report.
-    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end, show_hours, show_funding)
+    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end, show_hours, show_funding, show_scheduled)
      VALUES ($1,'draft',$2,$3,$4,$5,
              COALESCE((SELECT show_hours FROM board_reports
                         ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), false),
              COALESCE((SELECT show_funding FROM board_reports
-                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), 'non_general'))
+                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), 'non_general'),
+             COALESCE((SELECT show_scheduled FROM board_reports
+                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), true))
      RETURNING id`,
     [title, p.periodStart, p.periodEnd, p.forwardStart, p.forwardEnd]
   );
@@ -7379,8 +7405,14 @@ export async function listBoardReports() {
 const BOARD_REPORT_UPDATE_COLUMNS = {
   title: 'title', periodStart: 'period_start', periodEnd: 'period_end',
   forwardStart: 'forward_start', forwardEnd: 'forward_end', summaryNotes: 'summary_notes',
-  showHours: 'show_hours', showFunding: 'show_funding',
+  showHours: 'show_hours', showFunding: 'show_funding', showScheduled: 'show_scheduled',
 };
+
+// The name a draft gets from its dates: the month its period ends in.
+function boardReportAutoTitle(periodEnd) {
+  return new Date(`${String(periodEnd).slice(0, 10)}T12:00:00Z`)
+    .toLocaleDateString('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+}
 // Published reports are read-only: a report the board has already seen must not change
 // underneath them, which is the entire point of publishing.
 export async function updateBoardReport(id, fields) {
@@ -7393,6 +7425,13 @@ export async function updateBoardReport(id, fields) {
   for (const [key, col] of Object.entries(BOARD_REPORT_UPDATE_COLUMNS)) {
     if (fields[key] === undefined) continue;
     setCols.push(`${col} = $${i++}`); vals.push(fields[key]);
+  }
+  // A draft named after its dates follows them (1b): move the period to October and
+  // "September 2026" becomes "October 2026". A title someone typed is left alone.
+  if (fields.title === undefined && fields.periodEnd && cur.PeriodEnd
+      && cur.Title === boardReportAutoTitle(cur.PeriodEnd)
+      && boardReportAutoTitle(fields.periodEnd) !== cur.Title) {
+    setCols.push(`title = $${i++}`); vals.push(boardReportAutoTitle(fields.periodEnd));
   }
   if (!setCols.length) return cur;
   await pool.query(`UPDATE board_reports SET ${setCols.join(', ')} WHERE id = $1`, [id, ...vals]);
