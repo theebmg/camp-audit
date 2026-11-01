@@ -5722,7 +5722,7 @@ async function renderBoardReport(params = {}) {
         </div>
         ${published ? '' : `<div class="btn-row">
           <button type="button" class="btn btn-secondary" id="brRefresh" ${busy ? 'disabled' : ''}>${busy ? 'Working…' : 'Refresh suggestions'}</button>
-          <button type="button" class="btn btn-secondary" id="brAddItem">＋ Add item</button>
+          <button type="button" class="btn btn-secondary" id="brAddItem">＋ Add to report</button>
         </div>
         <p class="muted" style="margin:6px 0 0;font-size:0.82rem">Add anything the rules didn't propose — any status, any date.</p>`}
       </div>
@@ -6171,12 +6171,71 @@ async function renderBoardReport(params = {}) {
 // is fetched once and narrowed in the browser, so typing costs nothing and never races
 // a response. By default it shows only what hasn't been used — everything else is one
 // toggle away, labelled with where it went.
+// A one-off line typed straight onto the report: saved as a real admin task, flagged for the
+// report, so it is tracked and searchable later rather than living only on this page.
+function oneOffReportItemDialog(reportId) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" role="dialog" aria-modal="true" style="max-width:480px">
+        <h3 style="margin-top:0">One-off item for the report</h3>
+        <p class="muted" style="margin-top:-6px;font-size:0.85rem">Saved as an admin task, already set to "Include on board report".</p>
+        <div class="field-row"><label>Title</label><input class="oo-title" placeholder="What was done" /></div>
+        <div class="field-row"><label>Date</label><input class="oo-date" type="date" value="${isoDaysFromToday(0)}" /></div>
+        <div class="field-row"><label>Note (optional)</label><textarea class="oo-note" rows="2"></textarea></div>
+        <div class="field-row"><label>Photo (optional)</label><input class="oo-photo" type="file" accept="image/*" /></div>
+        <p class="oo-error" style="color:#b91c1c;margin:6px 0 0" hidden></p>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+          <button type="button" class="btn btn-secondary btn-inline modal-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary btn-inline modal-ok">Add</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const $o = (sel) => overlay.querySelector(sel);
+    setTimeout(() => $o('.oo-title').focus(), 0);
+    const close = (v) => { overlay.remove(); resolve(v); };
+    const fail = (msg) => { $o('.oo-error').textContent = msg; $o('.oo-error').hidden = false; };
+    $o('.modal-cancel').addEventListener('click', () => close(null));
+    $o('.modal-ok').addEventListener('click', async () => {
+      const title = $o('.oo-title').value.trim();
+      if (!title) { fail('Give it a title.'); return; }
+      if (!$o('.oo-date').value) { fail('Give it a date.'); return; }
+      $o('.modal-ok').disabled = true;
+      let r;
+      try {
+        r = await api(`/api/pg/board-reports/${reportId}/one-off`, {
+          method: 'POST',
+          body: JSON.stringify({ title, date: $o('.oo-date').value, note: $o('.oo-note').value.trim() || null }),
+        });
+      } catch (err) { $o('.modal-ok').disabled = false; fail(saveErrorMessage(err)); return; }
+      const file = $o('.oo-photo').files[0];
+      if (file) {
+        // The task exists either way; a photo that fails to upload is said so, not hidden.
+        try {
+          const fd = new FormData();
+          fd.append('file', file);
+          fd.append('entityType', 'admin_task');
+          fd.append('entityId', String(r.task.Id));
+          fd.append('category', 'admin_task');
+          const up = await fetch('/api/pg/attachments', { method: 'POST', body: fd, credentials: 'same-origin' });
+          if (!up.ok) throw new Error(`upload failed (${up.status})`);
+        } catch (err) {
+          r.message += ` The photo didn't upload (${err.message}) — add it on the admin task.`;
+        }
+      }
+      close(r);
+    });
+  });
+}
+
 async function openAddReportItem(reportId, onDone) {
   const TYPES = [
     { key: 'work_order', label: 'Work orders', short: 'WO' },
     { key: 'job_line', label: 'Job lines', short: 'Line' },
     { key: 'condition_finding', label: 'Findings', short: 'Finding' },
     { key: 'admin_task', label: 'Admin tasks', short: 'Task' },
+    { key: 'projected_occurrence', label: 'Calendar events', short: 'Event' },
   ];
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -6185,9 +6244,12 @@ async function openAddReportItem(reportId, onDone) {
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
         <div>
           <h3 style="margin:0">Add to this report</h3>
-          <p class="muted" style="margin:4px 0 0;font-size:0.85rem">Everything on the books — work orders, job lines, findings and admin tasks, at any status and any date.</p>
+          <p class="muted" style="margin:4px 0 0;font-size:0.85rem">Everything on the books — work orders, job lines, findings, admin tasks and calendar events. Adding one also checks its own "Include on board report".</p>
         </div>
-        <button type="button" class="btn btn-secondary addpanel-close">Close</button>
+        <span style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+          <button type="button" class="btn btn-secondary btn-inline addpanel-oneoff">＋ One-off item</button>
+          <button type="button" class="btn btn-secondary btn-inline addpanel-close">Close</button>
+        </span>
       </div>
       <input type="search" class="addpanel-q" placeholder="Filter — title, WO number, asset, status or date" autocomplete="off" />
       <button type="button" class="btn btn-secondary addpanel-filtertoggle">Filters</button>
@@ -6233,7 +6295,11 @@ async function openAddReportItem(reportId, onDone) {
   let query = '';
   const selected = new Map();   // key -> the candidate object, so "Add selected" needs no re-lookup
 
-  const keyOf = (c) => `${c.ItemType}:${c.ItemId}`;
+  // A calendar event is one event on many dates, so its key carries the date.
+  const keyOf = (c) => (c.ItemType === 'projected_occurrence' ? `${c.ItemType}:${c.ItemId}:${c.ItemDate}` : `${c.ItemType}:${c.ItemId}`);
+  // Every typed word must appear, in any order — the same rule as every combobox
+  // (rankOptions), so "drywall mud" finds "Mud Drywall".
+  const matches = (c) => !query || searchNorm(query).split(' ').filter(Boolean).every((w) => c.haystack.includes(w));
   const usedLabel = (c) => (c.OnThisReport ? 'on this report' : (c.ReportedOn ? `reported ${c.ReportedOn}` : null));
 
   let closed = false;
@@ -6289,7 +6355,7 @@ async function openAddReportItem(reportId, onDone) {
       // Substring, anywhere, case-insensitive — against the same fields the columns
       // show. haystack is built once per row at load, so a keystroke is a scan of
       // strings already in memory rather than a request.
-      return !query || c.haystack.includes(query);
+      return matches(c);
     });
   }
 
@@ -6346,7 +6412,7 @@ async function openAddReportItem(reportId, onDone) {
     const row = $('.addpanel-statuses');
     const names = statuses.map((s) => s.name);
     const pool = all.filter((c) => (typeFilter === 'all' || c.ItemType === typeFilter)
-      && (showUsed || !c.Used) && (!query || c.haystack.includes(query)));
+      && (showUsed || !c.Used) && matches(c));
     const chip = (n, hits) => `<button type="button" class="btn btn-secondary addpanel-status ${statusFilter.has(n) ? 'selected' : ''} ${hits ? '' : 'addpanel-status-empty'}" data-status="${escapeHtml(n)}">${escapeHtml(n)} <span class="addpanel-chip-count">${hits}</span></button>`;
     const counts = new Map(names.map((n) => [n, pool.filter((c) => c.Status === n).length]));
     // The whole configured vocabulary is eighteen statuses, and most of them have
@@ -6395,6 +6461,10 @@ async function openAddReportItem(reportId, onDone) {
     syncFooter();
   });
 
+  $('.addpanel-oneoff').addEventListener('click', async () => {
+    const r = await oneOffReportItemDialog(reportId);
+    if (r) toast(r.message, 6000);
+  });
   $('.addpanel-q').addEventListener('input', (e) => {
     query = e.target.value.trim().toLowerCase();
     renderStatusChips(); render(); syncFooter();
@@ -6415,7 +6485,7 @@ async function openAddReportItem(reportId, onDone) {
     if (!items.length) return;
     addBtn.disabled = true; addBtn.textContent = 'Adding…';
     try {
-      await api(`/api/pg/board-reports/${reportId}/items`, {
+      const r = await api(`/api/pg/board-reports/${reportId}/items`, {
         method: 'POST', body: JSON.stringify({ items }),
       });
       // The panel stays open — adding one batch is rarely the whole job — but the rows
@@ -6425,7 +6495,13 @@ async function openAddReportItem(reportId, onDone) {
         if (c) { c.OnThisReport = true; c.Used = true; }
       }
       selected.clear();
-      toast(`Added ${items.length} item${items.length === 1 ? '' : 's'} to the draft`);
+      // Say what else moved: the items' own flags, and anything finished after this
+      // report's period, which waits for its own month instead of landing here.
+      const parts = [];
+      if (r.added) parts.push(`Added ${r.added} item${r.added === 1 ? '' : 's'} to the draft`);
+      if (r.sourceChanges?.length) parts.push(`checked "Include on board report" on ${r.sourceChanges.length} of them`);
+      if (r.deferred?.length) parts.push(r.deferred.join(' '));
+      toast(parts.join('. ') || 'Nothing added', r.deferred?.length ? 9000 : 4000);
       render();
     } catch (e) {
       toast(e.message, 5000);
@@ -6446,7 +6522,7 @@ async function openAddReportItem(reportId, onDone) {
       haystack: [c.Title, c.WoNumber, c.Place, c.Status, c.Subtitle, c.CompletedDate, c.ParentTitle,
         c.CompletedDate ? formatDateNice(c.CompletedDate) : null,
         TYPES.find((t) => t.key === c.ItemType)?.label]
-        .filter(Boolean).join(' ').toLowerCase(),
+        .filter(Boolean).map(searchNorm).join(' '),
     }));
   } catch (e) {
     body.innerHTML = `<p class="muted" style="padding:18px 0">Couldn't load the list: ${escapeHtml(e.message)}</p>`;

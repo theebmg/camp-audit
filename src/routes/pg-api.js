@@ -90,6 +90,7 @@ import {
   getExpensesReportRawData,
   getOrCreateDraftBoardReport,
   refreshBoardReportSuggestions,
+  addOneOffBoardReportItem,
   setWorkOrderResolution,
   createFollowUpWorkOrder,
   listFollowUps,
@@ -2292,11 +2293,26 @@ router.post('/board-reports/:id(\\d+)/items', async (req, res, next) => {
       return res.status(400).json({ ok: false, error: 'items with ItemType and ItemId are required' });
     }
     let items;
+    let added = 0;
+    const deferred = [];
+    const sourceChanges = [];
     for (const item of incoming) {
-      items = await addBoardReportItemManually(req.params.id, item);
-      if (!items) return res.status(404).json({ ok: false, error: 'Not found' });
+      const r = await addBoardReportItemManually(req.params.id, item);
+      if (!r) return res.status(404).json({ ok: false, error: 'Not found' });
+      if (r.sourceChange) sourceChanges.push(r.sourceChange);
+      if (r.deferred) deferred.push(r.message); else { added += 1; items = r.items; }
     }
-    res.json({ ok: true, items, added: incoming.length });
+    res.json({ ok: true, items, added, deferred, sourceChanges });
+  } catch (e) { next(e); }
+});
+
+// A one-off item typed on the report screen: becomes a flagged admin task (see db.js).
+router.post('/board-reports/:id(\\d+)/one-off', async (req, res, next) => {
+  try {
+    const { title, note, date } = req.body || {};
+    const result = await addOneOffBoardReportItem(Number(req.params.id), { title, note, date, createdBy: currentUsername() });
+    if (!result) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, ...result });
   } catch (e) { next(e); }
 });
 

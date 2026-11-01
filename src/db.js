@@ -6148,7 +6148,7 @@ export async function listBoardReportCandidates(reportId = null) {
     // Already on THIS draft — including rows sitting unchecked, because proposing to
     // add something that is already sitting on the screen is noise either way.
     reportId
-      ? pool.query('SELECT item_type, item_id FROM board_report_items WHERE report_id = $1', [reportId])
+      ? pool.query('SELECT item_type, item_id, item_date::text AS item_date FROM board_report_items WHERE report_id = $1', [reportId])
       : Promise.resolve({ rows: [] }),
     // Already reached the board. Newest first so a thing reported twice reads as the
     // most recent time it went out.
@@ -6169,14 +6169,16 @@ export async function listBoardReportCandidates(reportId = null) {
     if (cur === undefined || r.sort_order < cur) statusSort.set(r.name, r.sort_order);
   }
   const taskStatusSort = statusSort;
-  const draftKeys = new Set(onDraft.rows.map((r) => `${r.item_type}:${r.item_id}`));
+  // Calendar occurrences are one event on many dates, so their key carries the date.
+  const draftKeys = new Set(onDraft.rows.map((r) => (r.item_type === 'projected_occurrence'
+    ? `${r.item_type}:${r.item_id}:${r.item_date}` : `${r.item_type}:${r.item_id}`)));
   const reportedOn = new Map();
   for (const r of published.rows) {
     const k = `${r.item_type}:${r.item_id}`;
     if (!reportedOn.has(k)) reportedOn.set(k, r.label);
   }
   const mark = (c) => {
-    const k = `${c.ItemType}:${c.ItemId}`;
+    const k = c.ItemType === 'projected_occurrence' ? `${c.ItemType}:${c.ItemId}:${c.ItemDate}` : `${c.ItemType}:${c.ItemId}`;
     c.OnThisReport = draftKeys.has(k);
     c.ReportedOn = reportedOn.get(k) || null;
     return c;
@@ -6226,6 +6228,28 @@ export async function listBoardReportCandidates(reportId = null) {
       StatusSort: taskStatusSort.get(t.StatusName) ?? 999,
     }); }),
   ];
+  // Calendar events across this report's whole window (period through look-ahead). A
+  // preventive-maintenance occurrence that already made its work order is left out — the
+  // work order is in the list already.
+  if (reportId) {
+    const report = await getBoardReport(reportId);
+    if (report?.PeriodStart && (report.ForwardEnd || report.PeriodEnd)) {
+      const occs = await listCalendarEventOccurrences(report.PeriodStart, report.ForwardEnd || report.PeriodEnd);
+      const from = String(report.PeriodStart).slice(0, 10);
+      const to = String(report.ForwardEnd || report.PeriodEnd).slice(0, 10);
+      for (const o of occs) {
+        if (o.WorkOrderTemplateId && o.WorkOrderId) continue;
+        if (o.OccurrenceDate < from || o.OccurrenceDate > to) continue;
+        candidates.push(mark({
+          ItemType: 'projected_occurrence', ItemId: o.Id, ItemDate: o.OccurrenceDate, Title: o.Title,
+          WoNumber: null, Place: o.AssetName || null, Status: 'Scheduled',
+          Completed: false, CompletedDate: null,
+          Subtitle: o.TypeName || 'Calendar event', AssetName: o.AssetName || null, Date: o.OccurrenceDate,
+          StatusSort: statusSort.get('Scheduled') ?? 999,
+        }));
+      }
+    }
+  }
   return { candidates, statuses };
 }
 
@@ -6267,11 +6291,23 @@ export async function addBoardReportItemManually(reportId, item) {
   if (report.Status === 'published') {
     const e = new Error('Published reports are read-only'); e.status = 409; throw e;
   }
+  // Adding something IS checking its "Include on board report" — one switch everywhere.
+  const sourceChange = await mirrorBoardFlagToSource(item.ItemType, Number(item.ItemId), true);
+  // Finished work belongs to the report for the period it was finished in (1b). Picked here
+  // but finished after this period, it is flagged and waits for its own report rather than
+  // landing a month early.
+  const { completed, completedDate } = await boardItemCompletion(item.ItemType, item.ItemId);
+  const periodEnd = report.PeriodEnd ? String(report.PeriodEnd).slice(0, 10) : null;
+  if (completed && completedDate && periodEnd && completedDate > periodEnd) {
+    return { items: null, deferred: true, sourceChange,
+      message: `"${item.Title}" was finished ${completedDate}, after this report's period — it is flagged and will go on that month's report.` };
+  }
   const section = item.section || await boardSectionFor(item.ItemType, item.ItemId);
+  const itemDate = item.ItemType === 'projected_occurrence' ? (item.ItemDate || null) : null;
   // No pass token: a hand-added item belongs to no suggestion pass, and the prune
   // skips it anyway on manually_added.
   await upsertBoardReportItem(reportId, {
-    itemType: item.ItemType, itemId: item.ItemId, section,
+    itemType: item.ItemType, itemId: item.ItemId, itemDate, section,
     included: true, sortIndex: 0,
     parentWorkOrderId: item.ParentWorkOrderId ?? null,
     snapTitle: item.Title, snapSubtitle: item.Subtitle, snapAssetName: item.AssetName ?? null,
@@ -6280,10 +6316,37 @@ export async function addBoardReportItemManually(reportId, item) {
   });
   await pool.query(
     `UPDATE board_report_items SET manually_added = true, user_touched = true, included = true
-     WHERE report_id = $1 AND item_type = $2 AND item_id = $3`,
-    [reportId, item.ItemType, item.ItemId]
+     WHERE report_id = $1 AND item_type = $2 AND item_id = $3 AND item_date IS NOT DISTINCT FROM $4::date`,
+    [reportId, item.ItemType, item.ItemId, itemDate]
   );
-  return listBoardReportItems(reportId);
+  return { items: await listBoardReportItems(reportId), deferred: false, sourceChange };
+}
+
+// A one-off line for the report, typed on the report screen. It is a REAL admin task —
+// flagged, searchable, on the Admin Tasks list — not text that lives only on the report.
+// Dated inside this report's period it goes straight onto the draft; dated outside, it waits
+// for the report covering that date.
+export async function addOneOffBoardReportItem(reportId, { title, note, date, createdBy }) {
+  const report = await getBoardReport(reportId);
+  if (!report) return null;
+  if (report.Status === 'published') {
+    const e = new Error('Published reports are read-only'); e.status = 409; throw e;
+  }
+  if (!String(title || '').trim()) { const e = new Error('Give it a title'); e.status = 400; throw e; }
+  if (!date) { const e = new Error('Give it a date'); e.status = 400; throw e; }
+  const task = await createAdminTask({ title: String(title).trim(), description: note || null,
+    taskDate: date, includeInBoardReport: true, createdBy });
+  const from = String(report.PeriodStart).slice(0, 10);
+  const to = String(report.PeriodEnd).slice(0, 10);
+  if (date < from || date > to) {
+    return { task, added: false,
+      message: `Saved as an admin task. Its date is outside ${report.Title}, so it will go on the report for that month.` };
+  }
+  const r = await addBoardReportItemManually(reportId, {
+    ItemType: 'admin_task', ItemId: task.Id, Title: task.Title, Status: task.StatusName,
+    Date: task.TaskDate, section: 'admin_work',
+  });
+  return { task, added: true, items: r.items, message: `Added to ${report.Title} and saved as an admin task.` };
 }
 
 // What has actually reached the board. An item counts as reported ONLY if it was
