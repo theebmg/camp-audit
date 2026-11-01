@@ -238,6 +238,21 @@ Not done — each needs Ben's say-so, none is urgent:
    records. Not needed for anything to work.
 3. `expenses.fund_id` still exists beside `expenses.funding_source_id`; the form writes both.
 
+**2026-11-01 — board report "unchecked item still shows" fixed.** Job line 264 (call for
+blacktop estimates) was unchecked, but WO 174's header still listed it under "Still to do" —
+`snap_open_lines` / the "Completed:" progress were snapshots of every line on the WO. Now
+`workOrderRollupForReport(wo, reportId)` leaves out lines unchecked on that report, and toggling a
+line rewrites its WO's lists (`refreshWorkOrderLineLists`). The upsert no longer lets a pass
+overwrite `included` on a `user_touched` row (the admin-task pass used to re-tick them).
+**One switch:** the report checkbox and the item's own "Include on board report" (admin task
+`include_in_board_report`; WO / job line / finding `board_focus`) mirror each other both ways
+(`mirrorBoardFlagToSource`, `syncBoardDraftFromSource`), with a toast and an activity-log entry.
+`board_focus_set_at` is now stamped only on a real change (forms re-sent it on every save).
+
+**Proposed, not built — follow-up work orders (#2).** Findings reported to Ben, awaiting his
+decisions. Key fact: `work_orders.parent_wo_id` is already the SPLIT parent — a follow-up link
+must be a separate column (`follow_up_of_wo_id`).
+
 **Proposed, not built:** `docs/hosted-photo-page-proposal.md` — recommendation was to hold.
 
 **Known-harmless:** an empty second draft (#26) exists, the shell created when #1 published.
