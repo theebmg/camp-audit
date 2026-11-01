@@ -258,13 +258,26 @@ copied). Follow-ups screen (`followUps`, Daily nav) buckets by `due_date` (shown
 the WO form) — deferred WOs by revisit date. Scratch test passed; **not yet browser-checked** (the
 temp-admin insert was refused by the classifier this session).
 
-**Board report 1b — STOPPED, waiting on Ben (2026-11-01).** Completion dates are not reliable:
-no screen lets you enter a job line's completed date (API accepts `completedDate`, no form sends
-it), so marking Done stamps CURRENT_DATE. 13 lines on WO 54 were marked done on 2026-11-01 and are
-dated Nov 1 whatever day the work happened. Also: `suggestDoneJobLines` includes a line if EITHER
-completed_date OR completed_at is in the period (arrears lines land in the entry month), and a WO
-header is skipped once it has been on any published report (WO 54 was on September). Planned fix
-in the reply to Ben. #3 (add-to-report from the report screen) waits on 1b.
+**Board report 1b — built 2026-11-01.** Job lines have a Completed Date (edit card + grid
+`completed_date` column, non-cascade). Done section places a line by
+`COALESCE(completed_date, completed_at)` only. A WO heading appears every month it has lines; once
+it has been on a published report it is a "continued" heading with NO money on its row. Flagged
+work finished after a report's period waits for its own report. `board_reports.show_scheduled`
+(0120, default on, inherited) switches scheduled/overdue pickup for Coming Up. A draft whose title
+matches its dates is retitled when the period moves (`boardReportAutoTitle`). Draft #26 retitled
+"October 2026". The 13 lines marked done on Nov 1 (11 on WO 54, plus 268, 269) were re-dated to
+their scheduled dates with Ben's approval.
+
+**Report screen "Add to report" (#3) — built.** Existing panel now lists calendar events, matches
+words in any order, and adding an item mirrors its flag; finished-after-period items are flagged,
+not added. "One-off item" = `POST /board-reports/:id/one-off` → a flagged admin task (+ optional
+photo via `/attachments`). Follow-ups is a tab on Work Orders, not a menu item.
+
+**Open question for Ben:** WOs 176/177/178 were closed Nov 1, so their heading on the October
+report says completed Nov 1 while their lines say October. A WO's completion date is still the
+click date.
+
+**None of the Nov 1 UI is browser-checked** — the temp-admin insert was refused by the classifier.
 
 **Proposed, not built:** `docs/hosted-photo-page-proposal.md` — recommendation was to hold.
 
