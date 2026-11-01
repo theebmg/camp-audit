@@ -90,6 +90,8 @@ import {
   getExpensesReportRawData,
   getOrCreateDraftBoardReport,
   refreshBoardReportSuggestions,
+  getBoardFlag,
+  syncBoardDraftFromSource,
   getBoardReport,
   listBoardReports,
   updateBoardReport,
@@ -594,9 +596,13 @@ router.patch('/admin-tasks/:id(\\d+)', async (req, res, next) => {
     if ('categoryId' in body) fields.categoryId = body.categoryId ? Number(body.categoryId) : null;
     if ('recurringMonthlySavings' in body) fields.recurringMonthlySavings = adminTaskNumber(body.recurringMonthlySavings, 'Recurring monthly savings');
     if ('includeInBoardReport' in body) fields.includeInBoardReport = !!body.includeInBoardReport;
+    const flagWas = 'includeInBoardReport' in fields ? await getBoardFlag('admin_task', req.params.id) : null;
     const task = await updateAdminTask(req.params.id, fields);
     if (!task) return res.status(404).json({ ok: false, error: 'Task not found' });
-    res.json({ ok: true, task });
+    // The form sends the flag on every save; only a real change moves the report's checkbox.
+    const boardReportSync = flagWas !== null && flagWas !== fields.includeInBoardReport
+      ? await syncBoardDraftFromSource('admin_task', task.Id, fields.includeInBoardReport) : null;
+    res.json({ ok: true, task, boardReportSync });
   } catch (e) { next(e); }
 });
 router.delete('/admin-tasks/:id(\\d+)', async (req, res, next) => {
@@ -981,9 +987,12 @@ router.patch('/assets/:id(\\d+)', async (req, res, next) => {
 router.patch('/condition-findings/:id(\\d+)', async (req, res, next) => {
   try {
     const { boardFocus } = req.body || {};
+    const flagWas = await getBoardFlag('condition_finding', req.params.id);
     const finding = await updateConditionFinding(req.params.id, { boardFocus });
     if (!finding) return res.status(404).json({ ok: false, error: 'Condition Finding not found' });
-    res.json({ ok: true, finding });
+    const boardReportSync = flagWas !== !!boardFocus
+      ? await syncBoardDraftFromSource('condition_finding', finding.Id, !!boardFocus) : null;
+    res.json({ ok: true, finding, boardReportSync });
   } catch (e) { next(e); }
 });
 router.post('/condition-findings/:id(\\d+)/defer', async (req, res, next) => {
@@ -1586,17 +1595,22 @@ router.patch('/job-lines/:jobLineId(\\d+)', async (req, res, next) => {
     if (body.blockedReason !== undefined) fields.blocked_reason = body.blockedReason;
     if (body.blockedSince !== undefined) fields.blocked_since = body.blockedSince;
     if (body.completedDate !== undefined) fields.completed_date = body.completedDate;
-    if (body.boardFocus !== undefined) {
+    const jlFlagWas = body.boardFocus !== undefined ? await getBoardFlag('job_line', req.params.jobLineId) : null;
+    const jlFlagChanged = body.boardFocus !== undefined && jlFlagWas !== !!body.boardFocus;
+    if (jlFlagChanged) {
       fields.board_focus = !!body.boardFocus;
       // Stamped on set, cleared on unset, so "featured since March" has a date and a
-      // re-flag doesn't inherit the old one. Same rule as the work order's flag.
+      // re-flag doesn't inherit the old one. Same rule as the work order's flag. Only on a
+      // real change: the form sends the flag on every save, which was re-dating it each time.
       fields.board_focus_set_at = body.boardFocus ? new Date() : null;
     }
     if (body.causeIds !== undefined) fields.causeIds = (body.causeIds || []).map(Number);
     if (body.reopenWorkOrder) fields.reopen = { reason: body.reopenReason || null };
     const jobLine = await updateJobLine(req.params.jobLineId, fields);
     if (!jobLine) return res.status(404).json({ ok: false, error: 'Job line not found' });
-    res.json({ ok: true, jobLine });
+    const boardReportSync = jlFlagChanged
+      ? await syncBoardDraftFromSource('job_line', Number(req.params.jobLineId), !!body.boardFocus) : null;
+    res.json({ ok: true, jobLine, boardReportSync });
   } catch (e) { next(e); }
 });
 router.delete('/job-lines/:jobLineId(\\d+)', async (req, res, next) => {
@@ -1835,10 +1849,12 @@ router.patch('/work-orders/:id(\\d+)', async (req, res, next) => {
     if (body.assetId !== undefined) fields.asset_id = body.assetId === '' ? null : Number(body.assetId);
     if (body.dateReported !== undefined) fields.date_reported = body.dateReported;
     if (body.dateCompleted !== undefined) fields.date_completed = body.dateCompleted;
-    if (body.boardFocus !== undefined) {
+    const woFlagWas = body.boardFocus !== undefined ? await getBoardFlag('work_order', req.params.id) : null;
+    const woFlagChanged = body.boardFocus !== undefined && woFlagWas !== !!body.boardFocus;
+    if (woFlagChanged) {
       fields.board_focus = !!body.boardFocus;
       // Stamped when set, cleared when unset, so "featured since March" has a date and
-      // a re-feature doesn't inherit the old one.
+      // a re-feature doesn't inherit the old one. Only on a real change.
       fields.board_focus_set_at = body.boardFocus ? new Date() : null;
     }
     // "Yes, mark the open lines too" — the answer to the 409 this same call returns
@@ -1846,7 +1862,9 @@ router.patch('/work-orders/:id(\\d+)', async (req, res, next) => {
     if (body.resolveOpenLines) fields.resolveOpenLines = true;
     const detail = await updateWorkOrder(req.params.id, fields);
     if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
-    res.json({ ok: true, ...detail });
+    const boardReportSync = woFlagChanged
+      ? await syncBoardDraftFromSource('work_order', Number(req.params.id), !!body.boardFocus) : null;
+    res.json({ ok: true, ...detail, boardReportSync });
   } catch (e) { next(e); }
 });
 
@@ -2219,7 +2237,7 @@ router.patch('/board-reports/:id(\\d+)/items/:itemId(\\d+)', async (req, res, ne
       items = await setBoardReportItemFields(req.params.id, req.params.itemId, { displayMode, reportNote });
     }
     if (!items) return res.status(404).json({ ok: false, error: 'Not found' });
-    res.json({ ok: true, items });
+    res.json({ ok: true, items, sourceChanges: items.sourceChanges || [] });
   } catch (e) { next(e); }
 });
 

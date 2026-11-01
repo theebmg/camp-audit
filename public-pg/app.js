@@ -2240,7 +2240,10 @@ async function renderAssetDetail({ id }, container = app) {
     renderAssetDetail({ id }, container);
   }));
   container.querySelectorAll('.toggle-board-focus').forEach((el) => el.addEventListener('click', async () => {
-    await api(`/api/pg/condition-findings/${el.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ boardFocus: el.dataset.next === 'true' }) });
+    try {
+      const r = await api(`/api/pg/condition-findings/${el.dataset.id}`, { method: 'PATCH', body: JSON.stringify({ boardFocus: el.dataset.next === 'true' }) });
+      if (r.boardReportSync) toast(r.boardReportSync, 6000);
+    } catch (err) { toast(saveErrorMessage(err), 8000); return; }
     renderAssetDetail({ id }, container);
   }));
   container.querySelectorAll('.finding-defer-toggle').forEach((el) => el.addEventListener('click', () => {
@@ -5054,8 +5057,8 @@ async function renderAdminTaskDetail({ id } = {}) {
     };
     try {
       if (id) {
-        await api(`/api/pg/admin-tasks/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
-        toast('Task saved');
+        const r = await api(`/api/pg/admin-tasks/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+        toast(r.boardReportSync ? `Task saved. ${r.boardReportSync}` : 'Task saved', r.boardReportSync ? 6000 : 2500);
         go('adminTasks', {}, { replace: true });
       } else {
         const { task: created } = await api('/api/pg/admin-tasks', { method: 'POST', body: JSON.stringify(payload) });
@@ -6066,6 +6069,14 @@ async function renderBoardReport(params = {}) {
           method: 'PATCH', body: JSON.stringify({ included: cb.checked }),
         });
         items = r.items; draw();
+        // The report checkbox and the item's own "Include on board report" are one switch;
+        // say where else it just moved, so the change is not a surprise later.
+        const moved = r.sourceChanges || [];
+        if (moved.length === 1) {
+          toast(`Also ${moved[0].On ? 'checked' : 'unchecked'} "Include on board report" on the ${moved[0].Noun} "${moved[0].Title}".`, 6000);
+        } else if (moved.length > 1) {
+          toast(`Also ${moved[0].On ? 'checked' : 'unchecked'} "Include on board report" on ${moved.length} items (${moved.map((m) => m.Noun).filter((v, i, a) => a.indexOf(v) === i).join(', ')}).`, 6000);
+        }
       } catch (err) {
         // Nothing was typed here, so putting the tick back is honest — with a reason.
         cb.checked = !cb.checked;
@@ -15294,7 +15305,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
         }),
       }));
       if (!saved) { toast('Left unchanged — the work order is still open'); return; }
-      toast('Work order updated');
+      toast(saved.boardReportSync ? `Work order updated. ${saved.boardReportSync}` : 'Work order updated', saved.boardReportSync ? 6000 : 2500);
       renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message, 5000); }
   });
@@ -15490,7 +15501,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
           causeIds,
         }) }));
         if (!saved) { toast('Nothing saved — the work order is still closed'); return; }
-        toast(saved.jobLine?.ReopenedWorkOrder ? 'Reopened to Review, and the line was saved' : 'Job line saved');
+        const jlMsg = saved.jobLine?.ReopenedWorkOrder ? 'Reopened to Review, and the line was saved' : 'Job line saved';
+        toast(saved.boardReportSync ? `${jlMsg}. ${saved.boardReportSync}` : jlMsg, saved.boardReportSync ? 6000 : 2500);
         renderWorkOrderDetail({ id }, container);
       } catch (err) { toast(err.message); }
     });

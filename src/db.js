@@ -6271,7 +6271,7 @@ export async function addBoardReportItemManually(reportId, item) {
     snapHours: item.Hours ?? null, snapCost: item.Cost ?? null,
   });
   await pool.query(
-    `UPDATE board_report_items SET manually_added = true, user_touched = true
+    `UPDATE board_report_items SET manually_added = true, user_touched = true, included = true
      WHERE report_id = $1 AND item_type = $2 AND item_id = $3`,
     [reportId, item.ItemType, item.ItemId]
   );
@@ -6354,7 +6354,7 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
     // were — a work order with new lines this period still needs its header.
     if (!woSeen.has(r.work_order_id) && !reported.has(reportedKey('work_order', r.work_order_id))) {
       woSeen.add(r.work_order_id);
-      const roll = await workOrderRollupForReport(r.work_order_id);
+      const roll = await workOrderRollupForReport(r.work_order_id, reportId);
       await upsertBoardReportItem(reportId, { passId,
         itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
         snapTitle: r.wo_title, snapAssetName: r.asset_name,
@@ -6657,7 +6657,15 @@ async function jobLineFundingForReport(jobLineIds) {
   return byLine;
 }
 
-async function workOrderRollupForReport(workOrderId) {
+// A line unchecked on the report must not come back as a title under its work order's
+// header ("Still to do: …" / "Completed: …"). Those lists are snapshots of the WO's lines, so
+// they need telling which ones the user removed — that is how the asphalt-pricing call stayed
+// on the October draft after its own row was unchecked.
+const NOT_EXCLUDED_ON_REPORT = `NOT EXISTS (
+  SELECT 1 FROM board_report_items bx
+  WHERE bx.report_id = $2 AND bx.item_type = 'job_line' AND bx.item_id = jl.id AND NOT bx.included)`;
+
+async function workOrderRollupForReport(workOrderId, reportId = null) {
   const { rows } = await pool.query(
     `SELECT
        COALESCE(SUM(${JOB_LINE_ACTUAL_COST_EXPR}), 0)                        AS actual_cost,
@@ -6747,8 +6755,9 @@ async function workOrderRollupForReport(workOrderId) {
     const done = await pool.query(
       `SELECT jl.title FROM job_lines jl JOIN job_line_statuses jls ON jls.id = jl.status_id
        WHERE jl.work_order_id = $1 AND jls.is_terminal AND jls.counts_as_work_performed
+         AND ${NOT_EXCLUDED_ON_REPORT}
        ORDER BY jl.completed_date DESC NULLS LAST, jl.id DESC LIMIT 4`,
-      [workOrderId]
+      [workOrderId, reportId]
     );
     if (done.rows.length) {
       const titles = done.rows.map((x) => String(x.title).split(/[,.]/)[0].trim().slice(0, 40));
@@ -6759,9 +6768,9 @@ async function workOrderRollupForReport(workOrderId) {
   // What the job still has left, for "Still to do" under an open work order.
   const { rows: open } = await pool.query(
     `SELECT jl.title FROM job_lines jl JOIN job_line_statuses jls ON jls.id = jl.status_id
-     WHERE jl.work_order_id = $1 AND NOT jls.is_terminal
+     WHERE jl.work_order_id = $1 AND NOT jls.is_terminal AND ${NOT_EXCLUDED_ON_REPORT}
      ORDER BY jl.sort_order, jl.id LIMIT 12`,
-    [workOrderId]
+    [workOrderId, reportId]
   );
 
   return {
@@ -7078,7 +7087,7 @@ async function suggestFlaggedItems(reportId, passId, reported) {
       [reportId, r.id, passId]
     );
     const anchorsDone = existing[0]?.section === 'done';
-    const roll = await workOrderRollupForReport(r.id);
+    const roll = await workOrderRollupForReport(r.id, reportId);
     await upsertBoardReportItem(reportId, { passId,
       itemType: 'work_order', itemId: r.id,
       section: (r.is_terminal || anchorsDone) ? 'done' : 'coming_up', sortIndex: 3000 + i,
@@ -7433,7 +7442,10 @@ export async function upsertBoardReportItem(reportId, {
      -- could never find the existing row and every pass inserted a duplicate.
      ON CONFLICT (report_id, item_type, item_id, (COALESCE(item_date, DATE '1900-01-01'))) DO UPDATE SET
        section      = EXCLUDED.section,
-       included     = COALESCE($6, board_report_items.included),
+       -- A manual check/uncheck always wins. The admin-task pass sends the task's own flag
+       -- every time, and this used to let it re-tick a row the user had just unticked.
+       included     = CASE WHEN board_report_items.user_touched THEN board_report_items.included
+                           ELSE COALESCE($6, board_report_items.included) END,
        display_mode = COALESCE($7, board_report_items.display_mode),
        report_note  = COALESCE($8, board_report_items.report_note),
        snap_title   = COALESCE(EXCLUDED.snap_title, board_report_items.snap_title),
@@ -7490,23 +7502,120 @@ async function assertReportEditable(reportId) {
   }
 }
 
-export async function setBoardReportItemIncluded(reportId, itemId, included) {
-  await assertReportEditable(reportId);
+// Every "Include on board report" switch in the app is one switch (Ben, Nov 2026): the report
+// checkbox and the flag on the admin task / work order / job line / finding move together,
+// like a three-way light switch. Turning either one changes the other, and says so.
+const BOARD_FLAG_SOURCES = {
+  admin_task:        { table: 'admin_tasks',        col: 'include_in_board_report', noun: 'admin task' },
+  work_order:        { table: 'work_orders',        col: 'board_focus', stamped: true, noun: 'work order' },
+  job_line:          { table: 'job_lines',          col: 'board_focus', stamped: true, noun: 'job line' },
+  condition_finding: { table: 'condition_findings', col: 'board_focus', stamped: true, noun: 'finding' },
+};
+
+export async function getBoardFlag(itemType, itemId) {
+  const src = BOARD_FLAG_SOURCES[itemType];
+  if (!src) return null;
+  const { rows } = await pool.query(`SELECT ${src.col} AS on FROM ${src.table} WHERE id = $1`, [itemId]);
+  return rows[0] ? rows[0].on === true : null;
+}
+
+// Report -> source. Writes only when the flag actually differs, and returns what it changed
+// so the screen can say "also turned off on the admin task".
+async function mirrorBoardFlagToSource(itemType, itemId, on) {
+  const src = BOARD_FLAG_SOURCES[itemType];
+  if (!src) return null;
   const { rows } = await pool.query(
-    `UPDATE board_report_items SET included = $3, user_touched = true
-     WHERE report_id = $1 AND id = $2 RETURNING item_type, item_id`,
-    [reportId, itemId, !!included]
+    `UPDATE ${src.table} SET ${src.col} = $2
+       ${src.stamped ? ', board_focus_set_at = CASE WHEN $2 THEN COALESCE(board_focus_set_at, now()) ELSE NULL END' : ''}
+     WHERE id = $1 AND ${src.col} IS DISTINCT FROM $2 RETURNING id, title`,
+    [itemId, on]
   );
   if (!rows[0]) return null;
-  if (rows[0].item_type === 'work_order') {
-    await pool.query(
+  await logActivity({ action: 'updated', entityType: itemType, entityId: rows[0].id, entityLabel: rows[0].title,
+    details: on ? 'Included on board report (checked on the report screen)'
+                : 'Removed from board report (unchecked on the report screen)' });
+  return { ItemType: itemType, ItemId: rows[0].id, Title: rows[0].title, Noun: src.noun, On: on };
+}
+
+// The "Still to do" / "Completed" titles on a work order's row are snapshots, so a line
+// checked or unchecked under it has to rewrite them, not wait for the next refresh.
+async function refreshWorkOrderLineLists(reportId, workOrderId) {
+  if (!workOrderId) return;
+  const { rows } = await pool.query(
+    `SELECT ws.is_terminal FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
+    [workOrderId]
+  );
+  if (!rows[0]) return;
+  const roll = await workOrderRollupForReport(workOrderId, reportId);
+  const open = !rows[0].is_terminal;
+  await pool.query(
+    `UPDATE board_report_items SET snap_open_lines = $3::jsonb, snap_progress = $4
+     WHERE report_id = $1 AND item_type = 'work_order' AND item_id = $2`,
+    [reportId, workOrderId,
+      open && roll.openLines.length ? JSON.stringify(roll.openLines) : null,
+      open ? roll.progress : null]
+  );
+}
+
+export async function setBoardReportItemIncluded(reportId, itemId, included, { mirror = true } = {}) {
+  await assertReportEditable(reportId);
+  const on = !!included;
+  const { rows } = await pool.query(
+    `UPDATE board_report_items SET included = $3, user_touched = true
+     WHERE report_id = $1 AND id = $2 RETURNING item_type, item_id, parent_work_order_id`,
+    [reportId, itemId, on]
+  );
+  if (!rows[0]) return null;
+  const { item_type: type, item_id: sourceId } = rows[0];
+  const sourceChanges = [];
+  if (mirror) {
+    const c = await mirrorBoardFlagToSource(type, sourceId, on);
+    if (c) sourceChanges.push(c);
+  }
+  if (type === 'work_order') {
+    const { rows: kids } = await pool.query(
       `UPDATE board_report_items SET included = $3, user_touched = true
        WHERE report_id = $1 AND item_type = 'job_line'
-         AND item_id IN (SELECT id FROM job_lines WHERE work_order_id = $2)`,
-      [reportId, rows[0].item_id, !!included]
+         AND item_id IN (SELECT id FROM job_lines WHERE work_order_id = $2)
+       RETURNING item_id`,
+      [reportId, sourceId, on]
     );
+    // Unchecking a work order unchecks its lines, so a flag on one of those lines must go too
+    // or it is a switch left on in another room. Checking it does not feature every line.
+    if (mirror && !on) {
+      for (const k of kids) {
+        const c = await mirrorBoardFlagToSource('job_line', k.item_id, false);
+        if (c) sourceChanges.push(c);
+      }
+    }
+  } else if (type === 'job_line') {
+    const { rows: jl } = await pool.query('SELECT work_order_id FROM job_lines WHERE id = $1', [sourceId]);
+    await refreshWorkOrderLineLists(reportId, rows[0].parent_work_order_id || jl[0]?.work_order_id);
   }
-  return listBoardReportItems(reportId);
+  const items = await listBoardReportItems(reportId);
+  items.sourceChanges = sourceChanges;
+  return items;
+}
+
+// Source -> report. Called when an "Include on board report" flag is changed on the item
+// itself; sets the draft's checkbox to match (as a user decision, so no pass overrides it).
+// Returns a sentence for the screen, or null when there is no draft to tell about.
+export async function syncBoardDraftFromSource(itemType, itemId, on) {
+  const { rows: drafts } = await pool.query(`SELECT id, title FROM board_reports WHERE status = 'draft' LIMIT 1`);
+  const draft = drafts[0];
+  if (!draft) return null;
+  const { rows } = await pool.query(
+    `SELECT id FROM board_report_items WHERE report_id = $1 AND item_type = $2 AND item_id = $3`,
+    [draft.id, itemType, itemId]
+  );
+  if (rows[0]) {
+    await setBoardReportItemIncluded(draft.id, rows[0].id, on, { mirror: false });
+    return on ? `Also checked on the ${draft.title} board report draft.`
+              : `Also unchecked on the ${draft.title} board report draft.`;
+  }
+  // An admin task still needs a date inside the period to be suggested; a flagged work order,
+  // line or finding goes on whatever its dates.
+  return on && itemType !== 'admin_task' ? `It will appear on the ${draft.title} board report draft.` : null;
 }
 
 export async function setBoardReportItemFields(reportId, itemId, { displayMode, reportNote }) {
