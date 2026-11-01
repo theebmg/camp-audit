@@ -1552,6 +1552,9 @@ export async function getWorkOrderDetail(woId) {
       Description: w.description,
       BoardFocus: w.board_focus,
       WoNumber: w.wo_number, ParentWoId: w.parent_wo_id, SplitRootId: w.split_root_id,
+      DueDate: w.due_date,
+      ResolutionType: w.resolution_type, FollowUpDeclinedReason: w.follow_up_declined_reason,
+      ...(await workOrderFollowUpLinks(w)),
       // null = this WO follows the global cascade default (§3.7).
       CascadeConfig: normalizeCascadeConfig(w.cascade_config),
       Asset: w.asset_id ? { Id: w.asset_id, Name: w.asset_name, LodgeHolder: w.asset_lodge_holder } : null,
@@ -1990,7 +1993,7 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
 }
 
 export async function updateWorkOrder(woId, fields) {
-  const allowed = ['title', 'description', 'priority', 'date_reported', 'date_completed', 'asset_id', 'board_focus', 'board_focus_set_at'];
+  const allowed = ['title', 'description', 'priority', 'date_reported', 'date_completed', 'asset_id', 'board_focus', 'board_focus_set_at', 'due_date'];
   const setCols = [];
   const vals = [];
   let i = 1;
@@ -4057,6 +4060,7 @@ function jobLineRowShape(r) {
     BlockedReason: r.blocked_reason, BlockedSince: r.blocked_since, CompletedDate: r.completed_date,
     ConditionFindingId: r.condition_finding_id,
     BoardFocus: r.board_focus, BoardFocusSetAt: r.board_focus_set_at,
+    ResolutionType: r.resolution_type || null,
     // Grid-only rendering metadata (§3): which cascade columns this line had
     // PINNED when it was last saved. The real columns above are always fully
     // stamped, so nothing outside the grid ever needs to read this.
@@ -4253,7 +4257,7 @@ const JOB_LINE_UPDATE_COLUMNS = [
   'estimated_hours', 'actual_hours', 'estimated_cost', 'actual_cost', 'scheduled_date',
   'scheduled_start_time', 'scheduled_duration_hours',
   'complaint', 'cause_note', 'correction', 'blocked_reason', 'blocked_since', 'completed_date',
-  'condition_finding_id', 'board_focus', 'board_focus_set_at',
+  'condition_finding_id', 'board_focus', 'board_focus_set_at', 'resolution_type',
 ];
 // Any of these changing is a calendar-visible move — the job-line edit
 // form's Scheduled Date field and the Calendar's drag-to-reschedule both
@@ -9742,6 +9746,129 @@ export async function splitWorkOrder(woId, jobLineIds) {
   } finally {
     client.release();
   }
+}
+
+// ── Follow-up work orders (0119) ─────────────────────────────────────────
+// A follow-up is a NEW work order created after the fact because a fix was temporary or only
+// part-done. It is deliberately not a split: it has its own number, its own money, and is linked
+// by follow_up_of_wo_id rather than parent_wo_id, so split-family totals never include it.
+
+export const RESOLUTION_TYPES = ['permanent', 'interim', 'partial'];
+
+// Both directions for the detail screen: where this one came from, and what came from it.
+async function workOrderFollowUpLinks(w) {
+  const [from, kids, line] = await Promise.all([
+    w.follow_up_of_wo_id ? pool.query(
+      `SELECT w.id, w.wo_number, w.title, ws.name AS status, ws.color, ws.is_terminal
+       FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
+      [w.follow_up_of_wo_id]) : { rows: [] },
+    pool.query(
+      `SELECT w.id, w.wo_number, w.title, ws.name AS status, ws.color, ws.is_terminal, w.due_date::text AS due_date
+       FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id
+       WHERE w.follow_up_of_wo_id = $1 ORDER BY w.id`, [w.id]),
+    w.follow_up_of_job_line_id
+      ? pool.query('SELECT id, title FROM job_lines WHERE id = $1', [w.follow_up_of_job_line_id]) : { rows: [] },
+  ]);
+  const shape = (r) => ({ Id: r.id, WoNumber: r.wo_number, Title: r.title, Status: r.status,
+    StatusColor: r.color, StatusIsTerminal: r.is_terminal, DueDate: r.due_date || null });
+  return {
+    FollowUpOf: from.rows[0] ? shape(from.rows[0]) : null,
+    FollowUpOfJobLine: line.rows[0] ? { Id: line.rows[0].id, Title: line.rows[0].title } : null,
+    FollowUps: kids.rows.map(shape),
+  };
+}
+
+// Set at close-out. "No follow-up" needs a reason, so an Interim tag never means "forgot".
+export async function setWorkOrderResolution(woId, { resolutionType, declineFollowUp = false, declinedReason = null }) {
+  if (resolutionType != null && !RESOLUTION_TYPES.includes(resolutionType)) {
+    const e = new Error('Resolution must be Permanent, Interim or Partial'); e.status = 400; throw e;
+  }
+  const needsFollowUp = resolutionType === 'interim' || resolutionType === 'partial';
+  if (needsFollowUp && declineFollowUp && !String(declinedReason || '').trim()) {
+    const e = new Error('Say briefly why no follow-up is needed'); e.status = 400; throw e;
+  }
+  const reason = needsFollowUp && declineFollowUp ? String(declinedReason).trim() : null;
+  const { rows } = await pool.query(
+    `UPDATE work_orders SET resolution_type = $2, follow_up_declined_reason = $3 WHERE id = $1 RETURNING id, title`,
+    [woId, resolutionType || null, reason]
+  );
+  if (!rows[0]) return null;
+  const label = resolutionType ? resolutionType[0].toUpperCase() + resolutionType.slice(1) : 'not set';
+  await logActivity({ action: 'updated', entityType: 'work_order', entityId: rows[0].id, entityLabel: rows[0].title,
+    details: `Resolution: ${label}${reason ? ` — no follow-up: ${reason}` : ''}` });
+  return getWorkOrderDetail(woId);
+}
+
+// Creates the follow-up from the form the user confirmed. Photos are LINKED, not copied: the
+// same file now shows on both work orders, so nothing is duplicated in storage.
+export async function createFollowUpWorkOrder(originalId, {
+  title, priority, dueDate, description, assetId, locationId, jobLineId = null, attachmentIds = [],
+}) {
+  const { rows: orig } = await pool.query('SELECT id, wo_number, title, asset_id, location_id, priority FROM work_orders WHERE id = $1', [originalId]);
+  const o = orig[0];
+  if (!o) { const e = new Error('Work order not found'); e.status = 404; throw e; }
+  if (jobLineId) {
+    const { rows } = await pool.query('SELECT 1 FROM job_lines WHERE id = $1 AND work_order_id = $2', [jobLineId, originalId]);
+    if (!rows[0]) { const e = new Error('That job line is not on the original work order'); e.status = 400; throw e; }
+  }
+  const result = await createWorkOrder({
+    title: String(title || '').trim() || `Follow-up: ${o.title}`,
+    assetId: assetId === undefined ? o.asset_id : (assetId || null),
+    locationId: locationId === undefined ? o.location_id : (locationId || null),
+    priority: priority || o.priority, description: description || null,
+  });
+  const newId = result.workOrderId;
+  await pool.query(
+    `UPDATE work_orders SET follow_up_of_wo_id = $2, follow_up_of_job_line_id = $3, due_date = $4 WHERE id = $1`,
+    [newId, originalId, jobLineId || null, dueDate || null]
+  );
+  // A follow-up now exists, so a "no follow-up because…" note on the original is no longer true.
+  await pool.query('UPDATE work_orders SET follow_up_declined_reason = NULL WHERE id = $1', [originalId]);
+  for (const aid of [...new Set((attachmentIds || []).map(Number).filter(Boolean))]) {
+    const { rows } = await pool.query(
+      `SELECT 1 FROM attachment_links WHERE attachment_id = $1 AND entity_type = 'work_order' AND entity_id = $2`, [aid, newId]);
+    if (!rows[0]) await linkAttachment(aid, { entityType: 'work_order', entityId: newId });
+  }
+  await logActivity({ action: 'created', entityType: 'work_order', entityId: newId, entityLabel: title,
+    details: `Follow-up of WO ${o.wo_number || o.id}` });
+  return { workOrderId: newId };
+}
+
+// The running list: open follow-ups, deferred work orders (a deferred WO is its own follow-up,
+// dated by its revisit date), and interim/partial fixes nobody has decided about yet.
+// Near-term vs long-term is worked out from the target date on the screen — no stored horizon.
+export async function listFollowUps({ includeClosed = false } = {}) {
+  const { rows } = await pool.query(
+    `SELECT w.id, w.wo_number, w.title, w.priority, ws.name AS status, ws.color AS status_color,
+            ws.is_terminal, w.due_date::text AS due_date, w.revisit_date::text AS revisit_date,
+            w.deferred_reason, w.resolution_type, w.follow_up_declined_reason,
+            COALESCE(a.name, l.name) AS place,
+            o.id AS from_id, o.wo_number AS from_number, o.title AS from_title, o.resolution_type AS from_resolution,
+            jl.title AS from_line_title,
+            CASE WHEN w.follow_up_of_wo_id IS NOT NULL THEN 'follow_up'
+                 WHEN ws.name = 'Deferred' THEN 'deferred'
+                 ELSE 'undecided' END AS kind
+     FROM work_orders w
+     JOIN work_order_statuses ws ON ws.id = w.status_id
+     LEFT JOIN assets a ON a.id = w.asset_id
+     LEFT JOIN locations l ON l.id = w.location_id
+     LEFT JOIN work_orders o ON o.id = w.follow_up_of_wo_id
+     LEFT JOIN job_lines jl ON jl.id = w.follow_up_of_job_line_id
+     WHERE (w.follow_up_of_wo_id IS NOT NULL AND ($1 OR NOT ws.is_terminal))
+        OR ws.name = 'Deferred'
+        OR (w.resolution_type IN ('interim', 'partial') AND w.follow_up_declined_reason IS NULL
+            AND NOT EXISTS (SELECT 1 FROM work_orders f WHERE f.follow_up_of_wo_id = w.id))
+     ORDER BY COALESCE(w.due_date, w.revisit_date) NULLS LAST, w.id`,
+    [!!includeClosed]
+  );
+  return rows.map((r) => ({
+    Id: r.id, WoNumber: r.wo_number, Title: r.title, Priority: r.priority,
+    Status: r.status, StatusColor: r.status_color, StatusIsTerminal: r.is_terminal,
+    Kind: r.kind, TargetDate: r.kind === 'deferred' ? (r.revisit_date || r.due_date) : r.due_date,
+    DeferredReason: r.deferred_reason, ResolutionType: r.resolution_type, Place: r.place,
+    FromId: r.from_id, FromNumber: r.from_number, FromTitle: r.from_title,
+    FromResolution: r.from_resolution, FromLineTitle: r.from_line_title,
+  }));
 }
 
 // Family rollup (§5.4) — every sibling off the same root, with a combined

@@ -90,6 +90,9 @@ import {
   getExpensesReportRawData,
   getOrCreateDraftBoardReport,
   refreshBoardReportSuggestions,
+  setWorkOrderResolution,
+  createFollowUpWorkOrder,
+  listFollowUps,
   getBoardFlag,
   syncBoardDraftFromSource,
   getBoardReport,
@@ -1595,6 +1598,12 @@ router.patch('/job-lines/:jobLineId(\\d+)', async (req, res, next) => {
     if (body.blockedReason !== undefined) fields.blocked_reason = body.blockedReason;
     if (body.blockedSince !== undefined) fields.blocked_since = body.blockedSince;
     if (body.completedDate !== undefined) fields.completed_date = body.completedDate;
+    if (body.resolutionType !== undefined) {
+      if (body.resolutionType && !['permanent', 'interim', 'partial'].includes(body.resolutionType)) {
+        return res.status(400).json({ ok: false, error: 'Resolution must be Permanent, Interim or Partial' });
+      }
+      fields.resolution_type = body.resolutionType || null;
+    }
     const jlFlagWas = body.boardFocus !== undefined ? await getBoardFlag('job_line', req.params.jobLineId) : null;
     const jlFlagChanged = body.boardFocus !== undefined && jlFlagWas !== !!body.boardFocus;
     if (jlFlagChanged) {
@@ -1760,6 +1769,34 @@ router.post('/work-orders', async (req, res, next) => {
 // §8's scheduler-ready endpoint. Called for real it creates and returns a
 // work order; called with dryRun it resolves the template's lines — pinned
 // state included — for the grid to prefill without writing anything.
+// ---- Follow-up work orders (0119) ----
+router.get('/follow-ups', async (req, res, next) => {
+  try {
+    res.json({ ok: true, followUps: await listFollowUps({ includeClosed: req.query.closed === '1' }) });
+  } catch (e) { next(e); }
+});
+router.patch('/work-orders/:id(\\d+)/resolution', async (req, res, next) => {
+  try {
+    const { resolutionType, declineFollowUp, declinedReason } = req.body || {};
+    const detail = await setWorkOrderResolution(Number(req.params.id), { resolutionType, declineFollowUp, declinedReason });
+    if (!detail) return res.status(404).json({ ok: false, error: 'Work Order not found' });
+    res.json({ ok: true, ...detail });
+  } catch (e) { next(e); }
+});
+router.post('/work-orders/:id(\\d+)/follow-ups', async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const result = await createFollowUpWorkOrder(Number(req.params.id), {
+      title: b.title, priority: b.priority, dueDate: b.dueDate || null, description: b.description,
+      assetId: b.assetId === undefined ? undefined : (b.assetId ? Number(b.assetId) : null),
+      locationId: b.locationId === undefined ? undefined : (b.locationId ? Number(b.locationId) : null),
+      jobLineId: b.jobLineId ? Number(b.jobLineId) : null,
+      attachmentIds: Array.isArray(b.attachmentIds) ? b.attachmentIds : [],
+    });
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
 router.post('/work-orders/from-template', async (req, res, next) => {
   try {
     const { templateId, scheduledDate, assetId, locationId, overrides, dryRun } = req.body || {};
@@ -1849,6 +1886,7 @@ router.patch('/work-orders/:id(\\d+)', async (req, res, next) => {
     if (body.assetId !== undefined) fields.asset_id = body.assetId === '' ? null : Number(body.assetId);
     if (body.dateReported !== undefined) fields.date_reported = body.dateReported;
     if (body.dateCompleted !== undefined) fields.date_completed = body.dateCompleted;
+    if (body.dueDate !== undefined) fields.due_date = body.dueDate || null;
     const woFlagWas = body.boardFocus !== undefined ? await getBoardFlag('work_order', req.params.id) : null;
     const woFlagChanged = body.boardFocus !== undefined && woFlagWas !== !!body.boardFocus;
     if (woFlagChanged) {

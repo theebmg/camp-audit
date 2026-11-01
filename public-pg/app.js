@@ -987,6 +987,7 @@ const NAV_ITEMS = [
   { icon: '📅', label: 'Calendar', view: 'calendar' },
   { icon: '📥', label: 'Inbox', view: 'inbox' },
   { icon: '🗂️', label: 'Admin Tasks', view: 'adminTasks' },
+  { icon: '↪️', label: 'Follow-ups', view: 'followUps' },
   { icon: '📝', label: 'Start Audit', view: 'auditPicker' },
   { icon: '📋', label: 'Audit Rounds', view: 'auditRounds' },
   { icon: '🗺️', label: 'Map', view: 'map' },
@@ -1027,7 +1028,7 @@ async function refreshNavBadges() {
 // the sidebar's reorder mode, and the result is saved to display_settings
 // (nav_layout). The trailing null-header section renders without a label.
 const DEFAULT_NAV_LAYOUT = [
-  { header: 'Daily', items: ['dashboard', 'workOrders', 'incoming', 'calendar', 'inbox', 'adminTasks'] },
+  { header: 'Daily', items: ['dashboard', 'workOrders', 'followUps', 'incoming', 'calendar', 'inbox', 'adminTasks'] },
   { header: 'Field', items: ['auditPicker', 'auditRounds', 'map', 'locations', 'notes', 'visits'] },
   { header: 'Money', items: ['expenses', 'materials', 'capitalPlan'] },
   { header: 'Records', items: ['people', 'groups', 'requests', 'crew', 'crewHours', 'maintenanceLog'] },
@@ -1418,6 +1419,7 @@ async function render(view, params = {}, opts = {}) {
       groupProfile: () => renderGroupProfile(params),
       workOrders: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderWorkOrdersDrilldown(params) : renderWorkOrders(params)),
       workOrderDetail: () => renderWorkOrderDetail(params),
+      followUps: () => renderFollowUps(params),
       newWorkOrder: () => renderNewWorkOrder(params),
       editWorkOrderLines: () => renderEditWorkOrderLines(params),
       materials: () => renderMaterialsOnHand(),
@@ -6431,6 +6433,274 @@ async function openAddReportItem(reportId, onDone) {
   render();
   syncFooter();
   setTimeout(() => $('.addpanel-q').focus(), 0);
+}
+
+// ── Follow-up work orders (0119) ─────────────────────────────────────────
+// A temporary or part-done fix leaves work owed. At close-out a work order is given a
+// resolution, and an Interim or Partial one either gets a follow-up work order or a reason
+// why not, so the Interim tag never just means "forgot". Deferred stays a status: a deferred
+// work order is already its own follow-up, with its reason and revisit date.
+const RESOLUTION_LABELS = {
+  permanent: 'Permanent',
+  interim: 'Interim — a temporary fix',
+  partial: 'Partial — some done, the rest put off',
+};
+const RESOLUTION_SHORT = { permanent: 'Permanent', interim: 'Interim', partial: 'Partial' };
+
+function isoDaysFromToday(days) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Near-term vs long-term comes from the target date (Ben, Nov 2026) — no stored horizon.
+function followUpBucket(targetDate) {
+  if (!targetDate) return 'later';
+  const t = String(targetDate).slice(0, 10);
+  if (t < isoDaysFromToday(0)) return 'overdue';
+  if (t <= isoDaysFromToday(30)) return 'soon';
+  if (t <= isoDaysFromToday(90)) return 'season';
+  return 'later';
+}
+const FOLLOW_UP_BUCKETS = {
+  overdue: 'Overdue', soon: 'Next 30 days', season: 'This season (31–90 days)', later: 'Long-term / no date',
+};
+
+// After any close: a work order that is now Done and has no resolution yet gets asked once.
+// Skipping leaves it unset; the detail screen keeps a "Resolution…" button for later.
+async function promptResolutionIfDone(id) {
+  let detail;
+  try { detail = await api(`/api/pg/work-orders/${id}`); } catch { return; }
+  if (detail.workOrder.Status !== 'Done' || detail.workOrder.ResolutionType) return;
+  await resolutionDialog(detail);
+}
+
+function resolutionDialog(detail) {
+  const wo = detail.workOrder;
+  const lines = detail.jobLines || [];
+  // A line tagged Interim inside an otherwise finished job is the usual reason to ask.
+  const preset = wo.ResolutionType
+    || (lines.some((l) => l.ResolutionType === 'interim') ? 'interim'
+      : lines.some((l) => l.ResolutionType === 'partial') ? 'partial' : 'permanent');
+  const flagged = lines.filter((l) => l.ResolutionType === 'interim' || l.ResolutionType === 'partial');
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" role="dialog" aria-modal="true" style="max-width:520px">
+        <h3 style="margin-top:0">How was WO ${escapeHtml(wo.WoNumber || wo.Id)} resolved?</h3>
+        <div class="res-types">${Object.entries(RESOLUTION_LABELS).map(([k, label]) => `
+          <label style="display:block;margin:6px 0;cursor:pointer"><input type="radio" name="resType" value="${k}" ${k === preset ? 'checked' : ''} style="width:auto;margin-right:8px" />${escapeHtml(label)}</label>`).join('')}
+        </div>
+        ${flagged.length ? `<p class="muted" style="font-size:0.85rem;margin:4px 0 0">Lines marked temporary: ${flagged.map((l) => escapeHtml(l.Title)).join(' · ')}</p>` : ''}
+        <div class="res-followup" style="margin-top:14px" hidden>
+          <strong>Follow-up needed?</strong>
+          <label style="display:block;margin:6px 0;cursor:pointer"><input type="radio" name="resFollow" value="yes" checked style="width:auto;margin-right:8px" />Yes — create a follow-up work order</label>
+          <label style="display:block;margin:6px 0;cursor:pointer"><input type="radio" name="resFollow" value="no" style="width:auto;margin-right:8px" />No</label>
+          <div class="res-reason" hidden>
+            <textarea class="modal-input" rows="2" placeholder="Why isn't a follow-up needed? (required)" style="width:100%"></textarea>
+          </div>
+        </div>
+        <p class="res-error" style="color:#b91c1c;margin:8px 0 0" hidden></p>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:18px">
+          <button type="button" class="btn btn-secondary btn-inline modal-cancel">Skip for now</button>
+          <button type="button" class="btn btn-primary btn-inline modal-ok">Save</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const $o = (sel) => overlay.querySelector(sel);
+    const type = () => overlay.querySelector('input[name="resType"]:checked')?.value;
+    const follow = () => overlay.querySelector('input[name="resFollow"]:checked')?.value;
+    const sync = () => {
+      const needs = type() === 'interim' || type() === 'partial';
+      $o('.res-followup').hidden = !needs;
+      $o('.res-reason').hidden = !needs || follow() !== 'no';
+      $o('.modal-ok').textContent = needs && follow() === 'yes' ? 'Next: follow-up details' : 'Save';
+    };
+    overlay.querySelectorAll('input[type="radio"]').forEach((r) => r.addEventListener('change', sync));
+    sync();
+    const close = (v) => { overlay.remove(); resolve(v); };
+    $o('.modal-cancel').addEventListener('click', () => close(false));
+    $o('.modal-ok').addEventListener('click', async () => {
+      const needs = type() === 'interim' || type() === 'partial';
+      const decline = needs && follow() === 'no';
+      const reason = $o('.res-reason textarea').value.trim();
+      if (decline && !reason) { $o('.res-error').textContent = 'Say briefly why no follow-up is needed.'; $o('.res-error').hidden = false; return; }
+      try {
+        await api(`/api/pg/work-orders/${wo.Id}/resolution`, {
+          method: 'PATCH', body: JSON.stringify({ resolutionType: type(), declineFollowUp: decline, declinedReason: reason }),
+        });
+      } catch (err) { $o('.res-error').textContent = saveErrorMessage(err); $o('.res-error').hidden = false; return; }
+      close(true);
+      if (needs && !decline) await followUpDialog(detail, { jobLineId: flagged[0]?.Id || null });
+    });
+  });
+}
+
+// The new-WO form for a follow-up, filled in from the original. Priority and target date sit at
+// the top because they are what usually changes; everything else is carried over to edit.
+async function followUpDialog(detail, { jobLineId = null } = {}) {
+  const wo = detail.workOrder;
+  const lines = detail.jobLines || [];
+  const fromLine = lines.find((l) => l.Id === jobLineId);
+  // Photos and documents from the work order and its lines, linked (not copied) when ticked.
+  let photos = [];
+  try {
+    const lists = await Promise.all([
+      api(`/api/pg/attachments?entityType=work_order&entityId=${wo.Id}`),
+      ...lines.map((l) => api(`/api/pg/attachments?entityType=job_line&entityId=${l.Id}`)),
+    ]);
+    const seen = new Set();
+    for (const l of lists) for (const a of l.attachments || []) { if (!seen.has(a.Id)) { seen.add(a.Id); photos.push(a); } }
+  } catch { photos = []; }
+  const note = fromLine
+    ? `Follow-up to "${fromLine.Title}" on WO ${wo.WoNumber || wo.Id}, which was a ${wo.ResolutionType === 'partial' ? 'partial' : 'temporary'} fix.`
+    : '';
+  const quick = [['2 weeks', 14], ['30 days', 30], ['This season', 90], ['Next year', 365]];
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" role="dialog" aria-modal="true" style="max-width:620px;width:94%;max-height:88vh;overflow:auto">
+        <h3 style="margin-top:0">New follow-up work order</h3>
+        <p class="muted" style="margin-top:-6px">From WO ${escapeHtml(wo.WoNumber || wo.Id)} — ${escapeHtml(wo.Title)}. Check it over, then create.</p>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;background:#f0f2fb;padding:10px 12px;border-radius:8px">
+          <div class="field-row" style="flex:1;min-width:150px;margin:0"><label><strong>Priority</strong></label>
+            <select class="fu-priority">${['Low', 'Medium', 'High', 'Urgent'].map((p) => `<option ${(wo.Priority || 'Medium') === p ? 'selected' : ''}>${p}</option>`).join('')}</select></div>
+          <div class="field-row" style="flex:1;min-width:170px;margin:0"><label><strong>Target date</strong></label>
+            <input type="date" class="fu-due" value="${isoDaysFromToday(30)}" /></div>
+          <div style="flex-basis:100%;display:flex;gap:6px;flex-wrap:wrap">${quick.map(([l, d]) => `<button type="button" class="btn btn-secondary btn-inline fu-quick" data-days="${d}" style="padding:2px 10px;font-size:0.8rem">${l}</button>`).join('')}
+            <button type="button" class="btn btn-secondary btn-inline fu-quick" data-days="" style="padding:2px 10px;font-size:0.8rem">No date</button></div>
+        </div>
+        <div class="field-row" style="margin-top:12px"><label>Title</label><input class="fu-title" value="${escapeHtml(`Follow-up: ${wo.Title}`)}" /></div>
+        <div class="field-row"><label>What still needs doing</label><textarea class="fu-desc" rows="3" placeholder="The follow-up note — what the permanent fix is">${escapeHtml(note)}</textarea></div>
+        ${lines.length ? `<div class="field-row"><label>Follows up on line (optional)</label><select class="fu-line">
+          <option value="">The whole work order</option>
+          ${lines.map((l) => `<option value="${l.Id}" ${l.Id === jobLineId ? 'selected' : ''}>${escapeHtml(l.Title)}${l.ResolutionType ? ` (${RESOLUTION_SHORT[l.ResolutionType]})` : ''}</option>`).join('')}
+        </select></div>` : ''}
+        <p class="muted" style="margin:4px 0 10px">Asset / location: <strong>${escapeHtml(wo.Asset?.Name || wo.Location?.Name || 'none')}</strong> (carried over)</p>
+        ${photos.length ? `<div class="field-row"><label>Photos &amp; documents to link</label>
+          <div style="display:flex;flex-wrap:wrap;gap:8px">${photos.map((a) => `
+            <label style="display:flex;flex-direction:column;align-items:center;width:92px;cursor:pointer;font-size:0.75rem">
+              ${a.ThumbUrl || (a.MimeType || '').startsWith('image/') ? `<img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:88px;height:66px;object-fit:cover;border-radius:4px" />` : `<span style="width:88px;height:66px;display:flex;align-items:center;justify-content:center;background:#eee;border-radius:4px">📄</span>`}
+              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;width:88px;text-align:center">${escapeHtml(a.Caption || a.OriginalFilename || '')}</span>
+              <input type="checkbox" class="fu-att" value="${a.Id}" checked style="width:auto" />
+            </label>`).join('')}</div></div>` : ''}
+        <p class="fu-error" style="color:#b91c1c;margin:8px 0 0" hidden></p>
+        <div class="btn-row" style="justify-content:flex-end;margin-top:14px">
+          <button type="button" class="btn btn-secondary btn-inline modal-cancel">Cancel</button>
+          <button type="button" class="btn btn-primary btn-inline modal-ok">Create follow-up</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const $o = (sel) => overlay.querySelector(sel);
+    overlay.querySelectorAll('.fu-quick').forEach((b) => b.addEventListener('click', () => {
+      $o('.fu-due').value = b.dataset.days ? isoDaysFromToday(Number(b.dataset.days)) : '';
+    }));
+    const close = (v) => { overlay.remove(); resolve(v); };
+    $o('.modal-cancel').addEventListener('click', () => close(null));
+    $o('.modal-ok').addEventListener('click', async () => {
+      const btn = $o('.modal-ok');
+      btn.disabled = true;
+      try {
+        const r = await api(`/api/pg/work-orders/${wo.Id}/follow-ups`, {
+          method: 'POST',
+          body: JSON.stringify({
+            title: $o('.fu-title').value, priority: $o('.fu-priority').value,
+            dueDate: $o('.fu-due').value || null, description: $o('.fu-desc').value,
+            jobLineId: $o('.fu-line')?.value || null,
+            attachmentIds: [...overlay.querySelectorAll('.fu-att:checked')].map((c) => Number(c.value)),
+          }),
+        });
+        close(r.workOrderId);
+        toast(`Follow-up created from WO ${wo.WoNumber || wo.Id}`);
+        go('workOrderDetail', { id: r.workOrderId });
+      } catch (err) {
+        btn.disabled = false;
+        $o('.fu-error').textContent = saveErrorMessage(err); $o('.fu-error').hidden = false;
+      }
+    });
+  });
+}
+
+// "Created from" above, "Follow-ups" below, both clickable, on the work order screen.
+function followUpLinksHtml(wo) {
+  const pill = (f) => `<span class="pill" style="${f.StatusColor ? `background:${escapeHtml(f.StatusColor)}22;` : ''}">${escapeHtml(f.Status)}</span>`;
+  const from = wo.FollowUpOf ? `<p style="margin:2px 0 8px">↩ Created from <a href="#" class="fu-link" data-wo="${wo.FollowUpOf.Id}">WO ${escapeHtml(wo.FollowUpOf.WoNumber || wo.FollowUpOf.Id)} — ${escapeHtml(wo.FollowUpOf.Title)}</a> ${pill(wo.FollowUpOf)}${wo.FollowUpOfJobLine ? `<span class="muted"> · line "${escapeHtml(wo.FollowUpOfJobLine.Title)}"</span>` : ''}</p>` : '';
+  return from;
+}
+function resolutionCardHtml(wo) {
+  const kids = wo.FollowUps || [];
+  const owed = (wo.ResolutionType === 'interim' || wo.ResolutionType === 'partial') && !kids.length && !wo.FollowUpDeclinedReason;
+  return `
+    <div class="card" id="woResolutionCard">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <h4 style="margin:0">Resolution &amp; follow-ups</h4>
+        <span style="display:flex;gap:8px;flex-wrap:wrap">
+          ${wo.StatusIsTerminal ? '<button type="button" class="btn btn-secondary btn-inline" id="setResolutionBtn">Resolution…</button>' : ''}
+          <button type="button" class="btn btn-secondary btn-inline" id="createFollowUpBtn">+ Follow-up</button>
+        </span>
+      </div>
+      <p style="margin:8px 0 0">${wo.ResolutionType ? `Resolved: <strong>${escapeHtml(RESOLUTION_SHORT[wo.ResolutionType])}</strong>` : '<span class="muted">No resolution recorded.</span>'}
+        ${wo.FollowUpDeclinedReason ? `<span class="muted"> · no follow-up: ${escapeHtml(wo.FollowUpDeclinedReason)}</span>` : ''}
+        ${owed ? '<span class="pill" style="background:#f59e0b22;margin-left:6px">Follow-up not decided</span>' : ''}</p>
+      ${kids.length ? `<div style="margin-top:8px">${kids.map((f) => `
+        <div class="list-item list-item-actionable fu-link" data-wo="${f.Id}" style="cursor:pointer">
+          <span>WO ${escapeHtml(f.WoNumber || f.Id)} — ${escapeHtml(f.Title)}${f.DueDate ? `<span class="muted"> · target ${escapeHtml(formatDateNice(f.DueDate))}</span>` : ''}</span>
+          <span class="pill" style="${f.StatusColor ? `background:${escapeHtml(f.StatusColor)}22;` : ''}">${escapeHtml(f.Status)}</span>
+        </div>`).join('')}</div>` : ''}
+    </div>`;
+}
+
+async function renderFollowUps(params = {}) {
+  setChrome({ title: 'Follow-ups', showBack: false, showLogout: true });
+  app.innerHTML = LOADING_HTML;
+  let bucket = params.bucket || '';
+  let showClosed = false;
+  let list = [];
+  async function load() {
+    list = (await api(`/api/pg/follow-ups${showClosed ? '?closed=1' : ''}`)).followUps || [];
+  }
+  function kindText(f) {
+    if (f.Kind === 'deferred') return `Deferred${f.DeferredReason ? `: ${f.DeferredReason}` : ''}`;
+    if (f.Kind === 'undecided') return `${RESOLUTION_SHORT[f.ResolutionType] || 'Interim'} fix — follow-up not decided`;
+    return `Follow-up of WO ${f.FromNumber || f.FromId}${f.FromLineTitle ? ` (line "${f.FromLineTitle}")` : ''}${f.FromResolution ? ` · ${RESOLUTION_SHORT[f.FromResolution]} fix` : ''}`;
+  }
+  function draw() {
+    const counts = {};
+    for (const f of list) {
+      const b = f.Kind === 'undecided' ? 'undecided' : followUpBucket(f.TargetDate);
+      counts[b] = (counts[b] || 0) + 1;
+    }
+    const shown = list.filter((f) => !bucket
+      || (bucket === 'undecided' ? f.Kind === 'undecided' : f.Kind !== 'undecided' && followUpBucket(f.TargetDate) === bucket));
+    const chips = [['', `All (${list.length})`], ...Object.entries(FOLLOW_UP_BUCKETS).map(([k, l]) => [k, `${l} (${counts[k] || 0})`]),
+      ['undecided', `Needs a decision (${counts.undecided || 0})`]];
+    setApp(`
+      <div class="card">
+        <h3 style="margin-top:0">Follow-up work</h3>
+        <p class="muted">Work still owed after a temporary or partial fix, plus deferred work orders. Grouped by target date.</p>
+        <div class="skill-chips" style="margin-bottom:8px">${chips.map(([k, l]) => `<span class="skill-chip fu-chip ${bucket === k ? 'selected' : ''}" data-b="${k}" style="cursor:pointer">${escapeHtml(l)}</span>`).join('')}</div>
+        <label style="cursor:pointer;font-size:0.85rem"><input type="checkbox" id="fuClosed" ${showClosed ? 'checked' : ''} style="width:auto;margin-right:6px" />Show finished follow-ups</label>
+      </div>
+      <div class="card">${shown.map((f) => `
+        <div class="list-item list-item-actionable fu-link" data-wo="${f.Id}" style="cursor:pointer;flex-wrap:wrap">
+          <div style="flex:1;min-width:220px">
+            <div><strong>WO ${escapeHtml(f.WoNumber || f.Id)}</strong> — ${escapeHtml(f.Title)}</div>
+            <div class="muted" style="font-size:0.85rem">${escapeHtml(kindText(f))}${f.Place ? ` · ${escapeHtml(f.Place)}` : ''}</div>
+          </div>
+          <div style="text-align:right">
+            <div>${f.TargetDate ? escapeHtml(formatDateNice(f.TargetDate)) : '<span class="muted">No date</span>'}${followUpBucket(f.TargetDate) === 'overdue' && !f.StatusIsTerminal ? ' <span class="pill" style="background:#ef444422">Overdue</span>' : ''}</div>
+            <div style="font-size:0.85rem"><span class="pill" style="${f.StatusColor ? `background:${escapeHtml(f.StatusColor)}22;` : ''}">${escapeHtml(f.Status)}</span> <span class="muted">${escapeHtml(f.Priority || '')}</span></div>
+          </div>
+        </div>`).join('') || '<p class="muted">Nothing here.</p>'}
+      </div>`);
+    app.querySelectorAll('.fu-chip').forEach((c) => c.addEventListener('click', () => { bucket = c.dataset.b; draw(); }));
+    app.querySelector('#fuClosed').addEventListener('change', async (e) => { showClosed = e.target.checked; await load(); draw(); });
+    app.querySelectorAll('.fu-link').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: el.dataset.wo })));
+  }
+  try { await load(); } catch (err) { app.innerHTML = `<p class="muted">Couldn't load follow-ups: ${escapeHtml(err.message)}</p>`; return; }
+  draw();
 }
 
 // A work order must never be terminal while any of its lines is unresolved, so every
@@ -15038,6 +15308,13 @@ function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
       </div>
       <div class="field-row"><label>Cause Note</label><textarea class="jl-e-cause-note" placeholder="Freetext detail — never becomes a new cause option">${escapeHtml(jl.CauseNote || '')}</textarea></div>
       <div class="field-row"><label>Correction</label><textarea class="jl-e-correction" placeholder="What was done to fix it?">${escapeHtml(jl.Correction || '')}</textarea></div>
+      <div class="field-row"><label>Resolution</label>
+        <select class="jl-e-resolution">
+          <option value="">—</option>
+          ${Object.entries(RESOLUTION_LABELS).map(([k, l]) => `<option value="${k}" ${jl.ResolutionType === k ? 'selected' : ''}>${escapeHtml(l)}</option>`).join('')}
+        </select>
+        <p class="muted" style="font-size:0.8rem;margin-top:4px">Mark a temporary fix here; when the work order closes you'll be asked about a follow-up.</p>
+      </div>
       <div class="field-row"><label>Blocked Reason</label><input class="jl-e-blocked-reason" value="${escapeHtml(jl.BlockedReason || '')}" placeholder="Leave blank if not blocked" /></div>
       <div class="field-row"><label>Blocked Since</label><input class="jl-e-blocked-since" type="date" value="${(jl.BlockedSince || '').slice(0, 10)}" /></div>
       <div class="field-row"><label>Board Report</label>
@@ -15157,6 +15434,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
     </div>` : ''}
     <div class="card">
       <h3>WO ${escapeHtml(wo.WoNumber || wo.Id)} — ${escapeHtml(wo.Title)}</h3>
+      ${followUpLinksHtml(wo)}
       <form id="woFieldsForm">
         <div class="field-row"><label>Asset</label><div id="woAssetPicker"></div></div>
         <div class="field-row"><label>Status</label>
@@ -15170,6 +15448,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <div class="field-row"><label>Priority</label>
           <select name="priority">${['Low', 'Medium', 'High', 'Urgent'].map((s) => `<option ${wo.Priority === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         </div>
+        <div class="field-row"><label>Target Date</label><input name="dueDate" type="date" value="${(wo.DueDate || '').slice(0, 10)}" /></div>
         <div class="field-row"><label>Board Report</label>
           <label class="skill-chip ${wo.BoardFocus ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="boardFocus" style="margin-right:6px" ${wo.BoardFocus ? 'checked' : ''} />Include on board report</label>
           <p class="muted" style="margin:4px 0 0;font-size:0.8rem">Puts this on the next draft whatever the dates say — in Done if it's finished, in Coming Up if it isn't. Clears when a report carrying it is published.</p>
@@ -15187,6 +15466,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
       </div>
       <div id="familyPanel" hidden></div>
     </div>
+
+    ${resolutionCardHtml(wo)}
 
     ${rollupHtml}
 
@@ -15301,11 +15582,13 @@ async function renderWorkOrderDetail({ id }, container = app) {
           statusId: Number(fd.get('statusId')), priority: fd.get('priority'), description: fd.get('description'),
           deferredReason: fd.get('deferredReason') || undefined, revisitDate: fd.get('revisitDate') || undefined,
           boardFocus: fd.has('boardFocus'),
+          dueDate: fd.get('dueDate') || null,
           ...(resolveOpenLines ? { resolveOpenLines: true } : {}),
         }),
       }));
       if (!saved) { toast('Left unchanged — the work order is still open'); return; }
       toast(saved.boardReportSync ? `Work order updated. ${saved.boardReportSync}` : 'Work order updated', saved.boardReportSync ? 6000 : 2500);
+      if (Number(fd.get('statusId')) !== wo.StatusId) await promptResolutionIfDone(id);
       renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message, 5000); }
   });
@@ -15498,6 +15781,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
           blockedReason: card.querySelector('.jl-e-blocked-reason').value,
           blockedSince: card.querySelector('.jl-e-blocked-since').value,
           boardFocus: card.querySelector('.jl-e-board-focus').checked,
+          resolutionType: card.querySelector('.jl-e-resolution').value || null,
           causeIds,
         }) }));
         if (!saved) { toast('Nothing saved — the work order is still closed'); return; }
@@ -15577,6 +15861,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       }));
       if (!saved) { toast('Left unchanged — the work order is still open'); return; }
       toast('Log entry added');
+      if (fd.get('statusChange')) await promptResolutionIfDone(id);
       renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message, 5000); }
   });
@@ -15638,6 +15923,14 @@ async function renderWorkOrderDetail({ id }, container = app) {
     } catch (err) { toast(err.message, 5000); }
   });
 
+  container.querySelectorAll('.fu-link').forEach((el) => el.addEventListener('click', (e) => { e.preventDefault(); go('workOrderDetail', { id: el.dataset.wo }); }));
+  container.querySelector('#setResolutionBtn')?.addEventListener('click', async () => {
+    if (await resolutionDialog(detail)) renderWorkOrderDetail({ id }, container);
+  });
+  container.querySelector('#createFollowUpBtn')?.addEventListener('click', () => {
+    const tagged = jobLines.find((l) => l.ResolutionType === 'interim' || l.ResolutionType === 'partial');
+    followUpDialog(detail, { jobLineId: tagged?.Id || null });
+  });
   container.querySelector('#completeWoBtn').addEventListener('click', async () => {
     if (!await confirmDialog(`Complete this Work Order? Any pending "asset field update" entries will be written to "${wo.Asset?.Name || 'the asset'}" immediately — this directly changes real asset data.`)) return;
     // Open lines are settled BEFORE the leftovers prompt: that prompt records real
@@ -15666,6 +15959,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
       }));
       if (!done) { toast('Left unchanged — the work order is still open'); return; }
       toast('Work order completed — asset updated');
+      await promptResolutionIfDone(id);
       renderWorkOrderDetail({ id }, container);
     } catch (err) { toast(err.message, 5000); }
   });
