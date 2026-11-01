@@ -249,9 +249,22 @@ overwrite `included` on a `user_touched` row (the admin-task pass used to re-tic
 (`mirrorBoardFlagToSource`, `syncBoardDraftFromSource`), with a toast and an activity-log entry.
 `board_focus_set_at` is now stamped only on a real change (forms re-sent it on every save).
 
-**Proposed, not built — follow-up work orders (#2).** Findings reported to Ben, awaiting his
-decisions. Key fact: `work_orders.parent_wo_id` is already the SPLIT parent — a follow-up link
-must be a separate column (`follow_up_of_wo_id`).
+**2026-11-01 — follow-up work orders built (0119).** Resolution Permanent / Interim / Partial at
+close-out (Deferred stays a status). `follow_up_of_wo_id` / `follow_up_of_job_line_id` /
+`resolution_type` / `follow_up_declined_reason` on work_orders; `resolution_type` on job_lines.
+NOT `parent_wo_id` (that is the split parent). `promptResolutionIfDone` runs after all three
+close paths; `followUpDialog` creates via `POST /work-orders/:id/follow-ups` (photos linked, not
+copied). Follow-ups screen (`followUps`, Daily nav) buckets by `due_date` (shown as Target Date on
+the WO form) — deferred WOs by revisit date. Scratch test passed; **not yet browser-checked** (the
+temp-admin insert was refused by the classifier this session).
+
+**Board report 1b — STOPPED, waiting on Ben (2026-11-01).** Completion dates are not reliable:
+no screen lets you enter a job line's completed date (API accepts `completedDate`, no form sends
+it), so marking Done stamps CURRENT_DATE. 13 lines on WO 54 were marked done on 2026-11-01 and are
+dated Nov 1 whatever day the work happened. Also: `suggestDoneJobLines` includes a line if EITHER
+completed_date OR completed_at is in the period (arrears lines land in the entry month), and a WO
+header is skipped once it has been on any published report (WO 54 was on September). Planned fix
+in the reply to Ben. #3 (add-to-report from the report screen) waits on 1b.
 
 **Proposed, not built:** `docs/hosted-photo-page-proposal.md` — recommendation was to hold.
 
