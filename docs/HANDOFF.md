@@ -30,6 +30,34 @@ signed-in account if `cmms@` is not a verified send-as alias on it. Ben to check
 
 ---
 
+## 1a. 2026-11-09 batch (Ben's six-item list) — built and deployed, NOT browser-verified
+
+Ben asked for these; all are live. **No one has clicked through them yet**: the permission
+classifier blocked both the temp-admin login and direct DB reads this session, and there is
+no headless browser on the host. Ben should click through these before relying on them:
+
+1. **WO status refresh** — the Work Orders split view now re-fetches the list after the
+   detail pane re-renders (`wo-detail-rendered` event → `list.refresh()`).
+2. **Job line grid width** — `WIDE_VIEWS` in `render()` adds `.app-wide`, which drops
+   `main#app`'s 1200px cap. Add other table-heavy views to `WIDE_VIEWS` if Ben wants them.
+3. **URLs** — `routeUrl` / `parseRoute` / `writeHistory` in `app.js`. Every `go()` writes the
+   address; `/work-orders/:id` and `/assets/:id` are pretty, everything else is
+   `/<kebab-view>?params`. history.state carries the breadcrumb stack; `popstate` restores
+   it. Server serves `index.html` for `^/[a-z][a-z0-9-]*(/\d+)?/?$`. `go(..., {replace})`
+   now **replaces the top stack entry** (it used to leave the old one there).
+   `setRouteParams()` updates the address when a screen changes in place (WO split view
+   `open=`, Reports explorer `entity=` / `fav=`).
+4–5. **Favorites** — migration 0122 `nav_favorites` (per username). Strip under the brand
+   (`#sidebarFavs`), ☆ next to the page title (`#favStarBtn`). Pins any address: screens,
+   single records, `/reports?mode=board`, saved report views (`/reports?entity=..&fav=id`).
+   Edit mode: reorder / rename / remove.
+6. **Completed date** — migration 0121 `work_orders.date_completed_manual`.
+   `WO_DONE_DATE_SQL` (db.js) = typed-on-WO date if manual, else latest job-line
+   `completed_date`, else the stored close date. Used by board report, WO list, reports.
+   Closing a WO now defaults to the latest line date. Completed field is editable on a closed
+   WO. Fixes the Well Pump House showing 11/1 instead of 10/28 with no data edits.
+   Test: `scripts/wo-completed-date-test.mjs`.
+
 ## 2. The system
 
 | | |
