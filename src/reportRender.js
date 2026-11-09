@@ -695,8 +695,9 @@ function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_gener
   const est = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
   const spend = openWorkOrder ? null : (money && est ? `${money} spent of ${est}` : (money || est));
   const ownFunding = openWorkOrder ? null : fundingTagText(it, showFunding);
-  // No funding of its own to show (open, or continued from an earlier report): say who paid
-  // for this period's lines instead.
+  // Continued from an earlier report: no money of its own, so say who paid for this period's
+  // lines instead. (An open work order that is new this period still shows no money on its
+  // row — Ben's rule; its lines carry their own tags.)
   const funding = ownFunding || opts.periodFunding || null;
   const bits = [
     it.SnapAssetName, it.SnapStatus, dates,
@@ -765,7 +766,7 @@ function sectionHtml(section, items, showHours = false, showFunding = 'non_gener
     const nested = nestedBlockHtml(lines.map((l) => nestedLineHtml(l, showHours, showFunding)).join(''));
     // An itemized work order's lines say what was completed, so the roll-up sentence that says
     // the same thing in prose is redundant directly above them.
-    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0, periodFunding: periodFundingText(lines, showFunding) }, showFunding));
+    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0, periodFunding: isContinuedHeader(it) ? periodFundingText(lines, showFunding) : null }, showFunding));
   }
 
   return `
@@ -904,7 +905,7 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
       const pMoney = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
       const pEst = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
       const ownFunding = openWo ? null : fundingTagText(it, showFunding);
-      const periodFunding = it.ItemType === 'work_order' && !ownFunding
+      const periodFunding = isContinuedHeader(it) && !ownFunding
         ? periodFundingText(rows.filter((l) => l.ItemType === 'job_line' && l.ParentWorkOrderId === it.ItemId), showFunding)
         : null;
       const bits = [it.SnapAssetName, itemDatesText(it),
