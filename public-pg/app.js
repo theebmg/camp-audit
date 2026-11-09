@@ -10757,6 +10757,106 @@ async function renderIncoming(params = {}) {
 }
 
 // One item: the text beside the form, a category picker, and the right confirm form (§5).
+// "Paid from" — one list of who or what paid: camp money (general or a named fund), a
+// person, a donor, in-kind. The same grouping the expense form uses.
+function paidFromSelectHtml(fundingSources, selectedId, id) {
+  return `<select id="${id}">
+    <option value="">— not set (counts as camp spend) —</option>
+    ${[['Camp', ['camp_general', 'camp_fund']], ['People', ['person']], ['Contributions', ['donor_org', 'in_kind']],
+      ['Other', ['campaign', 'other_category', 'cabin_holding', null]]].map(([group, kinds]) => {
+      const inGroup = fundingSources.filter((f) => kinds.includes(f.Kind));
+      return inGroup.length ? `<optgroup label="${group}">${inGroup.map((f) => `<option value="${f.Id}" ${selectedId === f.Id ? 'selected' : ''}>${escapeHtml(f.DisplayName || f.Name)}</option>`).join('')}</optgroup>` : '';
+    }).join('')}
+  </select>`;
+}
+
+// "Someone not listed…": anyone on the People list can be the payer; their funder row is
+// made on first use and added to the select.
+function wireOtherPersonPaidFrom(link, mount, selectEl, fundingSources) {
+  link?.addEventListener('click', async (e) => {
+    e.preventDefault();
+    mount.hidden = false;
+    const { people } = await api('/api/pg/people');
+    mountPersonPicker(mount, {
+      people,
+      onSelect: async (person) => {
+        if (!person) return;
+        try {
+          const { source } = await api('/api/pg/funding-sources/for-person', { method: 'POST', body: JSON.stringify({ personId: person.Id }) });
+          if (!fundingSources.some((f) => f.Id === source.Id)) {
+            fundingSources.push(source);
+            selectEl.insertAdjacentHTML('beforeend', `<option value="${source.Id}">${escapeHtml(source.DisplayName || source.Name)}</option>`);
+          }
+          selectEl.value = String(source.Id);
+          mount.hidden = true;
+        } catch (err) { toast(err.message, 6000); }
+      },
+    });
+    mount.querySelector('input')?.focus();
+  });
+}
+
+// "These charges are already on this work order — is the receipt one of them?" Resolves to
+// an expense id, 'new', or null (cancelled). Nothing is preselected: the person answers.
+// A charge within $1 or 5% of the receipt's amount is called out as a likely match.
+function pickExistingChargeDialog(charges, amount, target) {
+  const near = (c) => {
+    const v = c.Amount ?? c.Allocated;
+    if (amount == null || v == null) return null;
+    const diff = Math.abs(v - amount);
+    if (diff < 0.005) return 'Same amount';
+    if (diff <= Math.max(1, amount * 0.05)) return 'Close amount';
+    return null;
+  };
+  const money = (n) => (n == null ? 'amount unknown' : `$${Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+  const sorted = [...charges].sort((a, b) => (near(b) ? 1 : 0) - (near(a) ? 1 : 0));
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal-box" role="dialog" aria-modal="true" style="max-width:560px;width:95%">
+        <h3 style="margin-top:0">Is this receipt one of these?</h3>
+        <p class="muted" style="margin-top:0">${sorted.length === 1 ? 'A charge is' : `${sorted.length} charges are`} already on ${escapeHtml(target)}${amount != null ? ` — this receipt is ${money(amount)}` : ''}.
+          If the receipt is for one of them, pick it and the photo is added to that charge instead of entering it twice.</p>
+        <div class="dup-list" style="max-height:50vh;overflow-y:auto">
+          ${sorted.map((c) => {
+            const tag = near(c);
+            return `<label class="dup-row" style="display:flex;gap:10px;align-items:flex-start;padding:8px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;cursor:pointer${tag ? ';border-color:#e0a100;background:#fff8e1' : ''}">
+              <input type="radio" name="dupPick" value="${c.Id}" style="width:auto;margin-top:3px" />
+              <span style="flex:1;min-width:0">
+                <strong>${escapeHtml(c.Vendor || '(no vendor)')}</strong> · ${money(c.Amount)}
+                ${c.Allocated != null && c.Amount != null && Math.abs(c.Allocated - c.Amount) > 0.005 ? `<span class="muted"> (${money(c.Allocated)} of it here)</span>` : ''}
+                ${tag ? `<span class="pill" style="margin-left:4px;background:#e0a100;color:#fff">${tag}</span>` : ''}
+                <div class="muted" style="font-size:0.82rem">${c.PurchaseDate ? formatDateNice(c.PurchaseDate) : 'no date'}${c.LineTitles ? ` · ${escapeHtml(c.LineTitles)}` : ''} · ${c.PhotoCount ? `${c.PhotoCount} photo${c.PhotoCount === 1 ? '' : 's'} already` : 'no receipt photo yet'}${c.TriageStatus === 'inbox' ? ' · in triage' : ''}</div>
+              </span>
+            </label>`;
+          }).join('')}
+          <label class="dup-row" style="display:flex;gap:10px;align-items:center;padding:8px;border:1px dashed var(--border);border-radius:8px;cursor:pointer">
+            <input type="radio" name="dupPick" value="new" style="width:auto" />
+            <span><strong>No — none of these.</strong> It's a new charge.</span>
+          </label>
+        </div>
+        <div class="btn-row" style="margin-top:12px">
+          <button type="button" class="btn btn-primary dup-go" disabled>Continue</button>
+          <button type="button" class="btn btn-secondary dup-cancel">Cancel</button>
+        </div>
+      </div>`;
+    const done = (v) => { overlay.remove(); resolve(v); };
+    const go = overlay.querySelector('.dup-go');
+    overlay.querySelectorAll('input[name="dupPick"]').forEach((r) => r.addEventListener('change', () => {
+      go.disabled = false;
+      go.textContent = r.value === 'new' ? 'File as a new charge' : 'Add the photo to that charge';
+    }));
+    go.addEventListener('click', () => {
+      const v = overlay.querySelector('input[name="dupPick"]:checked')?.value;
+      if (!v) return;
+      done(v === 'new' ? 'new' : Number(v));
+    });
+    overlay.querySelector('.dup-cancel').addEventListener('click', () => done(null));
+    document.body.appendChild(overlay);
+  });
+}
+
 async function openIncomingItem(id, onChanged = () => {}) {
   const d = await api(`/api/pg/incoming/${id}`);
   const item = d.item;
@@ -10834,7 +10934,8 @@ async function openIncomingItem(id, onChanged = () => {}) {
         method: 'POST', body: JSON.stringify({ filedAs: category, ...payload }),
       });
       overlay.remove();
-      toast(r.LeftBehind ? `Moved — ${r.LeftBehind}` : (isMove ? 'Moved' : 'Filed'), r.LeftBehind ? 8000 : 4000);
+      const filedMsg = r.Entity === 'expense_receipt' ? 'Receipt photo added to the existing charge' : (isMove ? 'Moved' : 'Filed');
+      toast(r.LeftBehind ? `Moved — ${r.LeftBehind}` : filedMsg, r.LeftBehind ? 8000 : 4000);
       onChanged();
     } catch (e) { toast(e.message, 6000); }
   };
@@ -10873,23 +10974,88 @@ async function openIncomingItem(id, onChanged = () => {}) {
     }
 
     if (category === 'receipt') {
-      const cats = await api('/api/pg/expense-categories').catch(() => ({ categories: [] }));
+      const [cats, wos, fs] = await Promise.all([
+        api('/api/pg/expense-categories').catch(() => ({ categories: [] })),
+        api('/api/pg/work-orders').catch(() => ({ workOrders: [] })),
+        api('/api/pg/funding-sources').catch(() => ({ sources: [] })),
+      ]);
+      const fundingSources = fs.sources || [];
       host.innerHTML = `
         <div class="field-row"><label>Vendor</label><input type="text" id="rVendor" placeholder="Who was paid" /></div>
         <div class="field-row"><label>Amount</label><input type="number" step="0.01" id="rAmount" placeholder="optional — triage can fill it in" /></div>
         <div class="field-row"><label>Purchase date</label><input type="date" id="rDate" value="${escapeHtml(item.ReceivedDate)}" /></div>
+        <div class="field-row"><label>Paid from <span class="muted">(who paid / which fund)</span></label>
+          ${paidFromSelectHtml(fundingSources, null, 'rPaidFrom')}
+          <p class="muted" style="margin-top:2px;font-size:0.8rem"><a href="#" id="rOtherPerson">Someone not listed…</a></p>
+          <div id="rOtherPersonPick" hidden></div>
+        </div>
         <div class="field-row"><label>Category</label><select id="rCat">
           <option value="">— none —</option>
           ${(cats.categories || []).map((c) => `<option value="${c.Id}">${escapeHtml(c.Name)}</option>`).join('')}
         </select></div>
-        <p class="muted" style="font-size:0.85rem">Lands in the receipt triage inbox exactly like an emailed receipt, with the photo attached.</p>
+        <div class="field-row"><label>Work order <span class="muted">(optional)</span></label><div id="rWo"></div></div>
+        <div class="field-row" id="rLineRow" hidden><label>Job line <span class="muted">(optional — leave blank to charge the whole work order)</span></label>
+          <select id="rLine"><option value="">— the work order as a whole —</option></select></div>
+        <p class="muted" style="font-size:0.85rem" id="rWhere">With no work order it lands in the receipt triage inbox, exactly like an emailed receipt, with the photo attached.</p>
         <div class="btn-row"><button type="button" class="btn btn-primary" id="rGo">${isMove ? 'Move to receipt' : 'File as receipt'}</button></div>`;
-      host.querySelector('#rGo').addEventListener('click', () => submit({
-        vendor: host.querySelector('#rVendor').value || null,
-        amount: host.querySelector('#rAmount').value ? Number(host.querySelector('#rAmount').value) : null,
-        purchaseDate: host.querySelector('#rDate').value,
-        categoryId: host.querySelector('#rCat').value ? Number(host.querySelector('#rCat').value) : null,
-      }));
+      const paidSel = host.querySelector('#rPaidFrom');
+      wireOtherPersonPaidFrom(host.querySelector('#rOtherPerson'), host.querySelector('#rOtherPersonPick'), paidSel, fundingSources);
+
+      let woId = null;
+      const lineRow = host.querySelector('#rLineRow');
+      const lineSel = host.querySelector('#rLine');
+      const where = host.querySelector('#rWhere');
+      const setWo = async (id) => {
+        woId = id;
+        lineSel.innerHTML = '<option value="">— the work order as a whole —</option>';
+        lineRow.hidden = !id;
+        where.textContent = id
+          ? 'Charged to this work order (or the job line you pick). With an amount it is filed straight away; without one it also waits in receipt triage.'
+          : 'With no work order it lands in the receipt triage inbox, exactly like an emailed receipt, with the photo attached.';
+        if (!id) return;
+        try {
+          const d = await api(`/api/pg/work-orders/${id}`);
+          lineSel.innerHTML += (d.jobLines || []).map((jl) => `<option value="${jl.Id}">${escapeHtml(jl.Title)}${jl.StatusName ? ` — ${escapeHtml(jl.StatusName)}` : ''}</option>`).join('');
+        } catch (e) { toast(e.message, 5000); }
+      };
+      mountCombobox(host.querySelector('#rWo'), {
+        options: (wos.workOrders || []).map((w) => ({ value: w.Id, label: `#${w.WoNumber || w.Id} ${w.Title}`, sublabel: w.AssetName || null })),
+        placeholder: 'Work order…',
+        onSelect: (o) => setWo(o ? o.value : null),
+        onClear: () => setWo(null),
+      });
+
+      host.querySelector('#rGo').addEventListener('click', async () => {
+        const amountRaw = host.querySelector('#rAmount').value;
+        const paidId = paidSel.value ? Number(paidSel.value) : null;
+        const jobLineId = lineSel.value ? Number(lineSel.value) : null;
+        const payload = {
+          vendor: host.querySelector('#rVendor').value || null,
+          amount: amountRaw ? Number(amountRaw) : null,
+          purchaseDate: host.querySelector('#rDate').value,
+          categoryId: host.querySelector('#rCat').value ? Number(host.querySelector('#rCat').value) : null,
+          fundingSourceId: paidId,
+          // Choosing a fund in "Paid from" is what charges the receipt to it (same as the expense form).
+          fundId: fundingSources.find((f) => f.Id === paidId)?.FundId || null,
+          workOrderId: woId,
+          jobLineId,
+        };
+        // Before anything is written: is this the paper for a charge already entered here?
+        if (woId) {
+          let charges = [];
+          try {
+            const q = jobLineId ? `jobLineId=${jobLineId}` : `workOrderId=${woId}`;
+            charges = (await api(`/api/pg/expenses/existing-charges?${q}`)).charges || [];
+          } catch (e) { toast(e.message, 5000); return; }
+          if (charges.length) {
+            const target = jobLineId ? `this job line ("${lineSel.selectedOptions[0]?.textContent?.split(' — ')[0] || ''}")` : 'this work order';
+            const pick = await pickExistingChargeDialog(charges, payload.amount, target);
+            if (pick === null) return; // cancelled
+            if (pick !== 'new') { submit({ existingExpenseId: pick }); return; }
+          }
+        }
+        submit(payload);
+      });
       return;
     }
 

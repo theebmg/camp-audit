@@ -70,6 +70,7 @@ import {
   listCrewSessionsForWorkOrder, createCrewSession, deleteCrewSession, getCrewSessionReportRawData, getCrewHoursSummary,
   getJobLinesReportRawData, getFindingsReportRawData,
   listReportFavorites, createReportFavorite, deleteReportFavorite,
+  listExistingChargesFor,
   listNavFavorites, createNavFavorite, updateNavFavorite, reorderNavFavorites, deleteNavFavorite,
   adminListRequestFields, adminCreateRequestField, adminUpdateRequestField,
   listMaintenanceRequests, getMaintenanceRequestDetail, updateMaintenanceRequestStatus,
@@ -3531,6 +3532,16 @@ router.post('/incoming/:id(\\d+)/reopen', async (req, res, next) => {
 
 // Confirm an item into one of the four categories (§5). Nothing here guesses: the body carries
 // exactly what Ben filled in, and the item's own text and photos come along.
+// What a receipt about to be filed against a work order / job line might duplicate.
+router.get('/expenses/existing-charges', async (req, res, next) => {
+  try {
+    const workOrderId = req.query.workOrderId ? Number(req.query.workOrderId) : null;
+    const jobLineId = req.query.jobLineId ? Number(req.query.jobLineId) : null;
+    if (!workOrderId && !jobLineId) return res.status(400).json({ ok: false, error: 'workOrderId or jobLineId is required' });
+    res.json({ charges: await listExistingChargesFor({ workOrderId, jobLineId }) });
+  } catch (e) { next(e); }
+});
+
 router.post('/incoming/:id(\\d+)/file', async (req, res, next) => {
   try {
     const result = await fileIncomingItem(req.params.id, { ...req.body, by: currentUsername() });

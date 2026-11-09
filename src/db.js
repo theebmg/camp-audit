@@ -10890,6 +10890,34 @@ async function attachmentIdsFor(itemId) {
   return photos.map((p) => p.Id);
 }
 
+// Charges already sitting on a work order (its own and its lines') or on one job line.
+// Asked before a receipt is filed there, so the same purchase is not entered twice.
+export async function listExistingChargesFor({ workOrderId = null, jobLineId = null }) {
+  if (!workOrderId && !jobLineId) return [];
+  const { rows } = await pool.query(
+    `SELECT e.id, e.vendor, e.amount, e.purchase_date::text AS purchase_date, e.triage_status,
+            SUM(ea.amount) AS allocated,
+            string_agg(DISTINCT jl.title, ', ') AS line_titles,
+            (SELECT count(*)::int FROM attachment_links al WHERE al.entity_type = 'expense' AND al.entity_id = e.id) AS photo_count
+     FROM expense_allocations ea
+     JOIN expenses e ON e.id = ea.expense_id
+     LEFT JOIN job_lines jl ON ea.dest_type = 'job_line' AND jl.id = ea.dest_id
+     WHERE e.deleted_at IS NULL AND e.triage_status <> 'void'
+       AND ${jobLineId
+    ? `ea.dest_type = 'job_line' AND ea.dest_id = $1`
+    : `((ea.dest_type = 'work_order' AND ea.dest_id = $1)
+           OR (ea.dest_type = 'job_line' AND ea.dest_id IN (SELECT id FROM job_lines WHERE work_order_id = $1)))`}
+     GROUP BY e.id
+     ORDER BY e.purchase_date DESC NULLS LAST, e.id DESC`,
+    [jobLineId || workOrderId]
+  );
+  return rows.map((r) => ({
+    Id: r.id, Vendor: r.vendor, Amount: r.amount != null ? Number(r.amount) : null,
+    Allocated: r.allocated != null ? Number(r.allocated) : null, PurchaseDate: r.purchase_date,
+    LineTitles: r.line_titles, PhotoCount: r.photo_count, TriageStatus: r.triage_status,
+  }));
+}
+
 export async function fileIncomingItem(itemId, opts) {
   const item = await getIncomingItem(itemId);
   if (!item) { const e = new Error('Item not found'); e.status = 404; throw e; }
@@ -10933,8 +10961,22 @@ export async function fileIncomingItem(itemId, opts) {
     await pool.query('UPDATE visits SET incoming_item_id = $2 WHERE id = $1', [visit.Id, itemId]);
     entity = 'visit'; entityId = visit.Id; label = visit.Who;
 
+  } else if (filedAs === 'receipt' && opts.existingExpenseId) {
+    // "It's one of these" — the receipt is the paper for a charge already entered. Only the
+    // photo is added; no second expense. Recorded as expense_receipt so Move/Unfile takes
+    // the photo back off and never deletes the charge, which existed before this text did.
+    const { rows: ex } = await pool.query(
+      'SELECT id, vendor FROM expenses WHERE id = $1 AND deleted_at IS NULL', [opts.existingExpenseId]);
+    if (!ex[0]) { const e = new Error('That expense no longer exists'); e.status = 404; throw e; }
+    for (const attachmentId of attachmentIds) {
+      await linkAttachment(attachmentId, { entityType: 'expense', entityId: ex[0].id });
+    }
+    entity = 'expense_receipt'; entityId = ex[0].id; label = ex[0].vendor || `Expense #${ex[0].id}`;
+
   } else if (filedAs === 'receipt') {
-    // An ordinary triage-inbox expense, exactly as an emailed receipt (§5).
+    // An ordinary expense, exactly as an emailed receipt (§5). With a work order (and
+    // optionally a job line) and an amount it is already triaged — there is nothing left to
+    // decide — otherwise it waits in the triage inbox like any emailed receipt.
     const expense = await createExpense({
       vendor: opts.vendor || null,
       amount: opts.amount ?? null,
@@ -10942,13 +10984,17 @@ export async function fileIncomingItem(itemId, opts) {
       taxAmount: opts.taxAmount ?? null,
       categoryId: opts.categoryId || null,
       fundId: opts.fundId || null,
+      fundingSourceId: opts.fundingSourceId || null,
+      workOrderId: opts.workOrderId || null,
+      jobLineId: opts.jobLineId || null,
       assetId: opts.assetId || null,
       notes: opts.notes ?? item.DisplayText,
       createdBy: by,
     });
+    const placed = (opts.workOrderId || opts.jobLineId) && opts.amount != null;
     await pool.query(
-      `UPDATE expenses SET source = 'text', triage_status = 'inbox', incoming_item_id = $2 WHERE id = $1`,
-      [expense.Id, itemId]
+      `UPDATE expenses SET source = 'text', triage_status = $3, incoming_item_id = $2 WHERE id = $1`,
+      [expense.Id, itemId, placed ? 'triaged' : 'inbox']
     );
     for (const attachmentId of attachmentIds) {
       await linkAttachment(attachmentId, { entityType: 'expense', entityId: expense.Id });
@@ -11023,6 +11069,11 @@ export async function moveIncomingItem(itemId, opts) {
     if (plan.CanRemove) {
       if (item.FiledEntity === 'visit') await pool.query('DELETE FROM visits WHERE id = $1', [item.FiledEntityId]);
       else if (item.FiledEntity === 'expense') await pool.query(`UPDATE expenses SET deleted_at = now() WHERE id = $1`, [item.FiledEntityId]);
+      else if (item.FiledEntity === 'expense_receipt') {
+        await pool.query(
+          `DELETE FROM attachment_links WHERE entity_type = 'expense' AND entity_id = $1 AND attachment_id = ANY($2::int[])`,
+          [item.FiledEntityId, await attachmentIdsFor(itemId)]);
+      }
       else if (item.FiledEntity === 'attachment_batch') await pool.query('DELETE FROM attachment_batches WHERE id = $1', [item.FiledEntityId]);
       else if (item.FiledEntity === 'asset_note') await pool.query('DELETE FROM asset_notes WHERE id = $1', [item.FiledEntityId]);
     } else {
