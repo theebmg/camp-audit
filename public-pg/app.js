@@ -16036,6 +16036,26 @@ function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
     jl.BlockedReason ? '🚧 Blocked' : null,
   ].filter(Boolean).join(' · ');
 
+  // At a glance without opening the line: actual hours, actual cost (manual + linked receipts,
+  // the same total the rest of the app uses) and who paid it. Any cost no payer accounts for
+  // shows as Unattributed, as on the board report.
+  const spent = (jl.ActualCost != null || jl.LinkedExpenseCount)
+    ? Number(jl.ActualCost || 0) + Number(jl.LinkedExpenseTotal || 0) : null;
+  const paid = (jl.PaidBy || []).filter((p) => p.Amount);
+  const paidSum = paid.reduce((t, p) => t + Number(p.Amount), 0);
+  const gap = spent != null ? Math.round((spent - paidSum) * 100) / 100 : 0;
+  const money = (n) => `$${Number(n).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+  const paidParts = [
+    ...paid.map((p) => `${escapeHtml(p.IsGeneral ? 'Camp general' : p.Source)} ${money(p.Amount)}`),
+    gap > 0.004 && spent ? `<span class="jl-unattr">Unattributed ${money(gap)}</span>` : null,
+  ].filter(Boolean);
+  const statsHtml = (jl.ActualHours != null || spent != null || paidParts.length) ? `
+      <span class="jl-sum-stats">
+        ${jl.ActualHours != null ? `<span class="jl-stat"><b>${jl.ActualHours}h</b></span>` : ''}
+        ${spent != null ? `<span class="jl-stat"><b>${money(spent)}</b></span>` : ''}
+        ${paidParts.length ? `<span class="jl-stat jl-paid">${paidParts.join(' · ')}</span>` : ''}
+      </span>` : '';
+
   return `<details class="card jl-card" data-id="${jl.Id}">
     <summary style="cursor:pointer;display:flex;align-items:center;gap:10px;list-style:none">
       <label class="cb-wrap" style="flex:0 0 auto;margin:0" onclick="event.stopPropagation()"><input type="checkbox" class="jl-split-select" value="${jl.Id}" title="Select to split off into a new work order" style="width:18px;height:18px;flex-shrink:0" /></label>
@@ -16043,7 +16063,7 @@ function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
       <span style="flex:1;${jl.StatusIsTerminal ? 'text-decoration:line-through;color:var(--muted)' : ''}">
         <strong>${escapeHtml(jl.Title)}</strong>
         <div class="muted" style="font-weight:400;font-size:0.85rem">${summaryBits}</div>
-      </span>
+      </span>${statsHtml}
     </summary>
     <form class="jl-edit-form" style="margin-top:12px">
       <div class="field-row"><label>Status</label>

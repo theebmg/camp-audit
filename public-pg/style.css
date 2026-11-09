@@ -1206,3 +1206,14 @@ select { max-width: 100%; }
   width: 22px; height: 22px; padding: 0; border-radius: 50%; border: 2px solid var(--surface);
   background: #c62828; color: #fff; font-size: 11px; line-height: 18px; cursor: pointer;
 }
+
+/* Job line card, collapsed: hours · cost · who paid on the right (Nov 2026). */
+.jl-card > summary { flex-wrap: wrap; }
+.jl-sum-stats { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: baseline; gap: 4px 14px;
+  margin-left: auto; text-align: right; font-size: 0.85rem; max-width: 50%; }
+.jl-sum-stats .jl-stat b { font-variant-numeric: tabular-nums; }
+.jl-sum-stats .jl-paid { color: var(--muted); }
+.jl-sum-stats .jl-unattr { color: #b26a00; }
+@media (max-width: 640px) {
+  .jl-sum-stats { max-width: none; width: 100%; justify-content: flex-start; text-align: left; padding-left: 28px; }
+}

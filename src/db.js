@@ -4172,7 +4172,16 @@ async function hydrateJobLine(row) {
 
 export async function listJobLines(woId) {
   const { rows } = await pool.query('SELECT * FROM job_lines WHERE work_order_id = $1 ORDER BY sort_order, id', [woId]);
-  return Promise.all(rows.map(hydrateJobLine));
+  const [lines, funding] = await Promise.all([
+    Promise.all(rows.map(hydrateJobLine)),
+    rows.length ? jobLineFundingForReport(rows.map((r) => r.id)) : new Map(),
+  ]);
+  // Who paid, for the collapsed card's at-a-glance line (Nov 2026). Same source as the board
+  // report's funding tags, so the two can never tell different stories.
+  for (const l of lines) {
+    l.PaidBy = (funding.get(l.Id) || []).map((f) => ({ Source: f.Source, Amount: f.Amount, IsGeneral: f.IsGeneral }));
+  }
+  return lines;
 }
 
 export async function getJobLine(id) {
