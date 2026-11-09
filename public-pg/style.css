@@ -1153,3 +1153,46 @@ input.has-error, select.has-error, textarea.has-error {
   gap: 8px;
   margin-left: auto;
 }
+
+/* ---------- Image viewer (openImageViewer) ---------- */
+.zoomable { cursor: zoom-in; }
+.thumb-zoom-btn {
+  position: absolute; right: 3px; bottom: 3px; z-index: 1;
+  width: 28px; height: 28px; padding: 0; border: none; border-radius: 6px;
+  background: rgba(0, 0, 0, 0.55); color: #fff; font-size: 14px; line-height: 28px; cursor: zoom-in;
+}
+.imgv-overlay {
+  position: fixed; inset: 0; z-index: 1000; background: rgba(8, 9, 12, 0.94);
+  display: flex; flex-direction: column;
+}
+.imgv-bar {
+  display: flex; align-items: center; gap: 6px; padding: 8px 10px; flex-shrink: 0;
+  color: #eee; font-size: 0.9rem;
+}
+.imgv-count { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.imgv-btn {
+  background: rgba(255, 255, 255, 0.12); color: #fff; border: none; border-radius: 8px;
+  min-width: 40px; height: 40px; padding: 0 12px; font-size: 1.05rem; cursor: pointer;
+  text-decoration: none; display: inline-flex; align-items: center; justify-content: center;
+}
+.imgv-btn:hover { background: rgba(255, 255, 255, 0.22); }
+.imgv-open { font-size: 0.85rem; }
+.imgv-stage {
+  flex: 1; min-height: 0; overflow: auto; display: flex; align-items: center; justify-content: center;
+  padding: 0 8px 8px; touch-action: pan-x pan-y pinch-zoom;
+}
+.imgv-stage.zoomed { display: block; cursor: grab; }
+.imgv-stage.zoomed:active { cursor: grabbing; }
+.imgv-img { display: block; object-fit: contain; cursor: zoom-in; user-select: none; -webkit-user-drag: none; margin: auto; }
+.imgv-stage.zoomed .imgv-img { cursor: zoom-out; }
+.imgv-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 48px; height: 72px; border: none; border-radius: 10px;
+  background: rgba(255, 255, 255, 0.14); color: #fff; font-size: 2rem; cursor: pointer;
+}
+.imgv-prev { left: 8px; }
+.imgv-next { right: 8px; }
+@media (max-width: 760px) {
+  .imgv-open { display: none; }
+  .imgv-nav { width: 40px; height: 56px; }
+}

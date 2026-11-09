@@ -701,12 +701,161 @@ async function uploadSectionResumable(files, category, ownerId, sectionKey, trac
   return { attachmentIds, failures };
 }
 
-function attachmentThumbHtml(a) {
+// ---------- Image viewer (Nov 2026) ----------
+// Summary screens (Inbox, Expenses, Incoming) show small square thumbnails, cropped to
+// fit — useless for reading a receipt. Anything marked with data-zoom opens here full
+// screen: fitted first, then zoom in (buttons, +/−, mouse wheel, or click the picture)
+// and drag or scroll to read the fine print. Several photos page with ‹ › or arrow keys.
+// A PDF has nothing to show inline, so it opens in a new tab instead.
+//
+// data-zoom holds a JSON list [{u: url, k: kind}] — the whole set, so a card showing only
+// its first thumbnail still pages through every photo — and data-zoom-index the start.
+function zoomAttrs(list, index = 0) {
+  const items = list.filter((x) => x && x.u).map((x) => ({ u: x.u, k: x.k || 'image' }));
+  if (!items.length) return '';
+  return `data-zoom="${escapeHtml(JSON.stringify(items))}" data-zoom-index="${index}"`;
+}
+const zoomList = (attachments) => (attachments || []).map((a) => ({ u: a.Url, k: a.Kind || 'image' }));
+
+function openImageViewer(items, start = 0) {
+  let idx = Math.min(Math.max(start, 0), items.length - 1);
+  let scale = 0; // 0 = fit to screen; otherwise a multiple of the picture's natural size
+  const overlay = document.createElement('div');
+  overlay.className = 'imgv-overlay';
+  overlay.setAttribute('role', 'dialog');
+  overlay.setAttribute('aria-modal', 'true');
+  overlay.setAttribute('aria-label', 'Photo viewer');
+  overlay.innerHTML = `
+    <div class="imgv-bar">
+      <span class="imgv-count"></span>
+      <button type="button" class="imgv-btn" data-act="out" aria-label="Zoom out">−</button>
+      <button type="button" class="imgv-btn imgv-fit" data-act="fit">Fit</button>
+      <button type="button" class="imgv-btn" data-act="in" aria-label="Zoom in">+</button>
+      <a class="imgv-btn imgv-open" target="_blank" rel="noopener">Open original ↗</a>
+      <button type="button" class="imgv-btn" data-act="close" aria-label="Close">✕</button>
+    </div>
+    <div class="imgv-stage"><img class="imgv-img" alt="" /></div>
+    <button type="button" class="imgv-nav imgv-prev" data-act="prev" aria-label="Previous photo">‹</button>
+    <button type="button" class="imgv-nav imgv-next" data-act="next" aria-label="Next photo">›</button>`;
+  const stage = overlay.querySelector('.imgv-stage');
+  const img = overlay.querySelector('.imgv-img');
+
+  function applyScale(keepCenter = true) {
+    const cx = stage.scrollLeft + stage.clientWidth / 2;
+    const cy = stage.scrollTop + stage.clientHeight / 2;
+    const before = img.getBoundingClientRect().width || 1;
+    if (!scale) {
+      img.style.width = ''; img.style.maxWidth = '100%'; img.style.maxHeight = '100%';
+      stage.classList.remove('zoomed');
+    } else {
+      img.style.maxWidth = 'none'; img.style.maxHeight = 'none';
+      img.style.width = `${Math.round(img.naturalWidth * scale)}px`;
+      stage.classList.add('zoomed');
+    }
+    overlay.querySelector('.imgv-fit').textContent = scale ? `${Math.round(scale * 100)}%` : 'Fit';
+    if (keepCenter && scale) {
+      const ratio = img.getBoundingClientRect().width / before;
+      stage.scrollLeft = cx * ratio - stage.clientWidth / 2;
+      stage.scrollTop = cy * ratio - stage.clientHeight / 2;
+    }
+  }
+  // Zoom steps start from whatever "fit" currently shows, so the first + is never a jump down.
+  function fitScale() {
+    return img.naturalWidth ? Math.min(stage.clientWidth / img.naturalWidth, stage.clientHeight / img.naturalHeight, 1) : 1;
+  }
+  function zoom(factor) {
+    const cur = scale || fitScale();
+    scale = Math.min(Math.max(cur * factor, 0.1), 6);
+    applyScale();
+  }
+  function show() {
+    const it = items[idx];
+    scale = 0;
+    img.src = it.u;
+    overlay.querySelector('.imgv-open').href = it.u;
+    overlay.querySelector('.imgv-count').textContent = items.length > 1 ? `${idx + 1} / ${items.length}` : '';
+    overlay.querySelector('.imgv-prev').hidden = items.length < 2;
+    overlay.querySelector('.imgv-next').hidden = items.length < 2;
+    applyScale(false);
+  }
+  function close() {
+    overlay.remove();
+    document.removeEventListener('keydown', onKey, true);
+  }
+  function onKey(e) {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); close(); }
+    else if (e.key === 'ArrowLeft' && items.length > 1) { idx = (idx - 1 + items.length) % items.length; show(); }
+    else if (e.key === 'ArrowRight' && items.length > 1) { idx = (idx + 1) % items.length; show(); }
+    else if (e.key === '+' || e.key === '=') zoom(1.25);
+    else if (e.key === '-') zoom(0.8);
+    else if (e.key === '0') { scale = 0; applyScale(); }
+  }
+  overlay.addEventListener('click', (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'close') close();
+    else if (act === 'prev') { idx = (idx - 1 + items.length) % items.length; show(); }
+    else if (act === 'next') { idx = (idx + 1) % items.length; show(); }
+    else if (act === 'in') zoom(1.25);
+    else if (act === 'out') zoom(0.8);
+    else if (act === 'fit') { scale = scale ? 0 : 1; applyScale(); }
+    else if (e.target === img && !dragged) { if (scale) { scale = 0; applyScale(); } else { scale = Math.max(1, fitScale() * 2); applyScale(); } }
+    else if (e.target === stage) close(); // clicking the dark area around the picture closes
+  });
+  stage.addEventListener('wheel', (e) => {
+    if (!e.ctrlKey && !scale) { e.preventDefault(); zoom(e.deltaY < 0 ? 1.15 : 0.87); return; }
+    if (e.ctrlKey) { e.preventDefault(); zoom(e.deltaY < 0 ? 1.15 : 0.87); }
+  }, { passive: false });
+  // Drag to pan when zoomed in (a mouse has no scroll gesture for sideways).
+  let drag = null; let dragged = false;
+  stage.addEventListener('pointerdown', (e) => {
+    dragged = false;
+    if (!scale || e.pointerType !== 'mouse') return;
+    drag = { x: e.clientX, y: e.clientY, l: stage.scrollLeft, t: stage.scrollTop };
+    e.preventDefault();
+  });
+  window.addEventListener('pointermove', (e) => {
+    if (!drag || !overlay.isConnected) return;
+    if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 4) dragged = true;
+    stage.scrollLeft = drag.l - (e.clientX - drag.x);
+    stage.scrollTop = drag.t - (e.clientY - drag.y);
+  });
+  window.addEventListener('pointerup', () => { drag = null; });
+  img.addEventListener('load', () => applyScale(false));
+  img.addEventListener('error', () => {
+    overlay.querySelector('.imgv-count').textContent = 'This photo could not be loaded — try "Open original".';
+  });
+  document.addEventListener('keydown', onKey, true);
+  document.body.appendChild(overlay);
+  show();
+  overlay.querySelector('[data-act="close"]').focus();
+}
+
+// One listener for every data-zoom element in the app. Capture phase, so the card or row
+// underneath (which opens its own screen) never sees the click.
+document.addEventListener('click', (e) => {
+  const el = e.target.closest?.('[data-zoom]');
+  if (!el) return;
+  let items;
+  try { items = JSON.parse(el.dataset.zoom); } catch { return; }
+  if (!Array.isArray(items) || !items.length) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const start = Number(el.dataset.zoomIndex) || 0;
+  const it = items[start] || items[0];
+  if (it.k !== 'image') { window.open(it.u, '_blank', 'noopener'); return; }
+  // Page only through the pictures; documents in the same set open on their own.
+  const images = items.filter((x) => x.k === 'image');
+  openImageViewer(images, Math.max(0, images.indexOf(it)));
+}, true);
+
+// opts.zoom: [list, index] from zoomList() — makes the thumbnail open the viewer.
+function attachmentThumbHtml(a, opts = {}) {
+  const z = opts.zoom ? ` ${zoomAttrs(...opts.zoom)} class="zoomable" title="Click to enlarge"` : '';
   if (a.Kind === 'image') {
-    return `<img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:84px;height:84px;object-fit:cover;border-radius:8px;display:block" />`;
+    return `<img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt=""${z} style="width:84px;height:84px;object-fit:cover;border-radius:8px;display:block;flex-shrink:0" />`;
   }
   const icon = a.Kind === 'document' ? '📄' : a.Kind === 'audio' ? '🎵' : '📎';
-  return `<div style="width:84px;height:84px;border-radius:8px;background:#f0f2fb;display:flex;align-items:center;justify-content:center;font-size:28px">${icon}</div>`;
+  return `<div${z} style="width:84px;height:84px;border-radius:8px;background:#f0f2fb;display:flex;align-items:center;justify-content:center;font-size:28px;flex-shrink:0">${icon}</div>`;
 }
 
 // Renders a thumbnail grid + "+ Add" capture control into `container`, wired
@@ -4373,6 +4522,7 @@ async function renderInbox() {
             ${a.Kind === 'image'
               ? `<img src="${escapeHtml(a.ThumbUrl || a.Url)}" alt="" style="width:84px;height:84px;object-fit:cover;border-radius:8px;display:block" />`
               : `<div style="width:84px;height:84px;border-radius:8px;background:#f0f2fb;display:flex;align-items:center;justify-content:center;font-size:28px">📄</div>`}
+            <button type="button" class="thumb-zoom-btn" ${zoomAttrs(zoomList(b.Attachments), b.Attachments.indexOf(a))} aria-label="Enlarge" title="Enlarge">🔍</button>
           </label>`).join('')}
       </div>
       <div class="btn-row" style="margin-top:10px">
@@ -4592,9 +4742,10 @@ function expenseInboxCardHtml(e) {
   const thumb = (e.Attachments || [])[0];
   return `<div class="card expense-card" data-id="${e.Id}" style="cursor:pointer;border-left:4px solid #d98c00;margin-bottom:8px">
     <div style="display:flex;gap:10px;align-items:flex-start">
-      ${thumb ? attachmentThumbHtml(thumb) : '<div style="width:84px;height:84px;border-radius:8px;background:#fff3e0;display:flex;align-items:center;justify-content:center;font-size:28px;flex-shrink:0">🧾</div>'}
+      ${thumb ? attachmentThumbHtml(thumb, { zoom: [zoomList(e.Attachments), 0] }) : '<div style="width:84px;height:84px;border-radius:8px;background:#fff3e0;display:flex;align-items:center;justify-content:center;font-size:28px;flex-shrink:0">🧾</div>'}
       <div style="flex:1;min-width:0">
         <strong>${escapeHtml(e.Vendor || e.Subject || '(unidentified receipt)')}</strong>${expenseParsedBadge(e)}
+        ${(e.Attachments || []).length > 1 ? `<span class="pill" style="margin-left:4px">${e.Attachments.length} pages</span>` : ''}
         <div class="muted" style="font-size:0.85rem">${e.Amount != null ? `$${Number(e.Amount).toLocaleString()}` : 'amount unknown'}${e.PurchaseDate ? ` · ${formatDateNice(e.PurchaseDate)}` : ''}</div>
         ${e.SenderEmail ? `<div class="muted" style="font-size:0.8rem">${escapeHtml(e.SenderEmail)}</div>` : ''}
       </div>
@@ -10565,7 +10716,8 @@ async function renderIncoming(params = {}) {
               ${i.DisplayText ? `<div style="margin-top:3px;white-space:pre-wrap">${escapeHtml(i.DisplayText)}</div>`
                 : '<div class="muted" style="margin-top:3px;font-style:italic">Photo only — no message text</div>'}
               ${(i.Photos || []).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
-                ${i.Photos.slice(0, 4).map((ph) => `<img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt="" style="width:56px;height:56px;object-fit:cover;border-radius:6px" />`).join('')}
+                ${i.Photos.slice(0, 4).map((ph, pi) => `<img src="${escapeHtml(ph.ThumbUrl || ph.Url)}" alt="" class="zoomable" title="Click to enlarge" ${zoomAttrs(i.Photos.map((x) => ({ u: x.Url, k: x.Kind || 'image' })), pi)} style="width:56px;height:56px;object-fit:cover;border-radius:6px" />`).join('')}
+                ${i.Photos.length > 4 ? `<span class="muted" style="align-self:center;font-size:0.8rem">+${i.Photos.length - 4} more</span>` : ''}
               </div>` : ''}
               ${i.MediaError ? `<div class="muted" style="margin-top:4px;font-size:0.8rem;color:var(--danger)">
                 ${i.MediaExpected} photo${i.MediaExpected === 1 ? '' : 's'} did not come through
@@ -10628,7 +10780,7 @@ async function openIncomingItem(id, onChanged = () => {}) {
           <div class="muted" style="font-size:0.78rem">The text, as sent</div>
           <div style="white-space:pre-wrap">${escapeHtml(item.BodyText || '(no text)')}</div>
           ${(item.Photos || []).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
-            ${item.Photos.map((p) => `<img src="${escapeHtml(p.ThumbUrl || p.Url)}" alt="" style="width:64px;height:64px;object-fit:cover;border-radius:6px" />`).join('')}
+            ${item.Photos.map((p, pi) => `<img src="${escapeHtml(p.ThumbUrl || p.Url)}" alt="" class="zoomable" title="Click to enlarge" ${zoomAttrs(item.Photos.map((x) => ({ u: x.Url, k: x.Kind || 'image' })), pi)} style="width:64px;height:64px;object-fit:cover;border-radius:6px" />`).join('')}
           </div>` : ''}
         </div>
 
