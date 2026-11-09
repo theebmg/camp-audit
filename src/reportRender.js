@@ -766,7 +766,7 @@ function sectionHtml(section, items, showHours = false, showFunding = 'non_gener
     const nested = nestedBlockHtml(lines.map((l) => nestedLineHtml(l, showHours, showFunding)).join(''));
     // An itemized work order's lines say what was completed, so the roll-up sentence that says
     // the same thing in prose is redundant directly above them.
-    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0, periodFunding: isContinuedHeader(it) ? periodFundingText(lines, showFunding) : null }, showFunding));
+    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0, periodFunding: isContinuedHeader(it) ? periodFundingText(periodLinesOf(items, it.ItemId), showFunding) : null }, showFunding));
   }
 
   return `
@@ -806,6 +806,9 @@ function totalledItems(items) {
 // of its own (so last period is never re-printed or re-counted).
 const CONTINUED_SUBTITLE = 'continued from an earlier report';
 const isContinuedHeader = (i) => i.ItemType === 'work_order' && i.SnapCost == null && i.SnapSubtitle === CONTINUED_SUBTITLE;
+// This period's lines under a continued header: every INCLUDED line, printed or not. A header in
+// summary mode hides its lines, but the money they carry is still this period's spending.
+const periodLinesOf = (items, woId) => items.filter((l) => l.Included && l.ItemType === 'job_line' && l.ParentWorkOrderId === woId);
 
 // What the MONEY and HOURS add up from (Nov 2026). Same as totalledItems, except that under a
 // continued header it is that header's lines — this period's work — that count. Before, the
@@ -816,7 +819,7 @@ function moneyItems(items) {
   const visible = visibleItems(items);
   const continued = new Set(visible.filter(isContinuedHeader).map((i) => i.ItemId));
   const base = totalledItems(items);
-  return [...base, ...visible.filter((i) => i.ItemType === 'job_line' && continued.has(i.ParentWorkOrderId) && !base.includes(i))];
+  return [...base, ...items.filter((i) => i.Included && i.ItemType === 'job_line' && continued.has(i.ParentWorkOrderId) && !base.includes(i))];
 }
 
 export function renderBoardReportItemsHtml({ report, items, aggregates, reportPhotos = [] }) {
@@ -906,7 +909,7 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
       const pEst = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
       const ownFunding = openWo ? null : fundingTagText(it, showFunding);
       const periodFunding = isContinuedHeader(it) && !ownFunding
-        ? periodFundingText(rows.filter((l) => l.ItemType === 'job_line' && l.ParentWorkOrderId === it.ItemId), showFunding)
+        ? periodFundingText(periodLinesOf(items, it.ItemId), showFunding)
         : null;
       const bits = [it.SnapAssetName, itemDatesText(it),
         showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
