@@ -64,6 +64,17 @@ listener for any element with `data-zoom` (build it with `zoomAttrs(list, index)
 thumbnails (🔍 corner button, since the thumb itself is a select checkbox), and Incoming
 list + item panel. Not browser-verified by me either.
 
+**Follow-up 2: Incoming receipts → WO / job line.** The receipt form in Incoming now has
+Paid from (`paidFromSelectHtml` + `wireOtherPersonPaidFrom`, same list as the expense form),
+Work order (combobox) and optional Job line. Before filing to a WO it calls
+`GET /expenses/existing-charges` (`listExistingChargesFor`: a line's own charges, or a WO's
+own plus all its lines') and `pickExistingChargeDialog` asks "is this one of these?"
+(within $1 / 5% flagged). Picking one files with `existingExpenseId`: the photo is linked to
+that expense, no new expense, and the item is recorded as `filed_entity = 'expense_receipt'`
+so Move/Unfile **unlinks the photo and never deletes the charge** (plain `expense` is still
+soft-deleted on move, as before). A new receipt with a WO and an amount is created
+`triaged`; otherwise it stays `inbox`. Test: `scripts/receipt-to-wo-test.mjs`.
+
 ## 2. The system
 
 | | |

@@ -15,7 +15,7 @@ async function cleanup() {
   await db.pool.query(`DELETE FROM expense_allocations WHERE expense_id IN (${exp})`);
   await db.pool.query(`DELETE FROM savings_entries WHERE source_type = 'expense' AND source_id IN (${exp})`).catch(() => {});
   if (scratch.items.length) {
-    await db.pool.query('DELETE FROM incoming_item_moves WHERE item_id = ANY($1::int[])', [scratch.items]).catch(() => {});
+    await db.pool.query('DELETE FROM incoming_moves WHERE item_id = ANY($1::int[])', [scratch.items]).catch(() => {});
     await db.pool.query(`DELETE FROM attachment_links WHERE entity_type = 'incoming_item' AND entity_id = ANY($1::int[])`, [scratch.items]);
     await db.pool.query('UPDATE expenses SET incoming_item_id = NULL WHERE incoming_item_id = ANY($1::int[])', [scratch.items]);
   }
