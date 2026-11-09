@@ -10888,7 +10888,10 @@ async function openIncomingItem(id, onChanged = () => {}) {
           <div class="muted" style="font-size:0.78rem">The text, as sent</div>
           <div style="white-space:pre-wrap">${escapeHtml(item.BodyText || '(no text)')}</div>
           ${(item.Photos || []).length ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
-            ${item.Photos.map((p, pi) => `<img src="${escapeHtml(p.ThumbUrl || p.Url)}" alt="" class="zoomable" title="Click to enlarge" ${zoomAttrs(item.Photos.map((x) => ({ u: x.Url, k: x.Kind || 'image' })), pi)} style="width:64px;height:64px;object-fit:cover;border-radius:6px" />`).join('')}
+            ${item.Photos.map((p, pi) => `<span style="position:relative;display:inline-block">
+              <img src="${escapeHtml(p.ThumbUrl || p.Url)}" alt="" class="zoomable" title="Click to enlarge" ${zoomAttrs(item.Photos.map((x) => ({ u: x.Url, k: x.Kind || 'image' })), pi)} style="width:64px;height:64px;object-fit:cover;border-radius:6px;display:block" />
+              <button type="button" class="photo-del-btn inc-photo-del" data-id="${p.Id}" aria-label="Delete this photo" title="Delete this photo (a duplicate or a mistake)">✕</button>
+            </span>`).join('')}
           </div>` : ''}
         </div>
 
@@ -10920,6 +10923,29 @@ async function openIncomingItem(id, onChanged = () => {}) {
     </div>`;
   document.body.appendChild(overlay);
   overlay.querySelector('.modal-cancel').addEventListener('click', () => overlay.remove());
+  // A duplicate or mistaken photo: voided everywhere it was linked (the receipt or work order
+  // it was filed to as well), the same Void the rest of the app uses — gone from view, kept
+  // in the database.
+  overlay.querySelectorAll('.inc-photo-del').forEach((btn) => btn.addEventListener('click', async () => {
+    const filedNote = item.Status === 'filed' ? ` It also comes off the ${item.FiledAs || 'record'} this was filed to.` : '';
+    if (!await confirmDialog(`Delete this photo?${filedNote}`, { confirmLabel: 'Delete photo', danger: true })) return;
+    try {
+      await api(`/api/pg/attachments/${btn.dataset.id}/void`, { method: 'POST' });
+      const remaining = item.Photos.length - 1;
+      overlay.remove();
+      onChanged();
+      // Nothing left in the text at all: offer to clear the item too.
+      if (!remaining && !(item.BodyText || '').trim() && item.Status === 'new'
+        && await confirmDialog('That was the only thing in this text. Dismiss the text too?', { confirmLabel: 'Dismiss it', cancelLabel: 'Keep it' })) {
+        await api(`/api/pg/incoming/${id}/dismiss`, { method: 'POST' });
+        toast('Photo deleted and the text dismissed');
+        onChanged();
+        return;
+      }
+      toast('Photo deleted');
+      openIncomingItem(id, onChanged);
+    } catch (e) { toast(e.message, 5000); }
+  }));
   overlay.querySelector('#incDismiss').addEventListener('click', async () => {
     try {
       await api(`/api/pg/incoming/${id}/${item.Status === 'dismissed' ? 'reopen' : 'dismiss'}`, { method: 'POST' });
