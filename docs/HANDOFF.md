@@ -75,6 +75,15 @@ so Move/Unfile **unlinks the photo and never deletes the charge** (plain `expens
 soft-deleted on move, as before). A new receipt with a WO and an amount is created
 `triaged`; otherwise it stays `inbox`. Test: `scripts/receipt-to-wo-test.mjs`.
 
+**Follow-up 3: board report, carried-over work orders.** A WO already on an earlier report
+comes back as a header with no money (`continued from an earlier report`). Its lines were
+being skipped from totals as "rolled up", so this period's spend vanished from totals and the
+who-paid footer. `moneyItems()` in reportRender.js now counts those lines (piece-of-work
+counts still use `totalledItems`), and the header prints `This period: Ben $X · Camp general $Y`
+(`periodFundingText`, display only). Open WOs new this period still show no money on their row.
+**Known stale test:** board-report-test's "all N real expenses are still unset" asserts no
+expense has a payer — false since Ben started setting payers. Ask Ben before deleting it.
+
 ## 2. The system
 
 | | |
