@@ -16026,6 +16026,44 @@ const FUNDING_SOURCE_LABELS = {
 // close-gate logic are Phase 2), then its own crew and photos. Collapsed by
 // default (<details>) so N lines on one WO doesn't turn the page into an
 // unreadable wall on a phone.
+// A line's spending and who paid it: manual Actual Cost + linked receipts, against the payers
+// the server worked out (PaidBy). gap > 0 is money nobody is named for.
+function jobLineMoney(jl) {
+  const spent = (jl.ActualCost != null || jl.LinkedExpenseCount)
+    ? Number(jl.ActualCost || 0) + Number(jl.LinkedExpenseTotal || 0) : null;
+  const paid = (jl.PaidBy || []).filter((p) => p.Amount);
+  const paidSum = paid.reduce((t, p) => t + Number(p.Amount), 0);
+  const gap = spent != null ? Math.max(0, Math.round((spent - paidSum) * 100) / 100) : 0;
+  return { spent, paid, gap };
+}
+const fmtJlMoney = (n) => `$${Number(n).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+
+// Whole work order at a glance, above its lines: spent, who paid, and any unattributed money -
+// which is a button that filters the list down to the lines carrying it.
+function jobLinesMoneyBarHtml(jobLines) {
+  let spent = 0, gap = 0, gapLines = 0, any = false;
+  const by = new Map();
+  for (const jl of jobLines) {
+    const m = jobLineMoney(jl);
+    if (m.spent == null) continue;
+    any = true; spent += m.spent;
+    if (m.gap > 0.004) { gap += m.gap; gapLines += 1; }
+    for (const p of m.paid) {
+      const label = p.IsGeneral ? 'Camp general' : p.Source;
+      by.set(label, (by.get(label) || 0) + Number(p.Amount));
+    }
+  }
+  if (!any) return '';
+  const parts = [...by.entries()].sort((a, b) => b[1] - a[1])
+    .map(([label, amt]) => `${escapeHtml(label)} ${fmtJlMoney(amt)}`);
+  return `<div class="jl-money-bar">
+    <span><b>Spent ${fmtJlMoney(spent)}</b></span>
+    ${parts.length ? `<span class="muted">${parts.join(' · ')}</span>` : ''}
+    ${gapLines ? `<button type="button" class="jl-unattr-filter" aria-pressed="false" title="Show only the lines with money nobody is named for">⚠ Unattributed ${fmtJlMoney(gap)} on ${gapLines} line${gapLines === 1 ? '' : 's'} — show</button>`
+      : '<span class="jl-all-attr">✓ Every dollar has a payer</span>'}
+  </div>`;
+}
+
 function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
   const selectedCauseIds = new Set((jl.Causes || []).map((c) => c.Id));
   const summaryBits = [
@@ -16039,12 +16077,8 @@ function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
   // At a glance without opening the line: actual hours, actual cost (manual + linked receipts,
   // the same total the rest of the app uses) and who paid it. Any cost no payer accounts for
   // shows as Unattributed, as on the board report.
-  const spent = (jl.ActualCost != null || jl.LinkedExpenseCount)
-    ? Number(jl.ActualCost || 0) + Number(jl.LinkedExpenseTotal || 0) : null;
-  const paid = (jl.PaidBy || []).filter((p) => p.Amount);
-  const paidSum = paid.reduce((t, p) => t + Number(p.Amount), 0);
-  const gap = spent != null ? Math.round((spent - paidSum) * 100) / 100 : 0;
-  const money = (n) => `$${Number(n).toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+  const { spent, paid, gap } = jobLineMoney(jl);
+  const money = fmtJlMoney;
   const paidParts = [
     ...paid.map((p) => `${escapeHtml(p.IsGeneral ? 'Camp general' : p.Source)} ${money(p.Amount)}`),
     gap > 0.004 && spent ? `<span class="jl-unattr">Unattributed ${money(gap)}</span>` : null,
@@ -16056,7 +16090,7 @@ function jobLineCardHtml(jl, { causesCatalog, jobLineStatuses }) {
         ${paidParts.length ? `<span class="jl-stat jl-paid">${paidParts.join(' · ')}</span>` : ''}
       </span>` : '';
 
-  return `<details class="card jl-card" data-id="${jl.Id}">
+  return `<details class="card jl-card" data-id="${jl.Id}"${gap > 0.004 && spent ? ' data-unattr="1"' : ''}>
     <summary style="cursor:pointer;display:flex;align-items:center;gap:10px;list-style:none">
       <label class="cb-wrap" style="flex:0 0 auto;margin:0" onclick="event.stopPropagation()"><input type="checkbox" class="jl-split-select" value="${jl.Id}" title="Select to split off into a new work order" style="width:18px;height:18px;flex-shrink:0" /></label>
       ${statusPillHtml(jl.StatusName, jl.StatusColor)}
@@ -16285,6 +16319,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
 
     <div class="card">
       <h3>Job Lines</h3>
+      ${jobLinesMoneyBarHtml(jobLines)}
       <p class="muted">The unit of work — hours, cost, funding, responsibility, and scope all live on the line. A vendor on the roof, volunteers on the deck, one work order. Check lines above and use Split to move them into a new sibling work order (e.g. the roof needs a specialist, the deck doesn't).</p>
       <div class="btn-row">
         ${!wo.StatusIsTerminal ? `<button type="button" class="btn btn-secondary" id="editLinesBtn" ${window.innerWidth < GRID_MIN_WIDTH ? 'hidden' : ''}>✎ Edit lines in grid</button>` : ''}
@@ -16515,6 +16550,14 @@ async function renderWorkOrderDetail({ id }, container = app) {
     } catch (err) { toast(err.message, 5000); }
   });
 
+  container.querySelector('.jl-unattr-filter')?.addEventListener('click', (ev) => {
+    const btn = ev.currentTarget;
+    const on = btn.getAttribute('aria-pressed') !== 'true';
+    btn.setAttribute('aria-pressed', String(on));
+    btn.textContent = btn.textContent.replace(/ — (show|show all)$/, on ? ' — show all' : ' — show');
+    container.querySelectorAll('.jl-card').forEach((c) => { c.hidden = on && !c.dataset.unattr; });
+    if (on) container.querySelector('.jl-card[data-unattr]')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  });
   container.querySelectorAll('.jl-card').forEach((card) => {
     const jlId = card.dataset.id;
     const jl = jobLines.find((l) => String(l.Id) === jlId);

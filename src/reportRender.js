@@ -808,7 +808,11 @@ const CONTINUED_SUBTITLE = 'continued from an earlier report';
 const isContinuedHeader = (i) => i.ItemType === 'work_order' && i.SnapCost == null && i.SnapSubtitle === CONTINUED_SUBTITLE;
 // This period's lines under a continued header: every INCLUDED line, printed or not. A header in
 // summary mode hides its lines, but the money they carry is still this period's spending.
-const periodLinesOf = (items, woId) => items.filter((l) => l.Included && l.ItemType === 'job_line' && l.ParentWorkOrderId === woId);
+// Only work actually done counts: a Coming Up / Overdue line's cost is its ESTIMATE, and once
+// showed as "Unattributed $600" spending on Caretaker's Renovations (the unstarted kitchen).
+const isPlannedSection = (l) => l.Section === 'coming_up' || l.Section === 'overdue';
+const periodLinesOf = (items, woId) => items.filter((l) => l.Included && l.ItemType === 'job_line'
+  && l.ParentWorkOrderId === woId && !isPlannedSection(l));
 
 // What the MONEY and HOURS add up from (Nov 2026). Same as totalledItems, except that under a
 // continued header it is that header's lines — this period's work — that count. Before, the
@@ -819,7 +823,8 @@ function moneyItems(items) {
   const visible = visibleItems(items);
   const continued = new Set(visible.filter(isContinuedHeader).map((i) => i.ItemId));
   const base = totalledItems(items);
-  return [...base, ...items.filter((i) => i.Included && i.ItemType === 'job_line' && continued.has(i.ParentWorkOrderId) && !base.includes(i))];
+  return [...base, ...items.filter((i) => i.Included && i.ItemType === 'job_line' && continued.has(i.ParentWorkOrderId)
+    && !isPlannedSection(i) && !base.includes(i))];
 }
 
 export function renderBoardReportItemsHtml({ report, items, aggregates, reportPhotos = [] }) {

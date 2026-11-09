@@ -6809,6 +6809,15 @@ async function jobLineFundingForReport(jobLineIds) {
       const conflict = b && Number(b.amount) > 0
         && fromReceipts.some((f) => f.IsCamp !== (b.is_camp === true));
       if (conflict) fromReceipts.conflict = { receipts: fromReceipts.map((f) => f.Source).join(', '), line: budgetLabel };
+      // A typed-in Actual Cost on top of receipts is extra, no-receipt spending (the cost
+      // total adds the two), and it was paid from the line's own funding. Without this it had
+      // no payer at all: "Install flooring" showed $800 Unattributed (Nov 2026).
+      if (b && Number(b.amount) > 0) {
+        const same = fromReceipts.find((f) => f.Source === budgetLabel);
+        if (same) same.Amount += Number(b.amount);
+        else fromReceipts.push({ Source: budgetLabel, IsCamp: b.is_camp === true, IsGeneral: b.is_general === true,
+          Amount: Number(b.amount), From: 'job_line' });
+      }
       byLine.set(id, fromReceipts);
       continue;
     }

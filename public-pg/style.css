@@ -1217,3 +1217,12 @@ select { max-width: 100%; }
 @media (max-width: 640px) {
   .jl-sum-stats { max-width: none; width: 100%; justify-content: flex-start; text-align: left; padding-left: 28px; }
 }
+
+/* Work order money bar above the job lines (Nov 2026). */
+.jl-money-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; margin: 4px 0 10px;
+  padding: 8px 12px; border: 1px solid var(--border, #ddd); border-radius: 8px; font-size: 0.9rem; }
+.jl-unattr-filter { margin-left: auto; border: 1px solid #b26a00; color: #b26a00; background: transparent;
+  border-radius: 999px; padding: 3px 10px; cursor: pointer; font: inherit; }
+.jl-unattr-filter[aria-pressed="true"] { background: #b26a00; color: #fff; }
+.jl-all-attr { margin-left: auto; color: var(--muted); }
+.jl-card[hidden] { display: none; }
