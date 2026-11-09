@@ -4682,7 +4682,7 @@ function wireInboxBatch(batch) {
         if (!linePicker) return;
         const wo = await api(`/api/pg/work-orders/${woId}`);
         lineRow.hidden = false;
-        linePicker.innerHTML = (wo.jobLines || []).map((jl) => `<option value="${jl.Id}">${escapeHtml(jl.Title)}</option>`).join('') || '<option value="">— none —</option>';
+        linePicker.innerHTML = (wo.jobLines || []).map((jl) => `<option value="${jl.Id}" title="${escapeHtml(jl.Title)}">${escapeHtml(shortLineTitle(jl.Title))}</option>`).join('') || '<option value="">— none —</option>';
       }
       mountAssetCombobox(panel.querySelector('.asset-picker'), { onSelect: (a) => { asset = a; if (a) loadWos(a); } });
       panel.querySelectorAll('.suggest-asset-btn').forEach((sb) => sb.addEventListener('click', () => {
@@ -5211,7 +5211,7 @@ async function renderExpenseDetail({ id } = {}) {
     const wo = await api(`/api/pg/work-orders/${woId}`);
     lineRow.hidden = false;
     linePicker.innerHTML = '<option value="">— none —</option>' + (wo.jobLines || []).map((jl) =>
-      `<option value="${jl.Id}" ${jl.Id === selectedLineId ? 'selected' : ''}>${escapeHtml(jl.Title)}</option>`
+      `<option value="${jl.Id}" title="${escapeHtml(jl.Title)}" ${jl.Id === selectedLineId ? 'selected' : ''}>${escapeHtml(shortLineTitle(jl.Title))}</option>`
     ).join('');
   }
   if (expense?.WorkOrderId) await loadJobLinesFor(expense.WorkOrderId, expense.JobLineId);
@@ -10757,6 +10757,14 @@ async function renderIncoming(params = {}) {
 }
 
 // One item: the text beside the form, a category picker, and the right confirm form (§5).
+// A job line's title can be a whole paragraph. A native <select> sizes itself to its longest
+// option, so one long title stretched the list far past the screen and hid the others.
+// Options show a short form; the full title is on hover.
+function shortLineTitle(t, max = 70) {
+  const one = String(t || '').replace(/\s+/g, ' ').trim();
+  return one.length > max ? `${one.slice(0, max - 1).trimEnd()}…` : one;
+}
+
 // "Paid from" — one list of who or what paid: camp money (general or a named fund), a
 // person, a donor, in-kind. The same grouping the expense form uses.
 function paidFromSelectHtml(fundingSources, selectedId, id) {
@@ -11015,7 +11023,7 @@ async function openIncomingItem(id, onChanged = () => {}) {
         if (!id) return;
         try {
           const d = await api(`/api/pg/work-orders/${id}`);
-          lineSel.innerHTML += (d.jobLines || []).map((jl) => `<option value="${jl.Id}">${escapeHtml(jl.Title)}${jl.StatusName ? ` — ${escapeHtml(jl.StatusName)}` : ''}</option>`).join('');
+          lineSel.innerHTML += (d.jobLines || []).map((jl) => `<option value="${jl.Id}" title="${escapeHtml(jl.Title)}">${escapeHtml(shortLineTitle(jl.Title))}${jl.StatusName ? ` — ${escapeHtml(jl.StatusName)}` : ''}</option>`).join('');
         } catch (e) { toast(e.message, 5000); }
       };
       mountCombobox(host.querySelector('#rWo'), {
@@ -11048,7 +11056,7 @@ async function openIncomingItem(id, onChanged = () => {}) {
             charges = (await api(`/api/pg/expenses/existing-charges?${q}`)).charges || [];
           } catch (e) { toast(e.message, 5000); return; }
           if (charges.length) {
-            const target = jobLineId ? `this job line ("${lineSel.selectedOptions[0]?.textContent?.split(' — ')[0] || ''}")` : 'this work order';
+            const target = jobLineId ? `this job line ("${lineSel.selectedOptions[0]?.title || ''}")` : 'this work order';
             const pick = await pickExistingChargeDialog(charges, payload.amount, target);
             if (pick === null) return; // cancelled
             if (pick !== 'new') { submit({ existingExpenseId: pick }); return; }
@@ -16291,7 +16299,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
         <div class="field-row"><label>Date</label><input name="sessionDate" type="date" value="${isoDate(new Date())}" required /></div>
         <div class="field-row"><label>Hours (optional)</label><input name="hours" type="number" step="any" min="0" /></div>
         <div class="field-row"><label>Job Line (optional)</label>
-          <select name="jobLineId"><option value="">— general WO time —</option>${jobLines.map((jl) => `<option value="${jl.Id}">${escapeHtml(jl.Title)}</option>`).join('')}</select>
+          <select name="jobLineId"><option value="">— general WO time —</option>${jobLines.map((jl) => `<option value="${jl.Id}" title="${escapeHtml(jl.Title)}">${escapeHtml(shortLineTitle(jl.Title))}</option>`).join('')}</select>
         </div>
         <div class="field-row"><label>Who was here?</label>
           <div class="skill-chips" id="sessionAttendeeChips">

@@ -1196,3 +1196,6 @@ input.has-error, select.has-error, textarea.has-error {
   .imgv-open { display: none; }
   .imgv-nav { width: 40px; height: 56px; }
 }
+
+/* A select never grows past its container, however long an option is. */
+select { max-width: 100%; }
