@@ -601,6 +601,39 @@ function fundingTagText(it, showFunding) {
   return shown.map((f) => `${f.Source} ${fmtMoney(f.Amount)}`).join(' · ');
 }
 
+// Who paid for THIS PERIOD's work on a work order, for the work order's own row (Nov 2026).
+// A work order that is still open, or that went out on an earlier report, carries no money on
+// its row — its roll-up would be unfinished, or would re-print what the board already saw.
+// That also hid who paid this month ("Caretaker's Renovations" lost "Ben $X · Camp $Y").
+// This sums only the lines printed beneath it on this report, so it is this period's work and
+// nothing else. Display only: it is not in the counted set and never reaches the totals.
+//
+// In 'non_general' mode it appears only when someone other than the general budget paid, and
+// then names camp's share too, because "Ben $800" alone does not say what camp put in.
+function periodFundingText(lines, showFunding) {
+  if (showFunding === 'off' || !lines.length) return null;
+  const by = new Map();
+  let anyNonGeneral = false;
+  for (const l of lines) {
+    let attributed = 0;
+    for (const f of (Array.isArray(l.SnapFunding) ? l.SnapFunding : [])) {
+      if (!f || !f.Amount) continue;
+      const label = f.IsGeneral === true ? 'Camp general' : f.Source;
+      if (f.IsGeneral !== true) anyNonGeneral = true;
+      by.set(label, (by.get(label) || 0) + Number(f.Amount));
+      attributed += Number(f.Amount);
+    }
+    const gap = Math.round(((l.SnapCost || 0) - attributed) * 100) / 100;
+    if (gap > 0) by.set('Unattributed', (by.get('Unattributed') || 0) + gap);
+  }
+  if (!by.size || (showFunding === 'non_general' && !anyNonGeneral)) return null;
+  const parts = [...by.entries()]
+    .filter(([, amount]) => Math.round(amount * 100) !== 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([label, amount]) => `${label} ${fmtMoney(amount)}`);
+  return parts.length ? `This period: ${parts.join(' · ')}` : null;
+}
+
 function nestedLineHtml(it, showHours = false, showFunding = 'non_general') {
   // No date: every line under a work order happened inside the reporting period, and the work
   // order above already carries the span. Repeating it on each line was the noisiest thing left.
@@ -661,7 +694,10 @@ function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_gener
   const money = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
   const est = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
   const spend = openWorkOrder ? null : (money && est ? `${money} spent of ${est}` : (money || est));
-  const funding = openWorkOrder ? null : fundingTagText(it, showFunding);
+  const ownFunding = openWorkOrder ? null : fundingTagText(it, showFunding);
+  // No funding of its own to show (open, or continued from an earlier report): say who paid
+  // for this period's lines instead.
+  const funding = ownFunding || opts.periodFunding || null;
   const bits = [
     it.SnapAssetName, it.SnapStatus, dates,
     showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
@@ -706,8 +742,9 @@ function sectionHtml(section, items, showHours = false, showFunding = 'non_gener
   const visible = visibleItems(items).filter((i) => i.Section === section);
   if (!visible.length) return '';
   const counted = totalledItems(items).filter((i) => i.Section === section);
-  const hours = counted.reduce((t, i) => t + (i.SnapHours || 0), 0);
-  const cost = counted.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const money = moneyItems(items).filter((i) => i.Section === section);
+  const hours = money.reduce((t, i) => t + (i.SnapHours || 0), 0);
+  const cost = money.reduce((t, i) => t + (i.SnapCost || 0), 0);
   // No money in a section heading: the footer carries the figure, broken down by who paid, and
   // a subtotal repeated above it invited the reader to add the two together.
   const sub = [showHours && hours ? fmtHours(hours) : null].filter(Boolean).join(' · ');
@@ -728,7 +765,7 @@ function sectionHtml(section, items, showHours = false, showFunding = 'non_gener
     const nested = nestedBlockHtml(lines.map((l) => nestedLineHtml(l, showHours, showFunding)).join(''));
     // An itemized work order's lines say what was completed, so the roll-up sentence that says
     // the same thing in prose is redundant directly above them.
-    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0 }, showFunding));
+    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0, periodFunding: periodFundingText(lines, showFunding) }, showFunding));
   }
 
   return `
@@ -764,6 +801,23 @@ function totalledItems(items) {
   return visible.filter((i) => i.ItemType !== 'job_line' || !woIds.has(i.ParentWorkOrderId));
 }
 
+// A work order that already went out on an earlier report comes back as a header with no money
+// of its own (so last period is never re-printed or re-counted).
+const CONTINUED_SUBTITLE = 'continued from an earlier report';
+const isContinuedHeader = (i) => i.ItemType === 'work_order' && i.SnapCost == null && i.SnapSubtitle === CONTINUED_SUBTITLE;
+
+// What the MONEY and HOURS add up from (Nov 2026). Same as totalledItems, except that under a
+// continued header it is that header's lines — this period's work — that count. Before, the
+// header counted (as nothing) and its lines were skipped as "already rolled up", so a
+// carried-over job's spending this month vanished from the totals and the who-paid breakdown.
+// The piece-of-work COUNT still comes from totalledItems: it is one job either way.
+function moneyItems(items) {
+  const visible = visibleItems(items);
+  const continued = new Set(visible.filter(isContinuedHeader).map((i) => i.ItemId));
+  const base = totalledItems(items);
+  return [...base, ...visible.filter((i) => i.ItemType === 'job_line' && continued.has(i.ParentWorkOrderId) && !base.includes(i))];
+}
+
 export function renderBoardReportItemsHtml({ report, items, aggregates, reportPhotos = [] }) {
   const sections = ['done', 'coming_up', 'overdue', 'admin_work'];
   // Off unless this report says otherwise. Hours stay recorded on the work either way — this
@@ -771,7 +825,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
   const showHours = report.ShowHours === true;
   const showFunding = report.ShowFunding || 'non_general';
   const visible = visibleItems(items);
-  const counted = totalledItems(items);
+  const counted = moneyItems(items);
   const grandHours = counted.reduce((t, i) => t + (i.SnapHours || 0), 0);
   const grandCost = counted.reduce((t, i) => t + (i.SnapCost || 0), 0);
   return htmlShell(
@@ -832,7 +886,7 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     if (!rows.length) continue;
     // Same set the HTML counts and totals from: pieces of work, not job lines.
     const secCounted = countedAll.filter((i) => i.Section === sec);
-    const secHours = secCounted.reduce((t, i) => t + (i.SnapHours || 0), 0);
+    const secHours = moneyItems(items).filter((i) => i.Section === sec).reduce((t, i) => t + (i.SnapHours || 0), 0);
     const orphans = secCounted.filter((i) => i.ItemType === 'job_line');
     lines.push('', `${(SECTION_TITLES[sec] || sec).toUpperCase()} (${secCounted.length})`
       + `${showHours && secHours ? ` · ${fmtHours(secHours)}` : ''}:`);
@@ -849,10 +903,14 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
       const openWo = it.ItemType === 'work_order' && !it.SnapDate;
       const pMoney = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
       const pEst = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
+      const ownFunding = openWo ? null : fundingTagText(it, showFunding);
+      const periodFunding = it.ItemType === 'work_order' && !ownFunding
+        ? periodFundingText(rows.filter((l) => l.ItemType === 'job_line' && l.ParentWorkOrderId === it.ItemId), showFunding)
+        : null;
       const bits = [it.SnapAssetName, itemDatesText(it),
         showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
         openWo ? null : (pMoney && pEst ? `${pMoney} spent of ${pEst}` : (pMoney || pEst)),
-        openWo ? null : fundingTagText(it, showFunding)].filter(Boolean);
+        ownFunding || periodFunding].filter(Boolean);
       lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
       if (it.ItemType === 'work_order') {
         // Indented with a dash, which is as much of a connecting rail as plain text allows.
@@ -867,8 +925,9 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
       if (it.ReportNote) lines.push(`      ${it.ReportNote}`);
     }
   }
-  const grandCost = countedAll.reduce((t, i) => t + (i.SnapCost || 0), 0);
-  const grandHours = countedAll.reduce((t, i) => t + (i.SnapHours || 0), 0);
+  const moneyAll = moneyItems(items);
+  const grandCost = moneyAll.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const grandHours = moneyAll.reduce((t, i) => t + (i.SnapHours || 0), 0);
   // Same two rules as the HTML footer: no item count, and hours only when asked for.
   const totalParts = [
     grandCost ? `COST OF WORK SHOWN: ${fmtMoney(grandCost)}` : null,
@@ -877,7 +936,7 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
   // Same shape as the HTML: the cost, then whose money it was.
   if (totalParts.length) {
     lines.push('', totalParts.join(' · '));
-    const split = grandCost ? fundingBreakdown(countedAll) : [];
+    const split = grandCost ? fundingBreakdown(moneyAll) : [];
     if (split.length) lines.push(split.join(' · '));
   } else {
     lines.push('');
