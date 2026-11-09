@@ -98,6 +98,32 @@ body { min-height: 100dvh; }
 
 .sidebar-close { display: none; }
 
+/* Favorites: pinned under the app name, outside the scrolling menu so it never moves.
+   Its own scroll past a handful of entries keeps the menu below reachable. */
+.sidebar-favs {
+  padding: 0 12px 8px;
+  border-bottom: 1px solid var(--border);
+  max-height: 40vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+.fav-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 2px 6px 4px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--muted);
+}
+.fav-edit-toggle { background: none; border: none; color: var(--muted); font-size: 0.75rem; cursor: pointer; padding: 2px 4px; text-transform: none; letter-spacing: 0; }
+.fav-edit-toggle:hover { color: var(--text); }
+.fav-empty { margin: 0 6px 4px; font-size: 0.78rem; color: var(--muted); }
+.fav-item .fav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; text-align: left; }
+.nav-item.fav-item { padding: 7px 12px; margin-bottom: 2px; font-size: 0.92rem; gap: 10px; }
+.fav-item-editing { display: flex; align-items: center; gap: 6px; padding: 6px; font-size: 0.88rem; }
+.fav-act { background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--text); cursor: pointer; padding: 1px 6px; font-size: 0.75rem; }
+.fav-act:disabled { opacity: 0.35; cursor: default; }
+/* The star sits right after the page title (the title no longer stretches; see .topbar h1). */
+.topbar .fav-star { font-size: 1.25rem; color: var(--muted); margin-left: 2px; margin-right: auto; }
+.topbar .fav-star.is-fav { color: #e0a100; }
+
 .sidebar-nav {
   flex: 1;
   padding: 6px 12px;
@@ -251,7 +277,7 @@ body { min-height: 100dvh; }
 }
 
 .topbar h1 {
-  flex: 1;
+  flex: 0 1 auto;
   font-size: 1.25rem;
   font-weight: 800;
   letter-spacing: -0.01em;
@@ -354,6 +380,7 @@ main#app {
   width: 100%;
   margin: 0 auto;
 }
+main#app.app-wide { max-width: none; }
 
 /* ---------- Shared components ---------- */
 

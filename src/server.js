@@ -154,6 +154,11 @@ app.get(/^\/next\/(.*)/, (req, res) => res.redirect(301, `/${req.params[0]}`));
 // Friendly public URL for the request form (no login) — same file served at /request.html.
 app.get('/request', (req, res) => res.sendFile(path.join(__dirname, '..', 'public-pg', 'request.html')));
 app.use(express.static(path.join(__dirname, '..', 'public-pg')));
+// Every screen of the app has its own address (/work-orders, /work-orders/412,
+// /maintenance-log). They are all the same single page; the browser script reads the path.
+// Only plain lowercase-and-dash paths qualify, so a missing file (anything with a dot)
+// still 404s instead of quietly returning the app.
+app.get(/^\/[a-z][a-z0-9-]*(\/\d+)?\/?$/, (req, res) => res.sendFile(path.join(__dirname, '..', 'public-pg', 'index.html')));
 
 // JSON error handler — without this, an uncaught error anywhere in the API routes
 // falls through to Express's default HTML error page. The frontend's fetch().json()

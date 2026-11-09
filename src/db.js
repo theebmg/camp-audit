@@ -643,10 +643,20 @@ const JOB_LINE_ROLLUP_SQL = `
   ) unattr ON unattr.work_order_id = jl_agg.work_order_id
 `;
 
+// The day a work order's work was DONE, as reports and lists should show it (Nov 2026).
+// Closing a work order stamps date_completed with the close-out day, and Ben closes in
+// arrears at month end — so unless a person typed the date on the work order itself
+// (date_completed_manual), the latest completed date recorded on its job lines wins.
+// Open work orders (no date_completed) stay null. Expects the work order aliased `w`.
+export const WO_DONE_DATE_SQL = `(CASE WHEN w.date_completed IS NULL OR w.date_completed_manual THEN w.date_completed
+  ELSE COALESCE((SELECT MAX(jlx.completed_date) FROM job_lines jlx
+                 JOIN job_line_statuses sx ON sx.id = jlx.status_id
+                 WHERE jlx.work_order_id = w.id AND sx.counts_as_work_performed), w.date_completed) END)`;
+
 export async function getWorkOrdersReportRawData() {
   const [woRows, volRows, venRows] = await Promise.all([
     pool.query(
-      `SELECT w.id, w.title, ws.name AS status, w.priority, w.date_reported, w.date_completed,
+      `SELECT w.id, w.title, ws.name AS status, w.priority, w.date_reported, ${WO_DONE_DATE_SQL} AS date_completed,
               jl.earliest_scheduled_date AS scheduled_date,
               jl.estimated_hours, jl.estimated_cost, jl.actual_hours, jl.actual_cost,
               jl.funding_sources, jl.responsibility_classes,
@@ -821,6 +831,50 @@ export async function getDeferredFindingsBacklogRawData() {
      ORDER BY cf.severity DESC, cf.estimated_cost DESC NULLS LAST`
   );
   return { findings: rows };
+}
+
+// Menu favorites (migration 0122) — the strip pinned under the app name. Per username,
+// like report favorites. A favorite is a screen name plus its parameters, exactly what
+// the browser navigates with, so anything that has an address can be pinned.
+const navFavoriteRow = (r) => ({ Id: r.id, Label: r.label, Icon: r.icon, View: r.view, Params: r.params || {}, SortOrder: r.sort_order });
+
+export async function listNavFavorites() {
+  const { rows } = await pool.query(
+    'SELECT * FROM nav_favorites WHERE username = $1 ORDER BY sort_order, id', [currentUsername()]);
+  return rows.map(navFavoriteRow);
+}
+
+export async function createNavFavorite({ label, icon, view, params }) {
+  const { rows } = await pool.query(
+    `INSERT INTO nav_favorites (username, label, icon, view, params, sort_order)
+     VALUES ($1, $2, $3, $4, $5::jsonb,
+             (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM nav_favorites WHERE username = $1))
+     RETURNING *`,
+    [currentUsername(), label, icon || null, view, JSON.stringify(params || {})]);
+  return navFavoriteRow(rows[0]);
+}
+
+// Only the owner's own rows are ever touched — the username is in every WHERE.
+export async function updateNavFavorite(id, { label }) {
+  const { rows } = await pool.query(
+    'UPDATE nav_favorites SET label = $3 WHERE id = $1 AND username = $2 RETURNING *',
+    [id, currentUsername(), label]);
+  return rows[0] ? navFavoriteRow(rows[0]) : null;
+}
+
+export async function reorderNavFavorites(orderedIds) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const [i, id] of orderedIds.entries()) {
+      await client.query('UPDATE nav_favorites SET sort_order = $3 WHERE id = $1 AND username = $2', [id, currentUsername(), i + 1]);
+    }
+    await client.query('COMMIT');
+  } catch (e) { await client.query('ROLLBACK'); throw e; } finally { client.release(); }
+}
+
+export async function deleteNavFavorite(id) {
+  await pool.query('DELETE FROM nav_favorites WHERE id = $1 AND username = $2', [id, currentUsername()]);
 }
 
 // Saved Reports-tab filter combinations ("favorites") — scoped to the
@@ -1425,7 +1479,7 @@ const JOB_LINE_STATUS_BREAKDOWN_SQL = `
 export async function listWorkOrders() {
   const { rows } = await pool.query(
     `SELECT w.id, w.title, w.wo_number, w.parent_wo_id, w.split_root_id, ws.id AS status_id, ws.name AS status, ws.color AS status_color, ws.is_terminal AS status_is_terminal,
-            w.priority, w.date_reported, w.date_completed, w.deferred_reason, w.revisit_date,
+            w.priority, w.date_reported, ${WO_DONE_DATE_SQL} AS date_completed, w.deferred_reason, w.revisit_date,
             jl.earliest_scheduled_date AS scheduled_date,
             jl.line_count, jl.estimated_hours, jl.estimated_cost, jl.actual_hours, jl.actual_cost,
             slb.breakdown, slb.terminal_cost, slb.total_cost, slb.terminal_lines, slb.total_lines,
@@ -1529,7 +1583,7 @@ export async function workOrderRollup(woId) {
 
 export async function getWorkOrderDetail(woId) {
   const { rows } = await pool.query(
-    `SELECT w.*, ws.name AS status_name, ws.color AS status_color, ws.is_terminal AS status_is_terminal,
+    `SELECT w.*, ${WO_DONE_DATE_SQL}::text AS date_done, ws.name AS status_name, ws.color AS status_color, ws.is_terminal AS status_is_terminal,
             a.name AS asset_name, a.lodge_holder AS asset_lodge_holder, l.name AS location_name,
             EXISTS (SELECT 1 FROM job_lines bjl WHERE bjl.work_order_id = w.id AND bjl.blocked_reason IS NOT NULL) AS is_blocked
      FROM work_orders w
@@ -1547,7 +1601,7 @@ export async function getWorkOrderDetail(woId) {
     workOrder: {
       Id: w.id, Title: w.title, Status: w.status_name, StatusId: w.status_id, StatusColor: w.status_color, StatusIsTerminal: w.status_is_terminal,
       Priority: w.priority, IsBlocked: w.is_blocked,
-      'Date Reported': w.date_reported, 'Date Completed': w.date_completed,
+      'Date Reported': w.date_reported, 'Date Completed': w.date_done, DateCompletedManual: w.date_completed_manual,
       DeferredReason: w.deferred_reason, RevisitDate: w.revisit_date,
       Description: w.description,
       BoardFocus: w.board_focus,
@@ -1883,9 +1937,21 @@ async function changeWorkOrderStatus(client, woId, newStatusId, { deferredReason
   // The completion date has to be decided BEFORE anything is written, because the lines
   // being resolved alongside the work order are dated from it. Closing a WO in arrears
   // dates its lines to when the work happened, not to today.
-  const completionDate = workOrderCompletesWork(newName)
-    ? (cur.date_completed || today())
-    : null;
+  // A date already on the work order wins; then the latest day its job lines record the
+  // work as done; today only when nothing was recorded (Nov 2026 — closing out at month
+  // end was dating October work to November).
+  let completionDate = null;
+  if (workOrderCompletesWork(newName)) {
+    let lineDate = null;
+    if (!cur.date_completed) {
+      const { rows: ld } = await client.query(
+        `SELECT MAX(jl.completed_date)::text AS d FROM job_lines jl
+         JOIN job_line_statuses s ON s.id = jl.status_id
+         WHERE jl.work_order_id = $1 AND s.counts_as_work_performed`, [woId]);
+      lineDate = ld[0]?.d || null;
+    }
+    completionDate = cur.date_completed || lineDate || today();
+  }
   // The invariant, enforced here because this is the only place a work order's status_id
   // is ever written — the four INSERT paths all create non-terminal work orders, so
   // every route to terminal passes through this function.
@@ -1999,6 +2065,13 @@ export async function updateWorkOrder(woId, fields) {
   let i = 1;
   for (const [key, value] of Object.entries(fields)) {
     if (!allowed.includes(key)) continue;
+    // A completion date typed on the work order is a person's word and beats the
+    // job-line dates (WO_DONE_DATE_SQL). Clearing it hands the decision back to the
+    // lines but keeps the stored close date as the last-resort fallback.
+    if (key === 'date_completed') {
+      setCols.push(`date_completed_manual = ${value ? 'true' : 'false'}`);
+      if (!value) continue;
+    }
     setCols.push(`${key} = $${i++}`);
     vals.push(value === '' ? null : value);
   }
@@ -2564,14 +2637,14 @@ export async function getBoardReportRawData({ periodStart, periodEnd, todayStr }
       WHERE NOT ws.is_terminal
     `),
     pool.query(`
-      SELECT w.id, w.title, w.date_completed, a.name AS asset_name,
+      SELECT w.id, w.title, ${WO_DONE_DATE_SQL} AS date_completed, a.name AS asset_name,
              jl.estimated_cost, jl.actual_cost, jl.funding_sources
       FROM work_orders w
       JOIN work_order_statuses ws ON ws.id = w.status_id
       LEFT JOIN assets a ON a.id = w.asset_id
       LEFT JOIN (${JOB_LINE_ROLLUP_SQL}) jl ON jl.work_order_id = w.id
-      WHERE ws.name = 'Done' AND w.date_completed BETWEEN $1 AND $2
-      ORDER BY w.date_completed DESC
+      WHERE ws.name = 'Done' AND ${WO_DONE_DATE_SQL} BETWEEN $1 AND $2
+      ORDER BY 3 DESC
     `, [periodStart, periodEnd]),
     pool.query(`
       SELECT jl.id AS job_line_id, jl.title AS job_line_title, jl.scheduled_date,
@@ -6101,7 +6174,7 @@ export async function listBoardReportCandidates(reportId = null) {
   const [wos, lines, findings, tasks, statusVocab, onDraft, published] = await Promise.all([
     pool.query(
       `SELECT w.id, w.wo_number, w.title, ws.name AS status, ws.is_terminal, ws.sort_order AS status_sort,
-              w.date_completed::text AS completed_date, w.board_focus,
+              ${WO_DONE_DATE_SQL}::text AS completed_date, w.board_focus,
               COALESCE(a.name, l.name) AS place
        FROM work_orders w
        JOIN work_order_statuses ws ON ws.id = w.status_id
@@ -6259,7 +6332,7 @@ export async function listBoardReportCandidates(reportId = null) {
 // status can be a minute old, and the section an item lands in must not depend on that.
 export async function boardItemCompletion(itemType, itemId) {
   const q = {
-    work_order: `SELECT ws.is_terminal AS completed, w.date_completed::text AS completed_date
+    work_order: `SELECT ws.is_terminal AS completed, ${WO_DONE_DATE_SQL}::text AS completed_date
                  FROM work_orders w JOIN work_order_statuses ws ON ws.id = w.status_id WHERE w.id = $1`,
     job_line: `SELECT s.counts_as_work_performed AS completed,
                       COALESCE(jl.completed_date, jl.completed_at::date)::text AS completed_date
@@ -6398,7 +6471,7 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
             -- The work order's OWN status and dates, so the header row this pass writes
             -- carries the same detail the board-featured path has always written (decisions §7).
             ws.name AS wo_status, ws.is_terminal AS wo_is_terminal, w.date_reported::text AS wo_started,
-            w.date_completed::text AS wo_completed
+            ${WO_DONE_DATE_SQL}::text AS wo_completed
      FROM job_lines jl
      JOIN job_line_statuses s ON s.id = jl.status_id
      JOIN work_orders w ON w.id = jl.work_order_id
@@ -7145,7 +7218,7 @@ async function suggestFlaggedItems(reportId, passId, reported, { periodEnd } = {
   const { rows: wos } = await pool.query(
     `SELECT w.id, w.title, ws.name AS status, ws.is_terminal,
             w.date_reported::text AS started_date,
-            w.date_completed::text AS completed_date, w.board_focus_set_at,
+            ${WO_DONE_DATE_SQL}::text AS completed_date, w.board_focus_set_at,
             COALESCE(a.name, l.name) AS place
      FROM work_orders w
      JOIN work_order_statuses ws ON ws.id = w.status_id

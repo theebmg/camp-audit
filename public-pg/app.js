@@ -30,7 +30,12 @@ function captureDeepLinkParams() {
   const params = new URLSearchParams(window.location.search);
   const woId = params.get('openWorkOrder');
   const assetId = params.get('openAsset');
-  if (!woId && !assetId) return null;
+  if (!woId && !assetId) {
+    // Any other address names its screen directly (/work-orders/12, /reports?mode=board).
+    // Bare "/" may carry an OAuth result in its query string; that is the dashboard.
+    if (window.location.pathname === '/' || window.location.pathname === '') return null;
+    return parseRoute();
+  }
   window.history.replaceState({}, '', window.location.pathname);
   return woId ? { view: 'workOrderDetail', params: { id: woId } } : { view: 'assetDetail', params: { id: assetId } };
 }
@@ -877,6 +882,8 @@ async function renderAttachmentEditPanel(a, roles, entityType, entityId, contain
 
 function setChrome({ title, showBack, showLogout }) {
   pageTitle.textContent = title;
+  // The tab title names the screen, so the browser's Back/history list is readable too.
+  document.title = title ? `${title} · Sychar Operations` : 'Sychar Operations';
   backBtn.hidden = !showBack;
   logoutBtn.hidden = !showLogout;
   menuBtn.hidden = !showLogout;
@@ -952,19 +959,25 @@ async function go(view, params, opts = {}) {
   // already on, just keeps appending forever (bug: breadcrumb bar growing
   // unbounded, eventually off-screen, from ordinary nav clicks).
   if (opts.reset) state.stack = [];
-  if (!opts.replace) {
-    const top = state.stack[state.stack.length - 1];
-    // Belt-and-suspenders dedup: even a plain repeat of the exact same
-    // view+params (clicking the same tab twice, or a stray double-click)
-    // never pushes a second identical entry.
-    const isDuplicate = top && top.view === view && JSON.stringify(top.params) === JSON.stringify(params);
-    if (!isDuplicate) state.stack.push({ view, params });
-  }
+  // replace: this screen takes the place of the one on top (a new record becoming its
+  // detail page), so Back skips the form and the address bar names the right screen.
+  if (opts.replace && state.stack.length) state.stack.pop();
+  const top = state.stack[state.stack.length - 1];
+  // Belt-and-suspenders dedup: even a plain repeat of the exact same
+  // view+params (clicking the same tab twice, or a stray double-click)
+  // never pushes a second identical entry.
+  const isDuplicate = top && top.view === view && JSON.stringify(top.params) === JSON.stringify(params);
+  if (!isDuplicate) state.stack.push({ view, params });
+  writeHistory(view, params, !!opts.replace);
   render(view, params, { guarded: true });
 }
 async function goBack() {
   // Confirm before popping: bailing out after the pops would leave the
   // breadcrumb stack one entry short of where the user actually still is.
+  // When the browser has our previous screen behind this one, step back through it, so the
+  // arrow and the browser's own Back button walk the same path (popstate asks about
+  // unsaved work).
+  if ((history.state?.idx ?? 0) > 0 && state.stack.length > 1) { history.back(); return; }
   if (!(await confirmLeaveUnsaved())) return;
   state.stack.pop();
   const prev = state.stack.pop();
@@ -978,8 +991,242 @@ logoutBtn.addEventListener('click', async () => {
   if (!(await confirmLeaveUnsaved())) return;
   await fetch('/logout', { method: 'POST' });
   state.user = null; state.stack = [];
+  navFavorites = null; renderFavorites(); refreshFavStar();
   render('login');
 });
+
+// ---------- URLs (Nov 2026) ----------
+// Every screen has its own address — /work-orders, /maintenance-log, /work-orders/412,
+// /reports?mode=board — so the browser's Back button steps back one screen instead of
+// leaving the app, a refresh stays put, and any screen can be bookmarked or favorited.
+// The breadcrumb stack rides along in history.state, so Back/Forward restore it too.
+const ROUTE_ID_PATHS = { workOrderDetail: 'work-orders', assetDetail: 'assets' };
+const ROUTE_NUMERIC_KEY = /(^id$|Id$|^open$|^fav$|^year$|^month$)/;
+const kebabView = (v) => v.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+const camelView = (k) => k.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+// history.state must be cloneable; a few screens pass callbacks in their params.
+const jsonSafe = (x) => { try { return JSON.parse(JSON.stringify(x ?? {})); } catch { return {}; } };
+
+function routeUrl(view, params = {}) {
+  const p = { ...params };
+  let path;
+  if (view === 'dashboard') path = '/';
+  else if (ROUTE_ID_PATHS[view] && /^\d+$/.test(String(p.id ?? ''))) { path = `/${ROUTE_ID_PATHS[view]}/${p.id}`; delete p.id; }
+  else path = `/${kebabView(view)}`;
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(p)) {
+    if (v == null || v === '') continue;
+    if (['string', 'number', 'boolean'].includes(typeof v)) qs.set(k, String(v));
+  }
+  const q = qs.toString();
+  return path + (q ? `?${q}` : '');
+}
+
+function parseRoute(loc = window.location) {
+  const parts = loc.pathname.split('/').filter(Boolean);
+  let view;
+  const params = {};
+  if (!parts.length) view = 'dashboard';
+  else if (parts.length === 2 && /^\d+$/.test(parts[1])) {
+    view = Object.keys(ROUTE_ID_PATHS).find((k) => ROUTE_ID_PATHS[k] === parts[0]);
+    if (!view) return null;
+    params.id = Number(parts[1]);
+  } else if (parts.length === 1) view = camelView(parts[0]);
+  else return null;
+  for (const [k, v] of new URLSearchParams(loc.search)) {
+    params[k] = ROUTE_NUMERIC_KEY.test(k) && /^\d+$/.test(v) ? Number(v)
+      : v === 'true' ? true : v === 'false' ? false : v;
+  }
+  return { view, params };
+}
+
+function writeHistory(view, params, replace) {
+  if (view === 'login') return;
+  const url = routeUrl(view, params);
+  const prevIdx = history.state?.idx ?? 0;
+  const same = url === window.location.pathname + window.location.search;
+  const entry = { view, params: jsonSafe(params), stack: jsonSafe(state.stack), idx: replace || same ? prevIdx : prevIdx + 1 };
+  try {
+    if (replace || same) history.replaceState(entry, '', url);
+    else history.pushState(entry, '', url);
+  } catch { /* a history write failing must never block navigation */ }
+}
+
+// For a screen that changes what it shows without a navigation — the Work Orders split
+// view opening one, a report tab picking a saved favorite — so the address (and a
+// favorite taken of it) matches what is on screen.
+function setRouteParams(params) {
+  const top = state.stack[state.stack.length - 1];
+  if (top) top.params = params;
+  writeHistory(top?.view || currentView, params, true);
+  refreshFavStar();
+}
+
+window.addEventListener('popstate', async (e) => {
+  if (!state.user) return;
+  const target = e.state?.view ? e.state : parseRoute();
+  if (!target) return;
+  if (!(await confirmLeaveUnsaved())) {
+    // Stay: put the screen we are still on back at the top of history.
+    const top = state.stack[state.stack.length - 1];
+    if (top) writeHistory(top.view, top.params, false);
+    return;
+  }
+  state.stack = Array.isArray(e.state?.stack) && e.state.stack.length ? e.state.stack : [{ view: target.view, params: target.params }];
+  render(target.view, target.params, { guarded: true });
+});
+
+// ---------- Favorites (Nov 2026) ----------
+// A strip pinned under the app name, always in the same place, so the screens Ben uses
+// most — the board report above all — are one click away. ☆ beside any page title pins
+// that exact page: a whole screen, one work order, a report tab, a saved report view.
+// Per user (nav_favorites); loaded once a session.
+const sidebarFavsEl = document.getElementById('sidebarFavs');
+const favStarBtn = document.getElementById('favStarBtn');
+let navFavorites = null;
+let favEditMode = false;
+const FAV_VIEW_ICONS = { workOrderDetail: '🛠️', assetDetail: '🏷️', assetsInLocation: '📍', expenseDetail: '💵',
+  adminTaskDetail: '🗂️', requestDetail: '🧰', calendarEventDetail: '📅', auditRound: '📋', editWorkOrderLines: '🛠️' };
+
+function currentRoute() {
+  const top = state.stack[state.stack.length - 1];
+  return top ? { view: top.view, params: jsonSafe(top.params) } : null;
+}
+const favRouteKey = (view, params) => routeUrl(view, params);
+function favoriteForRoute(route) {
+  if (!route || !navFavorites) return null;
+  const key = favRouteKey(route.view, route.params);
+  return navFavorites.find((f) => favRouteKey(f.View, f.Params) === key) || null;
+}
+
+async function loadNavFavorites() {
+  try { navFavorites = (await api('/api/pg/nav-favorites')).favorites; } catch { navFavorites = navFavorites || []; }
+  renderFavorites();
+  refreshFavStar();
+}
+
+function favoriteIcon(view, params) {
+  if (view === 'reports' && params.mode === 'board') return '📰';
+  return NAV_ITEM_BY_VIEW[view]?.icon || FAV_VIEW_ICONS[view] || '⭐';
+}
+
+// The name offered when pinning: a record's own heading where there is one ("WO 412 —
+// Well pump house"), the report tab's name, else the page title.
+function favoriteDefaultLabel(route) {
+  const { view, params } = route;
+  if (view === 'reports') {
+    const tab = REPORT_TABS.find((t) => t.key === (params.mode || 'explorer'));
+    if (params.favLabel) return params.favLabel;
+    if (tab && tab.key !== 'explorer') return tab.label;
+  }
+  if (params.id != null || params.open != null) {
+    const h = (view === 'workOrders' ? document.querySelector('#paneWoDetail h3') : app.querySelector('h3'))?.textContent?.trim();
+    if (h) return h.length > 60 ? `${h.slice(0, 57)}…` : h;
+  }
+  return pageTitle.textContent.trim() || NAV_ITEM_BY_VIEW[view]?.label || 'Favorite';
+}
+
+function refreshFavStar() {
+  if (!favStarBtn) return;
+  const route = currentRoute();
+  const show = !!state.user && !!route && currentView !== 'login' && navFavorites !== null;
+  favStarBtn.hidden = !show;
+  if (!show) return;
+  const fav = favoriteForRoute(route);
+  favStarBtn.textContent = fav ? '★' : '☆';
+  favStarBtn.classList.toggle('is-fav', !!fav);
+  favStarBtn.title = fav ? `In your favorites as "${fav.Label}" — click to remove` : 'Add this page to your favorites';
+  favStarBtn.setAttribute('aria-label', favStarBtn.title);
+  renderFavorites();
+}
+
+favStarBtn?.addEventListener('click', async () => {
+  const route = currentRoute();
+  if (!route) return;
+  const fav = favoriteForRoute(route);
+  try {
+    if (fav) {
+      if (!await confirmDialog(`Remove "${fav.Label}" from your favorites?`, { confirmLabel: 'Remove' })) return;
+      await api(`/api/pg/nav-favorites/${fav.Id}`, { method: 'DELETE' });
+      navFavorites = navFavorites.filter((f) => f.Id !== fav.Id);
+      toast('Removed from favorites');
+    } else {
+      const label = await promptDialog('Name this favorite', { value: favoriteDefaultLabel(route), confirmLabel: 'Add to favorites' });
+      if (label == null || !label.trim()) return;
+      const params = { ...route.params };
+      delete params.favLabel;
+      const { favorite } = await api('/api/pg/nav-favorites', { method: 'POST', body: JSON.stringify({
+        label: label.trim(), icon: favoriteIcon(route.view, params), view: route.view, params,
+      }) });
+      navFavorites = [...navFavorites, favorite];
+      toast('Added to favorites — it’s at the top of the menu');
+    }
+  } catch (err) { toast(err.message, 5000); }
+  refreshFavStar();
+});
+
+function renderFavorites() {
+  if (!sidebarFavsEl) return;
+  if (!state.user || navFavorites === null) { sidebarFavsEl.hidden = true; return; }
+  sidebarFavsEl.hidden = false;
+  const route = currentRoute();
+  const activeKey = route ? favRouteKey(route.view, route.params) : null;
+  if (!navFavorites.length) {
+    favEditMode = false;
+    sidebarFavsEl.innerHTML = `<div class="fav-header"><span>Favorites</span></div>
+      <p class="fav-empty">Click ☆ next to any page title to pin it here.</p>`;
+    return;
+  }
+  sidebarFavsEl.innerHTML = `
+    <div class="fav-header"><span>Favorites</span>
+      <button type="button" class="fav-edit-toggle">${favEditMode ? 'Done' : 'Edit'}</button></div>
+    <div class="fav-list">
+      ${navFavorites.map((f, i) => favEditMode ? `
+        <div class="fav-item fav-item-editing" data-id="${f.Id}">
+          <span class="nav-icon">${escapeHtml(f.Icon || '⭐')}</span><span class="fav-label">${escapeHtml(f.Label)}</span>
+          <button type="button" class="fav-act" data-act="up" ${i === 0 ? 'disabled' : ''} aria-label="Move ${escapeHtml(f.Label)} up">▲</button>
+          <button type="button" class="fav-act" data-act="down" ${i === navFavorites.length - 1 ? 'disabled' : ''} aria-label="Move ${escapeHtml(f.Label)} down">▼</button>
+          <button type="button" class="fav-act" data-act="rename" aria-label="Rename ${escapeHtml(f.Label)}">✎</button>
+          <button type="button" class="fav-act" data-act="remove" aria-label="Remove ${escapeHtml(f.Label)}">✕</button>
+        </div>` : `
+        <button type="button" class="nav-item fav-item ${favRouteKey(f.View, f.Params) === activeKey ? 'active' : ''}" data-id="${f.Id}" title="${escapeHtml(f.Label)}">
+          <span class="nav-icon">${escapeHtml(f.Icon || '⭐')}</span><span class="fav-label">${escapeHtml(f.Label)}</span>
+        </button>`).join('')}
+    </div>`;
+  sidebarFavsEl.querySelector('.fav-edit-toggle').addEventListener('click', () => { favEditMode = !favEditMode; renderFavorites(); });
+  if (!favEditMode) {
+    sidebarFavsEl.querySelectorAll('button.fav-item').forEach((btn) => btn.addEventListener('click', () => {
+      const f = navFavorites.find((x) => x.Id === Number(btn.dataset.id));
+      if (!f) return;
+      closeSidebar();
+      go(f.View, { ...f.Params }, { reset: true });
+    }));
+    return;
+  }
+  sidebarFavsEl.querySelectorAll('.fav-act').forEach((btn) => btn.addEventListener('click', async () => {
+    const id = Number(btn.closest('.fav-item').dataset.id);
+    const i = navFavorites.findIndex((f) => f.Id === id);
+    const f = navFavorites[i];
+    try {
+      if (btn.dataset.act === 'remove') {
+        if (!await confirmDialog(`Remove "${f.Label}" from your favorites?`, { confirmLabel: 'Remove' })) return;
+        await api(`/api/pg/nav-favorites/${id}`, { method: 'DELETE' });
+        navFavorites.splice(i, 1);
+      } else if (btn.dataset.act === 'rename') {
+        const label = await promptDialog('Rename this favorite', { value: f.Label });
+        if (label == null || !label.trim()) return;
+        const { favorite } = await api(`/api/pg/nav-favorites/${id}`, { method: 'PATCH', body: JSON.stringify({ label: label.trim() }) });
+        navFavorites[i] = favorite;
+      } else {
+        const j = i + (btn.dataset.act === 'up' ? -1 : 1);
+        if (j < 0 || j >= navFavorites.length) return;
+        [navFavorites[i], navFavorites[j]] = [navFavorites[j], navFavorites[i]];
+        await api('/api/pg/nav-favorites/reorder', { method: 'POST', body: JSON.stringify({ orderedIds: navFavorites.map((x) => x.Id) }) });
+      }
+    } catch (err) { toast(err.message, 5000); }
+    refreshFavStar();
+  }));
+}
 
 const NAV_ITEMS = [
   { icon: '🏠', label: 'Dashboard', view: 'dashboard' },
@@ -1331,12 +1578,14 @@ function renderBreadcrumbs() {
     const idx = Number(el.dataset.idx);
     const target = state.stack[idx];
     state.stack = state.stack.slice(0, idx + 1);
+    writeHistory(target.view, target.params, false);
     render(target.view, target.params);
   }));
 }
 
 let currentView = null;
 
+const WIDE_VIEWS = new Set(['editWorkOrderLines']);
 async function render(view, params = {}, opts = {}) {
   // Guarding go()/goBack() alone missed anything that calls render() directly
   // — breadcrumb links do, and so would any future caller. render() is the one
@@ -1348,6 +1597,9 @@ async function render(view, params = {}, opts = {}) {
   if (!opts.guarded && view !== 'login' && view !== currentView) {
     if (!(await confirmLeaveUnsaved())) return;
   }
+  // Screens that are a wide table drop the 1200px reading-width cap and use the whole
+  // window — the job-line grid was stuck in the middle 40% of a wide monitor.
+  app.classList.toggle('app-wide', WIDE_VIEWS.has(view));
   try {
     // #app is replaced wholesale on every view swap, so anything holding a
     // window-level listener (the grid's unsaved-changes guard, its autosave
@@ -1359,6 +1611,7 @@ async function render(view, params = {}, opts = {}) {
     if (!state.user) { await renderLogin(); return fadeInApp(); }
     if (!state.options) state.options = await api('/api/pg/options');
     renderSidebar(view);
+    if (navFavorites === null) loadNavFavorites();
     // Badges are fetched after the sidebar is drawn, then redrawn only if a count changed —
     // so navigation is never waiting on two extra requests, and the nav does not flicker.
     refreshNavBadges().then((changed) => { if (changed) renderSidebar(view); }).catch(() => {});
@@ -1418,7 +1671,8 @@ async function render(view, params = {}, opts = {}) {
       holdings: () => renderHoldings(),
       groups: () => renderGroups(),
       groupProfile: () => renderGroupProfile(params),
-      workOrders: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderWorkOrdersDrilldown(params) : renderWorkOrders(params)),
+      workOrders: () => (window.innerWidth >= DRILLDOWN_MIN_WIDTH ? renderWorkOrdersDrilldown(params)
+        : params.open ? renderWorkOrderDetail({ id: params.open }) : renderWorkOrders(params)),
       workOrderDetail: () => renderWorkOrderDetail(params),
       followUps: () => renderFollowUps(params),
       newWorkOrder: () => renderNewWorkOrder(params),
@@ -1444,7 +1698,14 @@ async function render(view, params = {}, opts = {}) {
     if (handlers[view]) {
       await handlers[view]();
       fadeInApp();
+    } else {
+      // An address that names no screen (a typo, an old bookmark): land on the dashboard.
+      state.stack = [{ view: 'dashboard', params: {} }];
+      writeHistory('dashboard', {}, true);
+      await handlers.dashboard();
+      fadeInApp();
     }
+    refreshFavStar();
   } catch (e) {
     if (e.message !== 'Not authenticated') toast(e.message);
   }
@@ -1797,11 +2058,25 @@ async function renderWorkOrdersDrilldown(params = {}) {
   const paneWoList = document.getElementById('paneWoList');
   const paneWoDetail = document.getElementById('paneWoDetail');
 
-  await renderWorkOrders(params, paneWoList, {
+  // Every save in the detail pane re-renders it; each re-render after the first one for a
+  // given work order means something changed, so the list on the left is refreshed then.
+  let openId = null;
+  let list = null;
+  paneWoDetail.addEventListener('wo-detail-rendered', (e) => {
+    if (String(e.detail.id) === String(openId)) list?.refresh();
+    openId = e.detail.id;
+  });
+  list = await renderWorkOrders(params, paneWoList, {
     onOpenWorkOrder: async (id) => {
+      openId = null;
+      setRouteParams({ ...params, open: Number(id) });
       await renderWorkOrderDetail({ id }, paneWoDetail);
     },
   });
+  if (params.open) {
+    list?.select(params.open);
+    await renderWorkOrderDetail({ id: params.open }, paneWoDetail);
+  }
 }
 
 // Dispatch table for Admin's leaf tool views — every one of them now accepts
@@ -2752,7 +3027,7 @@ async function renderAssetHistory({ id }) {
 // whatever image was loaded when they were placed, so a new image with a
 // different frame/scale/orientation leaves them all pointing at the wrong
 // spot until someone repositions them by hand.
-const CAMP_MAP_IMAGE = { href: 'camp-map-2026-09.png', width: 3000, height: 1808 };
+const CAMP_MAP_IMAGE = { href: '/camp-map-2026-09.png', width: 3000, height: 1808 };
 const MAP_SWATCHES = ['#2b6cb0', '#8a6d3b', '#5c8a4e', '#c0433a', '#d0902a', '#6b4fa0', '#4b6b5c', '#8a8272'];
 const MAP_SEVERITY_COLORS = { none: '#0ca30c', warn: '#fab219', serious: '#ec835a', critical: '#d03b3b' };
 const MAP_GEOM_LABEL = { point: 'points', line: 'lines', zone: 'zones', mixed: 'mixed' };
@@ -5393,6 +5668,7 @@ async function renderReportsExplorer(params = {}) {
         if (btn.dataset.entity === entity) return;
         entity = btn.dataset.entity;
         columnsPickerOpen = false;
+        setRouteParams({ entity });
         app.innerHTML = LOADING_HTML;
         await loadSchema();
         await Promise.all([loadData(), loadFavorites()]);
@@ -5462,6 +5738,7 @@ async function renderReportsExplorer(params = {}) {
       if (fav.VisibleColumns?.length) visibleColumns = new Set(fav.VisibleColumns);
       sortKey = fav.SortKey || null;
       sortDir = fav.SortDir || 'asc';
+      setRouteParams({ entity, fav: fav.Id, favLabel: fav.Label });
       await loadData();
       draw();
     }));
@@ -5484,7 +5761,16 @@ async function renderReportsExplorer(params = {}) {
   }
 
   await loadSchema();
-  await Promise.all([loadData(), loadFavorites()]);
+  await loadFavorites();
+  // Opened from a pinned favorite or a bookmarked address: apply that saved view.
+  const startFav = params.fav != null ? favorites.find((f) => f.Id === Number(params.fav)) : null;
+  if (startFav) {
+    selectedFilters = filtersFromSaved(startFav.Filters);
+    if (startFav.VisibleColumns?.length) visibleColumns = new Set(startFav.VisibleColumns);
+    sortKey = startFav.SortKey || null;
+    sortDir = startFav.SortDir || 'asc';
+  }
+  await loadData();
   draw();
 }
 
@@ -11979,7 +12265,7 @@ function woProgressBarHtml(w) {
 async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder } = {}) {
   if (container === app) setChrome({ title: 'Work Orders', showBack: false, showLogout: true });
   container.innerHTML = LOADING_HTML;
-  const { workOrders } = await api('/api/pg/work-orders');
+  let { workOrders } = await api('/api/pg/work-orders');
   let cols = getWoColumnPrefs();
   let statusFilter = params.status || null;
   let scheduleFilter = params.schedule || null;
@@ -12107,6 +12393,17 @@ async function renderWorkOrders(params = {}, container = app, { onOpenWorkOrder 
   }
 
   draw();
+  // The split view re-fetches the list after the detail pane saves, so a status change
+  // shows on the left without leaving the screen. Scroll and selection survive.
+  return {
+    refresh: async () => {
+      const scroll = container.scrollTop;
+      try { ({ workOrders } = await api('/api/pg/work-orders')); } catch { return; }
+      draw();
+      container.scrollTop = scroll;
+    },
+    select: (id) => { selectedWoId = Number(id); draw(); },
+  };
 }
 
 function requestStatusPillClass(status) {
@@ -15574,6 +15871,11 @@ async function renderWorkOrderDetail({ id }, container = app) {
           <select name="priority">${['Low', 'Medium', 'High', 'Urgent'].map((s) => `<option ${wo.Priority === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
         </div>
         <div class="field-row"><label>Target Date</label><input name="dueDate" type="date" value="${(wo.DueDate || '').slice(0, 10)}" /></div>
+        ${wo.StatusIsTerminal ? `<div class="field-row"><label>Completed</label><input name="dateCompleted" type="date" value="${(wo['Date Completed'] || '').slice(0, 10)}" />
+          <p class="muted" style="margin:4px 0 0;font-size:0.8rem">${wo.DateCompletedManual
+            ? 'Set by hand on this work order. Clear it to go back to the job lines\u2019 completed dates.'
+            : 'The latest completed date on this work order\u2019s job lines (or the day it was closed, if none were recorded). Type a date here to override it.'}</p>
+        </div>` : ''}
         <div class="field-row"><label>Board Report</label>
           <label class="skill-chip ${wo.BoardFocus ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="boardFocus" style="margin-right:6px" ${wo.BoardFocus ? 'checked' : ''} />Include on board report</label>
           <p class="muted" style="margin:4px 0 0;font-size:0.8rem">Puts this on the next draft whatever the dates say — in Done if it's finished, in Coming Up if it isn't. Clears when a report carrying it is published.</p>
@@ -15683,6 +15985,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
     </div>`;
 
   const assetPicker = mountAssetCombobox(container.querySelector('#woAssetPicker'), { initialAsset: wo.Asset });
+  container.dispatchEvent(new CustomEvent('wo-detail-rendered', { detail: { id } }));
 
   const boardFocusCheckbox = container.querySelector('input[name="boardFocus"]');
   boardFocusCheckbox?.addEventListener('change', () => {
@@ -15708,6 +16011,10 @@ async function renderWorkOrderDetail({ id }, container = app) {
           deferredReason: fd.get('deferredReason') || undefined, revisitDate: fd.get('revisitDate') || undefined,
           boardFocus: fd.has('boardFocus'),
           dueDate: fd.get('dueDate') || null,
+          // Only sent when changed: the date shown may be derived from the job lines, and
+          // saving it back untouched would pin it as a hand-typed override.
+          ...(fd.has('dateCompleted') && fd.get('dateCompleted') !== (wo['Date Completed'] || '').slice(0, 10)
+            ? { dateCompleted: fd.get('dateCompleted') || null } : {}),
           ...(resolveOpenLines ? { resolveOpenLines: true } : {}),
         }),
       }));
@@ -16531,8 +16838,8 @@ function handleGcalOauthRedirect() {
     // is enough to proceed, this just skips the "Signed in as ..." label until
     // the next successful /login call populates it.
     state.user = state.user || 'you';
-    if (deepLink) await go(deepLink.view, deepLink.params, { reset: true });
-    else await go('dashboard', {});
+    if (deepLink) await go(deepLink.view, deepLink.params, { reset: true, replace: true });
+    else await go('dashboard', {}, { replace: true });
     handleGcalOauthRedirect();
   handleGmailOauthRedirect();
   } catch {

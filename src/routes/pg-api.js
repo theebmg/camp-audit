@@ -70,6 +70,7 @@ import {
   listCrewSessionsForWorkOrder, createCrewSession, deleteCrewSession, getCrewSessionReportRawData, getCrewHoursSummary,
   getJobLinesReportRawData, getFindingsReportRawData,
   listReportFavorites, createReportFavorite, deleteReportFavorite,
+  listNavFavorites, createNavFavorite, updateNavFavorite, reorderNavFavorites, deleteNavFavorite,
   adminListRequestFields, adminCreateRequestField, adminUpdateRequestField,
   listMaintenanceRequests, getMaintenanceRequestDetail, updateMaintenanceRequestStatus,
   convertRequestToWorkOrder, linkRequestToAsset, listRequestMessages, createRequestMessage,
@@ -1188,6 +1189,41 @@ router.post('/reports/favorites', async (req, res, next) => {
     const favorite = await createReportFavorite({ entity, label: label.trim(), filters, visibleColumns, sortKey, sortDir });
     res.json({ ok: true, favorite });
   } catch (e) { next(e); }
+});
+
+// ---- Menu favorites: the strip pinned under the app name (per user). ----
+router.get('/nav-favorites', async (req, res, next) => {
+  try { res.json({ favorites: await listNavFavorites() }); } catch (e) { next(e); }
+});
+router.post('/nav-favorites', async (req, res, next) => {
+  try {
+    const { label, icon, view, params } = req.body || {};
+    if (!label?.trim()) return res.status(400).json({ ok: false, error: 'Give the favorite a name' });
+    if (!view || typeof view !== 'string' || !/^[a-zA-Z]+$/.test(view)) return res.status(400).json({ ok: false, error: 'Unknown screen' });
+    if (params != null && (typeof params !== 'object' || Array.isArray(params))) return res.status(400).json({ ok: false, error: 'Bad screen parameters' });
+    const favorite = await createNavFavorite({ label: label.trim().slice(0, 80), icon: icon ? String(icon).slice(0, 16) : null, view, params: params || {} });
+    res.json({ ok: true, favorite });
+  } catch (e) { next(e); }
+});
+router.patch('/nav-favorites/:id(\\d+)', async (req, res, next) => {
+  try {
+    const label = req.body?.label?.trim();
+    if (!label) return res.status(400).json({ ok: false, error: 'Give the favorite a name' });
+    const favorite = await updateNavFavorite(Number(req.params.id), { label: label.slice(0, 80) });
+    if (!favorite) return res.status(404).json({ ok: false, error: 'Favorite not found' });
+    res.json({ ok: true, favorite });
+  } catch (e) { next(e); }
+});
+router.post('/nav-favorites/reorder', async (req, res, next) => {
+  try {
+    const ids = req.body?.orderedIds;
+    if (!Array.isArray(ids) || !ids.every((n) => Number.isInteger(n))) return res.status(400).json({ ok: false, error: 'orderedIds must be a list of ids' });
+    await reorderNavFavorites(ids);
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+router.delete('/nav-favorites/:id(\\d+)', async (req, res, next) => {
+  try { await deleteNavFavorite(Number(req.params.id)); res.json({ ok: true }); } catch (e) { next(e); }
 });
 
 router.delete('/reports/favorites/:id(\\d+)', async (req, res, next) => {
