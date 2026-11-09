@@ -2256,7 +2256,7 @@ router.get('/board-reports/:id(\\d+)', async (req, res, next) => {
 // covers the notes field because it's a textarea inside the report form.
 router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
   try {
-    const { title, periodStart, periodEnd, forwardStart, forwardEnd, showHours, showFunding, showScheduled } = req.body || {};
+    const { title, periodStart, periodEnd, forwardStart, forwardEnd, showHours, showFunding, showScheduled, showPaidToDate } = req.body || {};
     // Sanitised on the way IN, not on the way out, so what is stored is already safe and no
     // later reader has to remember to clean it (Part 2D).
     const summaryNotes = req.body && 'summaryNotes' in req.body
@@ -2298,6 +2298,7 @@ router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
       title, periodStart, periodEnd, forwardStart, forwardEnd, summaryNotes,
       showHours: showHours === undefined ? undefined : !!showHours,
       showScheduled: showScheduled === undefined ? undefined : !!showScheduled,
+      showPaidToDate: showPaidToDate === undefined ? undefined : !!showPaidToDate,
       showFunding: showFunding === undefined ? undefined : String(showFunding),
     });
     if (!report) return res.status(404).json({ ok: false, error: 'Not found' });

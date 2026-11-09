@@ -6137,6 +6137,17 @@ async function renderBoardReport(params = {}) {
           <p class="field-error" id="brShowScheduled-err"></p>
         </div>
         <div class="field-row">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
+            <input type="checkbox" id="brShowPaidToDate" ${report.ShowPaidToDate ? 'checked' : ''} ${published ? 'disabled' : ''} />
+            Show "Paid to date — all sources"
+          </label>
+          <p class="muted" style="margin:2px 0 0;font-size:0.8rem">
+            A box near the top listing everyone who has paid for work, all time through the end of
+            this period — contributors first, then camp funds, with totals.
+          </p>
+          <p class="field-error" id="brShowPaidToDate-err"></p>
+        </div>
+        <div class="field-row">
           <label for="brShowFunding">Show funding</label>
           <select id="brShowFunding" ${published ? 'disabled' : ''}>
             <option value="off" ${report.ShowFunding === 'off' ? 'selected' : ''}>Off — no funding anywhere</option>
@@ -6496,6 +6507,11 @@ async function renderBoardReport(params = {}) {
         e.target.checked = !e.target.checked;
         showFieldError('brShowHours', saveErrorMessage(err));
       }
+    });
+    document.getElementById('brShowPaidToDate')?.addEventListener('change', async (e) => {
+      clearFieldError('brShowPaidToDate');
+      try { await patchReport({ showPaidToDate: e.target.checked }); draw(); }
+      catch (err) { e.target.checked = !e.target.checked; showFieldError('brShowPaidToDate', saveErrorMessage(err)); }
     });
     document.getElementById('brShowScheduled')?.addEventListener('change', async (e) => {
       clearFieldError('brShowScheduled');

@@ -432,6 +432,38 @@ export function summaryHtmlToText(html) {
     .trim();
 }
 
+// "Paid to date — all sources" (Nov 2026): who has put money into the work, all time through
+// the end of this period. Contributors first (that is the point of the block: Ben wanted the
+// board to see what he has put in as a whole), then the camp's own pots, then a total.
+function paidToDateRows(aggregates, report) {
+  if (!report || report.ShowPaidToDate !== true) return [];
+  return (aggregates || []).filter((a) => a.GroupKey === 'paid_to_date' && a.ValueNumeric);
+}
+function paidToDateHtml(aggregates, report) {
+  const rows = paidToDateRows(aggregates, report);
+  if (!rows.length) return '';
+  const sum = (kind) => rows.filter((r) => r.Note === kind).reduce((t, r) => t + r.ValueNumeric, 0);
+  const contributed = sum('contributed'), camp = sum('camp');
+  const total = rows.reduce((t, r) => t + r.ValueNumeric, 0);
+  const row = (r) => `
+      <tr>
+        <td style="padding:5px 0;${r.Note === 'contributed' ? 'font-weight:700;color:#13432f;' : 'color:#2a2f45;'}">${escapeHtml(r.Label)}${r.Note === 'contributed' ? ' <span style="font-weight:400;color:#565c78;font-size:0.78rem;">contributed</span>' : ''}</td>
+        <td style="padding:5px 0;text-align:right;white-space:nowrap;${r.Note === 'contributed' ? 'font-weight:700;color:#13432f;' : ''}">${fmtMoney(r.ValueNumeric)}</td>
+      </tr>`;
+  return `
+    <div style="border:1px solid #c7d2dd;border-left:4px solid #13432f;border-radius:10px;padding:12px 16px;margin-bottom:18px;background:#ffffff;">
+      <div style="font-size:0.78rem;color:#565c78;text-transform:uppercase;letter-spacing:0.05em;">Paid to date — all sources</div>
+      <div style="font-size:0.78rem;color:#565c78;margin:2px 0 6px;">Every receipt and recorded cost through ${escapeHtml(String(report.PeriodEnd))}, across all work.</div>
+      <table role="presentation" style="width:100%;border-collapse:collapse;font-size:0.92rem;">
+        ${rows.map(row).join('')}
+        <tr><td colspan="2" style="border-top:1px solid #c7d2dd;padding:0;"></td></tr>
+        ${contributed ? `<tr><td style="padding:5px 0;color:#565c78;">Contributed (non-camp)</td><td style="padding:5px 0;text-align:right;color:#565c78;">${fmtMoney(contributed)}</td></tr>` : ''}
+        ${camp ? `<tr><td style="padding:5px 0;color:#565c78;">Camp funds</td><td style="padding:5px 0;text-align:right;color:#565c78;">${fmtMoney(camp)}</td></tr>` : ''}
+        <tr><td style="padding:5px 0;font-weight:700;">Total</td><td style="padding:5px 0;text-align:right;font-weight:700;">${fmtMoney(total)}</td></tr>
+      </table>
+    </div>`;
+}
+
 function moneyHeaderHtml(aggregates) {
   const byGroup = (g) => aggregates.filter((a) => a.GroupKey === g);
   const money = byGroup('money');
@@ -842,6 +874,7 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
     `${report.PeriodStart} to ${report.PeriodEnd} · looking ahead to ${report.ForwardEnd}${report.Status === 'draft' ? ' · DRAFT' : ''}`,
     `
     ${moneyHeaderHtml(aggregates)}
+    ${paidToDateHtml(aggregates, report)}
     ${approvedFundsHtml(aggregates, showFunding)}
     ${report.SummaryNotes ? `<div style="background:#fbf6ec;border:1px solid #e3d9c2;border-left:4px solid #13432f;border-radius:10px;padding:14px 16px;margin-bottom:10px;">${plainSummaryToHtml(report.SummaryNotes)}</div>` : ''}
     ${sections.map((sec) => sectionHtml(sec, items, showHours, showFunding)).join('')}
@@ -878,6 +911,15 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
   for (const a of aggregates.filter((x) => ['money', 'savings'].includes(x.GroupKey))) {
     lines.push(`${a.Label}: ${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : (a.ValueText || '—')}`);
     if (a.Note) lines.push(`  ${a.Note}`);
+  }
+  const ptdRows = paidToDateRows(aggregates, report);
+  if (ptdRows.length) {
+    lines.push('', `PAID TO DATE — ALL SOURCES (through ${report.PeriodEnd}):`);
+    for (const r of ptdRows) lines.push(`  ${r.Label}${r.Note === 'contributed' ? ' (contributed)' : ''}: ${fmtMoney(r.ValueNumeric)}`);
+    const tot = (k) => ptdRows.filter((r) => !k || r.Note === k).reduce((t, r) => t + r.ValueNumeric, 0);
+    if (tot('contributed')) lines.push(`  Contributed (non-camp): ${fmtMoney(tot('contributed'))}`);
+    if (tot('camp')) lines.push(`  Camp funds: ${fmtMoney(tot('camp'))}`);
+    lines.push(`  Total: ${fmtMoney(tot())}`);
   }
   const fundRows = aggregates.filter((x) => x.GroupKey === 'funds');
   if (fundRows.length && showFunding !== 'off') {

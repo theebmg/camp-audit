@@ -6167,6 +6167,54 @@ export async function computeBoardReportAggregates(reportId) {
   out.push({ groupKey: 'savings', label: 'Recurring savings secured to date (per year)', valueNumeric: Number(recAll.rows[0].annualized) });
   out.push({ groupKey: 'savings', label: 'One-time savings this period', valueNumeric: Number(one.rows[0].total) });
 
+  // Paid to date, all sources (Nov 2026): every receipt and every typed-in job line cost recorded
+  // through the end of the period, by who paid — so the board can see in one place what each
+  // person and each pot has put in. Always computed (cheap); shown only when the report's
+  // show_paid_to_date switch is on. Frozen with the other aggregates when the report publishes.
+  //
+  // Receipts: the receipt's fund, else the person behind its funding source, else the source's
+  // own name; no source, or the general one, is the camp's general budget.
+  // Typed-in costs: the line's own funding, labelled the way the board report labels it. They
+  // add to receipts rather than duplicate them (JOB_LINE_ACTUAL_COST_EXPR sums both).
+  const { rows: ptd } = await pool.query(
+    `WITH paid AS (
+       SELECT CASE WHEN f.id IS NOT NULL THEN f.name
+                   WHEN fs.id IS NULL OR fs.is_general THEN 'Camp general budget'
+                   ELSE COALESCE(pp.name, fs.short_label, fs.name) END AS who,
+              (f.id IS NOT NULL OR fs.id IS NULL OR fs.counts_as_camp_spend) AS is_camp,
+              e.amount AS amount
+       FROM expenses e
+       LEFT JOIN funds f ON f.id = e.fund_id
+       LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+       LEFT JOIN people pp ON pp.id = fs.person_id
+       WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND e.purchase_date <= $1
+       UNION ALL
+       SELECT CASE WHEN jl.funding_source IS NULL THEN 'Unattributed'
+                   WHEN k.is_general THEN 'Camp general budget'
+                   ELSE COALESCE(bp.name, bfs.short_label, bfs.name, ch.name, f.name, cc.name, ob.name, k.label, jl.funding_source) END,
+              COALESCE(bfs.counts_as_camp_spend, k.counts_as_camp_spend, true),
+              jl.actual_cost
+       FROM job_lines jl
+       LEFT JOIN job_line_funding_kinds k ON k.source = jl.funding_source
+       LEFT JOIN cabin_holders ch ON jl.funding_source = 'cabin_holder' AND ch.id = jl.funding_ref_id
+       LEFT JOIN funds f ON jl.funding_source = 'fund' AND f.id = jl.funding_ref_id
+       LEFT JOIN funding_sources bfs ON jl.funding_source = 'funder' AND bfs.id = jl.funding_ref_id
+       LEFT JOIN people bp ON bp.id = bfs.person_id
+       LEFT JOIN capital_campaign_projects cc ON jl.funding_source = 'capital_campaign' AND cc.id = jl.funding_ref_id
+       LEFT JOIN other_budget_categories ob ON jl.funding_source = 'other' AND ob.id = jl.funding_ref_id
+       WHERE jl.actual_cost > 0
+         AND COALESCE(jl.completed_date, jl.completed_at::date, jl.created_at::date) <= $1
+     )
+     SELECT who, bool_and(is_camp) AS is_camp, SUM(amount) AS amount
+     FROM paid GROUP BY who HAVING SUM(amount) <> 0
+     ORDER BY bool_and(is_camp), SUM(amount) DESC`,
+    [report.PeriodEnd]
+  );
+  for (const r of ptd) {
+    out.push({ groupKey: 'paid_to_date', label: r.who, valueNumeric: Number(r.amount),
+      note: r.who === 'Unattributed' ? 'unattributed' : (r.is_camp ? 'camp' : 'contributed') });
+  }
+
   await replaceBoardReportAggregates(reportId, out);
   return listBoardReportAggregates(reportId);
 }
@@ -7484,6 +7532,7 @@ function boardReportRowShape(r) {
     PublishSnapshot: r.publish_snapshot || null,
     ShowHours: r.show_hours === true,
     ShowScheduled: r.show_scheduled !== false,
+    ShowPaidToDate: r.show_paid_to_date === true,
     ShowFunding: r.show_funding || 'non_general',
     CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
   };
@@ -7530,14 +7579,16 @@ export async function getOrCreateDraftBoardReport() {
     // show_hours carries over from the most recent report rather than resetting: whoever turned
     // hours on last month almost certainly wants them on again, and the alternative is
     // rediscovering the toggle every month. Falls back to false when this is the first report.
-    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end, show_hours, show_funding, show_scheduled)
+    `INSERT INTO board_reports (title, status, period_start, period_end, forward_start, forward_end, show_hours, show_funding, show_scheduled, show_paid_to_date)
      VALUES ($1,'draft',$2,$3,$4,$5,
              COALESCE((SELECT show_hours FROM board_reports
                         ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), false),
              COALESCE((SELECT show_funding FROM board_reports
                         ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), 'non_general'),
              COALESCE((SELECT show_scheduled FROM board_reports
-                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), true))
+                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), true),
+             COALESCE((SELECT show_paid_to_date FROM board_reports
+                        ORDER BY COALESCE(published_at, created_at) DESC, id DESC LIMIT 1), false))
      RETURNING id`,
     [title, p.periodStart, p.periodEnd, p.forwardStart, p.forwardEnd]
   );
@@ -7559,7 +7610,7 @@ export async function listBoardReports() {
 const BOARD_REPORT_UPDATE_COLUMNS = {
   title: 'title', periodStart: 'period_start', periodEnd: 'period_end',
   forwardStart: 'forward_start', forwardEnd: 'forward_end', summaryNotes: 'summary_notes',
-  showHours: 'show_hours', showFunding: 'show_funding', showScheduled: 'show_scheduled',
+  showHours: 'show_hours', showFunding: 'show_funding', showScheduled: 'show_scheduled', showPaidToDate: 'show_paid_to_date',
 };
 
 // The name a draft gets from its dates: the month its period ends in.
