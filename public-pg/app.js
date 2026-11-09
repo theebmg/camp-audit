@@ -1001,6 +1001,8 @@ logoutBtn.addEventListener('click', async () => {
 // leaving the app, a refresh stays put, and any screen can be bookmarked or favorited.
 // The breadcrumb stack rides along in history.state, so Back/Forward restore it too.
 const ROUTE_ID_PATHS = { workOrderDetail: 'work-orders', assetDetail: 'assets' };
+// Carried in history.state only — display hints that would clutter the address.
+const ROUTE_HIDDEN_KEYS = new Set(['favLabel']);
 const ROUTE_NUMERIC_KEY = /(^id$|Id$|^open$|^fav$|^year$|^month$)/;
 const kebabView = (v) => v.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
 const camelView = (k) => k.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
@@ -1015,7 +1017,7 @@ function routeUrl(view, params = {}) {
   else path = `/${kebabView(view)}`;
   const qs = new URLSearchParams();
   for (const [k, v] of Object.entries(p)) {
-    if (v == null || v === '') continue;
+    if (v == null || v === '' || ROUTE_HIDDEN_KEYS.has(k)) continue;
     if (['string', 'number', 'boolean'].includes(typeof v)) qs.set(k, String(v));
   }
   const q = qs.toString();
