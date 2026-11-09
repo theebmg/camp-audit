@@ -58,6 +58,12 @@ no headless browser on the host. Ben should click through these before relying o
    WO. Fixes the Well Pump House showing 11/1 instead of 10/28 with no data edits.
    Test: `scripts/wo-completed-date-test.mjs`.
 
+**Follow-up same day:** receipt/photo viewer. `openImageViewer` + a capture-phase click
+listener for any element with `data-zoom` (build it with `zoomAttrs(list, index)` /
+`zoomList(attachments)`). Wired into expense receipt cards (Inbox + Expenses), Inbox batch
+thumbnails (🔍 corner button, since the thumb itself is a select checkbox), and Incoming
+list + item panel. Not browser-verified by me either.
+
 ## 2. The system
 
 | | |
