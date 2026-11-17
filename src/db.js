@@ -6217,8 +6217,9 @@ export async function computeBoardReportAggregates(reportId) {
      WHERE kind = 'one_time' AND occurred_on BETWEEN $1 AND $2`,
     [pS, pE]
   );
-  out.push({ groupKey: 'savings', label: 'Recurring savings secured · this period (per year)', valueNumeric: Number(rec.rows[0].annualized) });
-  out.push({ groupKey: 'savings', label: `Recurring savings secured · cumulative since ${fmtShortDate(trackStart)} (per year)`, valueNumeric: Number(recAll.rows[0].annualized) });
+  // Labels kept short: three tiles share one row, and on a phone a long label stacks a word a line.
+  out.push({ groupKey: 'savings', label: 'Recurring savings · this period', valueNumeric: Number(rec.rows[0].annualized), note: 'per year' });
+  out.push({ groupKey: 'savings', label: `Recurring savings · since ${fmtShortDate(trackStart).replace(/, \d{4}$/, '')}`, valueNumeric: Number(recAll.rows[0].annualized), note: 'per year' });
   out.push({ groupKey: 'savings', label: 'One-time savings · this period', valueNumeric: Number(one.rows[0].total) });
 
   // ── Financial summary at the BOTTOM of the report: this period, year to date (only when it
