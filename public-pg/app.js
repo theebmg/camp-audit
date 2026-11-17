@@ -6065,7 +6065,9 @@ async function renderBoardReport(params = {}) {
             const total = it.SnapTotalCost != null ? Number(it.SnapTotalCost) : null;
             const money = !done ? 'In progress'
               : (total ? `$${total.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} total`
-                : '<span style="color:#7a4a10">No cost recorded</span>');
+                : (it.SnapEstCost
+                  ? `<span style="color:#7a4a10">No actual cost — only a $${Number(it.SnapEstCost).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} estimate</span>`
+                  : '<span style="color:#7a4a10">No cost recorded</span>'));
             const bits = [it.SnapAssetName ? escapeHtml(it.SnapAssetName) : null, money,
               it.SnapPerformedBy ? `Performed by: ${escapeHtml(it.SnapPerformedBy)}` : null].filter(Boolean);
             return `<div class="muted" style="font-size:0.85rem">${bits.join(' · ')}</div>`;
@@ -6355,9 +6357,9 @@ async function renderBoardReport(params = {}) {
         ${warn.length ? `<ul style="margin:0 0 8px 18px;padding:0">${warn.map((w) => `<li style="margin:3px 0">${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
         ${noCost.length ? `<div style="margin:6px 0 10px">
           <div style="font-weight:600">Completed work with no cost recorded</div>
-          <p class="muted" style="margin:2px 0 4px;font-size:0.8rem">No receipt and no cost on any line. Add what it cost, or mark it labor only.</p>
+          <p class="muted" style="margin:2px 0 4px;font-size:0.8rem">No receipt and no Actual Cost on any line. The report counts actual money only, never estimates. If it was paid, put the amount in the line's Actual Cost (or attach the receipt — not both); otherwise mark it labor only.</p>
           ${noCost.map((w) => `<div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
-            <div style="min-width:0"><div>${escapeHtml(w.Title)}</div>${w.Done ? `<div class="muted" style="font-size:0.8rem">Completed ${escapeHtml(formatDateNice(w.Done))}</div>` : ''}</div>
+            <div style="min-width:0"><div>${escapeHtml(w.Title)}</div><div class="muted" style="font-size:0.8rem">${[w.Done ? `Completed ${escapeHtml(formatDateNice(w.Done))}` : null, w.Estimate ? `<span style="color:#7a4a10">Only an estimate: $${Number(w.Estimate).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>` : null].filter(Boolean).join(' · ')}</div></div>
             <span class="btn-row" style="margin:0">
               <button type="button" class="btn btn-secondary btn-inline br-nocost-open" data-id="${w.Id}">Add cost</button>
               <button type="button" class="btn btn-secondary btn-inline br-nocost-labor" data-id="${w.Id}">Labor only</button>

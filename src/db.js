@@ -7115,7 +7115,13 @@ export async function listCompletedWorkOrdersWithoutCost(reportId) {
   const out = [];
   for (const r of rows) {
     const c = await workOrderFullCost(r.id);
-    if (c.total === 0 && c.receipts === 0) out.push({ Id: r.id, Title: r.title, Done: r.done });
+    if (c.total !== 0 || c.receipts !== 0) continue;
+    // An estimate on finished work is the usual reason: the figure was typed as Estimated Cost
+    // and never moved to Actual Cost. Said, so the fix is obvious.
+    const { rows: est } = await pool.query(
+      'SELECT COALESCE(SUM(estimated_cost), 0) AS est FROM job_lines WHERE work_order_id = $1', [r.id]
+    );
+    out.push({ Id: r.id, Title: r.title, Done: r.done, Estimate: Number(est[0].est) || null });
   }
   return out;
 }
