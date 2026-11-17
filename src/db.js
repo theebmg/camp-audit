@@ -1601,7 +1601,7 @@ export async function getWorkOrderDetail(woId) {
     workOrder: {
       Id: w.id, Title: w.title, Status: w.status_name, StatusId: w.status_id, StatusColor: w.status_color, StatusIsTerminal: w.status_is_terminal,
       Priority: w.priority, IsBlocked: w.is_blocked,
-      'Date Reported': w.date_reported, 'Date Completed': w.date_done, DateCompletedManual: w.date_completed_manual,
+      'Date Reported': w.date_reported, 'Date Completed': w.date_done, DateCompletedManual: w.date_completed_manual, NoCostLaborOnly: w.no_cost_labor_only === true,
       DeferredReason: w.deferred_reason, RevisitDate: w.revisit_date,
       Description: w.description,
       BoardFocus: w.board_focus,
@@ -6968,6 +6968,102 @@ const NOT_EXCLUDED_ON_REPORT = `NOT EXISTS (
   SELECT 1 FROM board_report_items bx
   WHERE bx.report_id = $2 AND bx.item_type = 'job_line' AND bx.item_id = jl.id AND NOT bx.included)`;
 
+// A work order's FULL cost, by the money summary's rules (boardMoneyLedger): every receipt share
+// filed to the work order or to any of its lines (allocations, so a receipt split between the WO
+// and a line is counted once, by its parts), plus typed-in Actual Cost on finished lines.
+async function workOrderFullCost(workOrderId) {
+  const { rows } = await pool.query(
+    `SELECT
+       (SELECT COALESCE(SUM(ea.amount), 0) FROM expense_allocations ea
+          JOIN expenses e ON e.id = ea.expense_id
+         WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND e.amount IS NOT NULL
+           AND ((ea.dest_type = 'work_order' AND ea.dest_id = $1)
+             OR (ea.dest_type = 'job_line' AND ea.dest_id IN (SELECT id FROM job_lines WHERE work_order_id = $1))))
+       + (SELECT COALESCE(SUM(jl.actual_cost), 0) FROM job_lines jl
+          JOIN job_line_statuses s ON s.id = jl.status_id
+         WHERE jl.work_order_id = $1 AND jl.actual_cost > 0 AND s.counts_as_work_performed
+           AND COALESCE(jl.completed_date, jl.completed_at::date) IS NOT NULL) AS total,
+       (SELECT COUNT(*) FROM expense_allocations ea JOIN expenses e ON e.id = ea.expense_id
+         WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+           AND ((ea.dest_type = 'work_order' AND ea.dest_id = $1)
+             OR (ea.dest_type = 'job_line' AND ea.dest_id IN (SELECT id FROM job_lines WHERE work_order_id = $1)))) AS receipts`,
+    [workOrderId]
+  );
+  return { total: Math.round(Number(rows[0].total) * 100) / 100, receipts: Number(rows[0].receipts) };
+}
+
+// Stamp every COMPLETED work order on a draft with its full total and who paid it (display
+// only), and clear it from any that are not completed. Run at the end of a refresh pass.
+async function stampCompletedWorkOrderTotals(reportId) {
+  const { rows } = await pool.query(
+    `SELECT bi.id, bi.item_id, ws.is_terminal
+     FROM board_report_items bi
+     JOIN work_orders w ON w.id = bi.item_id
+     LEFT JOIN work_order_statuses ws ON ws.id = w.status_id
+     WHERE bi.report_id = $1 AND bi.item_type = 'work_order'`,
+    [reportId]
+  );
+  for (const r of rows) {
+    if (!r.is_terminal) {
+      await pool.query('UPDATE board_report_items SET snap_total_cost = NULL, snap_total_funding = NULL WHERE id = $1', [r.id]);
+      continue;
+    }
+    const { total } = await workOrderFullCost(r.item_id);
+    const roll = await workOrderRollupForReport(r.item_id, reportId);
+    const funding = roll.funding.map((f) => ({ Source: f.source, IsCamp: f.is_camp === true, IsGeneral: f.is_general === true, Amount: Number(f.amount) }))
+      .filter((f) => f.Amount);
+    await pool.query('UPDATE board_report_items SET snap_total_cost = $2, snap_total_funding = $3 WHERE id = $1',
+      [r.id, total, funding.length ? JSON.stringify(funding) : null]);
+  }
+}
+
+// Completed work orders in a period with no cost and no receipt, not marked labor-only — for the
+// report screen's pre-send panel, to catch money that was spent but never recorded.
+export async function listCompletedWorkOrdersWithoutCost(reportId) {
+  const { rows } = await pool.query(
+    `SELECT bi.item_id AS id, bi.snap_title AS title, bi.snap_date::text AS done
+     FROM board_report_items bi
+     JOIN work_orders w ON w.id = bi.item_id
+     JOIN work_order_statuses ws ON ws.id = w.status_id
+     WHERE bi.report_id = $1 AND bi.item_type = 'work_order' AND bi.included
+       AND ws.is_terminal AND NOT w.no_cost_labor_only
+     ORDER BY bi.snap_date, bi.item_id`,
+    [reportId]
+  );
+  const out = [];
+  for (const r of rows) {
+    const c = await workOrderFullCost(r.id);
+    if (c.total === 0 && c.receipts === 0) out.push({ Id: r.id, Title: r.title, Done: r.done });
+  }
+  return out;
+}
+
+// Labor-only completed work orders that nevertheless carry a cost — said, not hidden.
+export async function listLaborOnlyWorkOrdersWithCost(reportId) {
+  const { rows } = await pool.query(
+    `SELECT bi.item_id AS id, bi.snap_title AS title FROM board_report_items bi
+     JOIN work_orders w ON w.id = bi.item_id
+     WHERE bi.report_id = $1 AND bi.item_type = 'work_order' AND bi.included AND w.no_cost_labor_only`,
+    [reportId]
+  );
+  const out = [];
+  for (const r of rows) {
+    const c = await workOrderFullCost(r.id);
+    if (c.total !== 0) out.push({ Id: r.id, Title: r.title, Total: c.total });
+  }
+  return out;
+}
+
+export async function setWorkOrderLaborOnly(workOrderId, laborOnly) {
+  const { rows } = await pool.query(
+    'UPDATE work_orders SET no_cost_labor_only = $2 WHERE id = $1 RETURNING id, title', [workOrderId, !!laborOnly]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'updated', entityType: 'work_order', entityId: rows[0].id, entityLabel: rows[0].title,
+    details: laborOnly ? 'marked no cost (labor only)' : 'labor-only mark removed' });
+  return { Id: rows[0].id, NoCostLaborOnly: !!laborOnly };
+}
+
 async function workOrderRollupForReport(workOrderId, reportId = null) {
   const { rows } = await pool.query(
     `SELECT
@@ -7039,6 +7135,9 @@ async function workOrderRollupForReport(workOrderId, reportId = null) {
     fundingTotals.set(r.source, cur);
   }
   const funding = [...fundingTotals.values()].sort((a, b) => b.amount - a.amount);
+  // Receipts filed to the work order itself are part of what it cost, not only of who paid:
+  // the funding split above always had them and the cost did not, so the two disagreed.
+  const woLevelCost = woLevel.reduce((t, x) => t + Number(x.amount), 0);
 
   // Progress, weighted by estimated cost rather than by counting lines — eight of thirteen is
   // misleading when the lines are not the same size (§2c). Falls back to naming what finished
@@ -7078,8 +7177,8 @@ async function workOrderRollupForReport(workOrderId, reportId = null) {
 
   return {
     openLines: open.map((x) => String(x.title).trim()).filter(Boolean),
-    actualCost: Number(r.actual_cost) || 0,
-    hasActual: Number(r.lines_with_actual) > 0,
+    actualCost: (Number(r.actual_cost) || 0) + woLevelCost,
+    hasActual: Number(r.lines_with_actual) > 0 || woLevelCost !== 0,
     estCost: Number(r.est_cost) || 0,
     hasEst: Number(r.lines_with_est) > 0,
     actualHours: Number(r.actual_hours) || 0,
@@ -7586,6 +7685,8 @@ async function runBoardReportSuggestions(reportId) {
      RETURNING id`,
     [reportId, passId]
   );
+  // Full totals on completed work orders (display only), after pruning so only rows that stay.
+  await stampCompletedWorkOrderTotals(reportId);
   return {
     counts,
     prunedCount: pruned.length,
@@ -7744,6 +7845,9 @@ export async function listBoardReportItems(reportId) {
     SnapFunding: r.snap_funding || null,
     SnapHours: r.snap_hours != null ? Number(r.snap_hours) : null,
     SnapCost: r.snap_cost != null ? Number(r.snap_cost) : null,
+    // A completed work order's full total and who paid it — display only, never summed.
+    SnapTotalCost: r.snap_total_cost != null ? Number(r.snap_total_cost) : null,
+    SnapTotalFunding: r.snap_total_funding || null,
     SnapProgress: r.snap_progress,
     ParentWorkOrderId: r.parent_work_order_id,
     UserTouched: r.user_touched,

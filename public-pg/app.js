@@ -6329,11 +6329,24 @@ async function renderBoardReport(params = {}) {
       groups.get(u.Group).push(u);
     }
     const warn = checks.warnings || [];
+    const noCost = checks.noCost || [];
+    const nCheck = warn.length + noCost.length;
     return `
-      <div class="card" style="border-left:4px solid ${warn.length ? '#b45309' : '#13432f'}">
-        <h3 style="margin-bottom:4px">Before you send ${warn.length ? `<span class="pill" style="background:#fef3c7;color:#7a4a10">${warn.length} to check</span>` : '<span class="pill good">figures agree</span>'}</h3>
+      <div class="card" style="border-left:4px solid ${nCheck ? '#b45309' : '#13432f'}">
+        <h3 style="margin-bottom:4px">Before you send ${nCheck ? `<span class="pill" style="background:#fef3c7;color:#7a4a10">${nCheck} to check</span>` : '<span class="pill good">figures agree</span>'}</h3>
         <p class="muted" style="margin:0 0 8px;font-size:0.8rem">Only you see this. It is never part of the emailed report.</p>
         ${warn.length ? `<ul style="margin:0 0 8px 18px;padding:0">${warn.map((w) => `<li style="margin:3px 0">${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
+        ${noCost.length ? `<div style="margin:6px 0 10px">
+          <div style="font-weight:600">Completed work with no cost recorded</div>
+          <p class="muted" style="margin:2px 0 4px;font-size:0.8rem">No receipt and no cost on any line. Add what it cost, or mark it labor only.</p>
+          ${noCost.map((w) => `<div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+            <div style="min-width:0"><div>${escapeHtml(w.Title)}</div>${w.Done ? `<div class="muted" style="font-size:0.8rem">Completed ${escapeHtml(formatDateNice(w.Done))}</div>` : ''}</div>
+            <span class="btn-row" style="margin:0">
+              <button type="button" class="btn btn-secondary btn-inline br-nocost-open" data-id="${w.Id}">Add cost</button>
+              <button type="button" class="btn btn-secondary btn-inline br-nocost-labor" data-id="${w.Id}">Labor only</button>
+            </span>
+          </div>`).join('')}
+        </div>` : ''}
         <details ${groups.size ? '' : 'hidden'}>
           <summary style="cursor:pointer"><strong>Money to sort out</strong> <span class="muted">— ${(checks.unclassified || []).length} item(s). Each opens the record; Save brings you back here.</span></summary>
           ${[...groups.entries()].map(([g, list]) => `
@@ -6364,6 +6377,15 @@ async function renderBoardReport(params = {}) {
   function wireChecks() {
     document.getElementById('brRecheck')?.addEventListener('click', () => { checks = null; const el = document.getElementById('brChecks'); if (el) el.innerHTML = brChecksHtml(); loadChecks(); });
     document.querySelectorAll('#brChecks .br-unclass').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, { id: Number(el.dataset.id), from: 'board' })));
+    document.querySelectorAll('#brChecks .br-nocost-open').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: Number(el.dataset.id), from: 'board' })));
+    document.querySelectorAll('#brChecks .br-nocost-labor').forEach((el) => el.addEventListener('click', async () => {
+      el.disabled = true;
+      try {
+        await api(`/api/pg/work-orders/${el.dataset.id}/labor-only`, { method: 'POST', body: JSON.stringify({ laborOnly: true }) });
+        toast('Marked no cost (labor only)');
+        loadChecks();
+      } catch (err) { el.disabled = false; toast(err.message); }
+    }));
   }
 
   async function patchReport(fields) {
@@ -6454,7 +6476,7 @@ async function renderBoardReport(params = {}) {
       toast('Downloaded and saved to history'); await load(); draw();
     });
     document.getElementById('brEmail').addEventListener('click', async () => {
-      const nWarn = checks?.warnings?.length || 0;
+      const nWarn = (checks?.warnings?.length || 0) + (checks?.noCost?.length || 0);
       if (nWarn && !(await confirmDialog(`${nWarn} check(s) under "Before you send" have not been resolved. Send anyway?`, { confirmLabel: 'Continue', danger: false }))) return;
       const recipient = await promptDialog('Email the board report to:', { confirmLabel: 'Send', placeholder: 'name@example.org' });
       if (!recipient || !recipient.trim()) return;
@@ -16419,6 +16441,12 @@ async function renderWorkOrderDetail({ id }, container = app) {
           <p class="muted" style="margin:4px 0 0;font-size:0.8rem">${wo.DateCompletedManual
             ? 'Set by hand on this work order. Clear it to go back to the job lines\u2019 completed dates.'
             : 'The latest completed date on this work order\u2019s job lines (or the day it was closed, if none were recorded). Type a date here to override it.'}</p>
+        </div>
+        <div class="field-row">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
+            <input type="checkbox" id="woLaborOnly" ${wo.NoCostLaborOnly ? 'checked' : ''} /> No cost (labor only)
+          </label>
+          <p class="muted" style="margin:2px 0 0;font-size:0.8rem">Saves straight away. Stops the board report flagging this work order as having no cost recorded.</p>
         </div>` : ''}
         <div class="field-row"><label>Board Report</label>
           <label class="skill-chip ${wo.BoardFocus ? 'selected' : ''}" style="cursor:pointer;display:inline-flex"><input type="checkbox" name="boardFocus" style="margin-right:6px" ${wo.BoardFocus ? 'checked' : ''} />Include on board report</label>
@@ -16540,6 +16568,14 @@ async function renderWorkOrderDetail({ id }, container = app) {
   container.querySelector('#woStatusSelect').addEventListener('change', (e) => {
     const statusName = workOrderStatuses.find((s) => s.Id === Number(e.target.value))?.Name;
     container.querySelector('#deferredFieldsRow').hidden = statusName !== 'Deferred';
+  });
+
+  // "No cost (labor only)" saves on its own, like the board report's own toggles.
+  container.querySelector('#woLaborOnly')?.addEventListener('change', async (e) => {
+    try {
+      await api(`/api/pg/work-orders/${id}/labor-only`, { method: 'POST', body: JSON.stringify({ laborOnly: e.target.checked }) });
+      toast(e.target.checked ? 'Marked no cost (labor only)' : 'Labor-only mark removed');
+    } catch (err) { e.target.checked = !e.target.checked; toast(err.message); }
   });
 
   container.querySelector('#woFieldsForm').addEventListener('submit', async (e) => {

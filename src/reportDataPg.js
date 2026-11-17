@@ -8,6 +8,7 @@ import {
   getBoardReport, listBoardReportItems, listBoardReportAggregates, computeBoardReportAggregates,
   listSelectedReportPhotos, stampReportPhotoLabels,
   getFundBalances, boardLedgerFundTotals, listUnclassifiedMoney,
+  listCompletedWorkOrdersWithoutCost, listLaborOnlyWorkOrdersWithCost,
 } from './db.js';
 import { renderBoardReportItemsHtml, renderBoardReportItemsText, workSectionMoney } from './reportRender.js';
 import { buildEmailCopy, buildPhotoLabel } from './reportPhotos.js';
@@ -437,6 +438,13 @@ export async function computeBoardReportChecks(reportId) {
   const placeholders = summaryText.match(/\[[^\]\n]{3,}\]/g) || [];
   for (const ph of [...new Set(placeholders)]) warnings.push(`The summary still has placeholder text: ${ph}`);
 
+  // 7. Completed work orders: no cost recorded (likely spent but never entered), and labor-only
+  //    ones that carry a cost anyway (the board sees that cost; the mark is probably stale).
+  const noCost = await listCompletedWorkOrdersWithoutCost(reportId);
+  for (const w of await listLaborOnlyWorkOrdersWithCost(reportId)) {
+    warnings.push(`"${w.Title}" is marked no cost (labor only) but has ${money(w.Total)} recorded. The report shows the cost.`);
+  }
+
   const unclassified = await listUnclassifiedMoney(pE);
-  return { warnings, unclassified };
+  return { warnings, unclassified, noCost };
 }

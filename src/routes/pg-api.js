@@ -177,7 +177,7 @@ import {
   listBoardReportFunds, setBoardReportFund,
   listBoardReportPhotoCandidates,
   seedDefaultReportPhotos, setBoardReportPhoto, removeBoardReportPhoto,
-  listSelectedReportPhotos, addReportLevelPhoto, getReportEmailBudgetMb,
+  listSelectedReportPhotos, addReportLevelPhoto, getReportEmailBudgetMb, setWorkOrderLaborOnly,
   listPeople, getPerson, createPerson, updatePerson, deletePerson,
   findDuplicatePeople, mergePeople, previewPersonMerge, listRecordMerges,
   listPersonRoles, createPersonRole, updatePersonRole, deletePersonRole,
@@ -2361,6 +2361,15 @@ router.post('/board-reports/:id(\\d+)/one-off', async (req, res, next) => {
 
 // Pre-send checks: figures that should agree, date sanity, placeholder text, and the list of
 // unclassified money to work off. Screen only — never part of the emailed report.
+// Mark a completed work order "no cost (labor only)" so the report screen stops flagging it.
+router.post('/work-orders/:id(\\d+)/labor-only', async (req, res, next) => {
+  try {
+    const result = await setWorkOrderLaborOnly(Number(req.params.id), req.body?.laborOnly !== false);
+    if (!result) return res.status(404).json({ ok: false, error: 'Work order not found' });
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
 router.get('/board-reports/:id(\\d+)/checks', async (req, res, next) => {
   try {
     const result = await computeBoardReportChecks(req.params.id);

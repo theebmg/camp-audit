@@ -546,6 +546,11 @@ function prepareItems(items, report) {
       }
       out.SnapFunding = [...merged.values()];
     }
+    // A completed work order's total (Nov 2026): names off = no funding source beside it except
+    // camp pots (General / the Discretionary Audit Fund), which the board oversees.
+    if (!showNames && Array.isArray(it.SnapTotalFunding)) {
+      out.SnapTotalFunding = it.SnapTotalFunding.filter((f) => f && f.IsCamp !== false);
+    }
     const start = it.SnapStartDate ? isoStr(it.SnapStartDate).slice(0, 10) : null;
     const done = it.SnapDate ? isoStr(it.SnapDate).slice(0, 10) : null;
     if (start && pE && start > pE) out.SnapStartDate = null;
@@ -823,11 +828,17 @@ function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_gener
   // Continued from an earlier report: no money of its own, so say who paid for this period's
   // lines instead. (An open work order that is new this period still shows no money on its
   // row — Ben's rule; its lines carry their own tags.)
-  const funding = ownFunding || opts.periodFunding || null;
+  let funding = ownFunding || opts.periodFunding || null;
+  let shownMoney = spend;
+  // A completed work order with a stamped total prints that one figure and nothing else money-wise.
+  if (isCompletedWo(it) && it.SnapTotalCost !== undefined && it.SnapTotalCost !== null && opts.items) {
+    const t = woTotalBits(it, opts.items, showFunding);
+    shownMoney = t.money; funding = t.money ? t.funding : null;
+  }
   const bits = [
     it.SnapAssetName, it.SnapStatus, dates,
     showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
-    spend, funding,
+    shownMoney, funding,
   ].filter(Boolean);
   // The em-dash suffix is for things the detail line does not already say. Printing the
   // asset there as well gave "Front Gate Repair — Red Gate" above "Red Gate · Done · …",
@@ -891,7 +902,7 @@ function sectionHtml(section, items, showHours = false, showFunding = 'non_gener
     const nested = nestedBlockHtml(lines.map((l) => nestedLineHtml(l, showHours, showFunding)).join(''));
     // An itemized work order's lines say what was completed, so the roll-up sentence that says
     // the same thing in prose is redundant directly above them.
-    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0, periodFunding: isContinuedHeader(it) ? periodFundingText([it, ...periodLinesOf(items, it.ItemId)], showFunding) : null }, showFunding));
+    rendered.push(itemLineHtml(it, showHours, { items, nested, hideProgress: lines.length > 0, periodFunding: isContinuedHeader(it) ? periodFundingText([it, ...periodLinesOf(items, it.ItemId)], showFunding) : null }, showFunding));
   }
 
   return `
@@ -935,6 +946,24 @@ const isContinuedHeader = (i) => i.ItemType === 'work_order' && i.SnapCost == nu
 // receipts filed to the work order as a whole in this period, in its SnapFunding.
 const fundingSum = (i) => (Array.isArray(i.SnapFunding) ? i.SnapFunding : []).reduce((t, f) => t + Number((f && f.Amount) || 0), 0);
 const itemCost = (i) => (i.SnapCost != null ? Number(i.SnapCost) : (isContinuedHeader(i) ? fundingSum(i) : 0));
+
+// ── One total per COMPLETED work order (Nov 2026) ──
+// The full total (all its receipts and recorded costs, money-summary rules), printed once beside
+// the status line. Display only: "Cost of work shown" keeps counting this period's spending, so
+// when the two differ the figure says "total". Nothing at all when it cost nothing.
+const isCompletedWo = (i) => i.ItemType === 'work_order' && !!i.SnapDate;
+// What this report COUNTS for a work order: its own row, plus its lines when it is a continued header.
+function periodAmountOf(items, wo) {
+  return itemCost(wo) + (isContinuedHeader(wo) ? periodLinesOf(items, wo.ItemId).reduce((t, l) => t + itemCost(l), 0) : 0);
+}
+function woTotalBits(it, items, showFunding) {
+  const total = it.SnapTotalCost != null ? Number(it.SnapTotalCost) : null;
+  if (total == null || Math.round(total * 100) === 0) return { money: null, funding: null, differs: false };
+  const differs = Math.abs(total - periodAmountOf(items, it)) > 0.005;
+  const funding = fundingTagText({ SnapFunding: it.SnapTotalFunding }, showFunding);
+  return { money: `${fmtMoney(total)}${differs ? ' total' : ''}`, funding, differs };
+}
+const anyTotalDiffers = (items, showFunding) => visibleItems(items).some((i) => isCompletedWo(i) && woTotalBits(i, items, showFunding).differs);
 // This period's lines under a continued header: every INCLUDED line, printed or not. A header in
 // summary mode hides its lines, but the money they carry is still this period's spending.
 // Only work actually done counts: a Coming Up / Overdue line's cost is its ESTIMATE, and once
@@ -957,6 +986,7 @@ function moneyItems(items) {
 }
 
 // Under the footer total: why it can differ from the money summary.
+const WO_TOTAL_NOTE = 'A work order marked "total" includes costs from earlier periods; only this period\'s part is in the cost of work shown.';
 const WORK_TOTAL_NOTE = 'Cost of the work finished this period. Receipts count in the money summary on their purchase date.';
 
 // Figures for the pre-send check (screen only): what the work section and footer show, by funder.
@@ -1012,7 +1042,7 @@ export function renderBoardReportItemsHtml({ report, items: rawItems, aggregates
     ${split.length ? `<div style="margin-top:4px;color:#565c78;font-size:0.85rem;line-height:1.45;">
       ${escapeHtml(split.join(' · '))}
     </div>` : ''}
-    <div style="margin-top:4px;color:#565c78;font-size:0.76rem;line-height:1.35;">${escapeHtml(WORK_TOTAL_NOTE)}</div>`;
+    <div style="margin-top:4px;color:#565c78;font-size:0.76rem;line-height:1.35;">${escapeHtml(WORK_TOTAL_NOTE)}${anyTotalDiffers(items, showFunding) ? ` ${WO_TOTAL_NOTE}` : ''}</div>`;
     })()}
     ${financialSummaryHtml(aggregates, report)}
     <div style="margin-top:8px;color:#7a4a10;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
@@ -1067,10 +1097,15 @@ export function renderBoardReportItemsText({ report, items: rawItems, aggregates
       const periodFunding = isContinuedHeader(it) && !ownFunding
         ? periodFundingText([it, ...periodLinesOf(items, it.ItemId)], showFunding)
         : null;
+      let tMoney = openWo ? null : (pMoney && pEst ? `${pMoney} spent of ${pEst}` : (pMoney || pEst));
+      let tFunding = ownFunding || periodFunding;
+      if (isCompletedWo(it) && it.SnapTotalCost != null) {
+        const t = woTotalBits(it, items, showFunding);
+        tMoney = t.money; tFunding = t.money ? t.funding : null;
+      }
       const bits = [it.SnapAssetName, itemDatesText(it),
         showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
-        openWo ? null : (pMoney && pEst ? `${pMoney} spent of ${pEst}` : (pMoney || pEst)),
-        ownFunding || periodFunding].filter(Boolean);
+        tMoney, tFunding].filter(Boolean);
       lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
       if (it.ItemType === 'work_order') {
         // Indented with a dash, which is as much of a connecting rail as plain text allows.
@@ -1098,7 +1133,7 @@ export function renderBoardReportItemsText({ report, items: rawItems, aggregates
     lines.push('', totalParts.join(' · '));
     const split = grandCost ? fundingBreakdown(moneyAll) : [];
     if (split.length) lines.push(split.join(' · '));
-    lines.push(WORK_TOTAL_NOTE);
+    lines.push(`${WORK_TOTAL_NOTE}${anyTotalDiffers(items, showFunding) ? ` ${WO_TOTAL_NOTE}` : ''}`);
   } else {
     lines.push('');
   }
