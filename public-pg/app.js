@@ -6058,7 +6058,18 @@ async function renderBoardReport(params = {}) {
           <div><strong>${escapeHtml(it.SnapTitle || '(untitled)')}</strong>
             ${lines.length ? `<span class="muted" style="font-size:0.82rem"> — ${lines.filter((l) => l.Included).length} of ${lines.length} line(s)${state === 'some' ? ', partial' : ''}</span>` : ''}
           </div>
-          ${it.SnapAssetName ? `<div class="muted" style="font-size:0.85rem">${escapeHtml(it.SnapAssetName)}</div>` : ''}
+          ${(() => {
+            // What the report prints beside this work order (Nov 2026): its total when it is
+            // completed, "In progress" when open, and who did the work.
+            const done = !!it.SnapDate;
+            const total = it.SnapTotalCost != null ? Number(it.SnapTotalCost) : null;
+            const money = !done ? 'In progress'
+              : (total ? `$${total.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} total`
+                : '<span style="color:#7a4a10">No cost recorded</span>');
+            const bits = [it.SnapAssetName ? escapeHtml(it.SnapAssetName) : null, money,
+              it.SnapPerformedBy ? `Performed by: ${escapeHtml(it.SnapPerformedBy)}` : null].filter(Boolean);
+            return `<div class="muted" style="font-size:0.85rem">${bits.join(' · ')}</div>`;
+          })()}
           <div style="margin-top:3px;font-size:0.82rem">
             <label class="muted">Show as
               <select class="br-mode" data-item="${it.Id}">

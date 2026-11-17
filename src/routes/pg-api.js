@@ -90,7 +90,7 @@ import {
   listAdminTasks, getAdminTask, createAdminTask, updateAdminTask, deleteAdminTask,
   listExpenseInbox, getExpenseInboxCount, listExpenses, getExpense, createExpense, updateExpense, voidExpense, unvoidExpense,
   getExpensesReportRawData,
-  getOrCreateDraftBoardReport,
+  getOrCreateDraftBoardReport, stampCompletedWorkOrderTotals,
   refreshBoardReportSuggestions,
   addOneOffBoardReportItem,
   setWorkOrderResolution,
@@ -2219,6 +2219,7 @@ router.get('/board-reports', async (req, res, next) => {
 router.get('/board-reports/draft', async (req, res, next) => {
   try {
     const report = await getOrCreateDraftBoardReport();
+    await stampCompletedWorkOrderTotals(report.Id);
     res.json({
       report,
       items: await listBoardReportItems(report.Id),
@@ -2247,6 +2248,9 @@ router.get('/board-reports/:id(\\d+)', async (req, res, next) => {
   try {
     const report = await getBoardReport(req.params.id);
     if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
+    // A draft's work-order totals and performed-by tags are refreshed on open, so the screen's
+    // rows show what the report will print.
+    if (report.Status === 'draft') await stampCompletedWorkOrderTotals(report.Id);
     res.json({
       report,
       items: await listBoardReportItems(report.Id),
