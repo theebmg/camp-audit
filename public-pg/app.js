@@ -6,11 +6,15 @@ const app = document.getElementById('app');
 const boardReturnBar = (() => {
   const el = document.createElement('div');
   el.id = 'boardReturnBar';
-  el.hidden = true;
-  el.className = 'card';
-  el.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;border-left:4px solid #13432f;background:#eef5f0;margin-bottom:12px';
-  el.innerHTML = '<span>Opened from the board report\u2019s \u201cBefore you send\u201d list.</span>'
-    + '<button type="button" class="btn btn-primary btn-inline" id="boardReturnBtn">\u2190 Back to board report</button>';
+  // Shown/hidden through style.display, NOT the hidden attribute: an inline display:flex beats
+  // [hidden], which left this bar on every screen. Colours are explicit so no theme or .card
+  // rule can turn it white on white.
+  el.style.cssText = 'display:none;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;'
+    + 'padding:10px 14px;border:1px solid #c7d2dd;border-left:4px solid #13432f;border-radius:10px;'
+    + 'background:#eef5f0;color:#13432f;margin:0 0 12px';
+  el.innerHTML = '<span style="color:#13432f">Opened from the board report\u2019s \u201cBefore you send\u201d list.</span>'
+    + '<button type="button" id="boardReturnBtn" style="background:#13432f;color:#ffffff;border:none;border-radius:8px;'
+    + 'padding:8px 14px;font-weight:600;cursor:pointer">\u2190 Back to board report</button>';
   app.parentNode.insertBefore(el, app);
   el.querySelector('#boardReturnBtn').addEventListener('click', () => returnToBoardReport());
   return el;
@@ -1776,6 +1780,7 @@ async function render(view, params = {}, opts = {}) {
     destroyActiveJobLineGrid();
     formDirty = false;   // new screen, nothing typed on it yet
     currentView = view;
+    boardReturnBar.style.display = 'none';
     if (view === 'login') { await renderLogin(); return fadeInApp(); }
     if (!state.user) { await renderLogin(); return fadeInApp(); }
     if (!state.options) state.options = await api('/api/pg/options');
@@ -1864,7 +1869,7 @@ async function render(view, params = {}, opts = {}) {
       adminGcal: () => renderAdminGcal(),
       adminCalendarEventTypes: () => renderAdminCalendarEventTypes(),
     };
-    boardReturnBar.hidden = !cameFromBoard(params);
+    boardReturnBar.style.display = cameFromBoard(params) ? 'flex' : 'none';
     if (handlers[view]) {
       await handlers[view]();
       fadeInApp();
