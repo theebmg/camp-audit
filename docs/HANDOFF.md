@@ -109,6 +109,18 @@ expense has a payer — false since Ben started setting payers. Ask Ben before d
   and its lines, plus typed cost on finished lines. "total" is printed when it differs from what
   the report counts for that WO. `work_orders.no_cost_labor_only` silences the "no cost
   recorded" flag. The roll-up cost now includes WO-level receipts.
+- **Performed by (0126), no new tables:** a line's `responsibility_class` ('self' now displays
+  as "In-house") plus `job_line_vendors` / `job_line_volunteers`.
+  - `performedByForWorkOrders` rolls up to `snap_performed_by`, stamped on every draft render.
+    Vendors are named; volunteers and staff never are.
+  - The grid has a `vendor_id` cascade column. It shows the line's first linked vendor and
+    touches links only when that value changes.
+  - The line card's volunteer picker lists all people; attaching someone gives them the Volunteer
+    role (`ensureVolunteerRole`).
+  - Thank-you line: `volunteersToThank` covers lines finished in the period plus Crew Hours,
+    minus anyone with a login and anyone with `people.no_board_report_name`. It is frozen as
+    `thanks` aggregates. `board_reports.thanks_text` / `thanks_hidden` hold the override.
+  - The Reports explorer still says "Self": saved favourites filter on that word.
 
 ## 2. The system
 
