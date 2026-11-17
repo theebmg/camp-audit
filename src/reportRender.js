@@ -548,9 +548,9 @@ function prepareItems(items, report) {
     }
     // A completed work order's total (Nov 2026): names off = no funding source beside it except
     // camp pots (General / the Discretionary Audit Fund), which the board oversees.
-    if (!showNames && Array.isArray(it.SnapTotalFunding)) {
-      out.SnapTotalFunding = it.SnapTotalFunding.filter((f) => f && f.IsCamp !== false);
-    }
+    // The non-camp entries stay in the data (marked hidden) so a camp pot that paid only part is
+    // never printed as "Funded by" the whole.
+    if (!showNames) out.HideNonCampOnTotal = true;
     const start = it.SnapStartDate ? isoStr(it.SnapStartDate).slice(0, 10) : null;
     const done = it.SnapDate ? isoStr(it.SnapDate).slice(0, 10) : null;
     if (start && pE && start > pE) out.SnapStartDate = null;
@@ -960,7 +960,19 @@ function woTotalBits(it, items, showFunding) {
   const total = it.SnapTotalCost != null ? Number(it.SnapTotalCost) : null;
   if (total == null || Math.round(total * 100) === 0) return { money: null, funding: null, differs: false };
   const differs = Math.abs(total - periodAmountOf(items, it)) > 0.005;
-  const funding = fundingTagText({ SnapFunding: it.SnapTotalFunding }, showFunding);
+  let funding = null;
+  if (showFunding !== 'off') {
+    const all = (Array.isArray(it.SnapTotalFunding) ? it.SnapTotalFunding : []).filter((f) => f && f.Amount);
+    // Names off: no contributor, named or as "Contributed"; camp pots (the Discretionary Audit
+    // Fund, and General when Show funding is "all") still show, as amounts.
+    const visible = it.HideNonCampOnTotal ? all.filter((f) => f.IsCamp !== false) : all;
+    const shown = showFunding === 'all' ? visible : visible.filter((f) => f.IsGeneral !== true);
+    if (shown.length) {
+      funding = shown.length === 1 && all.length === 1
+        ? `Funded by ${shown[0].Source}`
+        : shown.map((f) => `${f.Source} ${fmtMoney(f.Amount)}`).join(' · ');
+    }
+  }
   return { money: `${fmtMoney(total)}${differs ? ' total' : ''}`, funding, differs };
 }
 const anyTotalDiffers = (items, showFunding) => visibleItems(items).some((i) => isCompletedWo(i) && woTotalBits(i, items, showFunding).differs);
