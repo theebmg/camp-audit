@@ -1746,8 +1746,8 @@ export async function adminDeleteJobLineStatus(id) {
 // The cascade-capable grid columns (§3.7). Every one of these is exposed as
 // a toggle in admin/settings and in the per-WO cascade popover; the names are
 // the job_lines column names, which is also what pinned_fields stores.
-export const CASCADE_COLUMNS = ['responsibility_class', 'funding_source', 'status_id', 'scheduled_date'];
-export const CASCADE_DEFAULTS = { responsibility_class: true, funding_source: true, status_id: true, scheduled_date: true };
+export const CASCADE_COLUMNS = ['responsibility_class', 'vendor_id', 'funding_source', 'status_id', 'scheduled_date'];
+export const CASCADE_DEFAULTS = { responsibility_class: true, vendor_id: true, funding_source: true, status_id: true, scheduled_date: true };
 // Anything not a known column, or not a boolean, is dropped rather than
 // trusted — a stale config from an older build can't smuggle in a column.
 export function normalizeCascadeConfig(cfg) {
@@ -2055,6 +2055,10 @@ export async function createWorkOrder({ title, assetId, locationId, priority, de
       // born with a date needs to reach the calendar sync worker on day one,
       // not wait for someone to edit it later.
       if (lineRows[0].scheduled_date) await queueGcalSync(client, 'job_line', lineRows[0].id);
+      // The grid's Vendor column (Nov 2026).
+      if (numOrNull(line.vendorId)) {
+        await client.query('INSERT INTO job_line_vendors (job_line_id, vendor_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [lineRows[0].id, numOrNull(line.vendorId)]);
+      }
     }
     await client.query('COMMIT');
     await logActivity({ action: 'created', entityType: 'work_order', entityId: woId, entityLabel: title });
@@ -3203,6 +3207,7 @@ function personRowShape(r) {
     Notes: r.notes,
     VolunteerSkills: r.volunteer_skills || [],
     VolunteerNotes: r.volunteer_notes,
+    NoBoardReportName: r.no_board_report_name === true,
     VendorId: r.vendor_id,
     VendorName: r.vendor_name ?? null,
     Active: r.active,
@@ -3483,6 +3488,7 @@ export async function createPerson({
 
 export async function updatePerson(id, {
   name, phone, email, notes, roleIds, volunteerSkills, volunteerNotes, vendorId, cabinHolderIds, active,
+  noBoardReportName,
 }) {
   const client = await pool.connect();
   try {
@@ -3501,6 +3507,7 @@ export async function updatePerson(id, {
     if (volunteerNotes !== undefined) set('volunteer_notes', volunteerNotes?.trim() || null);
     if (vendorId !== undefined) set('vendor_id', vendorId || null);
     if (active !== undefined) set('active', !!active);
+    if (noBoardReportName !== undefined) set('no_board_report_name', !!noBoardReportName);
     if (sets.length) await client.query(`UPDATE people SET ${sets.join(', ')} WHERE id = $1`, vals);
     if (roleIds !== undefined) await writePersonRoles(client, id, roleIds);
     if (cabinHolderIds !== undefined) await writePersonHoldings(client, id, cabinHolderIds);
@@ -4558,6 +4565,9 @@ export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds 
         );
         await logActivity({ action: 'created', entityType: 'job_line', entityId: rows[0].id, entityLabel: title, details: `On Work Order #${woId}` });
         if (rows[0].scheduled_date) gcalSyncs.push(rows[0].id);
+        if (numOrNull(line.vendorId)) {
+          await client.query('INSERT INTO job_line_vendors (job_line_id, vendor_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [rows[0].id, numOrNull(line.vendorId)]);
+        }
         continue;
       }
 
@@ -4580,6 +4590,15 @@ export async function replaceWorkOrderJobLines(woId, lines = [], { knownLineIds 
         await changeJobLineStatus(client, id, Number(line.statusId), { statusNote: line.statusNote });
       }
       if (String(prev.scheduled_date ?? '') !== String(line.scheduledDate || '')) gcalSyncs.push(id);
+      // Vendor: only when the grid sent one AND it differs from what the grid was showing.
+      if (line.vendorId !== undefined && numOrNull(line.vendorId) !== numOrNull(line.originalVendorId)) {
+        if (numOrNull(line.originalVendorId)) {
+          await client.query('DELETE FROM job_line_vendors WHERE job_line_id = $1 AND vendor_id = $2', [id, numOrNull(line.originalVendorId)]);
+        }
+        if (numOrNull(line.vendorId)) {
+          await client.query('INSERT INTO job_line_vendors (job_line_id, vendor_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [id, numOrNull(line.vendorId)]);
+        }
+      }
     }
 
     for (const lineId of gcalSyncs) await queueGcalSync(client, 'job_line', lineId);
@@ -4777,11 +4796,22 @@ export async function deleteCause(id) {
 //    per-WO (a vendor on the roof line, volunteers on the deck line, same
 //    WO). Identical shape/behavior to the old work_order_volunteers/vendors
 //    junctions they replaced. ───────────────────────────────────────────────
+// Anyone attached to work as a volunteer holds the Volunteer role (Nov 2026: the picker lists
+// every person, and this keeps the Volunteers list and crew pickers in step with it).
+async function ensureVolunteerRole(personId) {
+  await pool.query(
+    `INSERT INTO person_role_assignments (person_id, role_id)
+     SELECT $1, r.id FROM person_roles r WHERE r.name = 'Volunteer'
+       AND NOT EXISTS (SELECT 1 FROM person_role_assignments a WHERE a.person_id = $1 AND a.role_id = r.id)`,
+    [personId]
+  );
+}
+
 async function getJobLineAssignees(jobLineId) {
   const [vol, ven] = await Promise.all([
     pool.query(
-      `SELECT v.id, v.name, v.phone, v.skill FROM job_line_volunteers jlv
-       JOIN volunteers v ON v.id = jlv.volunteer_id WHERE jlv.job_line_id = $1 ORDER BY v.name`,
+      `SELECT v.id, v.name, v.phone, v.volunteer_skills AS skill FROM job_line_volunteers jlv
+       JOIN people v ON v.id = jlv.volunteer_id WHERE jlv.job_line_id = $1 ORDER BY v.name`,
       [jobLineId]
     ),
     pool.query(
@@ -4797,6 +4827,7 @@ async function getJobLineAssignees(jobLineId) {
 }
 export async function assignVolunteerToJobLine(jobLineId, volunteerId) {
   await pool.query(`INSERT INTO job_line_volunteers (job_line_id, volunteer_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [jobLineId, volunteerId]);
+  await ensureVolunteerRole(volunteerId);
   return getJobLineAssignees(jobLineId);
 }
 export async function unassignVolunteerFromJobLine(jobLineId, volunteerId) {
@@ -6222,6 +6253,11 @@ export async function computeBoardReportAggregates(reportId) {
   out.push({ groupKey: 'savings', label: `Recurring savings · since ${fmtShortDate(trackStart).replace(/, \d{4}$/, '')}`, valueNumeric: Number(recAll.rows[0].annualized), note: 'per year' });
   out.push({ groupKey: 'savings', label: 'One-time savings · this period', valueNumeric: Number(one.rows[0].total) });
 
+  // ── Volunteers to thank (names only; frozen with the rest at publish). ──
+  const thanks = await volunteersToThank(pS, pE);
+  for (const v of thanks.named) out.push({ groupKey: 'thanks', label: v.Name });
+  if (thanks.optedOut.length) out.push({ groupKey: 'thanks_meta', label: 'opted_out', valueNumeric: thanks.optedOut.length });
+
   // ── Financial summary at the BOTTOM of the report: this period, year to date (only when it
   // differs from cumulative), and cumulative since the tracking start. One row per figure, one
   // group per window; the renderer lays them out as columns. Shown when show_paid_to_date is on.
@@ -6994,7 +7030,53 @@ async function workOrderFullCost(workOrderId) {
 
 // Stamp every COMPLETED work order on a draft with its full total and who paid it (display
 // only), and clear it from any that are not completed. Run at the end of a refresh pass.
+// "Performed by" for a work order, rolled up from its lines (Nov 2026). One short tag:
+// In-house, each vendor by name, "Volunteers" (never names), "Cabin holder". A line marked Vendor
+// with no vendor linked reads "Vendor" until one is. Lines that will not be done (a terminal
+// status that is not work performed, e.g. Cancelled) do not count.
+export async function performedByForWorkOrders(workOrderIds) {
+  const out = new Map();
+  if (!workOrderIds.length) return out;
+  const { rows } = await pool.query(
+    `SELECT jl.work_order_id AS wo, jl.id, jl.responsibility_class AS cls,
+            ARRAY(SELECT vd.name FROM job_line_vendors jv JOIN vendors vd ON vd.id = jv.vendor_id
+                  WHERE jv.job_line_id = jl.id ORDER BY vd.name) AS vendors,
+            EXISTS (SELECT 1 FROM job_line_volunteers jvo WHERE jvo.job_line_id = jl.id) AS has_vols
+     FROM job_lines jl JOIN job_line_statuses s ON s.id = jl.status_id
+     WHERE jl.work_order_id = ANY($1) AND NOT (s.is_terminal AND NOT s.counts_as_work_performed)
+     ORDER BY jl.work_order_id, jl.sort_order, jl.id`,
+    [workOrderIds]
+  );
+  const acc = new Map();
+  for (const r of rows) {
+    if (!acc.has(r.wo)) acc.set(r.wo, { inHouse: false, vendors: [], unnamedVendor: false, vols: false, cabin: false });
+    const a = acc.get(r.wo);
+    if (r.cls === 'self') a.inHouse = true;
+    if (r.cls === 'cabin_holder') a.cabin = true;
+    if (r.cls === 'volunteer' || r.has_vols) a.vols = true;
+    for (const v of r.vendors) if (!a.vendors.includes(v)) a.vendors.push(v);
+    if (r.cls === 'vendor' && !r.vendors.length) a.unnamedVendor = true;
+  }
+  for (const [wo, a] of acc) {
+    const parts = [];
+    if (a.inHouse) parts.push('In-house');
+    parts.push(...a.vendors);
+    if (a.unnamedVendor && !a.vendors.length) parts.push('Vendor');
+    if (a.vols) parts.push('Volunteers');
+    if (a.cabin) parts.push('Cabin holder');
+    out.set(wo, parts.join(' + ') || null);
+  }
+  return out;
+}
+
 export async function stampCompletedWorkOrderTotals(reportId) {
+  const { rows: woItems } = await pool.query(
+    "SELECT id, item_id FROM board_report_items WHERE report_id = $1 AND item_type = 'work_order'", [reportId]
+  );
+  const tags = await performedByForWorkOrders(woItems.map((r) => r.item_id));
+  for (const r of woItems) {
+    await pool.query('UPDATE board_report_items SET snap_performed_by = $2 WHERE id = $1', [r.id, tags.get(r.item_id) || null]);
+  }
   const { rows } = await pool.query(
     `SELECT bi.id, bi.item_id, ws.is_terminal
      FROM board_report_items bi
@@ -7716,6 +7798,8 @@ function boardReportRowShape(r) {
     ShowScheduled: r.show_scheduled !== false,
     ShowPaidToDate: r.show_paid_to_date === true,
     ShowNamedContributors: r.show_named_contributors === true,
+    ThanksText: r.thanks_text ?? null,
+    ThanksHidden: r.thanks_hidden === true,
     ShowFunding: r.show_funding || 'non_general',
     CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
   };
@@ -7795,6 +7879,7 @@ const BOARD_REPORT_UPDATE_COLUMNS = {
   forwardStart: 'forward_start', forwardEnd: 'forward_end', summaryNotes: 'summary_notes',
   showHours: 'show_hours', showFunding: 'show_funding', showScheduled: 'show_scheduled', showPaidToDate: 'show_paid_to_date',
   showNamedContributors: 'show_named_contributors',
+  thanksText: 'thanks_text', thanksHidden: 'thanks_hidden',
 };
 
 // The name a draft gets from its dates: the month its period ends in.
@@ -7848,6 +7933,7 @@ export async function listBoardReportItems(reportId) {
     // A completed work order's full total and who paid it — display only, never summed.
     SnapTotalCost: r.snap_total_cost != null ? Number(r.snap_total_cost) : null,
     SnapTotalFunding: r.snap_total_funding || null,
+    SnapPerformedBy: r.snap_performed_by || null,
     SnapProgress: r.snap_progress,
     ParentWorkOrderId: r.parent_work_order_id,
     UserTouched: r.user_touched,
@@ -12602,4 +12688,85 @@ export async function boardLedgerFundTotals(throughDate = null) {
   const by = new Map();
   for (const r of ledger) if (r.fund_id) by.set(r.fund_id, Math.round(((by.get(r.fund_id) || 0) + r.amount) * 100) / 100);
   return by;
+}
+
+
+// The board report's thank-you line (Nov 2026). Everyone linked as a volunteer on a job line
+// finished in the period, plus anyone logged in Crew Hours in the period. People with a login
+// (camp staff — Ben) are never thanked as volunteers. Opted-out people are counted, not named.
+export async function volunteersToThank(periodStart, periodEnd) {
+  const { rows } = await pool.query(
+    `WITH ids AS (
+       SELECT jvo.volunteer_id AS id FROM job_line_volunteers jvo
+       JOIN job_lines jl ON jl.id = jvo.job_line_id
+       JOIN job_line_statuses s ON s.id = jl.status_id
+       WHERE s.counts_as_work_performed AND COALESCE(jl.completed_date, jl.completed_at::date) BETWEEN $1 AND $2
+       UNION
+       SELECT csv.volunteer_id FROM crew_session_volunteers csv
+       JOIN crew_sessions cs ON cs.id = csv.session_id WHERE cs.session_date BETWEEN $1 AND $2
+       UNION
+       SELECT cs.person_id FROM crew_sessions cs WHERE cs.person_id IS NOT NULL AND cs.session_date BETWEEN $1 AND $2
+     )
+     SELECT p.id, p.name, p.no_board_report_name AS opted_out
+     FROM ids JOIN people p ON p.id = ids.id
+     WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.person_id = p.id)
+     ORDER BY p.name`,
+    [periodStart, periodEnd]
+  );
+  // "Greenawalt, Ben" reads as "Ben Greenawalt" in a sentence.
+  const natural = (n) => {
+    const m = String(n || '').match(/^\s*([^,]+),\s*(.+)$/);
+    return m ? `${m[2].trim()} ${m[1].trim()}` : String(n || '').trim();
+  };
+  return {
+    named: rows.filter((r) => !r.opted_out).map((r) => ({ Id: r.id, Name: natural(r.name) })),
+    optedOut: rows.filter((r) => r.opted_out).map((r) => ({ Id: r.id, Name: natural(r.name) })),
+  };
+}
+
+// Completed work orders on a report whose every line was left on the default (In-house, nobody
+// attached) and that nobody has confirmed — the default may be wrong.
+export async function listCompletedWorkOrdersPerformerUnset(reportId) {
+  const { rows } = await pool.query(
+    `SELECT bi.item_id AS id, bi.snap_title AS title
+     FROM board_report_items bi
+     JOIN work_orders w ON w.id = bi.item_id
+     JOIN work_order_statuses ws ON ws.id = w.status_id
+     WHERE bi.report_id = $1 AND bi.item_type = 'work_order' AND bi.included
+       AND ws.is_terminal AND NOT w.performed_by_confirmed
+       AND NOT EXISTS (
+         SELECT 1 FROM job_lines jl WHERE jl.work_order_id = w.id
+           AND (jl.responsibility_class <> 'self'
+                OR EXISTS (SELECT 1 FROM job_line_vendors x WHERE x.job_line_id = jl.id)
+                OR EXISTS (SELECT 1 FROM job_line_volunteers y WHERE y.job_line_id = jl.id)))
+     ORDER BY bi.snap_date, bi.item_id`,
+    [reportId]
+  );
+  return rows.map((r) => ({ Id: r.id, Title: r.title }));
+}
+
+// Lines marked Vendor with no vendor linked, on work orders this report shows.
+export async function listVendorLinesWithoutVendor(reportId) {
+  const { rows } = await pool.query(
+    `SELECT jl.id, jl.title, jl.work_order_id, w.title AS wo_title
+     FROM job_lines jl JOIN work_orders w ON w.id = jl.work_order_id
+     JOIN job_line_statuses s ON s.id = jl.status_id
+     WHERE jl.responsibility_class = 'vendor' AND NOT (s.is_terminal AND NOT s.counts_as_work_performed)
+       AND NOT EXISTS (SELECT 1 FROM job_line_vendors x WHERE x.job_line_id = jl.id)
+       AND jl.work_order_id IN (SELECT item_id FROM board_report_items
+                                WHERE report_id = $1 AND item_type = 'work_order' AND included)
+     ORDER BY jl.work_order_id, jl.id`,
+    [reportId]
+  );
+  return rows.map((r) => ({ Id: r.id, Title: r.title, WorkOrderId: r.work_order_id, WorkOrderTitle: r.wo_title }));
+}
+
+export async function setWorkOrderPerformedByConfirmed(workOrderId, confirmed) {
+  const { rows } = await pool.query(
+    'UPDATE work_orders SET performed_by_confirmed = $2 WHERE id = $1 RETURNING id, title', [workOrderId, !!confirmed]
+  );
+  if (!rows[0]) return null;
+  await logActivity({ action: 'updated', entityType: 'work_order', entityId: rows[0].id, entityLabel: rows[0].title,
+    details: confirmed ? 'performed by confirmed (in-house)' : 'performed-by confirmation removed' });
+  return { Id: rows[0].id, PerformedByConfirmed: !!confirmed };
 }

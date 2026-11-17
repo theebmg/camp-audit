@@ -6235,6 +6235,8 @@ async function renderBoardReport(params = {}) {
         <p class="field-error" id="brSummary-err"></p>
       </div>
 
+      <div id="brThanks">${brThanksHtml()}</div>
+
       <div class="card" id="brPhotosCard">
         <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap">
           <h3 style="margin:0">Photos</h3>
@@ -6309,6 +6311,7 @@ async function renderBoardReport(params = {}) {
     wireReportsTabs();
     wire(published);
     wireChecks();
+    drawThanks();
     loadChecks();
   }
 
@@ -6330,7 +6333,10 @@ async function renderBoardReport(params = {}) {
     }
     const warn = checks.warnings || [];
     const noCost = checks.noCost || [];
-    const nCheck = warn.length + noCost.length;
+    const unset = checks.performerUnset || [];
+    const nCheck = warn.length + noCost.length + unset.length;
+    const thanksNames = checks.thanks?.names || [];
+    const thanksOut = Number(checks.thanks?.optedOut || 0);
     return `
       <div class="card" style="border-left:4px solid ${nCheck ? '#b45309' : '#13432f'}">
         <h3 style="margin-bottom:4px">Before you send ${nCheck ? `<span class="pill" style="background:#fef3c7;color:#7a4a10">${nCheck} to check</span>` : '<span class="pill good">figures agree</span>'}</h3>
@@ -6347,6 +6353,21 @@ async function renderBoardReport(params = {}) {
             </span>
           </div>`).join('')}
         </div>` : ''}
+        ${unset.length ? `<div style="margin:6px 0 10px">
+          <div style="font-weight:600">Completed work — who did it?</div>
+          <p class="muted" style="margin:2px 0 4px;font-size:0.8rem">Every line is still on the default (In-house, nobody attached). The report will say “In-house”.</p>
+          ${unset.map((w) => `<div class="list-item" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+            <div style="min-width:0">${escapeHtml(w.Title)}</div>
+            <span class="btn-row" style="margin:0">
+              <button type="button" class="btn btn-secondary btn-inline br-unset-open" data-id="${w.Id}">Set vendor / volunteers</button>
+              <button type="button" class="btn btn-secondary btn-inline br-unset-ok" data-id="${w.Id}">In-house is right</button>
+            </span>
+          </div>`).join('')}
+        </div>` : ''}
+        <div style="margin:6px 0 10px;font-size:0.88rem">
+          <strong>Thank-you line will name:</strong>
+          ${thanksNames.length ? escapeHtml(thanksNames.join(', ')) : '<span class="muted">nobody</span>'}${thanksOut ? ` <span class="muted">(+${thanksOut} who asked not to be named)</span>` : ''}
+        </div>
         <details ${groups.size ? '' : 'hidden'}>
           <summary style="cursor:pointer"><strong>Money to sort out</strong> <span class="muted">— ${(checks.unclassified || []).length} item(s). Each opens the record; Save brings you back here.</span></summary>
           ${[...groups.entries()].map(([g, list]) => `
@@ -6361,6 +6382,58 @@ async function renderBoardReport(params = {}) {
         <div class="btn-row" style="margin-top:8px"><button type="button" class="btn btn-secondary btn-inline" id="brRecheck">Re-check</button></div>
       </div>`;
   }
+  // The volunteer thank-you line (Nov 2026): generated from the period's volunteers, editable,
+  // removable. Same wording rule as the report (src/reportRender.js autoThanksSentence).
+  function autoThanks() {
+    const names = checks?.thanks?.names || [];
+    const optedOut = Number(checks?.thanks?.optedOut || 0);
+    if (!names.length && !optedOut) return '';
+    if (!names.length) return 'Thank you to our volunteers for their help this month.';
+    const list = optedOut ? `${names.join(', ')}, and others`
+      : (names.length === 1 ? names[0] : names.length === 2 ? `${names[0]} and ${names[1]}`
+        : `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`);
+    return `Thank you to ${list} for their help this month.`;
+  }
+  function brThanksHtml() {
+    if (!report) return '';
+    const published = report.Status === 'published';
+    const auto = autoThanks();
+    const typed = report.ThanksText || '';
+    if (published && (report.ThanksHidden || (!typed && !auto))) return '';
+    return `
+      <div class="card">
+        <h3 style="margin-bottom:4px">Volunteer thank-you</h3>
+        <p class="muted" style="margin:0 0 6px;font-size:0.82rem">Printed under the summary. Names only — volunteers on work finished this period and anyone in Crew Hours. People marked “Don't name me” are left out. ${checks ? '' : 'Loading…'}</p>
+        <textarea id="brThanksText" rows="2" ${published ? 'disabled' : ''} placeholder="${escapeHtml(auto || 'No volunteers recorded this period — nothing will print unless you type a line here.')}">${escapeHtml(typed || '')}</textarea>
+        ${published ? '' : `<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:6px">
+          <label style="display:flex;align-items:center;gap:6px;font-weight:400;cursor:pointer;margin:0">
+            <input type="checkbox" id="brThanksHidden" ${report.ThanksHidden ? 'checked' : ''} /> Leave out of this report
+          </label>
+          ${typed ? '<button type="button" class="btn btn-secondary btn-inline" id="brThanksAuto">Use the automatic line</button>' : ''}
+          <span class="muted" style="font-size:0.8rem">${typed ? 'Your wording is used.' : (auto ? 'Empty = the automatic line (shown faded above).' : '')}</span>
+        </div>`}
+        <p class="field-error" id="brThanksText-err"></p>
+      </div>`;
+  }
+  function drawThanks() {
+    const el = document.getElementById('brThanks');
+    if (!el) return;
+    el.innerHTML = brThanksHtml();
+    document.getElementById('brThanksText')?.addEventListener('change', async (e) => {
+      clearFieldError('brThanksText');
+      try { await patchReport({ thanksText: e.target.value }); drawThanks(); }
+      catch (err) { showFieldError('brThanksText', saveErrorMessage(err)); }
+    });
+    document.getElementById('brThanksHidden')?.addEventListener('change', async (e) => {
+      try { await patchReport({ thanksHidden: e.target.checked }); drawThanks(); }
+      catch (err) { e.target.checked = !e.target.checked; showFieldError('brThanksText', saveErrorMessage(err)); }
+    });
+    document.getElementById('brThanksAuto')?.addEventListener('click', async () => {
+      try { await patchReport({ thanksText: '' }); drawThanks(); }
+      catch (err) { showFieldError('brThanksText', saveErrorMessage(err)); }
+    });
+  }
+
   async function loadChecks() {
     if (!report || report.Status === 'published') return;
     const seq = ++checksSeq;
@@ -6373,10 +6446,20 @@ async function renderBoardReport(params = {}) {
     }
     const el = document.getElementById('brChecks');
     if (el) { el.innerHTML = brChecksHtml(); wireChecks(); }
+    drawThanks();
   }
   function wireChecks() {
     document.getElementById('brRecheck')?.addEventListener('click', () => { checks = null; const el = document.getElementById('brChecks'); if (el) el.innerHTML = brChecksHtml(); loadChecks(); });
     document.querySelectorAll('#brChecks .br-unclass').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, { id: Number(el.dataset.id), from: 'board' })));
+    document.querySelectorAll('#brChecks .br-unset-open').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: Number(el.dataset.id), from: 'board' })));
+    document.querySelectorAll('#brChecks .br-unset-ok').forEach((el) => el.addEventListener('click', async () => {
+      el.disabled = true;
+      try {
+        await api(`/api/pg/work-orders/${el.dataset.id}/performed-by-confirmed`, { method: 'POST', body: JSON.stringify({ confirmed: true }) });
+        toast('Confirmed: in-house');
+        loadChecks();
+      } catch (err) { el.disabled = false; toast(err.message); }
+    }));
     document.querySelectorAll('#brChecks .br-nocost-open').forEach((el) => el.addEventListener('click', () => go('workOrderDetail', { id: Number(el.dataset.id), from: 'board' })));
     document.querySelectorAll('#brChecks .br-nocost-labor').forEach((el) => el.addEventListener('click', async () => {
       el.disabled = true;
@@ -6476,7 +6559,7 @@ async function renderBoardReport(params = {}) {
       toast('Downloaded and saved to history'); await load(); draw();
     });
     document.getElementById('brEmail').addEventListener('click', async () => {
-      const nWarn = (checks?.warnings?.length || 0) + (checks?.noCost?.length || 0);
+      const nWarn = (checks?.warnings?.length || 0) + (checks?.noCost?.length || 0) + (checks?.performerUnset?.length || 0);
       if (nWarn && !(await confirmDialog(`${nWarn} check(s) under "Before you send" have not been resolved. Send anyway?`, { confirmLabel: 'Continue', danger: false }))) return;
       const recipient = await promptDialog('Email the board report to:', { confirmLabel: 'Send', placeholder: 'name@example.org' });
       if (!recipient || !recipient.trim()) return;
@@ -12200,6 +12283,12 @@ async function renderPersonProfile({ id }) {
           <label style="margin-top:6px">Volunteer notes</label>
           <textarea id="pVolNotes" rows="2">${escapeHtml(person.VolunteerNotes || '')}</textarea>
         </div>
+        <div class="field-row">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
+            <input type="checkbox" id="pNoBoardName" ${person.NoBoardReportName ? 'checked' : ''} /> Don't name me in board reports
+          </label>
+          <p class="muted" style="margin:2px 0 0;font-size:0.8rem">Left out of the volunteer thank-you line; the line then ends “…and others.”</p>
+        </div>
         <div class="field-row" id="vendWrap" hidden>
           <label>Vendor</label>
           <select id="pVendor">
@@ -12231,6 +12320,7 @@ async function renderPersonProfile({ id }) {
         roleIds: [...overlay.querySelectorAll('.p-role:checked')].map((c) => Number(c.value)),
         volunteerSkills: [...overlay.querySelectorAll('.p-skill:checked')].map((c) => c.value),
         volunteerNotes: overlay.querySelector('#pVolNotes')?.value ?? null,
+        noBoardReportName: !!overlay.querySelector('#pNoBoardName')?.checked,
         vendorId: overlay.querySelector('#pVendor')?.value ? Number(overlay.querySelector('#pVendor').value) : null,
       };
       try {
@@ -13084,7 +13174,9 @@ async function renderRequestDetail({ id }, container = app) {
   });
 }
 
-const RESPONSIBILITY_CLASS_LABELS = { self: 'Self', volunteer: 'Volunteer', vendor: 'Vendor', cabin_holder: 'Cabin-Holder' };
+// "Self" reads as In-house everywhere (Nov 2026): the board report's performed-by tag uses the
+// same word. The stored value stays 'self'.
+const RESPONSIBILITY_CLASS_LABELS = { self: 'In-house', volunteer: 'Volunteer', vendor: 'Vendor', cabin_holder: 'Cabin-Holder' };
 
 // Job line creation flow (Build Brief v2, 1.7): each "+ Add job line" row
 // captures title, responsibility class, funding source + ref, estimated
@@ -14857,6 +14949,9 @@ const JLG_COLUMNS = [
   { key: 'estHours', label: 'Est. Hours', kind: 'number' },
   { key: 'estCost', label: 'Est. Cost', kind: 'number' },
   { key: 'responsibility_class', label: 'Responsibility', kind: 'select', cascade: true },
+  // Who did it, when it was a vendor (Nov 2026). The line's first linked vendor; more can be added
+  // on the line card. Cascades like the other pickers.
+  { key: 'vendor_id', label: 'Vendor', kind: 'combobox', cascade: true },
   { key: 'funding_source', label: 'Funding Source', kind: 'combobox', cascade: true },
   { key: 'status_id', label: 'Status', kind: 'select', cascade: true },
   { key: 'scheduled_date', label: 'Scheduled Date', kind: 'date', cascade: true },
@@ -14865,7 +14960,9 @@ const JLG_COLUMNS = [
   { key: 'completed_date', label: 'Completed', kind: 'date' },
 ];
 const JLG_CASCADE_COLUMNS = JLG_COLUMNS.filter((c) => c.cascade);
-const JLG_CASCADE_DEFAULTS = { responsibility_class: true, funding_source: true, status_id: true, scheduled_date: true };
+// Columns by key, so the row markup does not depend on their order.
+const JLG_COL = (key) => JLG_COLUMNS.find((c) => c.key === key);
+const JLG_CASCADE_DEFAULTS = { responsibility_class: true, vendor_id: true, funding_source: true, status_id: true, scheduled_date: true };
 // Every shortcut that exists appears in the legend — the legend IS the
 // documentation (§4).
 const JLG_SHORTCUTS = [
@@ -14918,6 +15015,7 @@ function mountJobLineGrid(container, {
   woId = null,
   jobLineStatuses = [],
   fundingOptions = [],
+  vendors = [],
   initialRows = null,
   cascadeConfig = null,          // per-WO override; null = follow the global default
   globalCascadeDefaults = JLG_CASCADE_DEFAULTS,
@@ -14939,6 +15037,10 @@ function mountJobLineGrid(container, {
   let dragUid = null;
 
   const comboboxes = new Map();  // row uid -> funding combobox instance
+  const vendorBoxes = new Map(); // row uid -> vendor combobox instance
+  let vendorOptions = vendors.map((v) => ({ value: String(v.Id), label: v.Name }));
+  const comboFor = (col, uid) => (col === 'funding_source' ? comboboxes.get(uid) : col === 'vendor_id' ? vendorBoxes.get(uid) : null);
+  const mountSel = (col) => (col === 'funding_source' ? '.jlg-fund-mount' : col === 'vendor_id' ? '.jlg-vendor-mount' : null);
   const rowEls = new Map();      // row uid -> <tr>
 
   const cascadeOn = (col) => {
@@ -14949,6 +15051,7 @@ function mountJobLineGrid(container, {
 
   const blankValues = () => ({
     responsibility_class: 'self',
+    vendor_id: '',
     funding_source: fundingOptionValue('operating_budget', null),
     status_id: firstOpenStatus ? String(firstOpenStatus.Id) : '',
     scheduled_date: '',
@@ -14964,6 +15067,7 @@ function mountJobLineGrid(container, {
       touched: new Set(seed.touched || seed.pinned || []),
       errors: new Map(Object.entries(seed.errors || {})),
       originalStatusId: seed.originalStatusId ?? null,
+      originalVendorId: seed.originalVendorId ?? null,
       statusNote: null,
     };
   }
@@ -15002,6 +15106,7 @@ function mountJobLineGrid(container, {
     if (col.kind === 'date') {
       return `<input type="date" class="${cls}" data-col="${col.key}" value="${escapeHtml(value || '')}"${errTitle} />`;
     }
+    if (col.key === 'vendor_id') return `<div class="jlg-vendor-mount ${cls}" data-col="${col.key}"${errTitle}></div>`;
     return `<div class="jlg-fund-mount ${cls}" data-col="${col.key}"${errTitle}></div>`;
   }
 
@@ -15014,11 +15119,12 @@ function mountJobLineGrid(container, {
       </td>
       <td class="jlg-c-num"><input class="jlg-num${row.errors.has('estHours') ? ' jlg-error' : ''}" data-col="estHours" type="number" step="any" min="0" value="${escapeHtml(row.estHours)}" /></td>
       <td class="jlg-c-num"><input class="jlg-num${row.errors.has('estCost') ? ' jlg-error' : ''}" data-col="estCost" type="number" step="0.01" min="0" value="${escapeHtml(row.estCost)}" /></td>
-      <td class="jlg-c-resp">${cellControlHtml(JLG_COLUMNS[3], idx, row)}</td>
-      <td class="jlg-c-fund">${cellControlHtml(JLG_COLUMNS[4], idx, row)}</td>
-      <td class="jlg-c-status">${cellControlHtml(JLG_COLUMNS[5], idx, row)}</td>
-      <td class="jlg-c-date">${cellControlHtml(JLG_COLUMNS[6], idx, row)}</td>
-      <td class="jlg-c-date">${cellControlHtml(JLG_COLUMNS[7], idx, row)}</td>
+      <td class="jlg-c-resp">${cellControlHtml(JLG_COL('responsibility_class'), idx, row)}</td>
+      <td class="jlg-c-vendor">${cellControlHtml(JLG_COL('vendor_id'), idx, row)}</td>
+      <td class="jlg-c-fund">${cellControlHtml(JLG_COL('funding_source'), idx, row)}</td>
+      <td class="jlg-c-status">${cellControlHtml(JLG_COL('status_id'), idx, row)}</td>
+      <td class="jlg-c-date">${cellControlHtml(JLG_COL('scheduled_date'), idx, row)}</td>
+      <td class="jlg-c-date">${cellControlHtml(JLG_COL('completed_date'), idx, row)}</td>
       <td class="jlg-c-menu"><button type="button" class="jlg-remove" title="Remove this line" aria-label="Remove line ${idx + 1}">✕</button></td>
     </tr>`;
   }
@@ -15081,6 +15187,7 @@ function mountJobLineGrid(container, {
 
   function renderRows() {
     comboboxes.clear();
+    vendorBoxes.clear();
     rowEls.clear();
     bodyEl.innerHTML = rows.map((r, i) => rowHtml(r, i)).join('');
     [...bodyEl.querySelectorAll('.jlg-row')].forEach((tr, i) => wireRow(tr, rows[i]));
@@ -15100,6 +15207,7 @@ function mountJobLineGrid(container, {
     while (rows.length > 1 && rowIsEmpty(rows[rows.length - 1]) && rowIsEmpty(rows[rows.length - 2])) {
       const dropped = rows.pop();
       comboboxes.delete(dropped.uid);
+      vendorBoxes.delete(dropped.uid);
       rowEls.delete(dropped.uid);
       bodyEl.lastElementChild?.remove();
     }
@@ -15123,7 +15231,7 @@ function mountJobLineGrid(container, {
       const tr = rowEls.get(row.uid);
       if (!tr) return;
       const value = displayed(i, col);
-      if (col === 'funding_source') comboboxes.get(row.uid)?.setDisplay(value);
+      if (comboFor(col, row.uid)) comboFor(col, row.uid).setDisplay(value);
       else {
         const el = tr.querySelector(`[data-col="${col}"]`);
         if (el) el.value = value ?? '';
@@ -15150,14 +15258,14 @@ function mountJobLineGrid(container, {
     const tr = rowEls.get(row.uid);
     if (tr) {
       const follow = isFollowing(idx, col);
-      const el = col === 'funding_source' ? tr.querySelector('.jlg-fund-mount') : tr.querySelector(`[data-col="${col}"]`);
+      const el = mountSel(col) ? tr.querySelector(mountSel(col)) : tr.querySelector(`[data-col="${col}"]`);
       if (el) {
         el.classList.toggle('jlg-follow', follow);
         el.classList.remove('jlg-error');
         el.removeAttribute('title');
       }
       const value = displayed(idx, col);
-      if (col === 'funding_source') comboboxes.get(row.uid)?.[follow ? 'setDisplay' : 'setValue'](value);
+      if (comboFor(col, row.uid)) comboFor(col, row.uid)[follow ? 'setDisplay' : 'setValue'](value);
       else if (el) el.value = value ?? '';
     }
     if (idx === 0) refreshFollowers(col);
@@ -15221,6 +15329,37 @@ function mountJobLineGrid(container, {
       });
       if (follow) cbx.setDisplay(displayed(idx, 'funding_source'));
       comboboxes.set(row.uid, cbx);
+    }
+
+    const vendorMount = tr.querySelector('.jlg-vendor-mount');
+    if (vendorMount) {
+      const idx = idxOf();
+      const follow = isFollowing(idx, 'vendor_id');
+      const vbx = mountCombobox(vendorMount, {
+        options: vendorOptions,
+        value: follow ? null : (displayed(idx, 'vendor_id') || null),
+        placeholder: '—',
+        emptyText: 'No vendor by that name',
+        extraRowHtml: (typed) => (typed ? `<div class="ac-item ac-add" data-add-vendor="1">＋ Add vendor “${escapeHtml(typed)}”</div>` : ''),
+        onExtraRow: (resultsEl, typed) => {
+          resultsEl.querySelector('[data-add-vendor]')?.addEventListener('mousedown', async (e) => {
+            e.preventDefault();
+            try {
+              const { vendor } = await api('/api/pg/vendors', { method: 'POST', body: JSON.stringify({ name: typed }) });
+              vendorOptions = [...vendorOptions, { value: String(vendor.Id), label: vendor.Name }]
+                .sort((a, b) => a.label.localeCompare(b.label));
+              vendorBoxes.forEach((b) => b.setOptions(vendorOptions));
+              vbx.setValue(String(vendor.Id));
+              setCascadeValue(idxOf(), 'vendor_id', String(vendor.Id));
+              toast(`Vendor “${vendor.Name}” added`);
+            } catch (err) { toast(err.message); }
+          });
+        },
+        onSelect: (opt) => setCascadeValue(idxOf(), 'vendor_id', opt ? opt.value : ''),
+        onClear: () => setCascadeValue(idxOf(), 'vendor_id', ''),
+      });
+      if (follow) vbx.setDisplay(displayed(idx, 'vendor_id'));
+      vendorBoxes.set(row.uid, vbx);
     }
 
     tr.querySelector('.jlg-remove').addEventListener('click', () => removeRow(row));
@@ -15378,6 +15517,7 @@ function mountJobLineGrid(container, {
     hours: 'estHours', 'est hours': 'estHours', 'est. hours': 'estHours', 'estimated hours': 'estHours', hrs: 'estHours',
     cost: 'estCost', 'est cost': 'estCost', 'est. cost': 'estCost', 'estimated cost': 'estCost',
     responsibility: 'responsibility_class', 'responsible': 'responsibility_class',
+    vendor: 'vendor_id', contractor: 'vendor_id', 'performed by': 'vendor_id',
     funding: 'funding_source', 'funding source': 'funding_source', source: 'funding_source',
     status: 'status_id',
     date: 'scheduled_date', 'scheduled date': 'scheduled_date', scheduled: 'scheduled_date',
@@ -15396,6 +15536,10 @@ function mountJobLineGrid(container, {
     if (colKey === 'responsibility_class') {
       const hit = Object.entries(RESPONSIBILITY_CLASS_LABELS).find(([k, v]) => k === q || v.toLowerCase() === q);
       return hit ? hit[0] : null;
+    }
+    if (colKey === 'vendor_id') {
+      const hit = vendorOptions.find((o) => o.label.toLowerCase() === q) || vendorOptions.find((o) => o.label.toLowerCase().startsWith(q));
+      return hit ? hit.value : null;
     }
     if (colKey === 'status_id') {
       const hit = jobLineStatuses.find((s) => s.Name.toLowerCase() === q);
@@ -15486,7 +15630,8 @@ function mountJobLineGrid(container, {
     if (anchorRowIdx < 0) return;
     const col = e.target.dataset?.col
       || (e.target.classList?.contains('jlg-title') ? 'title' : null)
-      || (e.target.closest('.jlg-fund-mount') ? 'funding_source' : null);
+      || (e.target.closest('.jlg-fund-mount') ? 'funding_source' : null)
+      || (e.target.closest('.jlg-vendor-mount') ? 'vendor_id' : null);
     const anchorColIdx = Math.max(0, JLG_COLUMNS.findIndex((c) => c.key === col));
     e.preventDefault();
     // Plain multi-line text with no tabs, pasted into a Title cell, is a list
@@ -15616,6 +15761,8 @@ function mountJobLineGrid(container, {
           id: row.id,
           title: String(row.title).trim(),
           responsibilityClass: displayed(idx, 'responsibility_class') || 'self',
+          vendorId: displayed(idx, 'vendor_id') ? Number(displayed(idx, 'vendor_id')) : null,
+          originalVendorId: row.originalVendorId ?? null,
           fundingSource: funding.source,
           fundingRefId: funding.refId,
           estimatedHours: row.estHours === '' ? null : Number(row.estHours),
@@ -15774,6 +15921,7 @@ function jlgRowsRaw(jobLines) {
     estCost: jl.EstimatedCost ?? '',
     values: {
       responsibility_class: jl.ResponsibilityClass || 'self',
+      vendor_id: jl.vendors && jl.vendors[0] ? String(jl.vendors[0].Id) : '',
       funding_source: fundingOptionValue(jl.FundingSource, jl.FundingRefId),
       status_id: String(jl.StatusId ?? ''),
       scheduled_date: (jl.ScheduledDate || '').slice(0, 10),
@@ -15781,6 +15929,7 @@ function jlgRowsRaw(jobLines) {
     },
     pinned: jl.PinnedFields || [],
     originalStatusId: jl.StatusId ?? null,
+    originalVendorId: jl.vendors && jl.vendors[0] ? jl.vendors[0].Id : null,
   }));
 }
 
@@ -15789,15 +15938,16 @@ function jlgRowsRaw(jobLines) {
 // sources, flattened into the one searchable list the Funding Source column
 // uses (§9).
 async function loadGridContext() {
-  const [campaignRes, cabinRes, otherRes, fundsRes, settings, fundingOptions] = await Promise.all([
+  const [campaignRes, cabinRes, otherRes, fundsRes, settings, fundingOptions, vendorsRes] = await Promise.all([
     api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'),
     api('/api/pg/budget/other-categories'), api('/api/pg/funds'), api('/api/pg/display-settings'),
-    loadFundingOptions(),
+    loadFundingOptions(), api('/api/pg/vendors').catch(() => ({ vendors: [] })),
   ]);
   const fundingEntities = { capital_campaign: campaignRes.items, cabin_holder: cabinRes.items, other: otherRes.items, fund: fundsRes.funds };
   return {
     fundingEntities,
     fundingOptions,
+    vendors: (vendorsRes.vendors || []).filter((v) => v.Active !== false),
     jobLineStatuses: state.options.jobLineStatuses,
     globalCascadeDefaults: settings.CascadeDefaults || JLG_CASCADE_DEFAULTS,
   };
@@ -15901,6 +16051,7 @@ async function renderNewWorkOrder({ assetId, assetName, templateId }) {
       woId: null,
       jobLineStatuses: gridCtx.jobLineStatuses,
       fundingOptions: gridCtx.fundingOptions,
+      vendors: gridCtx.vendors,
       globalCascadeDefaults: gridCtx.globalCascadeDefaults,
       cascadeConfig,
       initialRows,
@@ -16110,6 +16261,7 @@ async function renderEditWorkOrderLines({ id }) {
       woId: id,
       jobLineStatuses: gridCtx.jobLineStatuses,
       fundingOptions: gridCtx.fundingOptions,
+      vendors: gridCtx.vendors,
       globalCascadeDefaults: gridCtx.globalCascadeDefaults,
       cascadeConfig: cascadeConfig !== undefined ? cascadeConfig : wo.CascadeConfig,
       initialRows,
@@ -16333,7 +16485,7 @@ async function renderWorkOrderDetail({ id }, container = app) {
   if (container === app) setChrome({ title: 'Work Order', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
   const [detail, allVolunteers, allVendors, skillsRes, tplRes, campaignRes, cabinRes, otherRes, causesRes, fundsRes] = await Promise.all([
-    api(`/api/pg/work-orders/${id}`), api('/api/pg/volunteers'), api('/api/pg/vendors'), api('/api/pg/skills'),
+    api(`/api/pg/work-orders/${id}`), api('/api/pg/people'), api('/api/pg/vendors'), api('/api/pg/skills'),
     api('/api/pg/checklist-templates'),
     api('/api/pg/budget/capital-campaign-projects'), api('/api/pg/budget/cabin-holders'), api('/api/pg/budget/other-categories'),
     api('/api/pg/causes'), api('/api/pg/funds'),
@@ -16347,7 +16499,8 @@ async function renderWorkOrderDetail({ id }, container = app) {
   // Job-line pickers (assign-crew, crew-session attendee union) read the full
   // roster off `state` rather than threading it through every helper — same
   // trick the rest of this file uses for state.options.
-  state._allVolunteers = allVolunteers.volunteers;
+  // Any person can be attached as a volunteer (Nov 2026); attaching them gives them the role.
+  state._allVolunteers = allVolunteers.people || [];
   state._allVendors = allVendors.vendors;
 
   const workOrderStatuses = state.options.workOrderStatuses; // admin-editable (2.2) — never hardcode this list
@@ -16854,6 +17007,18 @@ async function renderWorkOrderDetail({ id }, container = app) {
       ],
       placeholder: '— assign volunteer or vendor —',
       emptyText: 'Nobody matches',
+      extraRowHtml: (typed) => (typed ? `<div class="ac-item ac-add" data-add-vendor="1">＋ Add vendor “${escapeHtml(typed)}”</div>` : ''),
+      onExtraRow: (resultsEl, typed) => {
+        resultsEl.querySelector('[data-add-vendor]')?.addEventListener('mousedown', async (e) => {
+          e.preventDefault();
+          try {
+            const { vendor } = await api('/api/pg/vendors', { method: 'POST', body: JSON.stringify({ name: typed }) });
+            await api(`/api/pg/job-lines/${jlId}/vendors`, { method: 'POST', body: JSON.stringify({ vendorId: vendor.Id }) });
+            toast(`Vendor “${vendor.Name}” added`);
+            renderWorkOrderDetail({ id }, container);
+          } catch (err) { toast(err.message); }
+        });
+      },
       onSelect: async (opt) => {
         if (!opt) return;
         const [kind, entId] = String(opt.value).split(':');

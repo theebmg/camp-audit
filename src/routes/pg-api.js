@@ -177,7 +177,7 @@ import {
   listBoardReportFunds, setBoardReportFund,
   listBoardReportPhotoCandidates,
   seedDefaultReportPhotos, setBoardReportPhoto, removeBoardReportPhoto,
-  listSelectedReportPhotos, addReportLevelPhoto, getReportEmailBudgetMb, setWorkOrderLaborOnly,
+  listSelectedReportPhotos, addReportLevelPhoto, getReportEmailBudgetMb, setWorkOrderLaborOnly, setWorkOrderPerformedByConfirmed,
   listPeople, getPerson, createPerson, updatePerson, deletePerson,
   findDuplicatePeople, mergePeople, previewPersonMerge, listRecordMerges,
   listPersonRoles, createPersonRole, updatePersonRole, deletePersonRole,
@@ -2260,7 +2260,7 @@ router.get('/board-reports/:id(\\d+)', async (req, res, next) => {
 // covers the notes field because it's a textarea inside the report form.
 router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
   try {
-    const { title, periodStart, periodEnd, forwardStart, forwardEnd, showHours, showFunding, showScheduled, showPaidToDate, showNamedContributors } = req.body || {};
+    const { title, periodStart, periodEnd, forwardStart, forwardEnd, showHours, showFunding, showScheduled, showPaidToDate, showNamedContributors, thanksText, thanksHidden } = req.body || {};
     // Sanitised on the way IN, not on the way out, so what is stored is already safe and no
     // later reader has to remember to clean it (Part 2D).
     const summaryNotes = req.body && 'summaryNotes' in req.body
@@ -2304,6 +2304,9 @@ router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
       showScheduled: showScheduled === undefined ? undefined : !!showScheduled,
       showPaidToDate: showPaidToDate === undefined ? undefined : !!showPaidToDate,
       showNamedContributors: showNamedContributors === undefined ? undefined : !!showNamedContributors,
+      // Empty text = go back to the generated line.
+      thanksText: thanksText === undefined ? undefined : (String(thanksText || '').trim() || null),
+      thanksHidden: thanksHidden === undefined ? undefined : !!thanksHidden,
       showFunding: showFunding === undefined ? undefined : String(showFunding),
     });
     if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2361,6 +2364,16 @@ router.post('/board-reports/:id(\\d+)/one-off', async (req, res, next) => {
 
 // Pre-send checks: figures that should agree, date sanity, placeholder text, and the list of
 // unclassified money to work off. Screen only — never part of the emailed report.
+// "In-house is right": stops the report screen flagging a completed work order whose lines were
+// all left on the default performer.
+router.post('/work-orders/:id(\\d+)/performed-by-confirmed', async (req, res, next) => {
+  try {
+    const result = await setWorkOrderPerformedByConfirmed(Number(req.params.id), req.body?.confirmed !== false);
+    if (!result) return res.status(404).json({ ok: false, error: 'Work order not found' });
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
 // Mark a completed work order "no cost (labor only)" so the report screen stops flagging it.
 router.post('/work-orders/:id(\\d+)/labor-only', async (req, res, next) => {
   try {

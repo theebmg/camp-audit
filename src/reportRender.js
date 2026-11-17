@@ -839,6 +839,9 @@ function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_gener
     it.SnapAssetName, it.SnapStatus, dates,
     showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
     shownMoney, funding,
+    // Who did the work (Nov 2026): In-house / vendor names / "Volunteers" — never a volunteer's
+    // or Ben's name. Open work orders carry it too.
+    it.ItemType === 'work_order' ? it.SnapPerformedBy : null,
   ].filter(Boolean);
   // The em-dash suffix is for things the detail line does not already say. Printing the
   // asset there as well gave "Front Gate Repair — Red Gate" above "Red Gate · Done · …",
@@ -997,6 +1000,26 @@ function moneyItems(items) {
     && !isPlannedSection(i) && !base.includes(i))];
 }
 
+// The volunteer thank-you line (Nov 2026): names only, never hours or money. Ben's edited text
+// wins; "thanks_hidden" leaves it out; with nobody to thank it does not render at all.
+export function autoThanksSentence(aggregates) {
+  const names = (aggregates || []).filter((a) => a.GroupKey === 'thanks').map((a) => a.Label).filter(Boolean);
+  const optedOut = Number((aggregates || []).find((a) => a.GroupKey === 'thanks_meta' && a.Label === 'opted_out')?.ValueNumeric || 0);
+  if (!names.length && !optedOut) return null;
+  if (!names.length) return 'Thank you to our volunteers for their help this month.';
+  const list = optedOut
+    ? `${names.join(', ')}, and others`
+    : (names.length === 1 ? names[0]
+      : names.length === 2 ? `${names[0]} and ${names[1]}`
+        : `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`);
+  return `Thank you to ${list} for their help this month.`;
+}
+function thanksSentence(report, aggregates) {
+  if (report.ThanksHidden === true) return null;
+  const typed = String(report.ThanksText || '').trim();
+  return typed || autoThanksSentence(aggregates);
+}
+
 // Under the footer total: why it can differ from the money summary.
 const WO_TOTAL_NOTE = 'A work order marked "total" includes costs from earlier periods; only this period\'s part is in the cost of work shown.';
 const WORK_TOTAL_NOTE = 'Cost of the work finished this period. Receipts count in the money summary on their purchase date.';
@@ -1034,6 +1057,10 @@ export function renderBoardReportItemsHtml({ report, items: rawItems, aggregates
     ${moneyHeaderHtml(aggregates)}
     ${approvedFundsHtml(aggregates, showFunding)}
     ${report.SummaryNotes ? `<div style="background:#fbf6ec;border:1px solid #e3d9c2;border-left:4px solid #13432f;border-radius:10px;padding:14px 16px;margin-bottom:10px;">${plainSummaryToHtml(report.SummaryNotes)}</div>` : ''}
+    ${(() => {
+      const thanks = thanksSentence(report, aggregates);
+      return thanks ? `<div style="background:#fbf6ec;border:1px solid #e3d9c2;border-left:4px solid #13432f;border-radius:10px;padding:10px 16px;margin-bottom:10px;font-style:italic;">${escapeHtml(thanks)}</div>` : '';
+    })()}
     ${sections.map((sec) => sectionHtml(sec, items, showHours, showFunding)).join('')}
     ${Array.isArray(reportPhotos) && reportPhotos.length ? `
       <h2 style="margin:26px 0 6px;font-size:1.05rem;color:#13432f;border-top:2px solid #13432f;padding-top:12px;text-transform:uppercase;letter-spacing:0.04em;">Other photos this month</h2>
@@ -1081,6 +1108,8 @@ export function renderBoardReportItemsText({ report, items: rawItems, aggregates
     }
   }
   if (report.SummaryNotes) lines.push('', summaryHtmlToText(report.SummaryNotes));
+  const thanksLine = thanksSentence(report, aggregates);
+  if (thanksLine) lines.push('', thanksLine);
   const visible = visibleItems(items);
   const countedAll = totalledItems(items);
   for (const sec of ['done', 'coming_up', 'overdue', 'admin_work']) {
@@ -1117,7 +1146,7 @@ export function renderBoardReportItemsText({ report, items: rawItems, aggregates
       }
       const bits = [it.SnapAssetName, itemDatesText(it),
         showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
-        tMoney, tFunding].filter(Boolean);
+        tMoney, tFunding, it.ItemType === 'work_order' ? it.SnapPerformedBy : null].filter(Boolean);
       lines.push(`  ${it.SnapTitle || '(untitled)'}${bits.length ? ` — ${bits.join(' · ')}` : ''}`);
       if (it.ItemType === 'work_order') {
         // Indented with a dash, which is as much of a connecting rail as plain text allows.

@@ -9,6 +9,7 @@ import {
   listSelectedReportPhotos, stampReportPhotoLabels,
   getFundBalances, boardLedgerFundTotals, listUnclassifiedMoney,
   listCompletedWorkOrdersWithoutCost, listLaborOnlyWorkOrdersWithCost, stampCompletedWorkOrderTotals,
+  listCompletedWorkOrdersPerformerUnset, listVendorLinesWithoutVendor,
 } from './db.js';
 import { renderBoardReportItemsHtml, renderBoardReportItemsText, workSectionMoney } from './reportRender.js';
 import { buildEmailCopy, buildPhotoLabel } from './reportPhotos.js';
@@ -449,6 +450,15 @@ export async function computeBoardReportChecks(reportId) {
     warnings.push(`"${w.Title}" is marked no cost (labor only) but has ${money(w.Total)} recorded. The report shows the cost.`);
   }
 
+  // 8. Performed by: lines marked Vendor with no vendor named (the tag can only say "Vendor"),
+  //    completed work orders still on the default In-house, and who the thank-you line names.
+  for (const l of await listVendorLinesWithoutVendor(reportId)) {
+    warnings.push(`"${l.Title}" (${l.WorkOrderTitle}) is marked Vendor but no vendor is linked, so the report can only say "Vendor".`);
+  }
+  const performerUnset = await listCompletedWorkOrdersPerformerUnset(reportId);
+  const thanksNames = aggregates.filter((a) => a.GroupKey === 'thanks').map((a) => a.Label);
+  const thanksOptedOut = Number(aggregates.find((a) => a.GroupKey === 'thanks_meta' && a.Label === 'opted_out')?.ValueNumeric || 0);
+
   const unclassified = await listUnclassifiedMoney(pE);
-  return { warnings, unclassified, noCost };
+  return { warnings, unclassified, noCost, performerUnset, thanks: { names: thanksNames, optedOut: thanksOptedOut } };
 }
