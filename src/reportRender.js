@@ -484,10 +484,6 @@ function financialSummary(aggregates, report) {
   const visibleRows = rows.filter((r) => r.strong || cols.some((c) => val(c, ...r.key)));
 
   const notes = [];
-  const unlinkedCum = meta.find((m) => m.Label === 'unlinked_cum');
-  if (unlinkedCum && Number(unlinkedCum.ValueNumeric) > 0) {
-    notes.push(`Camp funds include ${fmtMoney(unlinkedCum.ValueNumeric)} in receipts not yet linked to any work, so no work item above shows them.`);
-  }
   notes.push('Receipts count on their purchase date; work paid without a receipt counts when the work is finished.');
   if (!cols.some((c) => c.key === 'summary_ytd')) {
     notes.push(`Tracking began ${fmtDate(start)}, so year to date is the same as cumulative.`);
@@ -958,7 +954,7 @@ function moneyItems(items) {
 }
 
 // Under the footer total: why it can differ from the money summary.
-const WORK_TOTAL_NOTE = 'Cost of the work finished this period. Receipts bought in another month, or not yet linked to work, are in the money summary instead.';
+const WORK_TOTAL_NOTE = 'Cost of the work finished this period. Receipts count in the money summary on their purchase date.';
 
 // Figures for the pre-send check (screen only): what the work section and footer show, by funder.
 export function workSectionMoney({ report, items }) {

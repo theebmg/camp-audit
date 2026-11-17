@@ -6169,7 +6169,6 @@ export async function computeBoardReportAggregates(reportId) {
   }
   const unlinkedP = await unlinkedReceiptsTotal(pS, pE);
   const campNotes = [potParts.length > 1 ? `${potParts.join(' · ')}.` : null,
-    unlinkedP > 0 ? `Includes ${fmtMoneyPlain(unlinkedP)} in receipts not yet linked to work.` : null,
     period.typedCamp > 0 ? `Includes ${fmtMoneyPlain(period.typedCamp)} of work paid without a receipt.` : null,
   ].filter(Boolean);
   out.push({ groupKey: 'money', label: 'Camp funds spent · this period', valueNumeric: period.camp,
@@ -6187,7 +6186,6 @@ export async function computeBoardReportAggregates(reportId) {
     const spent = round2(ledger.filter((r) => r.fund_id === f.Id).reduce((t, r) => t + r.amount, 0));
     if (spent <= 0) continue;
     const remaining = Number(f.Amount) - spent;
-    const unlinked = await unlinkedReceiptsTotal(null, pE, f.Id);
     const daysLeft = f.EndDate
       ? Math.ceil((new Date(`${(f.EndDate instanceof Date ? f.EndDate.toISOString() : String(f.EndDate)).slice(0, 10)}T12:00:00Z`) - new Date(`${pE}T12:00:00Z`)) / 86400000)
       : null;
@@ -6195,7 +6193,6 @@ export async function computeBoardReportAggregates(reportId) {
       `${fmtMoneyPlain(spent)} of ${fmtMoneyPlain(Number(f.Amount))} used`,
       remaining >= 0 ? `${fmtMoneyPlain(remaining)} left` : `${fmtMoneyPlain(-remaining)} over`,
     ];
-    if (unlinked > 0) bits.push(`${fmtMoneyPlain(unlinked)} not yet linked to work`);
     if (daysLeft != null) bits.push(daysLeft >= 0 ? `${daysLeft} days left` : 'window closed');
     out.push({
       groupKey: 'funds', label: f.Name, valueText: bits.join(' · '), valueNumeric: spent,
