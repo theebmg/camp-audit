@@ -12421,18 +12421,25 @@ export async function listUnclassifiedMoney(throughDate = null) {
   const money = (n) => `$${Number(n).toFixed(2)}`;
   const { rows: unlinked } = await pool.query(
     `SELECT e.id, e.purchase_date::text AS dt, e.vendor, e.amount::float AS amount,
-            (e.amount - COALESCE(al.total, 0))::float AS unlinked
+            (e.amount - COALESCE(al.total, 0))::float AS unlinked,
+            COALESCE(f.name, pp.name, fs.name) AS paid_from
      FROM expenses e
      LEFT JOIN (SELECT expense_id, SUM(amount) AS total FROM expense_allocations GROUP BY expense_id) al ON al.expense_id = e.id
+     LEFT JOIN funds f ON f.id = e.fund_id
+     LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+     LEFT JOIN people pp ON pp.id = fs.person_id
      WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND e.amount IS NOT NULL
        AND COALESCE(al.total, 0) < e.amount AND ($1::date IS NULL OR e.purchase_date <= $1)
      ORDER BY e.purchase_date, e.id`, [throughDate]);
   for (const r of unlinked) {
-    out.push({ Kind: 'receipt_unlinked', Group: 'Receipts not linked to any work', Id: r.id,
+    // The money side is fine (it counts against its fund or payer); what is missing is WHICH JOB it
+    // paid for, so no work item on the report can show it.
+    out.push({ Kind: 'receipt_unlinked', Group: 'Receipts not attached to a work order or job line', Id: r.id,
       Title: `${r.vendor || 'Receipt'} · ${r.dt}`, Amount: r.unlinked,
-      Detail: r.unlinked < r.amount
-        ? `${money(r.unlinked)} of ${money(r.amount)} not split to work`
-        : 'Counts as spend, but no work order or line shows it',
+      Detail: `${r.paid_from ? `Paid from ${r.paid_from} (counted there). ` : ''}`
+        + (r.unlinked < r.amount
+          ? `${money(r.unlinked)} of ${money(r.amount)} is not attached to any work.`
+          : 'Not attached to any work, so no work item on the report shows it. Pick a work order on the receipt.'),
       Link: { view: 'expenseDetail', params: { id: r.id } } });
   }
   const { rows: noPayer } = await pool.query(

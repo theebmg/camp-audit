@@ -3,6 +3,24 @@
 // touched. Same shell/router pattern as the original for familiarity.
 
 const app = document.getElementById('app');
+const boardReturnBar = (() => {
+  const el = document.createElement('div');
+  el.id = 'boardReturnBar';
+  el.hidden = true;
+  el.className = 'card';
+  el.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;border-left:4px solid #13432f;background:#eef5f0;margin-bottom:12px';
+  el.innerHTML = '<span>Opened from the board report\u2019s \u201cBefore you send\u201d list.</span>'
+    + '<button type="button" class="btn btn-primary btn-inline" id="boardReturnBtn">\u2190 Back to board report</button>';
+  app.parentNode.insertBefore(el, app);
+  el.querySelector('#boardReturnBtn').addEventListener('click', () => returnToBoardReport());
+  return el;
+})();
+// Back to the report screen, which re-runs its checks on arrival.
+function returnToBoardReport() {
+  go('reports', { mode: 'board' }, { replace: true });
+}
+// Opened from the board report: anything that would normally drop you on a list goes back there.
+const cameFromBoard = (params) => params && params.from === 'board';
 const pageTitle = document.getElementById('pageTitle');
 const backBtn = document.getElementById('backBtn');
 const menuBtn = document.getElementById('menuBtn');
@@ -1846,6 +1864,7 @@ async function render(view, params = {}, opts = {}) {
       adminGcal: () => renderAdminGcal(),
       adminCalendarEventTypes: () => renderAdminCalendarEventTypes(),
     };
+    boardReturnBar.hidden = !cameFromBoard(params);
     if (handlers[view]) {
       await handlers[view]();
       fadeInApp();
@@ -5083,7 +5102,8 @@ function initOriginalEmailViewer(expense) {
 // an entry Ben is typing himself) then lands here again in edit mode so a
 // receipt photo can still be attached. An inbox row PATCHes, which flips
 // triage_status from 'inbox' to 'triaged' as a side effect of any save.
-async function renderExpenseDetail({ id } = {}) {
+async function renderExpenseDetail(routeParams = {}) {
+  const { id } = routeParams;
   setChrome({ title: id ? 'Edit Expense' : 'Add Expense', showBack: true, showLogout: true });
   app.innerHTML = LOADING_HTML;
   const expense = id ? (await api(`/api/pg/expenses/${id}`)).expense : null;
@@ -5248,7 +5268,8 @@ async function renderExpenseDetail({ id } = {}) {
       if (id) {
         await api(`/api/pg/expenses/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
         toast('Expense saved');
-        go('expenses', {}, { replace: true });
+        if (cameFromBoard(routeParams)) returnToBoardReport();
+        else go('expenses', {}, { replace: true });
       } else {
         const { expense: created } = await api('/api/pg/expenses', { method: 'POST', body: JSON.stringify(payload) });
         toast('Expense added — attach a receipt below if you have one');
@@ -5265,7 +5286,7 @@ async function renderExpenseDetail({ id } = {}) {
 
   document.getElementById('voidExpenseBtn')?.addEventListener('click', async () => {
     if (!await confirmDialog('Void this expense? The receipt file (if any) is untouched and this can be undone from the expense.')) return;
-    try { await api(`/api/pg/expenses/${id}/void`, { method: 'POST' }); toast('Voided'); go('expenses', {}, { replace: true }); }
+    try { await api(`/api/pg/expenses/${id}/void`, { method: 'POST' }); toast('Voided'); if (cameFromBoard(routeParams)) returnToBoardReport(); else go('expenses', {}, { replace: true }); }
     catch (err) { toast(err.message); }
   });
 }
@@ -6309,7 +6330,7 @@ async function renderBoardReport(params = {}) {
         <p class="muted" style="margin:0 0 8px;font-size:0.8rem">Only you see this. It is never part of the emailed report.</p>
         ${warn.length ? `<ul style="margin:0 0 8px 18px;padding:0">${warn.map((w) => `<li style="margin:3px 0">${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
         <details ${groups.size ? '' : 'hidden'}>
-          <summary style="cursor:pointer"><strong>Unclassified money</strong> <span class="muted">— ${(checks.unclassified || []).length} item(s) to sort out</span></summary>
+          <summary style="cursor:pointer"><strong>Money to sort out</strong> <span class="muted">— ${(checks.unclassified || []).length} item(s). Each opens the record; Save brings you back here.</span></summary>
           ${[...groups.entries()].map(([g, list]) => `
             <div style="margin-top:10px">
               <div style="font-weight:600">${escapeHtml(g)} <span class="muted" style="font-weight:400">· ${fmt(list.reduce((t, u) => t + Number(u.Amount || 0), 0))}</span></div>
@@ -6337,7 +6358,7 @@ async function renderBoardReport(params = {}) {
   }
   function wireChecks() {
     document.getElementById('brRecheck')?.addEventListener('click', () => { checks = null; const el = document.getElementById('brChecks'); if (el) el.innerHTML = brChecksHtml(); loadChecks(); });
-    document.querySelectorAll('#brChecks .br-unclass').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, { id: Number(el.dataset.id) })));
+    document.querySelectorAll('#brChecks .br-unclass').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, { id: Number(el.dataset.id), from: 'board' })));
   }
 
   async function patchReport(fields) {
