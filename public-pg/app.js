@@ -6139,13 +6139,24 @@ async function renderBoardReport(params = {}) {
         <div class="field-row">
           <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
             <input type="checkbox" id="brShowPaidToDate" ${report.ShowPaidToDate ? 'checked' : ''} ${published ? 'disabled' : ''} />
-            Show "Paid to date — all sources"
+            Show the financial summary (cumulative costs)
           </label>
           <p class="muted" style="margin:2px 0 0;font-size:0.8rem">
-            A box near the top listing everyone who has paid for work, all time through the end of
-            this period — contributors first, then camp funds, with totals.
+            A table at the end of the report: this period, and cumulative since the tracking start
+            date (Admin → Funds), split into camp funds and contributed money.
           </p>
           <p class="field-error" id="brShowPaidToDate-err"></p>
+        </div>
+        <div class="field-row">
+          <label style="display:flex;align-items:center;gap:8px;font-weight:400;cursor:pointer">
+            <input type="checkbox" id="brShowNamedContributors" ${report.ShowNamedContributors ? 'checked' : ''} ${published ? 'disabled' : ''} />
+            Show named contributors
+          </label>
+          <p class="muted" style="margin:2px 0 0;font-size:0.8rem">
+            Off by default. Off, the board sees "Contributed" instead of a person's name, both in
+            the financial summary and on each work item's funding line.
+          </p>
+          <p class="field-error" id="brShowNamedContributors-err"></p>
         </div>
         <div class="field-row">
           <label for="brShowFunding">Show funding</label>
@@ -6223,6 +6234,8 @@ async function renderBoardReport(params = {}) {
       ${sectionHtml('overdue', 'Overdue')}
       ${sectionHtml('admin_work', 'Administrative Work')}
 
+      <div id="brChecks">${brChecksHtml()}</div>
+
       <div class="card">
         <div class="btn-row">
           <button type="button" class="btn btn-secondary" id="brPreview">Preview</button>
@@ -6269,12 +6282,64 @@ async function renderBoardReport(params = {}) {
     `);
     wireReportsTabs();
     wire(published);
+    wireChecks();
+    loadChecks();
   }
 
   // THE BUG THE DATE FIELDS HAD: this threw the response away. The save succeeded, but the
   // local `report` still held the old dates, and the redraw that followed rebuilt the inputs
   // from it — so a correctly saved date flashed and snapped back to the previous one, with
   // nothing to explain it. The server returns the updated report; use it.
+  // Pre-send checks (screen only, never emailed): figures that should agree, date sanity,
+  // placeholder text, and the unclassified money to work off.
+  let checks = null; let checksSeq = 0;
+  function brChecksHtml() {
+    if (!report || report.Status === 'published') return '';
+    if (!checks) return '<div class="card"><p class="muted" style="margin:0">Checking figures…</p></div>';
+    const fmt = (n) => (n == null ? '—' : `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+    const groups = new Map();
+    for (const u of checks.unclassified || []) {
+      if (!groups.has(u.Group)) groups.set(u.Group, []);
+      groups.get(u.Group).push(u);
+    }
+    const warn = checks.warnings || [];
+    return `
+      <div class="card" style="border-left:4px solid ${warn.length ? '#b45309' : '#13432f'}">
+        <h3 style="margin-bottom:4px">Before you send ${warn.length ? `<span class="pill" style="background:#fef3c7;color:#7a4a10">${warn.length} to check</span>` : '<span class="pill good">figures agree</span>'}</h3>
+        <p class="muted" style="margin:0 0 8px;font-size:0.8rem">Only you see this. It is never part of the emailed report.</p>
+        ${warn.length ? `<ul style="margin:0 0 8px 18px;padding:0">${warn.map((w) => `<li style="margin:3px 0">${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
+        <details ${groups.size ? '' : 'hidden'}>
+          <summary style="cursor:pointer"><strong>Unclassified money</strong> <span class="muted">— ${(checks.unclassified || []).length} item(s) to sort out</span></summary>
+          ${[...groups.entries()].map(([g, list]) => `
+            <div style="margin-top:10px">
+              <div style="font-weight:600">${escapeHtml(g)} <span class="muted" style="font-weight:400">· ${fmt(list.reduce((t, u) => t + Number(u.Amount || 0), 0))}</span></div>
+              ${list.map((u) => `<div class="list-item br-unclass" data-view="${escapeHtml(u.Link.view)}" data-id="${u.Link.params.id}" style="cursor:pointer;display:flex;justify-content:space-between;gap:10px">
+                <div style="min-width:0"><div>${escapeHtml(u.Title)}</div><div class="muted" style="font-size:0.8rem">${escapeHtml(u.Detail)}</div></div>
+                <div style="white-space:nowrap">${fmt(u.Amount)}</div>
+              </div>`).join('')}
+            </div>`).join('')}
+        </details>
+        <div class="btn-row" style="margin-top:8px"><button type="button" class="btn btn-secondary btn-inline" id="brRecheck">Re-check</button></div>
+      </div>`;
+  }
+  async function loadChecks() {
+    if (!report || report.Status === 'published') return;
+    const seq = ++checksSeq;
+    try {
+      const r = await api(`/api/pg/board-reports/${report.Id}/checks`);
+      if (seq !== checksSeq) return;
+      checks = r;
+    } catch (err) {
+      checks = { warnings: [`Could not run the checks: ${err.message}`], unclassified: [] };
+    }
+    const el = document.getElementById('brChecks');
+    if (el) { el.innerHTML = brChecksHtml(); wireChecks(); }
+  }
+  function wireChecks() {
+    document.getElementById('brRecheck')?.addEventListener('click', () => { checks = null; const el = document.getElementById('brChecks'); if (el) el.innerHTML = brChecksHtml(); loadChecks(); });
+    document.querySelectorAll('#brChecks .br-unclass').forEach((el) => el.addEventListener('click', () => go(el.dataset.view, { id: Number(el.dataset.id) })));
+  }
+
   async function patchReport(fields) {
     const r = await api(`/api/pg/board-reports/${report.Id}`, { method: 'PATCH', body: JSON.stringify(fields) });
     if (r && r.report) report = r.report;
@@ -6363,6 +6428,8 @@ async function renderBoardReport(params = {}) {
       toast('Downloaded and saved to history'); await load(); draw();
     });
     document.getElementById('brEmail').addEventListener('click', async () => {
+      const nWarn = checks?.warnings?.length || 0;
+      if (nWarn && !(await confirmDialog(`${nWarn} check(s) under "Before you send" have not been resolved. Send anyway?`, { confirmLabel: 'Continue', danger: false }))) return;
       const recipient = await promptDialog('Email the board report to:', { confirmLabel: 'Send', placeholder: 'name@example.org' });
       if (!recipient || !recipient.trim()) return;
       const to = recipient.trim();
@@ -6507,6 +6574,11 @@ async function renderBoardReport(params = {}) {
         e.target.checked = !e.target.checked;
         showFieldError('brShowHours', saveErrorMessage(err));
       }
+    });
+    document.getElementById('brShowNamedContributors')?.addEventListener('change', async (e) => {
+      clearFieldError('brShowNamedContributors');
+      try { await patchReport({ showNamedContributors: e.target.checked }); draw(); }
+      catch (err) { e.target.checked = !e.target.checked; showFieldError('brShowNamedContributors', saveErrorMessage(err)); }
     });
     document.getElementById('brShowPaidToDate')?.addEventListener('change', async (e) => {
       clearFieldError('brShowPaidToDate');
@@ -8831,7 +8903,7 @@ async function renderAdminTaskStatuses(container = app) {
 async function renderAdminFunds(container = app) {
   if (container === app) setChrome({ title: 'Funds', showBack: true, showLogout: true });
   container.innerHTML = LOADING_HTML;
-  const { funds } = await api('/api/pg/funds');
+  const [{ funds }, displaySettings] = await Promise.all([api('/api/pg/funds'), api('/api/pg/display-settings')]);
 
   const fundRowHtml = (f) => `
     <div class="card fund-row" data-id="${f.Id}">
@@ -8863,6 +8935,15 @@ async function renderAdminFunds(container = app) {
     <div class="card"><h3>Funds</h3>
       <p class="muted">Money with a ceiling Ben is personally accountable for — a reference line, not an enforcement mechanism. Spending past Amount always warns, never blocks. The camp's operating budget is NOT a fund; it stays a label with no balance tracked here.</p>
     </div>
+    <div class="card">
+      <h3>Tracking start date</h3>
+      <p class="muted">Where "cumulative" figures on the board report begin. Leave empty to start from the earliest recorded cost or receipt.</p>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input type="date" id="trackingStartInput" value="${escapeHtml(displaySettings.TrackingStartDate || '')}" style="max-width:200px" />
+        <button type="button" class="btn btn-secondary btn-inline" id="trackingStartClear">Clear</button>
+      </div>
+      <p class="field-error" id="trackingStartInput-err"></p>
+    </div>
     ${funds.map(fundRowHtml).join('') || '<p class="muted">No funds defined yet.</p>'}
     <div class="card">
       <h3>Add Fund</h3>
@@ -8876,6 +8957,19 @@ async function renderAdminFunds(container = app) {
         <button class="btn btn-primary" type="submit">Add</button>
       </form>
     </div>`;
+
+  const saveTrackingStart = async (value) => {
+    clearFieldError('trackingStartInput');
+    try {
+      await api('/api/pg/display-settings', { method: 'PUT', body: JSON.stringify({ trackingStartDate: value || null }) });
+      toast(value ? 'Tracking start date saved' : 'Tracking start date cleared');
+    } catch (err) { showFieldError('trackingStartInput', saveErrorMessage(err)); }
+  };
+  container.querySelector('#trackingStartInput').addEventListener('change', (e) => saveTrackingStart(e.target.value));
+  container.querySelector('#trackingStartClear').addEventListener('click', () => {
+    container.querySelector('#trackingStartInput').value = '';
+    saveTrackingStart('');
+  });
 
   container.querySelectorAll('.fund-row').forEach((row) => {
     const id = row.dataset.id;
@@ -16426,6 +16520,13 @@ async function renderWorkOrderDetail({ id }, container = app) {
     e.preventDefault();
     if (!await confirmDialog('Save changes to this work order?')) return;
     const fd = new FormData(e.target);
+    // Completed earlier than started (the day the work order was entered): allowed, because work
+    // is often entered in arrears, but said out loud so a typo in the date is caught.
+    const doneDate = fd.get('dateCompleted');
+    const startedDate = String(wo['Date Reported'] || '').slice(0, 10);
+    if (doneDate && startedDate && doneDate < startedDate
+        && doneDate !== (wo['Date Completed'] || '').slice(0, 10)
+        && !await confirmDialog(`Completed (${formatDateNice(doneDate)}) is earlier than the day this work order was started/entered (${formatDateNice(startedDate)}). Reports will show it as started ${formatDateNice(doneDate)}. Save anyway?`, { confirmLabel: 'Save', danger: false })) return;
     const newAsset = assetPicker.getSelected();
     try {
       const saved = await withOpenLinePrompt((resolveOpenLines) => api(`/api/pg/work-orders/${id}`, {

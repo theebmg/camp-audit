@@ -7,7 +7,7 @@
 import express from 'express';
 import multer from 'multer';
 import { currentComponentState, sortHistory } from '../components.js';
-import { buildCapitalPlanPg, buildBoardReportPg, renderBoardReportFromItems, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
+import { buildCapitalPlanPg, buildBoardReportPg, renderBoardReportFromItems, computeBoardReportChecks, buildWorkPerformedReportPg, buildDeferredBacklogReportPg, buildVisitorActivityReportPg } from '../reportDataPg.js';
 import {
   sanitizeSummaryHtml, plainSummaryToHtml,
   renderBoardReportHtml, renderBoardReportText, renderPlainEmailHtml,
@@ -1780,14 +1780,18 @@ router.get('/display-settings', async (req, res, next) => {
 });
 router.put('/display-settings', async (req, res, next) => {
   try {
-    const { woProgressWeighting, reportImageCap, navLayout, cascadeDefaults } = req.body || {};
+    const { woProgressWeighting, reportImageCap, navLayout, cascadeDefaults, trackingStartDate } = req.body || {};
+    if (trackingStartDate !== undefined && trackingStartDate !== null && trackingStartDate !== ''
+        && !/^\d{4}-\d{2}-\d{2}$/.test(String(trackingStartDate))) {
+      return res.status(400).json({ ok: false, error: "Tracking start date isn't a valid date. Use the date picker." });
+    }
     if (woProgressWeighting !== undefined && !['cost', 'count'].includes(woProgressWeighting)) return res.status(400).json({ ok: false, error: 'woProgressWeighting must be "cost" or "count"' });
     if (reportImageCap !== undefined && (!Number.isInteger(reportImageCap) || reportImageCap < 1)) return res.status(400).json({ ok: false, error: 'reportImageCap must be a positive integer' });
     if (navLayout !== undefined && navLayout !== null && !isValidNavLayout(navLayout)) return res.status(400).json({ ok: false, error: 'navLayout must be null or an array of { header: string|null, items: string[] }' });
     if (cascadeDefaults !== undefined && (!cascadeDefaults || typeof cascadeDefaults !== 'object' || Array.isArray(cascadeDefaults))) {
       return res.status(400).json({ ok: false, error: 'cascadeDefaults must be an object of { column: boolean }' });
     }
-    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout, cascadeDefaults }) });
+    res.json({ ok: true, settings: await updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout, cascadeDefaults, trackingStartDate }) });
   } catch (e) { next(e); }
 });
 
@@ -2256,7 +2260,7 @@ router.get('/board-reports/:id(\\d+)', async (req, res, next) => {
 // covers the notes field because it's a textarea inside the report form.
 router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
   try {
-    const { title, periodStart, periodEnd, forwardStart, forwardEnd, showHours, showFunding, showScheduled, showPaidToDate } = req.body || {};
+    const { title, periodStart, periodEnd, forwardStart, forwardEnd, showHours, showFunding, showScheduled, showPaidToDate, showNamedContributors } = req.body || {};
     // Sanitised on the way IN, not on the way out, so what is stored is already safe and no
     // later reader has to remember to clean it (Part 2D).
     const summaryNotes = req.body && 'summaryNotes' in req.body
@@ -2299,6 +2303,7 @@ router.patch('/board-reports/:id(\\d+)', async (req, res, next) => {
       showHours: showHours === undefined ? undefined : !!showHours,
       showScheduled: showScheduled === undefined ? undefined : !!showScheduled,
       showPaidToDate: showPaidToDate === undefined ? undefined : !!showPaidToDate,
+      showNamedContributors: showNamedContributors === undefined ? undefined : !!showNamedContributors,
       showFunding: showFunding === undefined ? undefined : String(showFunding),
     });
     if (!report) return res.status(404).json({ ok: false, error: 'Not found' });
@@ -2349,6 +2354,16 @@ router.post('/board-reports/:id(\\d+)/one-off', async (req, res, next) => {
   try {
     const { title, note, date } = req.body || {};
     const result = await addOneOffBoardReportItem(Number(req.params.id), { title, note, date, createdBy: currentUsername() });
+    if (!result) return res.status(404).json({ ok: false, error: 'Not found' });
+    res.json({ ok: true, ...result });
+  } catch (e) { next(e); }
+});
+
+// Pre-send checks: figures that should agree, date sanity, placeholder text, and the list of
+// unclassified money to work off. Screen only — never part of the emailed report.
+router.get('/board-reports/:id(\\d+)/checks', async (req, res, next) => {
+  try {
+    const result = await computeBoardReportChecks(req.params.id);
     if (!result) return res.status(404).json({ ok: false, error: 'Not found' });
     res.json({ ok: true, ...result });
   } catch (e) { next(e); }

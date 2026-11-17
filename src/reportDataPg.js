@@ -7,8 +7,9 @@ import {
   getAdminTasksBoardReportRawData,
   getBoardReport, listBoardReportItems, listBoardReportAggregates, computeBoardReportAggregates,
   listSelectedReportPhotos, stampReportPhotoLabels,
+  getFundBalances, boardLedgerFundTotals, listUnclassifiedMoney,
 } from './db.js';
-import { renderBoardReportItemsHtml, renderBoardReportItemsText } from './reportRender.js';
+import { renderBoardReportItemsHtml, renderBoardReportItemsText, workSectionMoney } from './reportRender.js';
 import { buildEmailCopy, buildPhotoLabel } from './reportPhotos.js';
 import { currentComponentState } from './components.js';
 import { FUNDING_SOURCE_LABELS } from './reports.js';
@@ -361,4 +362,81 @@ export async function renderBoardReportFromItems(reportId, { withPhotos = false 
     inlineAttachments,
     photoFailures,
   };
+}
+
+// Pre-send checks (Nov 2026). Run when the report screen loads or refreshes; shown on the screen
+// before send, NEVER in the emailed report. Each warning says which figures disagree and by how
+// much, so a mismatch is something to look into rather than a mystery.
+export async function computeBoardReportChecks(reportId) {
+  const report = await getBoardReport(reportId);
+  if (!report) return null;
+  if (report.Status === 'draft') await computeBoardReportAggregates(reportId);
+  const [items, aggregates] = await Promise.all([listBoardReportItems(reportId), listBoardReportAggregates(reportId)]);
+  const pE = String(report.PeriodEnd).slice(0, 10);
+  const money = (n) => `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const near = (a, b) => Math.abs(Number(a) - Number(b)) < 0.005;
+  const agg = (g, label, note) => aggregates.find((a) => a.GroupKey === g && a.Label === label && (note === undefined || a.Note === note));
+  const warnings = [];
+
+  // 1. The header and the summary's "this period" column come from the same ledger: must match.
+  const headCamp = aggregates.find((a) => a.GroupKey === 'money' && /^Camp funds spent/.test(a.Label));
+  const sumCamp = agg('summary_period', 'Camp funds', 'camp');
+  if (headCamp && sumCamp && !near(headCamp.ValueNumeric, sumCamp.ValueNumeric)) {
+    warnings.push(`Camp funds this period: header ${money(headCamp.ValueNumeric)}, financial summary ${money(sumCamp.ValueNumeric)}.`);
+  }
+  // 2. Year to date vs cumulative, when tracking started inside this year they must be the same.
+  const ytd = agg('summary_ytd', 'Total', 'total');
+  const cum = agg('summary_cum', 'Total', 'total');
+  if (!ytd && cum) {
+    const per = agg('summary_period', 'Total', 'total');
+    if (per && Number(per.ValueNumeric) - Number(cum.ValueNumeric) > 0.005) {
+      warnings.push(`This period's total (${money(per.ValueNumeric)}) is more than the cumulative total (${money(cum.ValueNumeric)}). Check the tracking start date in Admin.`);
+    }
+  }
+  // 3. Fund status on the report (ledger, as of period end) vs the fund balance everywhere else.
+  const balances = await getFundBalances();
+  const ledgerAll = await boardLedgerFundTotals(null);
+  for (const f of aggregates.filter((a) => a.GroupKey === 'funds')) {
+    const bal = balances.find((b) => b.Name === f.Label);
+    if (!bal) continue;
+    const reportUsed = Number(f.ValueNumeric || 0);
+    const appUsed = Number(bal.Spent);
+    if (!near(reportUsed, appUsed)) {
+      const afterPeriod = (ledgerAll.get(bal.Id) || 0) - reportUsed;
+      const why = near(reportUsed + afterPeriod, appUsed) && afterPeriod > 0
+        ? ` The difference is ${money(afterPeriod)} spent after ${pE}, which belongs to a later report.`
+        : ' The fund screen counts something the report does not; look at the fund\'s receipts and lines.';
+      warnings.push(`${f.Label}: report says ${money(reportUsed)} used as of ${pE}; the fund screen says ${money(appUsed)}.${why}`);
+    }
+  }
+  // 4. Funds this period: header vs the work section. They can differ legitimately (receipts
+  //    bought in another month, or not linked to work) — said, with the amounts.
+  const work = workSectionMoney({ report, items });
+  const unlinkedP = Number(agg('summary_meta', 'unlinked_period')?.ValueNumeric || 0);
+  for (const pot of aggregates.filter((a) => a.GroupKey === 'summary_period' && a.Note === 'pot' && a.Label !== 'General budget')) {
+    const inWork = Number(work.bySource[pot.Label] || 0);
+    if (!near(inWork, pot.ValueNumeric)) {
+      warnings.push(`${pot.Label} this period: money summary ${money(pot.ValueNumeric)}, work section ${money(inWork)}. `
+        + 'Usually receipts not linked to work, or receipts bought in a different month from when the work finished'
+        + `${unlinkedP ? ` (${money(unlinkedP)} of this period's camp receipts are not linked to work)` : ''}.`);
+    }
+  }
+  const nonCampP = agg('summary_period', 'Contributed (non-camp)', 'noncamp');
+  if (nonCampP && !near(work.nonCamp, nonCampP.ValueNumeric)) {
+    warnings.push(`Contributed (non-camp) this period: money summary ${money(nonCampP.ValueNumeric)}, work section ${money(work.nonCamp)}.`);
+  }
+  // 5. Dates.
+  for (const it of work.items.filter((i) => i.Included)) {
+    const s = it.SnapStartDate && String(it.SnapStartDate).slice(0, 10);
+    const d = it.SnapDate && String(it.SnapDate).slice(0, 10);
+    if (it.Section === 'done' && s && d && s > d) warnings.push(`"${it.SnapTitle}" shows started ${s} after completed ${d}.`);
+    if (it.Section === 'overdue' && d && d > pE) warnings.push(`"${it.SnapTitle}" is under Overdue but is scheduled ${d}, after the period end. Press Refresh suggestions.`);
+  }
+  // 6. Leftover placeholder text in the narrative, e.g. "[One line on how the day went.]".
+  const summaryText = String(report.SummaryNotes || '').replace(/<[^>]+>/g, ' ');
+  const placeholders = summaryText.match(/\[[^\]\n]{3,}\]/g) || [];
+  for (const ph of [...new Set(placeholders)]) warnings.push(`The summary still has placeholder text: ${ph}`);
+
+  const unclassified = await listUnclassifiedMoney(pE);
+  return { warnings, unclassified };
 }

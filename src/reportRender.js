@@ -11,7 +11,17 @@ function escapeHtml(s) {
 // objects straight from `date`/`timestamp` columns — normalize both to a
 // string before slicing.
 const isoStr = (v) => (v instanceof Date ? v.toISOString() : String(v || ''));
-const fmtDate = (iso) => isoStr(iso).slice(0, 10);
+// Plain dates on everything the board sees ("Oct 31, 2026"), never ISO (Nov 2026).
+const fmtDate = (iso) => {
+  const d = isoStr(iso).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return d;
+  return new Date(`${d}T12:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+};
+// "Sep 10 – Oct 31, 2026", dropping the first year when both ends share it.
+const fmtRange = (a, b) => {
+  const A = fmtDate(a), B = fmtDate(b);
+  return String(a).slice(0, 4) === String(b).slice(0, 4) ? `${A.replace(/, \d{4}$/, '')} – ${B}` : `${A} – ${B}`;
+};
 // Whole dollars print clean; anything with cents prints BOTH of them. toLocaleString's default
 // drops a trailing zero, which put "$1,399.4" on the footer of a board report — a number that
 // reads as unfinished rather than as a figure anyone checked.
@@ -432,36 +442,120 @@ export function summaryHtmlToText(html) {
     .trim();
 }
 
-// "Paid to date — all sources" (Nov 2026): who has put money into the work, all time through
-// the end of this period. Contributors first (that is the point of the block: Ben wanted the
-// board to see what he has put in as a whole), then the camp's own pots, then a total.
-function paidToDateRows(aggregates, report) {
-  if (!report || report.ShowPaidToDate !== true) return [];
-  return (aggregates || []).filter((a) => a.GroupKey === 'paid_to_date' && a.ValueNumeric);
+// Financial summary (Nov 2026), at the BOTTOM of the report: every figure in one table, each
+// column a labelled window — this period, year to date (only when it differs), and cumulative
+// since the tracking start. Shown when the report's show_paid_to_date switch is on.
+//
+// Named contributors are off by default (show_named_contributors). Off, only the aggregate
+// "Contributed (non-camp)" shows. On, a single contributor is named ON that line rather than
+// repeated beneath it with the same figure; two or more are listed under it.
+function financialSummary(aggregates, report) {
+  if (!report || report.ShowPaidToDate !== true) return null;
+  const meta = (aggregates || []).filter((a) => a.GroupKey === 'summary_meta');
+  const range = meta.find((m) => m.Label === 'range');
+  if (!range) return null;
+  const [start, end] = String(range.ValueText || '').split('|');
+  const cols = [
+    ['summary_period', 'This period'],
+    ['summary_ytd', 'Year to date'],
+    ['summary_cum', `Since ${fmtDate(start)}`],
+  ].filter(([k]) => aggregates.some((a) => a.GroupKey === k))
+    .map(([k, title]) => ({ key: k, title, rows: aggregates.filter((a) => a.GroupKey === k) }));
+  const cum = cols[cols.length - 1].rows;
+  const val = (col, label, note) => {
+    const r = col.rows.find((x) => x.Label === label && x.Note === note);
+    return r ? Number(r.ValueNumeric) : 0;
+  };
+  const showNames = report.ShowNamedContributors === true;
+  const contributors = cum.filter((r) => r.Note === 'contributor');
+  const rows = [];
+  rows.push({ label: 'Camp funds', key: ['Camp funds', 'camp'], strong: true });
+  for (const r of cum.filter((x) => x.Note === 'pot')) rows.push({ label: r.Label, key: [r.Label, 'pot'], indent: true });
+  const typedNonCamp = val(cols[cols.length - 1], 'typed_noncamp', 'meta');
+  const nonCampNote = typedNonCamp > 0 ? 'Includes work paid directly, without a receipt.' : null;
+  if (showNames && contributors.length === 1) {
+    rows.push({ label: `Contributed (non-camp) — ${contributors[0].Label}`, key: ['Contributed (non-camp)', 'noncamp'], strong: true, note: nonCampNote });
+  } else {
+    rows.push({ label: 'Contributed (non-camp)', key: ['Contributed (non-camp)', 'noncamp'], strong: true, note: nonCampNote });
+    if (showNames) for (const r of contributors) rows.push({ label: r.Label, key: [r.Label, 'contributor'], indent: true });
+  }
+  if (cum.some((x) => x.Note === 'inkind')) rows.push({ label: 'of which in-kind', key: ['of which in-kind', 'inkind'], indent: true });
+  rows.push({ label: 'Total', key: ['Total', 'total'], strong: true, total: true });
+  const visibleRows = rows.filter((r) => r.strong || cols.some((c) => val(c, ...r.key)));
+
+  const notes = [];
+  const unlinkedCum = meta.find((m) => m.Label === 'unlinked_cum');
+  if (unlinkedCum && Number(unlinkedCum.ValueNumeric) > 0) {
+    notes.push(`Camp funds include ${fmtMoney(unlinkedCum.ValueNumeric)} in receipts not yet linked to any work, so no work item above shows them.`);
+  }
+  notes.push('Receipts count on their purchase date; work paid without a receipt counts when the work is finished.');
+  if (!cols.some((c) => c.key === 'summary_ytd')) {
+    notes.push(`Tracking began ${fmtDate(start)}, so year to date is the same as cumulative.`);
+  }
+  return { start, end, cols, rows: visibleRows, val, notes };
 }
-function paidToDateHtml(aggregates, report) {
-  const rows = paidToDateRows(aggregates, report);
-  if (!rows.length) return '';
-  const sum = (kind) => rows.filter((r) => r.Note === kind).reduce((t, r) => t + r.ValueNumeric, 0);
-  const contributed = sum('contributed'), camp = sum('camp');
-  const total = rows.reduce((t, r) => t + r.ValueNumeric, 0);
-  const row = (r) => `
+
+function financialSummaryHtml(aggregates, report) {
+  const f = financialSummary(aggregates, report);
+  if (!f) return '';
+  const th = (t) => `<th style="padding:4px 0 6px 10px;text-align:right;font-weight:600;color:#565c78;font-size:0.74rem;text-transform:uppercase;letter-spacing:0.04em;white-space:nowrap;">${escapeHtml(t)}</th>`;
+  const tr = (r) => `
       <tr>
-        <td style="padding:5px 0;${r.Note === 'contributed' ? 'font-weight:700;color:#13432f;' : 'color:#2a2f45;'}">${escapeHtml(r.Label)}${r.Note === 'contributed' ? ' <span style="font-weight:400;color:#565c78;font-size:0.78rem;">contributed</span>' : ''}</td>
-        <td style="padding:5px 0;text-align:right;white-space:nowrap;${r.Note === 'contributed' ? 'font-weight:700;color:#13432f;' : ''}">${fmtMoney(r.ValueNumeric)}</td>
+        <td style="padding:5px 0;${r.indent ? 'padding-left:16px;color:#474d66;' : ''}${r.strong ? 'font-weight:700;color:#13432f;' : ''}${r.total ? 'border-top:1px solid #c7d2dd;' : ''}">
+          ${escapeHtml(r.label)}${r.note ? `<div style="font-weight:400;color:#565c78;font-size:0.74rem;">${escapeHtml(r.note)}</div>` : ''}
+        </td>
+        ${f.cols.map((c) => `<td style="padding:5px 0 5px 10px;text-align:right;white-space:nowrap;vertical-align:top;${r.strong ? 'font-weight:700;' : 'color:#474d66;'}${r.total ? 'border-top:1px solid #c7d2dd;' : ''}">${fmtMoney(f.val(c, ...r.key))}</td>`).join('')}
       </tr>`;
   return `
-    <div style="border:1px solid #c7d2dd;border-left:4px solid #13432f;border-radius:10px;padding:12px 16px;margin-bottom:18px;background:#ffffff;">
-      <div style="font-size:0.78rem;color:#565c78;text-transform:uppercase;letter-spacing:0.05em;">Paid to date — all sources</div>
-      <div style="font-size:0.78rem;color:#565c78;margin:2px 0 6px;">Every receipt and recorded cost through ${escapeHtml(String(report.PeriodEnd))}, across all work.</div>
-      <table role="presentation" style="width:100%;border-collapse:collapse;font-size:0.92rem;">
-        ${rows.map(row).join('')}
-        <tr><td colspan="2" style="border-top:1px solid #c7d2dd;padding:0;"></td></tr>
-        ${contributed ? `<tr><td style="padding:5px 0;color:#565c78;">Contributed (non-camp)</td><td style="padding:5px 0;text-align:right;color:#565c78;">${fmtMoney(contributed)}</td></tr>` : ''}
-        ${camp ? `<tr><td style="padding:5px 0;color:#565c78;">Camp funds</td><td style="padding:5px 0;text-align:right;color:#565c78;">${fmtMoney(camp)}</td></tr>` : ''}
-        <tr><td style="padding:5px 0;font-weight:700;">Total</td><td style="padding:5px 0;text-align:right;font-weight:700;">${fmtMoney(total)}</td></tr>
+    <div style="border:1px solid #c7d2dd;border-left:4px solid #13432f;border-radius:10px;padding:12px 16px;margin-top:22px;background:#ffffff;">
+      <div style="font-size:0.95rem;font-weight:700;color:#13432f;">Cumulative costs · ${escapeHtml(fmtRange(f.start, f.end))}</div>
+      <div style="font-size:0.78rem;color:#565c78;margin:2px 0 8px;">Every receipt and recorded cost, by who paid.</div>
+      <table role="presentation" style="width:100%;border-collapse:collapse;font-size:0.9rem;">
+        <tr><td></td>${f.cols.map((c) => th(c.title)).join('')}</tr>
+        ${f.rows.map(tr).join('')}
       </table>
+      ${f.notes.map((n) => `<div style="margin-top:6px;color:#565c78;font-size:0.76rem;line-height:1.35;">${escapeHtml(n)}</div>`).join('')}
     </div>`;
+}
+
+function financialSummaryText(aggregates, report) {
+  const f = financialSummary(aggregates, report);
+  if (!f) return [];
+  const out = ['', `CUMULATIVE COSTS · ${fmtRange(f.start, f.end)}`, `  (${f.cols.map((c) => c.title).join(' / ')})`];
+  for (const r of f.rows) {
+    out.push(`  ${r.indent ? '  ' : ''}${r.label}: ${f.cols.map((c) => fmtMoney(f.val(c, ...r.key))).join(' / ')}`);
+    if (r.note) out.push(`      ${r.note}`);
+  }
+  for (const n of f.notes) out.push(`  ${n}`);
+  return out;
+}
+
+// Board-facing tidy-up of the item rows before rendering (Nov 2026):
+//   - named contributors OFF: a non-camp funding source prints as "Contributed", never a name,
+//     and sources that collapse to the same label are merged;
+//   - "Started" is never after "Completed", and a start date after the period end is dropped
+//     (a report through Oct 31 must not say something started Nov 1 or is "In progress").
+function prepareItems(items, report) {
+  const showNames = report.ShowNamedContributors === true;
+  const pE = String(report.PeriodEnd || '').slice(0, 10);
+  return (items || []).map((it) => {
+    const out = { ...it };
+    if (!showNames && Array.isArray(it.SnapFunding)) {
+      const merged = new Map();
+      for (const f of it.SnapFunding) {
+        if (!f) continue;
+        const label = f.IsCamp === false ? 'Contributed' : f.Source;
+        const prev = merged.get(label);
+        merged.set(label, prev ? { ...prev, Amount: Number(prev.Amount) + Number(f.Amount || 0) } : { ...f, Source: label });
+      }
+      out.SnapFunding = [...merged.values()];
+    }
+    const start = it.SnapStartDate ? isoStr(it.SnapStartDate).slice(0, 10) : null;
+    const done = it.SnapDate ? isoStr(it.SnapDate).slice(0, 10) : null;
+    if (start && pE && start > pE) out.SnapStartDate = null;
+    else if (start && done && start > done && it.Section === 'done') out.SnapStartDate = done;
+    return out;
+  });
 }
 
 function moneyHeaderHtml(aggregates) {
@@ -589,7 +683,7 @@ function fundingBreakdown(counted) {
       attributed += Number(f.Amount);
     }
   }
-  const total = counted.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const total = counted.reduce((t, i) => t + itemCost(i), 0);
   const gap = Math.round((total - attributed) * 100) / 100;
   if (gap > 0) by.set('Unattributed', (by.get('Unattributed') || 0) + gap);
   return [...by.entries()]
@@ -655,7 +749,7 @@ function periodFundingText(lines, showFunding) {
       by.set(label, (by.get(label) || 0) + Number(f.Amount));
       attributed += Number(f.Amount);
     }
-    const gap = Math.round(((l.SnapCost || 0) - attributed) * 100) / 100;
+    const gap = Math.round((itemCost(l) - attributed) * 100) / 100;
     if (gap > 0) by.set('Unattributed', (by.get('Unattributed') || 0) + gap);
   }
   if (!by.size || (showFunding === 'non_general' && !anyNonGeneral)) return null;
@@ -726,7 +820,7 @@ function itemLineHtml(it, showHours = false, opts = {}, showFunding = 'non_gener
   const money = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
   const est = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
   const spend = openWorkOrder ? null : (money && est ? `${money} spent of ${est}` : (money || est));
-  const ownFunding = openWorkOrder ? null : fundingTagText(it, showFunding);
+  const ownFunding = openWorkOrder || isContinuedHeader(it) ? null : fundingTagText(it, showFunding);
   // Continued from an earlier report: no money of its own, so say who paid for this period's
   // lines instead. (An open work order that is new this period still shows no money on its
   // row — Ben's rule; its lines carry their own tags.)
@@ -777,7 +871,7 @@ function sectionHtml(section, items, showHours = false, showFunding = 'non_gener
   const counted = totalledItems(items).filter((i) => i.Section === section);
   const money = moneyItems(items).filter((i) => i.Section === section);
   const hours = money.reduce((t, i) => t + (i.SnapHours || 0), 0);
-  const cost = money.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const cost = money.reduce((t, i) => t + itemCost(i), 0);
   // No money in a section heading: the footer carries the figure, broken down by who paid, and
   // a subtotal repeated above it invited the reader to add the two together.
   const sub = [showHours && hours ? fmtHours(hours) : null].filter(Boolean).join(' · ');
@@ -798,7 +892,7 @@ function sectionHtml(section, items, showHours = false, showFunding = 'non_gener
     const nested = nestedBlockHtml(lines.map((l) => nestedLineHtml(l, showHours, showFunding)).join(''));
     // An itemized work order's lines say what was completed, so the roll-up sentence that says
     // the same thing in prose is redundant directly above them.
-    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0, periodFunding: isContinuedHeader(it) ? periodFundingText(periodLinesOf(items, it.ItemId), showFunding) : null }, showFunding));
+    rendered.push(itemLineHtml(it, showHours, { nested, hideProgress: lines.length > 0, periodFunding: isContinuedHeader(it) ? periodFundingText([it, ...periodLinesOf(items, it.ItemId)], showFunding) : null }, showFunding));
   }
 
   return `
@@ -838,6 +932,10 @@ function totalledItems(items) {
 // of its own (so last period is never re-printed or re-counted).
 const CONTINUED_SUBTITLE = 'continued from an earlier report';
 const isContinuedHeader = (i) => i.ItemType === 'work_order' && i.SnapCost == null && i.SnapSubtitle === CONTINUED_SUBTITLE;
+// What an item adds to the money. A continued header has no roll-up (SnapCost null), but may carry
+// receipts filed to the work order as a whole in this period, in its SnapFunding.
+const fundingSum = (i) => (Array.isArray(i.SnapFunding) ? i.SnapFunding : []).reduce((t, f) => t + Number((f && f.Amount) || 0), 0);
+const itemCost = (i) => (i.SnapCost != null ? Number(i.SnapCost) : (isContinuedHeader(i) ? fundingSum(i) : 0));
 // This period's lines under a continued header: every INCLUDED line, printed or not. A header in
 // summary mode hides its lines, but the money they carry is still this period's spending.
 // Only work actually done counts: a Coming Up / Overdue line's cost is its ESTIMATE, and once
@@ -859,7 +957,26 @@ function moneyItems(items) {
     && !isPlannedSection(i) && !base.includes(i))];
 }
 
-export function renderBoardReportItemsHtml({ report, items, aggregates, reportPhotos = [] }) {
+// Under the footer total: why it can differ from the money summary.
+const WORK_TOTAL_NOTE = 'Cost of the work finished this period. Receipts bought in another month, or not yet linked to work, are in the money summary instead.';
+
+// Figures for the pre-send check (screen only): what the work section and footer show, by funder.
+export function workSectionMoney({ report, items }) {
+  const prepared = prepareItems(items, { ...report, ShowNamedContributors: true });
+  const counted = moneyItems(prepared);
+  const by = new Map();
+  for (const it of counted) for (const f of (Array.isArray(it.SnapFunding) ? it.SnapFunding : [])) {
+    if (!f || !f.Amount) continue;
+    by.set(f.Source, (by.get(f.Source) || 0) + Number(f.Amount));
+  }
+  const isCampBy = new Map();
+  for (const it of counted) for (const f of (Array.isArray(it.SnapFunding) ? it.SnapFunding : [])) if (f) isCampBy.set(f.Source, f.IsCamp !== false);
+  const nonCamp = [...by.entries()].filter(([k]) => isCampBy.get(k) === false).reduce((t, [, v]) => t + v, 0);
+  return { total: counted.reduce((t, i) => t + itemCost(i), 0), bySource: Object.fromEntries(by), nonCamp, items: prepared };
+}
+
+export function renderBoardReportItemsHtml({ report, items: rawItems, aggregates, reportPhotos = [] }) {
+  const items = prepareItems(rawItems, report);
   const sections = ['done', 'coming_up', 'overdue', 'admin_work'];
   // Off unless this report says otherwise. Hours stay recorded on the work either way — this
   // only decides whether the board sees them.
@@ -868,13 +985,12 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
   const visible = visibleItems(items);
   const counted = moneyItems(items);
   const grandHours = counted.reduce((t, i) => t + (i.SnapHours || 0), 0);
-  const grandCost = counted.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const grandCost = counted.reduce((t, i) => t + itemCost(i), 0);
   return htmlShell(
     `Board Report — ${report.Title}`,
-    `${report.PeriodStart} to ${report.PeriodEnd} · looking ahead to ${report.ForwardEnd}${report.Status === 'draft' ? ' · DRAFT' : ''}`,
+    `${fmtRange(report.PeriodStart, report.PeriodEnd)} · looking ahead to ${fmtDate(report.ForwardEnd)}${report.Status === 'draft' ? ' · DRAFT' : ''}`,
     `
     ${moneyHeaderHtml(aggregates)}
-    ${paidToDateHtml(aggregates, report)}
     ${approvedFundsHtml(aggregates, showFunding)}
     ${report.SummaryNotes ? `<div style="background:#fbf6ec;border:1px solid #e3d9c2;border-left:4px solid #13432f;border-radius:10px;padding:14px 16px;margin-bottom:10px;">${plainSummaryToHtml(report.SummaryNotes)}</div>` : ''}
     ${sections.map((sec) => sectionHtml(sec, items, showHours, showFunding)).join('')}
@@ -896,30 +1012,24 @@ export function renderBoardReportItemsHtml({ report, items, aggregates, reportPh
     </div>
     ${split.length ? `<div style="margin-top:4px;color:#565c78;font-size:0.85rem;line-height:1.45;">
       ${escapeHtml(split.join(' · '))}
-    </div>` : ''}`;
+    </div>` : ''}
+    <div style="margin-top:4px;color:#565c78;font-size:0.76rem;line-height:1.35;">${escapeHtml(WORK_TOTAL_NOTE)}</div>`;
     })()}
+    ${financialSummaryHtml(aggregates, report)}
     <div style="margin-top:8px;color:#7a4a10;font-size:0.78rem;">${escapeHtml(OPS_LABEL)}</div>
   `
   );
 }
 
-export function renderBoardReportItemsText({ report, items, aggregates }) {
+export function renderBoardReportItemsText({ report, items: rawItems, aggregates }) {
+  const items = prepareItems(rawItems, report);
   const showHours = report.ShowHours === true;
   const showFunding = report.ShowFunding || 'non_general';
   const lines = [`CAMP SYCHAR — BOARD REPORT — ${report.Title}`,
-    `${report.PeriodStart} to ${report.PeriodEnd} (ahead to ${report.ForwardEnd})${report.Status === 'draft' ? ' — DRAFT' : ''}`, ''];
+    `${fmtRange(report.PeriodStart, report.PeriodEnd)} (ahead to ${fmtDate(report.ForwardEnd)})${report.Status === 'draft' ? ' — DRAFT' : ''}`, ''];
   for (const a of aggregates.filter((x) => ['money', 'savings'].includes(x.GroupKey))) {
     lines.push(`${a.Label}: ${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : (a.ValueText || '—')}`);
     if (a.Note) lines.push(`  ${a.Note}`);
-  }
-  const ptdRows = paidToDateRows(aggregates, report);
-  if (ptdRows.length) {
-    lines.push('', `PAID TO DATE — ALL SOURCES (through ${report.PeriodEnd}):`);
-    for (const r of ptdRows) lines.push(`  ${r.Label}${r.Note === 'contributed' ? ' (contributed)' : ''}: ${fmtMoney(r.ValueNumeric)}`);
-    const tot = (k) => ptdRows.filter((r) => !k || r.Note === k).reduce((t, r) => t + r.ValueNumeric, 0);
-    if (tot('contributed')) lines.push(`  Contributed (non-camp): ${fmtMoney(tot('contributed'))}`);
-    if (tot('camp')) lines.push(`  Camp funds: ${fmtMoney(tot('camp'))}`);
-    lines.push(`  Total: ${fmtMoney(tot())}`);
   }
   const fundRows = aggregates.filter((x) => x.GroupKey === 'funds');
   if (fundRows.length && showFunding !== 'off') {
@@ -954,9 +1064,9 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
       const openWo = it.ItemType === 'work_order' && !it.SnapDate;
       const pMoney = it.SnapCost != null ? fmtMoney(it.SnapCost) : null;
       const pEst = it.SnapEstCost != null && !it.SnapDate ? `~${fmtMoney(it.SnapEstCost)} est.` : null;
-      const ownFunding = openWo ? null : fundingTagText(it, showFunding);
+      const ownFunding = openWo || isContinuedHeader(it) ? null : fundingTagText(it, showFunding);
       const periodFunding = isContinuedHeader(it) && !ownFunding
-        ? periodFundingText(periodLinesOf(items, it.ItemId), showFunding)
+        ? periodFundingText([it, ...periodLinesOf(items, it.ItemId)], showFunding)
         : null;
       const bits = [it.SnapAssetName, itemDatesText(it),
         showHours && it.SnapHours != null ? fmtHours(it.SnapHours) : null,
@@ -977,7 +1087,7 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     }
   }
   const moneyAll = moneyItems(items);
-  const grandCost = moneyAll.reduce((t, i) => t + (i.SnapCost || 0), 0);
+  const grandCost = moneyAll.reduce((t, i) => t + itemCost(i), 0);
   const grandHours = moneyAll.reduce((t, i) => t + (i.SnapHours || 0), 0);
   // Same two rules as the HTML footer: no item count, and hours only when asked for.
   const totalParts = [
@@ -989,9 +1099,11 @@ export function renderBoardReportItemsText({ report, items, aggregates }) {
     lines.push('', totalParts.join(' · '));
     const split = grandCost ? fundingBreakdown(moneyAll) : [];
     if (split.length) lines.push(split.join(' · '));
+    lines.push(WORK_TOTAL_NOTE);
   } else {
     lines.push('');
   }
+  lines.push(...financialSummaryText(aggregates, report));
 
   lines.push('', OPS_LABEL);
   return lines.join('\n');

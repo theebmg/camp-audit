@@ -1758,8 +1758,9 @@ export function normalizeCascadeConfig(cfg) {
 }
 
 export async function getDisplaySettings() {
-  const { rows } = await pool.query('SELECT wo_progress_weighting, report_image_cap, nav_layout, cascade_defaults FROM display_settings ORDER BY id LIMIT 1');
+  const { rows } = await pool.query('SELECT wo_progress_weighting, report_image_cap, nav_layout, cascade_defaults, tracking_start_date::text AS tracking_start_date FROM display_settings ORDER BY id LIMIT 1');
   return {
+    TrackingStartDate: rows[0]?.tracking_start_date || null,
     WoProgressWeighting: rows[0]?.wo_progress_weighting || 'cost',
     ReportImageCap: rows[0]?.report_image_cap ?? 4,
     NavLayout: rows[0]?.nav_layout ?? null,
@@ -1768,7 +1769,15 @@ export async function getDisplaySettings() {
 }
 // navLayout: undefined = leave alone, null = reset to the built-in default
 // (COALESCE can't express that, hence the separate $4 flag).
-export async function updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout, cascadeDefaults }) {
+export async function updateDisplaySettings({ woProgressWeighting, reportImageCap, navLayout, cascadeDefaults, trackingStartDate }) {
+  // Tracking start date: undefined = leave alone, '' or null = clear (fall back to earliest record).
+  if (trackingStartDate !== undefined) {
+    await pool.query(
+      'UPDATE display_settings SET tracking_start_date = $1 WHERE id = (SELECT id FROM display_settings ORDER BY id LIMIT 1)',
+      [trackingStartDate || null]
+    );
+    await logActivity({ action: 'updated', entityType: 'display_settings', entityLabel: 'display settings', details: `trackingStartDate=${trackingStartDate || '—'}` });
+  }
   // cascadeDefaults is merged onto the current value rather than replacing
   // it, so a settings screen that only knows about three of the four columns
   // can't silently wipe the fourth.
@@ -6008,141 +6017,188 @@ export async function setBoardReportFund(reportId, fundId, included) {
   return listBoardReportFunds(reportId);
 }
 
+// ── The money ledger (Nov 2026) ─────────────────────────────────────────────────────────────
+// ONE list of every dollar the board report can talk about, each row tagged with its date, which
+// fund (if any) it drew on, whether it is camp money, and who paid. Every money figure on the
+// report — this period, year to date, cumulative, the fund status, the who-paid summary — is a
+// sum over these rows, so two figures can only differ because their WINDOWS differ.
+//
+// Before this, each figure had its own query and they disagreed (Oct 2026 draft):
+//   - a receipt with no fund of its own but split to a fund counted as General in the header and
+//     in "paid to date", and as the fund in the fund bar ($523.54);
+//   - a typed-in cost on a line that also had a receipt was dropped from "Contributed" ($800);
+//   - "paid to date" counted a typed-in cost on unfinished work by the day the line was CREATED
+//     ($2,096.05 on the Nov 9 leaf pickup), so cumulative and year to date drifted apart.
+//
+// Rules, which match the rest of the app:
+//   receipts    count on their purchase date. Fund: the receipt's own fund, else any split that
+//               names a fund (that share), else none. The rest is camp unless its funding source
+//               says otherwise.
+//   typed-in    a job line's Actual Cost is extra, no-receipt spending (JOB_LINE_ACTUAL_COST_EXPR
+//               adds it to receipts). It counts only once the work is finished, on its completed
+//               date, paid from the line's own funding.
+async function boardMoneyLedger(throughDate = null) {
+  const { rows } = await pool.query(
+    `WITH ok AS (
+       SELECT e.* FROM expenses e
+       WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND e.amount IS NOT NULL
+         AND e.purchase_date IS NOT NULL AND ($1::date IS NULL OR e.purchase_date <= $1)
+     ), fund_split AS (
+       SELECT ea.expense_id, ea.funding_ref_id AS fund_id, SUM(ea.amount) AS amount
+       FROM expense_allocations ea
+       WHERE ea.funding_source = 'fund' AND ea.funding_ref_id IS NOT NULL
+       GROUP BY 1, 2
+     ), fund_split_tot AS (SELECT expense_id, SUM(amount) AS t FROM fund_split GROUP BY 1)
+     SELECT 'receipt' AS kind, e.id AS ref_id, e.purchase_date::text AS dt, e.amount::float AS amount,
+            f.id AS fund_id, f.name AS fund_name, true AS is_camp, false AS in_kind, f.name AS who
+     FROM ok e JOIN funds f ON f.id = e.fund_id
+     UNION ALL
+     SELECT 'receipt', e.id, e.purchase_date::text, fsp.amount::float, f.id, f.name, true, false, f.name
+     FROM ok e JOIN fund_split fsp ON fsp.expense_id = e.id JOIN funds f ON f.id = fsp.fund_id
+     WHERE e.fund_id IS NULL
+     UNION ALL
+     SELECT 'receipt', e.id, e.purchase_date::text, (e.amount - COALESCE(t.t, 0))::float, NULL, NULL,
+            (fs.id IS NULL OR fs.counts_as_camp_spend), COALESCE(fs.is_in_kind, false),
+            CASE WHEN fs.id IS NULL OR fs.is_general THEN 'Camp general budget'
+                 ELSE COALESCE(pp.name, fs.short_label, fs.name) END
+     FROM ok e
+     LEFT JOIN fund_split_tot t ON t.expense_id = e.id
+     LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+     LEFT JOIN people pp ON pp.id = fs.person_id
+     WHERE e.fund_id IS NULL AND e.amount - COALESCE(t.t, 0) <> 0
+     UNION ALL
+     SELECT 'typed', jl.id, COALESCE(jl.completed_date, jl.completed_at::date)::text, jl.actual_cost::float,
+            f.id, f.name,
+            COALESCE(bfs.counts_as_camp_spend, k.counts_as_camp_spend, true),
+            COALESCE(bfs.is_in_kind, false),
+            CASE WHEN jl.funding_source IS NULL THEN 'Unattributed'
+                 WHEN k.is_general THEN 'Camp general budget'
+                 ELSE COALESCE(bp.name, bfs.short_label, bfs.name, ch.name, f.name, cc.name, ob.name, k.label, jl.funding_source) END
+     FROM job_lines jl
+     JOIN job_line_statuses s ON s.id = jl.status_id
+     LEFT JOIN job_line_funding_kinds k ON k.source = jl.funding_source
+     LEFT JOIN cabin_holders ch ON jl.funding_source = 'cabin_holder' AND ch.id = jl.funding_ref_id
+     LEFT JOIN funds f ON jl.funding_source = 'fund' AND f.id = jl.funding_ref_id
+     LEFT JOIN funding_sources bfs ON jl.funding_source = 'funder' AND bfs.id = jl.funding_ref_id
+     LEFT JOIN people bp ON bp.id = bfs.person_id
+     LEFT JOIN capital_campaign_projects cc ON jl.funding_source = 'capital_campaign' AND cc.id = jl.funding_ref_id
+     LEFT JOIN other_budget_categories ob ON jl.funding_source = 'other' AND ob.id = jl.funding_ref_id
+     WHERE jl.actual_cost > 0 AND s.counts_as_work_performed
+       AND COALESCE(jl.completed_date, jl.completed_at::date) IS NOT NULL
+       AND ($1::date IS NULL OR COALESCE(jl.completed_date, jl.completed_at::date) <= $1)`,
+    [throughDate]
+  );
+  return rows.map((r) => ({ ...r, amount: Number(r.amount) }));
+}
+
+// Where "cumulative" starts: the admin setting, else the earliest thing in the ledger.
+async function trackingStartFor(ledger, fallback) {
+  const { rows } = await pool.query('SELECT tracking_start_date::text AS d FROM display_settings ORDER BY id LIMIT 1');
+  if (rows[0]?.d) return rows[0].d;
+  const dates = ledger.map((r) => r.dt).filter(Boolean).sort();
+  return dates[0] || fallback;
+}
+
+const round2 = (n) => Math.round(Number(n) * 100) / 100;
+
+// Totals for one window of the ledger. Camp is broken down by pot (General / each fund /
+// Unattributed); non-camp by who paid.
+function ledgerWindow(ledger, from, to) {
+  const rows = ledger.filter((r) => r.dt >= from && r.dt <= to);
+  const sum = (xs) => round2(xs.reduce((t, r) => t + r.amount, 0));
+  const camp = rows.filter((r) => r.is_camp);
+  const nonCamp = rows.filter((r) => !r.is_camp);
+  const pots = new Map();
+  for (const r of camp) {
+    const pot = r.fund_name || (r.who === 'Unattributed' ? 'Unattributed' : 'General');
+    pots.set(pot, round2((pots.get(pot) || 0) + r.amount));
+  }
+  const people = new Map();
+  for (const r of nonCamp) people.set(r.who, round2((people.get(r.who) || 0) + r.amount));
+  return {
+    camp: sum(camp), nonCamp: sum(nonCamp), inKind: sum(rows.filter((r) => r.in_kind)),
+    total: sum(rows), typedCamp: sum(camp.filter((r) => r.kind === 'typed')),
+    typedNonCamp: sum(nonCamp.filter((r) => r.kind === 'typed')),
+    pots, people,
+  };
+}
+
+// Camp receipts bought in a window and not (fully) linked to any work. They are real spend, so
+// they are in the money figures, but the work section cannot show them.
+async function unlinkedReceiptsTotal(from, to, fundId = null) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(SUM(e.amount - COALESCE(al.total, 0)), 0) AS total
+     FROM expenses e
+     LEFT JOIN (SELECT expense_id, SUM(amount) AS total FROM expense_allocations GROUP BY expense_id) al
+       ON al.expense_id = e.id
+     LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND e.amount IS NOT NULL
+       AND COALESCE(al.total, 0) < e.amount
+       AND ($1::date IS NULL OR e.purchase_date >= $1) AND e.purchase_date <= $2
+       AND ($3::int IS NULL OR e.fund_id = $3)
+       AND (e.fund_id IS NOT NULL OR fs.id IS NULL OR fs.counts_as_camp_spend)`,
+    [from, to, fundId]
+  );
+  return round2(rows[0].total);
+}
+
+const fmtShortDate = (iso) => new Date(`${String(iso).slice(0, 10)}T12:00:00Z`)
+  .toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+
 export async function computeBoardReportAggregates(reportId) {
   const report = await getBoardReport(reportId);
   if (!report) return [];
-  const yearStart = `${String(report.PeriodEnd).slice(0, 4)}-01-01`;
+  const pS = String(report.PeriodStart).slice(0, 10);
+  const pE = String(report.PeriodEnd).slice(0, 10);
+  const yearStart = `${pE.slice(0, 4)}-01-01`;
+  const ledger = await boardMoneyLedger(pE);
+  const trackStart = await trackingStartFor(ledger, pS);
+  const period = ledgerWindow(ledger, pS, pE);
+  const ytd = ledgerWindow(ledger, yearStart, pE);
+  const cum = ledgerWindow(ledger, trackStart, pE);
   const out = [];
 
-  // Total spend reads the RECEIPTS, not their allocations. Allocations divide the same
-  // money between destinations — they never add to it — so summing them under-reports
-  // every receipt nobody has split yet, which is most of them. (Found the hard way:
-  // this said $0 spent against 11 real receipts, because none had been split.)
-  // Allocations are how spend is ATTRIBUTED — per fund, per job — not how it is totalled.
-  // Camp money and contributed money are reported SEPARATELY and never summed (§2b). A gift or
-  // a personal payment is not the camp spending, and mixing them would overstate both the
-  // camp's outgoings and, by hiding it, the size of what was given.
-  //
-  // An expense with no funding source set counts as camp spend, because that is what every
-  // existing receipt is until Ben marks the personal ones — and showing a receipt as neither
-  // would quietly drop real money out of the total.
-  const CAMP = `(fs.id IS NULL OR fs.counts_as_camp_spend)`;
-  const spendSql = (where) => `
-    SELECT COALESCE(SUM(e.amount) FILTER (WHERE ${CAMP}), 0)                      AS camp,
-           -- Everything that is NOT camp money, however it happens to be classified. Keying
-           -- this off is_contribution alone would quietly drop a non-camp source nobody
-           -- remembered to tick, and the board would read it as camp spend by omission.
-           COALESCE(SUM(e.amount) FILTER (WHERE fs.id IS NOT NULL AND NOT fs.counts_as_camp_spend), 0) AS contributed,
-           COALESCE(SUM(e.amount) FILTER (WHERE fs.is_in_kind), 0)                AS in_kind
-    FROM expenses e
-    LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
-    WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND ${where}`;
-
-  const spend = await pool.query(spendSql('e.purchase_date BETWEEN $1 AND $2'), [report.PeriodStart, report.PeriodEnd]);
-  const ytd = await pool.query(spendSql('e.purchase_date BETWEEN $1 AND $2'), [yearStart, report.PeriodEnd]);
-  const p = spend.rows[0]; const y = ytd.rows[0];
-
-  // Work paid for directly, with no receipt: a cabin holder settling with a contractor in cash
-  // is real contributed money, and counting only receipts made it invisible. Measured from the
-  // job line's own actual cost, dated by when the line was completed.
-  const directSql = (from, to) => pool.query(
-    `SELECT COALESCE(SUM(jl.actual_cost), 0) AS total
-     FROM job_lines jl
-     LEFT JOIN job_line_funding_kinds k ON k.source = jl.funding_source
-     WHERE jl.funding_source IS NOT NULL AND NOT COALESCE(k.counts_as_camp_spend, true)
-       AND jl.actual_cost IS NOT NULL
-       AND COALESCE(jl.completed_date, jl.completed_at::date) BETWEEN $1 AND $2
-       -- Only where no receipt has been split onto the line: receipts win, and counting both
-       -- would report the same money twice.
-       AND NOT EXISTS (SELECT 1 FROM expense_allocations ea
-                        WHERE ea.dest_type = 'job_line' AND ea.dest_id = jl.id)`,
-    [from, to]
-  );
-  const directP = Number((await directSql(report.PeriodStart, report.PeriodEnd)).rows[0].total);
-  const directY = Number((await directSql(yearStart, report.PeriodEnd)).rows[0].total);
-
-  const nonCampP = Number(p.contributed) + directP;
-  const nonCampY = Number(y.contributed) + directY;
-
-  // Camp money is one figure to the board but comes from more than one pot. The split says
-  // which, so "camp spent $978" does not read as "$978 out of the general budget" when most of
-  // it came from a fund the board itself earmarked. Receipts only, like the tile it sits under.
-  const { rows: campSplit } = await pool.query(
-    `SELECT COALESCE(f.name, 'General') AS source, SUM(e.amount) AS amount
-     FROM expenses e
-     LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
-     LEFT JOIN funds f ON f.id = e.fund_id
-     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
-       AND e.purchase_date BETWEEN $1 AND $2
-       AND (fs.id IS NULL OR fs.counts_as_camp_spend)
-     GROUP BY 1 HAVING SUM(e.amount) <> 0
-     -- General first, then the largest fund: the reader wants the ordinary pot before the
-     -- earmarked ones.
-     ORDER BY (COALESCE(f.name, 'General') <> 'General'), SUM(e.amount) DESC`,
-    [report.PeriodStart, report.PeriodEnd]
-  );
-  out.push({
-    groupKey: 'money', label: 'Camp funds spent this period', valueNumeric: Number(p.camp),
-    note: campSplit.length > 1
-      ? campSplit.map((r) => `${r.source} ${fmtMoneyPlain(Number(r.amount))}`).join(' · ')
-      : null,
-  });
-  out.push({ groupKey: 'money', label: 'Camp funds spent year to date', valueNumeric: Number(y.camp) });
-  // Only shown once there is something to show, so the header does not carry a permanent zero
-  // while Ben has not yet marked anything as non-camp.
-  if (nonCampP > 0 || nonCampY > 0) {
-    out.push({
-      groupKey: 'money', label: 'Contributed (non-camp)', valueNumeric: nonCampP,
-      note: 'Includes work paid directly, without a receipt.',
-    });
+  // ── Top of the report: what the board oversees. Camp money this period, split by pot. ──
+  // The split always names General and every fund that moved, so "$1,183" is never read as
+  // "$1,183 out of the general budget" when it came from an earmarked fund.
+  const potParts = [];
+  if (period.camp) {
+    potParts.push(`General ${fmtMoneyPlain(period.pots.get('General') || 0)}`);
+    for (const [pot, amt] of period.pots) if (pot !== 'General' && amt) potParts.push(`${pot} ${fmtMoneyPlain(amt)}`);
   }
-  if (Number(p.in_kind) > 0 || Number(y.in_kind) > 0) {
-    out.push({ groupKey: 'money', label: 'In-kind this period', valueNumeric: Number(p.in_kind) });
-  }
+  const unlinkedP = await unlinkedReceiptsTotal(pS, pE);
+  const campNotes = [potParts.length > 1 ? potParts.join(' · ') : null,
+    unlinkedP > 0 ? `Includes ${fmtMoneyPlain(unlinkedP)} in receipts not yet linked to work.` : null,
+    period.typedCamp > 0 ? `Includes ${fmtMoneyPlain(period.typedCamp)} of work paid without a receipt.` : null,
+  ].filter(Boolean);
+  out.push({ groupKey: 'money', label: 'Camp funds spent · this period', valueNumeric: period.camp,
+    note: campNotes.join(' ') || null });
 
-  // Approved funds: camp money the board earmarked for something in particular. It IS camp
-  // spend — it sits inside "Camp funds spent", not beside it — but the board approved a figure
-  // and is entitled to see how much of it has gone. Reuses getFundBalances, which already
-  // counts both halves: shares allocated to the fund, plus the unsplit remainder of any receipt
-  // charged to it.
-  //
-  // Only funds with something to report. A fund nobody has drawn on is not news.
-  // Hidden funds are left out of the block entirely. No row means shown.
+  // ── Approved funds: used / remaining / days left, all AS OF THE PERIOD END. ──
+  // The same ledger as everything else, so the fund bar and the summary at the bottom cannot
+  // disagree. Spending after the period end belongs to a later report.
   const { rows: hiddenRows } = await pool.query(
     'SELECT fund_id FROM board_report_funds WHERE report_id = $1 AND NOT included', [reportId]
   );
   const hiddenFunds = new Set(hiddenRows.map((r) => r.fund_id));
-  for (const f of await getFundBalances()) {
-    if (hiddenFunds.has(f.Id)) continue;
-    // getFundBalances is the single definition of fund spend — receipts, fund-tagged splits and
-    // receiptless work alike. Adding a second helping here is how the two figures drifted apart.
-    const spent = Number(f.Spent);
-    if (!f.Active || spent <= 0) continue;
+  for (const f of await listFunds()) {
+    if (hiddenFunds.has(f.Id) || !f.Active) continue;
+    const spent = round2(ledger.filter((r) => r.fund_id === f.Id).reduce((t, r) => t + r.amount, 0));
+    if (spent <= 0) continue;
     const remaining = Number(f.Amount) - spent;
-    // Fund usage and the footer's breakdown answer different questions — everything drawn on the
-    // fund, versus the part of it that landed on work this report shows. Saying how much is not
-    // yet attached to any work makes the difference legible instead of looking like an error,
-    // and it is a to-do in its own right.
-    const unlinked = Number((await pool.query(
-      `SELECT COALESCE(SUM(e.amount - COALESCE(al.total, 0)), 0) AS total
-       FROM expenses e
-       LEFT JOIN (SELECT expense_id, SUM(amount) AS total FROM expense_allocations GROUP BY expense_id) al
-         ON al.expense_id = e.id
-       WHERE e.fund_id = $1 AND e.triage_status != 'void' AND e.deleted_at IS NULL
-         AND COALESCE(al.total, 0) < e.amount`,
-      [f.Id]
-    )).rows[0].total);
+    const unlinked = await unlinkedReceiptsTotal(null, pE, f.Id);
+    const daysLeft = f.EndDate
+      ? Math.ceil((new Date(`${(f.EndDate instanceof Date ? f.EndDate.toISOString() : String(f.EndDate)).slice(0, 10)}T12:00:00Z`) - new Date(`${pE}T12:00:00Z`)) / 86400000)
+      : null;
     const bits = [
       `${fmtMoneyPlain(spent)} of ${fmtMoneyPlain(Number(f.Amount))} used`,
       remaining >= 0 ? `${fmtMoneyPlain(remaining)} left` : `${fmtMoneyPlain(-remaining)} over`,
     ];
     if (unlinked > 0) bits.push(`${fmtMoneyPlain(unlinked)} not yet linked to work`);
-    // Days left only while there are any — a closed window says so instead of counting down
-    // past zero.
-    if (f.DaysLeft != null) bits.push(f.DaysLeft >= 0 ? `${f.DaysLeft} days left` : 'window closed');
+    if (daysLeft != null) bits.push(daysLeft >= 0 ? `${daysLeft} days left` : 'window closed');
     out.push({
-      groupKey: 'funds', label: f.Name, valueText: bits.join(' · '),
-      note: f.AuthorizedBy ? `authorized by ${f.AuthorizedBy}` : null,
+      groupKey: 'funds', label: f.Name, valueText: bits.join(' · '), valueNumeric: spent,
+      note: [f.AuthorizedBy ? `authorized by ${f.AuthorizedBy}` : null, `as of ${fmtShortDate(pE)}`].filter(Boolean).join(' · '),
     });
   }
 
@@ -6151,70 +6207,44 @@ export async function computeBoardReportAggregates(reportId) {
   const rec = await pool.query(
     `SELECT COALESCE(SUM(CASE WHEN period = 'monthly' THEN amount * 12 ELSE amount END), 0) AS annualized
      FROM savings_entries WHERE kind = 'recurring' AND occurred_on BETWEEN $1 AND $2`,
-    [report.PeriodStart, report.PeriodEnd]
+    [pS, pE]
   );
   const recAll = await pool.query(
     `SELECT COALESCE(SUM(CASE WHEN period = 'monthly' THEN amount * 12 ELSE amount END), 0) AS annualized
-     FROM savings_entries WHERE kind = 'recurring' AND occurred_on <= $1`,
-    [report.PeriodEnd]
+     FROM savings_entries WHERE kind = 'recurring' AND occurred_on BETWEEN $1 AND $2`,
+    [trackStart, pE]
   );
   const one = await pool.query(
     `SELECT COALESCE(SUM(amount), 0) AS total FROM savings_entries
      WHERE kind = 'one_time' AND occurred_on BETWEEN $1 AND $2`,
-    [report.PeriodStart, report.PeriodEnd]
+    [pS, pE]
   );
-  out.push({ groupKey: 'savings', label: 'Recurring savings secured this period (per year)', valueNumeric: Number(rec.rows[0].annualized) });
-  out.push({ groupKey: 'savings', label: 'Recurring savings secured to date (per year)', valueNumeric: Number(recAll.rows[0].annualized) });
-  out.push({ groupKey: 'savings', label: 'One-time savings this period', valueNumeric: Number(one.rows[0].total) });
+  out.push({ groupKey: 'savings', label: 'Recurring savings secured · this period (per year)', valueNumeric: Number(rec.rows[0].annualized) });
+  out.push({ groupKey: 'savings', label: `Recurring savings secured · cumulative since ${fmtShortDate(trackStart)} (per year)`, valueNumeric: Number(recAll.rows[0].annualized) });
+  out.push({ groupKey: 'savings', label: 'One-time savings · this period', valueNumeric: Number(one.rows[0].total) });
 
-  // Paid to date, all sources (Nov 2026): every receipt and every typed-in job line cost recorded
-  // through the end of the period, by who paid — so the board can see in one place what each
-  // person and each pot has put in. Always computed (cheap); shown only when the report's
-  // show_paid_to_date switch is on. Frozen with the other aggregates when the report publishes.
-  //
-  // Receipts: the receipt's fund, else the person behind its funding source, else the source's
-  // own name; no source, or the general one, is the camp's general budget.
-  // Typed-in costs: the line's own funding, labelled the way the board report labels it. They
-  // add to receipts rather than duplicate them (JOB_LINE_ACTUAL_COST_EXPR sums both).
-  const { rows: ptd } = await pool.query(
-    `WITH paid AS (
-       SELECT CASE WHEN f.id IS NOT NULL THEN f.name
-                   WHEN fs.id IS NULL OR fs.is_general THEN 'Camp general budget'
-                   ELSE COALESCE(pp.name, fs.short_label, fs.name) END AS who,
-              (f.id IS NOT NULL OR fs.id IS NULL OR fs.counts_as_camp_spend) AS is_camp,
-              e.amount AS amount
-       FROM expenses e
-       LEFT JOIN funds f ON f.id = e.fund_id
-       LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
-       LEFT JOIN people pp ON pp.id = fs.person_id
-       WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND e.purchase_date <= $1
-       UNION ALL
-       SELECT CASE WHEN jl.funding_source IS NULL THEN 'Unattributed'
-                   WHEN k.is_general THEN 'Camp general budget'
-                   ELSE COALESCE(bp.name, bfs.short_label, bfs.name, ch.name, f.name, cc.name, ob.name, k.label, jl.funding_source) END,
-              COALESCE(bfs.counts_as_camp_spend, k.counts_as_camp_spend, true),
-              jl.actual_cost
-       FROM job_lines jl
-       LEFT JOIN job_line_funding_kinds k ON k.source = jl.funding_source
-       LEFT JOIN cabin_holders ch ON jl.funding_source = 'cabin_holder' AND ch.id = jl.funding_ref_id
-       LEFT JOIN funds f ON jl.funding_source = 'fund' AND f.id = jl.funding_ref_id
-       LEFT JOIN funding_sources bfs ON jl.funding_source = 'funder' AND bfs.id = jl.funding_ref_id
-       LEFT JOIN people bp ON bp.id = bfs.person_id
-       LEFT JOIN capital_campaign_projects cc ON jl.funding_source = 'capital_campaign' AND cc.id = jl.funding_ref_id
-       LEFT JOIN other_budget_categories ob ON jl.funding_source = 'other' AND ob.id = jl.funding_ref_id
-       WHERE jl.actual_cost > 0
-         AND COALESCE(jl.completed_date, jl.completed_at::date, jl.created_at::date) <= $1
-     )
-     SELECT who, bool_and(is_camp) AS is_camp, SUM(amount) AS amount
-     FROM paid GROUP BY who HAVING SUM(amount) <> 0
-     ORDER BY bool_and(is_camp), SUM(amount) DESC`,
-    [report.PeriodEnd]
-  );
-  for (const r of ptd) {
-    out.push({ groupKey: 'paid_to_date', label: r.who, valueNumeric: Number(r.amount),
-      note: r.who === 'Unattributed' ? 'unattributed' : (r.is_camp ? 'camp' : 'contributed') });
+  // ── Financial summary at the BOTTOM of the report: this period, year to date (only when it
+  // differs from cumulative), and cumulative since the tracking start. One row per figure, one
+  // group per window; the renderer lays them out as columns. Shown when show_paid_to_date is on.
+  out.push({ groupKey: 'summary_meta', label: 'range', valueText: `${trackStart}|${pE}` });
+  const windows = [['summary_period', period]];
+  if (trackStart < yearStart) windows.push(['summary_ytd', ytd]);
+  windows.push(['summary_cum', cum]);
+  for (const [key, w] of windows) {
+    out.push({ groupKey: key, label: 'Camp funds', valueNumeric: w.camp, note: 'camp' });
+    const pots = [...w.pots.entries()].sort((a, b) => (a[0] === 'General' ? -1 : b[0] === 'General' ? 1 : b[1] - a[1]));
+    for (const [pot, amt] of pots) out.push({ groupKey: key, label: pot === 'General' ? 'General budget' : pot, valueNumeric: amt, note: 'pot' });
+    out.push({ groupKey: key, label: 'Contributed (non-camp)', valueNumeric: w.nonCamp, note: 'noncamp' });
+    for (const [who, amt] of [...w.people.entries()].sort((a, b) => b[1] - a[1])) {
+      out.push({ groupKey: key, label: who, valueNumeric: amt, note: 'contributor' });
+    }
+    if (w.inKind) out.push({ groupKey: key, label: 'of which in-kind', valueNumeric: w.inKind, note: 'inkind' });
+    out.push({ groupKey: key, label: 'Total', valueNumeric: w.total, note: 'total' });
+    if (w.typedNonCamp) out.push({ groupKey: key, label: 'typed_noncamp', valueNumeric: w.typedNonCamp, note: 'meta' });
   }
-
+  const unlinkedCum = await unlinkedReceiptsTotal(trackStart, pE);
+  if (unlinkedCum > 0) out.push({ groupKey: 'summary_meta', label: 'unlinked_cum', valueNumeric: unlinkedCum });
+  if (unlinkedP > 0) out.push({ groupKey: 'summary_meta', label: 'unlinked_period', valueNumeric: unlinkedP });
   await replaceBoardReportAggregates(reportId, out);
   return listBoardReportAggregates(reportId);
 }
@@ -6500,12 +6530,54 @@ async function getReportedItemKeys() {
   return new Set(rows.map((r) => `${r.item_type}:${r.item_id}:${r.item_date || ''}`));
 }
 
+// The earliest of some dates (ISO strings or Dates), ignoring blanks.
+function earliestDate(...ds) {
+  const iso = ds.filter(Boolean).map((d) => (d instanceof Date ? d.toISOString() : String(d)).slice(0, 10)).sort();
+  return iso[0] || null;
+}
+
 const reportedKey = (itemType, itemId, itemDate = null) => `${itemType}:${itemId}:${itemDate || ''}`;
 
 // ── Board report suggestions (Build Brief §5) ────────────────────────────
 // Everything here is a SUGGESTION. Each pass upserts rows pre-checked, and
 // upsertBoardReportItem never overwrites an explicit include/exclude, so re-running
 // after a date change can't undo a decision. Nothing is ever force-included.
+
+// Receipts filed to a work order AS A WHOLE (not to one of its lines), bought inside a window,
+// with who paid, by the same precedence jobLineFundingForReport uses. A carried-over work order's
+// row carries no roll-up, so without this a receipt filed to the job itself vanished from that
+// month's work section and footer ($452.33 on Caretaker's Renovations, Oct 2026).
+async function workOrderReceiptFundingInWindow(workOrderId, from, to) {
+  const { rows } = await pool.query(
+    `SELECT COALESCE(f.name, afp.name, afs.short_label, afs.name, fs.short_label, fs.name, k.label, 'Unassigned') AS source,
+            CASE WHEN f.id IS NOT NULL THEN true
+                 WHEN afs.id IS NOT NULL THEN afs.counts_as_camp_spend
+                 WHEN fs.id IS NOT NULL THEN fs.counts_as_camp_spend
+                 WHEN k.source IS NOT NULL THEN k.counts_as_camp_spend
+                 ELSE true END AS is_camp,
+            CASE WHEN f.id IS NOT NULL OR afs.id IS NOT NULL THEN false
+                 WHEN fs.id IS NOT NULL THEN fs.is_general
+                 WHEN k.source IS NOT NULL THEN k.is_general
+                 ELSE true END AS is_general,
+            SUM(ea.amount) AS amount
+     FROM expense_allocations ea
+     JOIN expenses e ON e.id = ea.expense_id
+     LEFT JOIN funds f ON f.id = COALESCE(e.fund_id, CASE WHEN ea.funding_source = 'fund' THEN ea.funding_ref_id END)
+     LEFT JOIN funding_sources afs ON ea.funding_source = 'funder' AND afs.id = ea.funding_ref_id AND e.fund_id IS NULL
+     LEFT JOIN people afp ON afp.id = afs.person_id
+     LEFT JOIN funding_sources fs ON fs.id = e.funding_source_id
+     LEFT JOIN job_line_funding_kinds k ON k.source = ea.funding_source
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL
+       AND ea.dest_type = 'work_order' AND ea.dest_id = $1
+       AND e.purchase_date BETWEEN $2 AND $3
+     GROUP BY 1, 2, 3 HAVING SUM(ea.amount) <> 0`,
+    [workOrderId, from, to]
+  );
+  return rows.map((r) => ({
+    Source: r.source, IsCamp: r.is_camp === true, IsGeneral: r.is_general === true,
+    Amount: Number(r.amount), From: 'wo_receipt',
+  }));
+}
 
 // Done: job lines resolved inside the backward period — line level, so a work order
 // with 2 of 5 lines finished contributes those 2 and not itself.
@@ -6566,6 +6638,7 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
       // re-print what the board was already shown. The lines beneath carry this month's costs.
       const continued = reported.has(reportedKey('work_order', r.work_order_id));
       const roll = await workOrderRollupForReport(r.work_order_id, reportId);
+      const woReceipts = continued ? await workOrderReceiptFundingInWindow(r.work_order_id, periodStart, periodEnd) : [];
       await upsertBoardReportItem(reportId, { passId,
         itemType: 'work_order', itemId: r.work_order_id, section: 'done', sortIndex: i,
         snapTitle: r.wo_title, snapAssetName: r.asset_name,
@@ -6573,7 +6646,10 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
         // no date while the board-featured front gate showed both — two paths writing a work
         // order row with different amounts of detail (decisions §7).
         snapStatus: r.wo_status,
-        snapStartDate: r.wo_started || roll.firstDate,
+        // "Started" is the earlier of the day the work order was entered and its first line's
+        // date: work entered in arrears (WOs 177/178, entered Nov 1 for work done Oct 27/28)
+        // otherwise read as started after it was completed.
+        snapStartDate: earliestDate(r.wo_started, roll.firstDate, r.wo_completed),
         // Only a finished work order gets a finish date. Falling back to the newest completed
         // LINE made an open WO read "Completed" because some of its lines were done.
         snapDate: r.wo_completed || (r.wo_is_terminal ? roll.lastCompleted : null),
@@ -6582,7 +6658,11 @@ async function suggestDoneJobLines(reportId, passId, reported, { periodStart, pe
         snapCost: !continued && roll.hasActual ? roll.actualCost : null,
         snapEstCost: !continued && roll.hasEst ? roll.estCost : null,
         snapHours: continued ? null : (roll.actualHours || null),
-        snapFunding: !continued && roll.funding.length ? roll.funding : null,
+        // A continued header carries no roll-up, but receipts filed to the job as a whole in
+        // this period are this period's spending and ride on the header (display + totals).
+        snapFunding: continued
+          ? (woReceipts.length ? woReceipts : null)
+          : (roll.funding.length ? roll.funding : null),
         snapProgress: r.wo_completed ? null : roll.progress,
         snapOpenLines: r.wo_is_terminal ? null : roll.openLines,
       });
@@ -6635,8 +6715,10 @@ async function suggestAdminTasks(reportId, passId, reported, { periodStart, peri
 
 // Coming Up: scheduled inside the forward window, plus anything flagged regardless of
 // date, plus overdue. Overdue is computed, never a stored status, so it clears itself.
-async function suggestComingUp(reportId, passId, reported, { forwardStart, forwardEnd, showScheduled = true }) {
-  const todayStr = today();
+async function suggestComingUp(reportId, passId, reported, { periodEnd, forwardStart, forwardEnd, showScheduled = true }) {
+  // Overdue is judged AS OF THE PERIOD END, not the day the report is generated: a report that
+  // runs through Oct 31 must not call a Nov 9 pickup overdue because it was built on Nov 17.
+  const todayStr = String(periodEnd || today()).slice(0, 10);
   const { rows } = await pool.query(
     `SELECT jl.id, jl.title, jl.scheduled_date::text AS scheduled_date, jl.estimated_cost,
             jl.board_focus, COALESCE(jl.board_focus_set_at, w.board_focus_set_at) AS focus_since,
@@ -7317,7 +7399,7 @@ async function suggestFlaggedItems(reportId, passId, reported, { periodEnd } = {
       itemType: 'work_order', itemId: r.id,
       section: (r.is_terminal || anchorsDone) ? 'done' : 'coming_up', sortIndex: 3000 + i,
       snapTitle: r.title, snapAssetName: r.place, snapStatus: r.status,
-      snapStartDate: r.started_date || roll.firstDate,
+      snapStartDate: earliestDate(r.started_date, roll.firstDate, r.completed_date),
       snapDate: r.completed_date || (r.is_terminal ? roll.lastCompleted : null),
       snapCost: roll.hasActual ? roll.actualCost : null,
       snapEstCost: roll.hasEst ? roll.estCost : null,
@@ -7533,6 +7615,7 @@ function boardReportRowShape(r) {
     ShowHours: r.show_hours === true,
     ShowScheduled: r.show_scheduled !== false,
     ShowPaidToDate: r.show_paid_to_date === true,
+    ShowNamedContributors: r.show_named_contributors === true,
     ShowFunding: r.show_funding || 'non_general',
     CreatedAt: r.created_at, UpdatedAt: r.updated_at, PublishedAt: r.published_at,
   };
@@ -7611,6 +7694,7 @@ const BOARD_REPORT_UPDATE_COLUMNS = {
   title: 'title', periodStart: 'period_start', periodEnd: 'period_end',
   forwardStart: 'forward_start', forwardEnd: 'forward_end', summaryNotes: 'summary_notes',
   showHours: 'show_hours', showFunding: 'show_funding', showScheduled: 'show_scheduled', showPaidToDate: 'show_paid_to_date',
+  showNamedContributors: 'show_named_contributors',
 };
 
 // The name a draft gets from its dates: the month its period ends in.
@@ -12326,4 +12410,86 @@ export async function getAdminTasksWorkPerformedRawData({ from, to }) {
     [from, to]
   );
   return rows.map(adminTaskRowShape);
+}
+
+// ── Unclassified money (Nov 2026) ───────────────────────────────────────────────────────────
+// Everything that makes the board report's money figures harder to reconcile, so it can be
+// worked off one item at a time. Screen only; never in the board's copy.
+export async function listUnclassifiedMoney(throughDate = null) {
+  const out = [];
+  const money = (n) => `$${Number(n).toFixed(2)}`;
+  const { rows: unlinked } = await pool.query(
+    `SELECT e.id, e.purchase_date::text AS dt, e.vendor, e.amount::float AS amount,
+            (e.amount - COALESCE(al.total, 0))::float AS unlinked
+     FROM expenses e
+     LEFT JOIN (SELECT expense_id, SUM(amount) AS total FROM expense_allocations GROUP BY expense_id) al ON al.expense_id = e.id
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND e.amount IS NOT NULL
+       AND COALESCE(al.total, 0) < e.amount AND ($1::date IS NULL OR e.purchase_date <= $1)
+     ORDER BY e.purchase_date, e.id`, [throughDate]);
+  for (const r of unlinked) {
+    out.push({ Kind: 'receipt_unlinked', Group: 'Receipts not linked to any work', Id: r.id,
+      Title: `${r.vendor || 'Receipt'} · ${r.dt}`, Amount: r.unlinked,
+      Detail: r.unlinked < r.amount
+        ? `${money(r.unlinked)} of ${money(r.amount)} not split to work`
+        : 'Counts as spend, but no work order or line shows it',
+      Link: { view: 'expenseDetail', params: { id: r.id } } });
+  }
+  const { rows: noPayer } = await pool.query(
+    `SELECT e.id, e.purchase_date::text AS dt, e.vendor, e.amount::float AS amount
+     FROM expenses e
+     WHERE e.triage_status != 'void' AND e.deleted_at IS NULL AND e.amount IS NOT NULL
+       AND e.fund_id IS NULL AND e.funding_source_id IS NULL
+       AND NOT EXISTS (SELECT 1 FROM expense_allocations ea WHERE ea.expense_id = e.id AND ea.funding_source = 'fund')
+       AND ($1::date IS NULL OR e.purchase_date <= $1)
+     ORDER BY e.purchase_date, e.id`, [throughDate]);
+  for (const r of noPayer) {
+    out.push({ Kind: 'receipt_no_payer', Group: 'Receipts with no "Paid from"', Id: r.id,
+      Title: `${r.vendor || 'Receipt'} · ${r.dt}`, Amount: r.amount,
+      Detail: 'Counted as camp general budget until someone says otherwise',
+      Link: { view: 'expenseDetail', params: { id: r.id } } });
+  }
+  const { rows: pending } = await pool.query(
+    `SELECT e.id, e.purchase_date::text AS dt, e.vendor, e.amount::float AS amount
+     FROM expenses e
+     WHERE e.deleted_at IS NULL AND (e.triage_status = 'inbox' OR (e.amount IS NULL AND e.triage_status != 'void'))
+     ORDER BY e.purchase_date NULLS LAST, e.id`);
+  for (const r of pending) {
+    out.push({ Kind: 'receipt_pending', Group: 'Receipts still in the inbox or missing an amount', Id: r.id,
+      Title: `${r.vendor || 'Receipt'} · ${r.dt || 'no date'}`, Amount: r.amount,
+      Detail: r.amount == null ? 'No amount, so not counted anywhere' : 'Still in the inbox',
+      Link: { view: 'expenseDetail', params: { id: r.id } } });
+  }
+  const { rows: lines } = await pool.query(
+    `SELECT jl.id, jl.title, jl.work_order_id, w.title AS wo_title, jl.actual_cost::float AS amount,
+            jl.funding_source, s.counts_as_work_performed AS done,
+            COALESCE(jl.completed_date, jl.completed_at::date)::text AS done_dt, jl.scheduled_date::text AS sched
+     FROM job_lines jl
+     JOIN job_line_statuses s ON s.id = jl.status_id
+     JOIN work_orders w ON w.id = jl.work_order_id
+     WHERE jl.actual_cost > 0
+       AND (jl.funding_source IS NULL OR NOT s.counts_as_work_performed
+            OR COALESCE(jl.completed_date, jl.completed_at::date) IS NULL)
+     ORDER BY jl.work_order_id, jl.id`);
+  for (const r of lines) {
+    const finished = r.done && r.done_dt;
+    out.push(finished
+      ? { Kind: 'line_no_funding', Group: 'Finished work with a cost but no funding source', Id: r.id,
+          Title: `${r.title} — ${r.wo_title}`, Amount: r.amount,
+          Detail: 'Counted as camp spend, shown as Unattributed',
+          Link: { view: 'workOrderDetail', params: { id: r.work_order_id } } }
+      : { Kind: 'line_cost_unfinished', Group: 'Cost typed on work that is not finished', Id: r.id,
+          Title: `${r.title} — ${r.wo_title}`, Amount: r.amount,
+          Detail: `Not counted until the line is completed${r.sched ? ` (scheduled ${r.sched})` : ''}. If this is an estimate, move it to Estimated Cost.`,
+          Link: { view: 'workOrderDetail', params: { id: r.work_order_id } } });
+  }
+  return out;
+}
+
+// Fund usage from the board report's ledger — compared with getFundBalances by the pre-send
+// check, so the two definitions of "fund spent" can never drift apart unnoticed.
+export async function boardLedgerFundTotals(throughDate = null) {
+  const ledger = await boardMoneyLedger(throughDate);
+  const by = new Map();
+  for (const r of ledger) if (r.fund_id) by.set(r.fund_id, Math.round(((by.get(r.fund_id) || 0) + r.amount) * 100) / 100);
+  return by;
 }
