@@ -84,6 +84,26 @@ counts still use `totalledItems`), and the header prints `This period: Ben $X ·
 **Known stale test:** board-report-test's "all N real expenses are still unset" asserts no
 expense has a payer — false since Ben started setting payers. Ask Ben before deleting it.
 
+## 1b. 2026-11-17 — board report financial fixes (migration 0124)
+
+- **One money ledger** (`boardMoneyLedger` in db.js) feeds every board-report money figure.
+  Receipts count on their purchase date, and their fund is the receipt's own fund or else any
+  split that names a fund. Typed-in Actual Cost counts only on finished lines, on the completed
+  date, and is added to receipts. This fixed the October conflicts: $523.54 shown as General
+  (it was the DAF), $800 dropped from Contributed, and $2,096.05 on unfinished line 265 counted
+  by its created date.
+- Receipts filed to a carried-over WO as a whole ride on the header's `snap_funding`
+  (`workOrderReceiptFundingInWindow`). The renderer counts them via `itemCost()`.
+- Financial summary (`summary_*` aggregate groups) renders at the bottom; the toggle is still
+  `show_paid_to_date`. Range starts at `display_settings.tracking_start_date` (Admin → Funds),
+  else the earliest record. `show_named_contributors` defaults off (published reports were set
+  on to keep them as sent).
+- Fund status and Overdue are judged as of the period end. "Started" = the earliest of entry
+  date, first line date and completed date.
+- `GET /board-reports/:id/checks` drives the "Before you send" card plus Unclassified money.
+  Screen only; Email asks for confirmation while warnings remain.
+- Not browser-clicked yet. Verified by regenerating draft #26 in the container.
+
 ## 2. The system
 
 | | |
