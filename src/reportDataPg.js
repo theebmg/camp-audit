@@ -8,7 +8,7 @@ import {
   getBoardReport, listBoardReportItems, listBoardReportAggregates, computeBoardReportAggregates,
   listSelectedReportPhotos, stampReportPhotoLabels,
   getFundBalances, boardLedgerFundTotals, listUnclassifiedMoney,
-  listCompletedWorkOrdersWithoutCost, listLaborOnlyWorkOrdersWithCost,
+  listCompletedWorkOrdersWithoutCost, listLaborOnlyWorkOrdersWithCost, stampCompletedWorkOrderTotals,
 } from './db.js';
 import { renderBoardReportItemsHtml, renderBoardReportItemsText, workSectionMoney } from './reportRender.js';
 import { buildEmailCopy, buildPhotoLabel } from './reportPhotos.js';
@@ -310,7 +310,9 @@ export async function buildDeferredBacklogReportPg() {
 export async function renderBoardReportFromItems(reportId, { withPhotos = false } = {}) {
   const report = await getBoardReport(reportId);
   if (!report) return null;
-  if (report.Status === 'draft') await computeBoardReportAggregates(reportId);
+  // A draft is always current: money header and completed work orders' totals are recomputed
+  // on every render, so a cost added a minute ago shows without pressing Refresh.
+  if (report.Status === 'draft') { await computeBoardReportAggregates(reportId); await stampCompletedWorkOrderTotals(reportId); }
   const [items, aggregates] = await Promise.all([
     listBoardReportItems(reportId),
     listBoardReportAggregates(reportId),
@@ -371,7 +373,9 @@ export async function renderBoardReportFromItems(reportId, { withPhotos = false 
 export async function computeBoardReportChecks(reportId) {
   const report = await getBoardReport(reportId);
   if (!report) return null;
-  if (report.Status === 'draft') await computeBoardReportAggregates(reportId);
+  // A draft is always current: money header and completed work orders' totals are recomputed
+  // on every render, so a cost added a minute ago shows without pressing Refresh.
+  if (report.Status === 'draft') { await computeBoardReportAggregates(reportId); await stampCompletedWorkOrderTotals(reportId); }
   const [items, aggregates] = await Promise.all([listBoardReportItems(reportId), listBoardReportAggregates(reportId)]);
   const pE = String(report.PeriodEnd).slice(0, 10);
   const money = (n) => `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;

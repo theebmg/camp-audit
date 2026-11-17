@@ -6994,7 +6994,7 @@ async function workOrderFullCost(workOrderId) {
 
 // Stamp every COMPLETED work order on a draft with its full total and who paid it (display
 // only), and clear it from any that are not completed. Run at the end of a refresh pass.
-async function stampCompletedWorkOrderTotals(reportId) {
+export async function stampCompletedWorkOrderTotals(reportId) {
   const { rows } = await pool.query(
     `SELECT bi.id, bi.item_id, ws.is_terminal
      FROM board_report_items bi
