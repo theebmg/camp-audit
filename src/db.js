@@ -6163,11 +6163,12 @@ export async function computeBoardReportAggregates(reportId) {
   // "$1,183 out of the general budget" when it came from an earmarked fund.
   const potParts = [];
   if (period.camp) {
-    potParts.push(`General ${fmtMoneyPlain(period.pots.get('General') || 0)}`);
-    for (const [pot, amt] of period.pots) if (pot !== 'General' && amt) potParts.push(`${pot} ${fmtMoneyPlain(amt)}`);
+    const cents = (n) => `$${Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    potParts.push(`General ${cents(period.pots.get('General') || 0)}`);
+    for (const [pot, amt] of period.pots) if (pot !== 'General' && amt) potParts.push(`${pot} ${cents(amt)}`);
   }
   const unlinkedP = await unlinkedReceiptsTotal(pS, pE);
-  const campNotes = [potParts.length > 1 ? potParts.join(' · ') : null,
+  const campNotes = [potParts.length > 1 ? `${potParts.join(' · ')}.` : null,
     unlinkedP > 0 ? `Includes ${fmtMoneyPlain(unlinkedP)} in receipts not yet linked to work.` : null,
     period.typedCamp > 0 ? `Includes ${fmtMoneyPlain(period.typedCamp)} of work paid without a receipt.` : null,
   ].filter(Boolean);
