@@ -103,6 +103,12 @@ expense has a payer — false since Ben started setting payers. Ask Ben before d
 - `GET /board-reports/:id/checks` drives the "Before you send" card plus Unclassified money.
   Screen only; Email asks for confirmation while warnings remain.
 - Not browser-clicked yet. Verified by regenerating draft #26 in the container.
+- **Per-WO totals (0125):** a completed WO prints one full total, `snap_total_cost` /
+  `snap_total_funding`, stamped by `stampCompletedWorkOrderTotals` at the end of a refresh.
+  It is display only and never summed. `workOrderFullCost` sums receipt allocations on the WO
+  and its lines, plus typed cost on finished lines. "total" is printed when it differs from what
+  the report counts for that WO. `work_orders.no_cost_labor_only` silences the "no cost
+  recorded" flag. The roll-up cost now includes WO-level receipts.
 
 ## 2. The system
 
