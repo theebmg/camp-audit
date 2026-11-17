@@ -559,8 +559,8 @@ function moneyHeaderHtml(aggregates) {
   const money = byGroup('money');
   const savings = byGroup('savings');
   if (!money.length && !savings.length) return '';
-  const cell = (a) => `
-    <td style="padding:12px 14px;border-left:4px solid #13432f;border-right:1px solid #c7d2dd;">
+  const cell = (a, span = 1) => `
+    <td${span > 1 ? ` colspan="${span}"` : ''} style="padding:12px 14px;border-left:4px solid #13432f;border-right:1px solid #c7d2dd;vertical-align:top;">
       <div style="color:#565c78;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em;line-height:1.35;">${escapeHtml(a.Label)}</div>
       <div style="font-size:1.15rem;font-weight:700;color:#13432f;margin-top:2px;">${a.ValueNumeric != null ? fmtMoney(a.ValueNumeric) : escapeHtml(a.ValueText || '—')}</div>
       ${a.Note ? `<div style="color:#565c78;font-size:0.68rem;line-height:1.3;margin-top:3px;">${escapeHtml(a.Note)}</div>` : ''}
@@ -570,8 +570,11 @@ function moneyHeaderHtml(aggregates) {
   const cols = Math.max(money.length, savings.length, 1);
   const row = (cells) => {
     if (!cells.length) return '';
-    const filler = '<td style="padding:12px 14px;"></td>'.repeat(cols - cells.length);
-    return `<tr>${cells.map(cell).join('')}${filler}</tr>`;
+    // A short row's last tile stretches across the leftover columns rather than leaving empty
+    // filler cells: one "Camp funds spent" tile over three savings tiles used to sit squeezed
+    // into the first column, its note wrapping tall beside two blank cells.
+    const spare = cols - cells.length;
+    return `<tr>${cells.map((c, i) => cell(c, i === cells.length - 1 ? spare + 1 : 1)).join('')}</tr>`;
   };
   return `
     <table role="presentation" bgcolor="#eef5f0" style="width:100%;border-collapse:collapse;background:#eef5f0;border:1px solid #c7d2dd;border-radius:10px;margin-bottom:18px;table-layout:fixed;">
